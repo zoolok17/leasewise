@@ -46,6 +46,12 @@ ERROR_IDEMPOTENCY = (
 )
 ERROR_INVALID_CONFIG = '{"error":{"code":"INVALID_CONFIG","message":"config document is invalid"}}'
 ERROR_STORE_NOT_FOUND = '{"error":{"code":"STORE_ERROR","message":"database not found"}}'
+ERROR_STORE_FAILED = '{"error":{"code":"STORE_ERROR","message":"store operation failed"}}'
+
+# A 64-char (SHA-256-style) policy hash: the fixed-length hex the reducer
+# requires. Free text and paths cannot masquerade as one.
+PRICE_HASH = "0123456789abcdef" * 4
+CAP_HASH = "fedcba9876543210" * 4
 
 
 def _now_ms():
@@ -431,6 +437,126 @@ class ReducerValidation(_Base):
         bad = _readings_import(self.db, self.tmp, doc)
         self.assertEqual(bad.returncode, 2)
         self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+
+
+class ConfigImportUpsert(_Base):
+    """BLOCKER: config-import must be an upsert, not a delete-and-reinsert.
+
+    A delete-and-reinsert fails once any reading exists (a foreign key to the
+    re-inserted account/machine) and silently resets the operator-owned
+    coverage flag and the gateway report columns. The upsert updates retained
+    aliases, inserts new ones, and deletes a removed alias only when nothing
+    references it.
+    """
+
+    def test_reimport_after_reading(self):
+        # After a reading references an account, a re-import must not fail on
+        # a foreign key: it keeps the inventory and the reading's window.
+        now = _now_ms()
+        doc = _doc([_cli_window("ci1", "desktop", "meter", "wkCi", 4000,
+                                now - 10000, now - 10000)])
+        self.assertEqual(_readings_import(self.db, self.tmp, doc).returncode, 0)
+        self.assertEqual(self._window("wkCi")["used_bps"], 4000)
+
+        # Re-import the same inventory: exit 0 (no FK violation), intact.
+        again = _config_import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        status = self._status_json()
+        self.assertEqual([a["alias"] for a in status["accounts"]], ["meter"])
+        self.assertEqual(status["machines"], ["desktop", "worker"])
+        self.assertEqual([g["alias"] for g in status["gateways"]], ["g1", "g2"])
+        self.assertEqual(self._window("wkCi")["used_bps"], 4000)
+
+    def test_reimport_preserves_coverage_and_report(self):
+        # The operator's coverage_complete flag and the gateway report survive
+        # a re-import: the upsert touches only config-owned columns.
+        now = _now_ms()
+        self.assertEqual(_set_coverage(self.db, "meter", True).returncode, 0)
+        snap = _doc([_gateway_snapshot("ci2", "desktop", "meter", "g1", 1, 10,
+                                       now - 1000,
+                                       policy_hashes={"price": PRICE_HASH,
+                                                      "child_cap": CAP_HASH},
+                                       sized_ready=True)])
+        self.assertEqual(_readings_import(self.db, self.tmp, snap).returncode, 0)
+        reports = {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
+        self.assertEqual(reports["g1"]["last_seq"], 10)
+
+        again = _config_import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        status = self._status_json()
+        self.assertTrue(status["accounts"][0]["coverage_complete"])
+        reports = {g["alias"]: g["report"] for g in status["gateways"]}
+        self.assertEqual(reports["g1"]["last_seq"], 10)
+        self.assertEqual(reports["g1"]["state"], "ok")
+
+    def test_reimport_removed_alias_referenced(self):
+        # A machine that a reading references cannot be removed from the
+        # inventory: the re-import is INVALID_CONFIG, store untouched.
+        doc = _doc([_cli_window("ci3", "worker", "meter", "wkRef", 500,
+                                _now_ms() - 10000, _now_ms() - 10000)])
+        self.assertEqual(_readings_import(self.db, self.tmp, doc).returncode, 0)
+
+        # Remove "worker" (and its gateway g2) from the inventory.
+        without_worker = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+            ],
+        }
+        bad = _config_import(self.db, self.tmp, without_worker)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The store is untouched: worker and g2 are still present.
+        status = self._status_json()
+        self.assertEqual(status["machines"], ["desktop", "worker"])
+        self.assertEqual([g["alias"] for g in status["gateways"]], ["g1", "g2"])
+
+    def test_reimport_removed_alias_unreferenced(self):
+        # A removed alias that nothing references IS deleted; the rest of the
+        # inventory is retained (with its UUIDs).
+        with_spare = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}, {"alias": "spare"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+            ],
+        }
+        self.assertEqual(_config_import(self.db, self.tmp, with_spare).returncode, 0)
+        conn = sqlite3.connect(self.db)
+        try:
+            ids = dict(conn.execute("SELECT alias, id FROM machines"))
+        finally:
+            conn.close()
+        self.assertIn("spare", ids)
+
+        without_spare = {
+            "version": 1,
+            "accounts": with_spare["accounts"],
+            "machines": [{"alias": "desktop"}],
+            "gateways": with_spare["gateways"],
+        }
+        self.assertEqual(_config_import(self.db, self.tmp, without_spare).returncode, 0)
+        status = self._status_json()
+        self.assertEqual(status["machines"], ["desktop"])
+        # The retained machine keeps its UUID.
+        conn = sqlite3.connect(self.db)
+        try:
+            retained = dict(conn.execute("SELECT alias, id FROM machines"))
+        finally:
+            conn.close()
+        self.assertNotIn("spare", retained)
+        self.assertEqual(retained["desktop"], ids["desktop"])
 
 
 if __name__ == "__main__":

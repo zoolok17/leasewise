@@ -93,13 +93,18 @@ def init_db(path):
 
 
 def import_config(path, file):
-    """Validate a version-1 document and replace the inventory atomically.
+    """Validate a version-1 document and reconcile the inventory atomically.
 
     Validation happens before any write, so a rejected document leaves the
-    store untouched. The replacement runs under the write lock: the old
-    alias->UUID maps are read inside the same transaction, every retained
-    alias reuses its stored UUID, and new aliases get new UUIDs. Future
-    cards: an active-lease check will gate this replacement.
+    store untouched. The reconciliation runs under the write lock and is an
+    UPSERT, not a delete-and-reinsert: retained aliases keep their stored
+    UUID and every card-2 state column (coverage_complete, the gateway
+    report); new aliases get new UUIDs; and a removed alias is deleted only
+    when nothing references it (a reading or window still pointing at a
+    removed account/machine is INVALID_CONFIG). A delete-and-reinsert would
+    fail on the foreign keys once any reading exists and would silently reset
+    the operator-owned state. Future cards: an active-lease check will gate
+    this reconciliation.
     """
     try:
         with open(file, "r", encoding="utf-8-sig") as handle:
@@ -116,7 +121,7 @@ def import_config(path, file):
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
-            _replace(conn, accounts, machines, gateways)
+            _upsert(conn, accounts, machines, gateways)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -127,55 +132,100 @@ def import_config(path, file):
         conn.close()
 
 
-def _replace(conn, accounts, machines, gateways):
-    """Replace all rows. Called inside the import's BEGIN IMMEDIATE.
+def _upsert(conn, accounts, machines, gateways):
+    """Reconcile the inventory to the document. Inside the import's BEGIN
+    IMMEDIATE. Expects the normalized tuples from validate.validate().
 
-    Expects the normalized tuples from validate.validate().
+    Retained aliases are updated in place (config-owned columns only, so the
+    card-2 state columns survive); new aliases are inserted; removed aliases
+    are deleted only when unreferenced (children before parents).
     """
     # Read the old maps under the write lock: a concurrent import cannot
-    # commit new UUIDs between this read and the DELETEs below.
+    # commit new UUIDs between this read and the updates/deletes below.
     old_accounts = dict(conn.execute("SELECT alias, id FROM accounts"))
     old_machines = dict(conn.execute("SELECT alias, id FROM machines"))
     old_gateways = dict(conn.execute("SELECT alias, id FROM gateways"))
 
-    conn.execute("DELETE FROM gateways")
-    conn.execute("DELETE FROM machines")
-    conn.execute("DELETE FROM accounts")
-
-    # New id per alias: the stored UUID when the alias is retained, a new
-    # UUID otherwise. Gateways reference the ids, not the aliases.
+    # The id each alias maps to: the stored UUID when retained, a new UUID
+    # otherwise. Gateways reference these ids, not the aliases.
     account_ids = {}
-    for alias, vendor, kind, budget in accounts:
-        account_id = old_accounts.get(alias) or str(uuid.uuid4())
-        account_ids[alias] = account_id
-        conn.execute(
-            "INSERT INTO accounts(id, alias, vendor, kind, budget_micro_eur)"
-            " VALUES(?,?,?,?,?)",
-            (account_id, alias, vendor, kind, budget),
-        )
-
     machine_ids = {}
+    for alias, _vendor, _kind, _budget in accounts:
+        account_ids[alias] = old_accounts.get(alias) or str(uuid.uuid4())
     for alias in machines:
-        machine_id = old_machines.get(alias) or str(uuid.uuid4())
-        machine_ids[alias] = machine_id
-        conn.execute(
-            "INSERT INTO machines(id, alias) VALUES(?,?)",
-            (machine_id, alias),
-        )
+        machine_ids[alias] = old_machines.get(alias) or str(uuid.uuid4())
 
+    # Accounts: update config-owned columns for retained aliases (the card-2
+    # state columns - window_keys, activity_seq, coverage_complete,
+    # required_reporters, outage_local_concurrency_cap - are left untouched);
+    # insert new ones.
+    for alias, vendor, kind, budget in accounts:
+        if alias in old_accounts:
+            conn.execute(
+                "UPDATE accounts SET vendor=?, kind=?, budget_micro_eur=? "
+                "WHERE id=?",
+                (vendor, kind, budget, account_ids[alias]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO accounts(id, alias, vendor, kind, budget_micro_eur)"
+                " VALUES(?,?,?,?,?)",
+                (account_ids[alias], alias, vendor, kind, budget),
+            )
+
+    # Machines: only id + alias in this card (the alias is the identity), so a
+    # retained machine needs no update; insert new ones.
+    for alias in machines:
+        if alias not in old_machines:
+            conn.execute(
+                "INSERT INTO machines(id, alias) VALUES(?,?)",
+                (machine_ids[alias], alias),
+            )
+
+    # Gateways: update config-owned columns for retained aliases (the report
+    # columns - ledger_epoch, last_seq, period_*, policy_hashes, last_report_at,
+    # state, sized_ready - are left untouched); insert new ones.
     for alias, account, machine, share, period in gateways:
-        conn.execute(
-            "INSERT INTO gateways(id, alias, account_id, machine_id,"
-            " share_micro_eur, period) VALUES(?,?,?,?,?,?)",
-            (
-                old_gateways.get(alias) or str(uuid.uuid4()),
-                alias,
-                account_ids[account],
-                machine_ids[machine],
-                share,
-                period,
-            ),
-        )
+        gateway_id = old_gateways.get(alias) or str(uuid.uuid4())
+        if alias in old_gateways:
+            conn.execute(
+                "UPDATE gateways SET account_id=?, machine_id=?, "
+                "share_micro_eur=?, period=? WHERE id=?",
+                (account_ids[account], machine_ids[machine], share, period,
+                 gateway_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO gateways(id, alias, account_id, machine_id,"
+                " share_micro_eur, period) VALUES(?,?,?,?,?,?)",
+                (gateway_id, alias, account_ids[account],
+                 machine_ids[machine], share, period),
+            )
+
+    # Removed aliases, children before parents. validate() guarantees no
+    # retained/new gateway references a removed account or machine, so the
+    # only live references to a removed alias are readings and windows.
+    for alias in set(old_gateways) - {g[0] for g in gateways}:
+        conn.execute("DELETE FROM gateways WHERE id=?", (old_gateways[alias],))
+    for alias in set(old_machines) - set(machines):
+        if _references(conn, "readings", "machine_id", old_machines[alias]):
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
+    for alias in set(old_accounts) - {a[0] for a in accounts}:
+        if (_references(conn, "readings", "account_id", old_accounts[alias])
+                or _references(conn, "windows", "account_id",
+                               old_accounts[alias])):
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))
+
+
+def _references(conn, table, column, entity_id):
+    """True when any row in `table` points at `entity_id` via `column`."""
+    row = conn.execute(
+        "SELECT 1 FROM " + table + " WHERE " + column + " = ? LIMIT 1",
+        (entity_id,),
+    ).fetchone()
+    return row is not None
 
 
 def reading_import(path, file):
