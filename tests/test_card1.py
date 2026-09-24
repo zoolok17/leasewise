@@ -33,12 +33,20 @@ VALID_DOC = {
     ],
 }
 
+# A card-1 store (no readings imported) projects an empty report per gateway.
+EMPTY_REPORT = (
+    '{"state":"none","last_report_at":null,"ledger_epoch":null,"last_seq":null,'
+    '"period_start":null,"period_end":null,"policy_hashes":null,"sized_ready":false}'
+)
+
 EXPECTED_STATUS = (
     '{"schema_version":2,"accounts":[{"alias":"meter","kind":"metered",'
-    '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+    '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
+    '"coverage_complete":false,"windows":[]}],'
     '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
-    '"machine":"desktop","share_micro_eur":60000000},{"alias":"g2","account":"meter",'
-    '"machine":"worker","share_micro_eur":40000000}]}'
+    '"machine":"desktop","share_micro_eur":60000000,"report":' + EMPTY_REPORT + '},'
+    '{"alias":"g2","account":"meter","machine":"worker","share_micro_eur":40000000,'
+    '"report":' + EMPTY_REPORT + '}]}'
 )
 
 ERROR_INVALID_CONFIG = '{"error":{"code":"INVALID_CONFIG","message":"config document is invalid"}}'
@@ -191,11 +199,13 @@ class Card1Tests(_Base):
         # approved aliases and the static schema/field names may appear.
         expected = (
             '{"schema_version":2,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
-            '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+            '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
+            '"coverage_complete":false,"windows":[]}],'
             '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
-            '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000},'
+            '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000,'
+            '"report":' + EMPTY_REPORT + '},'
             '{"alias":"priv-gw-9","account":"priv-acct-7","machine":"priv-mach-3",'
-            '"share_micro_eur":60000000}]}'
+            '"share_micro_eur":60000000,"report":' + EMPTY_REPORT + '}]}'
         )
         self.assertEqual(st.stdout.strip(), expected)
         self.assertNotIn("vendor", st.stdout)
@@ -432,12 +442,12 @@ class Card1FixRoundTests(_Base):
         expected = (
             '{"schema_version":2,"accounts":['
             '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
-            '"allocated_micro_eur":100000000},'
+            '"allocated_micro_eur":100000000,"coverage_complete":false,"windows":[]},'
             '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'
-            '"allocated_micro_eur":0}],'
+            '"allocated_micro_eur":0,"coverage_complete":false,"windows":[]}],'
             '"machines":["desktop"],"gateways":['
             '{"alias":"g1","account":"meter","machine":"desktop",'
-            '"share_micro_eur":100000000}]}'
+            '"share_micro_eur":100000000,"report":' + EMPTY_REPORT + '}]}'
         )
         self.assertEqual(_status(self.db).stdout.strip(), expected)
         # A subscription account carrying a budget is invalid.
