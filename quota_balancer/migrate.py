@@ -6,15 +6,19 @@ tables of this card.
 
 Migration protocol (fix round): the preliminary version read takes no lock.
 A version-0 store is switched to WAL first (WAL is a file-mode switch and
-cannot run inside a transaction) and the switch is checked; then the write
-lock is taken (BEGIN IMMEDIATE) and the version re-read inside it, so
-concurrent inits serialize and a latecomer observes version 1 as a no-op.
-The DDL and the version stamp commit as one transaction; any failure rolls
-back, so a stop between statements leaves no half-built store. A store at
-any other version is rejected before anything is written or switched.
+cannot run inside a transaction) and the switch is checked; the switch takes
+a brief exclusive lock that does not wait through the busy handler, so under
+a concurrent init it is retried on the busy condition until a bounded
+deadline. Then the write lock is taken (BEGIN IMMEDIATE) and the version
+re-read inside it, so concurrent inits serialize and a latecomer observes
+version 1 as a no-op. The DDL and the version stamp commit as one
+transaction; any failure rolls back, so a stop between statements leaves no
+half-built store. A store at any other version is rejected before anything
+is written or switched.
 """
 
 import sqlite3
+import time
 
 from .errors import (
     CODE_SCHEMA_UNSUPPORTED,
@@ -25,6 +29,14 @@ from .errors import (
 )
 
 SCHEMA_VERSION = 1
+
+# The WAL switch (set_wal) takes a brief exclusive lock on the database file
+# and, unlike ordinary statements, does not wait through the busy handler:
+# under a concurrent init it can raise "database is locked" while a sibling
+# is mid-DDL. Retrying on the busy condition until a bounded deadline makes
+# parallel init idempotent; a persistent lock then surfaces as STORE_ERROR.
+WAL_RETRY_DEADLINE_SECONDS = 5.0
+WAL_RETRY_SLEEP_SECONDS = 0.02
 
 # The three DDL statements, byte for byte from docs/DESIGN.md section 8.
 _DDL_V1 = (
@@ -54,11 +66,32 @@ def require_supported(conn):
         raise QuotaError(CODE_SCHEMA_UNSUPPORTED, MSG_SCHEMA_UNSUPPORTED)
 
 
+def _is_busy_error(exc):
+    """True for the SQLite "database is locked" busy conditions."""
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
 def set_wal(conn):
-    """Switch the database to WAL mode and verify the switch happened."""
-    mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-    if mode.lower() != "wal":
-        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED)
+    """Switch the database to WAL mode and verify the switch happened.
+
+    The switch takes a brief exclusive lock and does not wait through the
+    busy handler, so a concurrent init's write lock can make it raise
+    "database is locked". Retry on the busy condition until a bounded
+    deadline; a real, persistent lock then surfaces as STORE_ERROR (exit 3)
+    rather than a half-switched store.
+    """
+    deadline = time.monotonic() + WAL_RETRY_DEADLINE_SECONDS
+    while True:
+        try:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if not _is_busy_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(WAL_RETRY_SLEEP_SECONDS)
+            continue
+        if mode.lower() != "wal":
+            raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED)
+        return
 
 
 def rollback_quietly(conn):

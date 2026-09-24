@@ -221,6 +221,78 @@ class Card1Tests(_Base):
         self.assertNotIn(path_sentinel, bad.stderr + bad.stdout)
 
 
+class Card1CarryOverTests(_Base):
+    """Carry-over (card 1): concurrent `init` on a fresh store is idempotent.
+
+    Before the fix the WAL switch in `migrate.set_wal` ran outside the write
+    lock and, unlike ordinary statements, does not wait through the busy
+    handler: a concurrent init's DDL transaction could make it raise
+    "database is locked", so one of the parallel inits exited 3 (STORE_ERROR).
+    The fix retries the WAL switch on the busy condition until a bounded
+    deadline, so parallel inits serialize on the write lock and a latecomer
+    observes version 1 as a no-op. The race is timing-dependent, so the check
+    runs several init processes in parallel over repeated rounds on a fresh
+    store and requires every process to exit 0.
+    """
+
+    PROCS = 16
+    ROUNDS = 20
+
+    def _init_parallel(self):
+        """Launch PROCS `init` processes against the store; return exit codes."""
+        procs = [
+            subprocess.Popen(
+                [PYTHON, "-m", "quota_balancer", "--db", self.db, "init"],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(self.PROCS)
+        ]
+        codes = []
+        for p in procs:
+            # communicate() drains the pipes and waits, keeping the others
+            # running in parallel rather than serializing on the pipe buffer.
+            p.communicate()
+            codes.append(p.returncode)
+        return codes
+
+    def test_concurrent_init_all_exit_zero(self):
+        for round_no in range(self.ROUNDS):
+            # Fresh store each round: the race is on a version-0 file, so the
+            # -wal/-shm side files are removed too.
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(self.db + suffix)
+                except FileNotFoundError:
+                    pass
+            codes = self._init_parallel()
+            self.assertEqual(
+                codes,
+                [0] * self.PROCS,
+                f"round {round_no}: a parallel init did not exit 0 "
+                f"(sorted codes {sorted(codes)})",
+            )
+        # Converged on exactly the card-1 store: version 1, WAL, three tables.
+        conn = sqlite3.connect(self.db)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertEqual(version, 1)
+        self.assertEqual(journal.lower(), "wal")
+        self.assertEqual(tables, {"accounts", "machines", "gateways"})
+
+
 class Card1FixRoundTests(_Base):
     """Fix-round tests for the 350478c cold reads.
 
