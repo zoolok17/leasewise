@@ -63,10 +63,13 @@ process to exit 0.
     older (out-of-order) epoch is a no-op. A *later* epoch is restarted
     by its first post-reset observation; time passage alone proves no
     recovery.
-  - **Explicit confidence mapping** (the three legacy states): a legacy
-    `stale` maps to the observed value with `source_stale=true` and its
-    original timestamp; `unknown` stays `unknown`; `observed` stays
-    `observed`.
+  - **Explicit confidence vocabulary**: the input states are exactly
+    `observed` and `unknown` (the card-2 input contract), plus the separate
+    `source_stale` boolean. A legacy `stale` sample is mapped *by the
+    producer* (the reporter, card 7b) to `observed` with
+    `source_stale=true`; card 2 stores the flag and preserves the value and
+    the source timestamp. The reducer does not accept `stale` as a
+    confidence value.
   - **Gateway report.** Ledger `seq` is monotonic — a non-increasing seq
     is a no-op. A change of ledger epoch or policy hashes marks the
     report `reconciliation_required`. `last_report_at` is the source
@@ -99,8 +102,9 @@ process to exit 0.
 - **`errors.py`** — adds `IDEMPOTENCY_CONFLICT` (exit 2) and its static
   message; the other card-1 codes and the static-message discipline are
   unchanged.
-- **`cli.py`** — two new verbs: `reading-import --file` and
-  `set-coverage --account --complete`.
+- **`cli.py`** — three new verbs: `reading-import --file`,
+  `set-coverage --account --complete`, and (fix round) `reconcile
+  --gateway`.
 - **README** "Card 2" section with the demo commands.
 - **`tests/test_card2.py`** — the five named checks plus the reducer
   rules (see Tests).
@@ -288,6 +292,51 @@ so it is not byte-stable across processes, by design (the design reports
   leaves the store untouched, a replay is a no-op, an ambiguous source
   updates no account) are pinned by the tests above.
 
+## Fix round (two independent cold reads; lead dispositions 2026-09-24)
+
+Both cold reads (READ A, READ B) came back NOT READY. The lead verified the
+findings; the dispositions below were implemented as new commits on top of
+876458a. Every new test went red at the pre-fix tree and green with the fix
+(foreground suite: `python3 -m unittest discover -s tests -v`).
+
+| Finding | Fix | Test(s) |
+|---|---|---|
+| BLOCKER (A+B): config-import delete-and-reinsert fails once a reading exists (FK) and silently resets coverage/report | Upsert: retained aliases updated on config-owned columns only; a removed alias is deleted only if unreferenced, else INVALID_CONFIG | `ConfigImportUpsert` (4 tests) |
+| B-M1: a new epoch was accepted without a post-reset observation; an older sample could lower the high-water | A later epoch restarts only when `observed_at >= stored resets_at`; drift falls through to the same-epoch high-water | `test_new_epoch_rejected_before_reset` |
+| B-M2: reconciliation_required self-cleared on the next report; a changed hash became the baseline | Sticky until the operator's explicit `reconcile --gateway` verb (new: `store.reconcile`); re-epoch/re-hash re-raise it | `test_reconciliation_sticky_epoch`, `test_reconciliation_sticky_hash` |
+| B-M3: an out-of-range integer crashed with a driver overflow traceback (path leak) | Every integer in the reading validator bounded to the non-negative signed-64 range; a last-resort handler in `cli.main` emits the static error contract for any unexpected fault | `test_integers_bounded_to_signed_64` (one case per field) |
+| B-M4: an unknown reading refreshed a known value's `observed_at` and flipped its confidence | `reduce_window` returns the row unchanged for an unknown reading over a window that has a known value | `test_unknown_reading_does_not_refresh_known_window` (+ upgrade guard `test_unknown_then_known_upgrades`) |
+| A-MAJOR: no explicit sqlite busy timeout | Explicit `timeout=30.0` in `store._connect`; a held write lock is waited out and the operation proceeds, never a raw driver fault | `StoreConnectivity` (2 tests) |
+| B-m1: seq compared before epoch | Epoch compared before seq; a new ledger's lower first seq is accepted | `test_new_epoch_lower_seq_accepted` |
+| B-m2 = A-MINOR: gateway reports not bound to the gateway's own machine/account | A snapshot must match the gateway's own machine AND account (a null account can never bind): else INVALID_CONFIG | `test_gateway_report_bound_to_owner` |
+| B-m3: negative timestamps/sequences accepted; `observed` accepted with nulls | All integers non-negative (see M3); `observed` requires a value AND a reset in every window | `test_rejects_negative_timestamps_and_sequences`, `test_observed_confidence_requires_values` |
+| B-m4 (privacy): window key and policy hashes were unbounded free text, echoed in status | A window key must be a local alias; a policy hash must be a 64-char lowercase hex digest; all test window keys and hashes conformed | `test_window_key_and_policy_hash_are_bounded` |
+| B-n3 (NIT): `event_id` not validated as a UUID | `event_id` must be a canonical lowercase local UUID (section 7: IDs are local UUIDs); all test event IDs are deterministic local UUIDs | `test_rejects_non_uuid_event_id` |
+
+- **m5 (NIT, doc fix)**: the step record and README claimed the reducer
+  "maps" the legacy `stale` state. The card-2 input vocabulary is
+  `observed`/`unknown` only; the legacy mapping is the producer's (card 7b)
+  responsibility. Both documents corrected.
+- **n1 (NIT, reason, not widened)**: `readings.kind` carries
+  `CHECK(kind IN ('cli_window','gateway_snapshot'))`. The section-7
+  `usage` kind (a later card) cannot be added with `ALTER TABLE` —
+  SQLite has no in-place CHECK modification — so that card's migration
+  must rebuild the table. Card 2 stays closed to its two kinds; the
+  rebuild is documented for that card.
+- **n2 (NIT)**: the card-1 carry-over docstring said a latecomer init
+  "observes version 1"; corrected to "the current schema version". A
+  pre-init v1 store read yields `SCHEMA_UNSUPPORTED` with the static
+  message; the "run init" hint is deliberately not in the message (the
+  static-message contract is frozen by card-1 tests) — the code and this
+  document point at `init`.
+- **READ A MAJOR (local repro note)**: the crashed-writer hot-journal stall
+  did not reproduce in this seat's environment (first access after a
+  SIGKILL'd mid-DDL migration succeeded in ~0.1 s). The fix is the
+  explicit, bounded busy timeout plus the held-lock behavior test, which
+  pins the wait-and-proceed path the recovery relies on.
+
+Full suite after the fix round: 46 tests, all green (foreground).
+
 ## Commits on `card-2`
 
 - de597a5 base (origin/main, card 1 merged)
@@ -295,3 +344,6 @@ so it is not byte-stable across processes, by design (the design reports
 - 891d50e feat(card-2): schema v2 — readings/windows tables, report/coverage columns
 - c403190 feat(card-2): reading reducer, fixture CLI, and status projection
 - 3704571 test(card-2): named checks and reducer rules
+- 876458a docs(card-2): step record, README section, and demo transcript
+- e8d3d91 fix(card-2): make config-import an upsert (BLOCKER)
+- dc19558 fix(card-2): cold-read fix round — reducer, report, and validator contracts
