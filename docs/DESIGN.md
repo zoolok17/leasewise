@@ -20,7 +20,8 @@ migration and acceptance-test gates still apply before enforcement is enabled.
 
 One coordinator serves a private tailnet; reporters and gateways remain local. No shared
 network SQLite, automatic failover, dashboard scraping, web configuration or HTML in this
-build plan. Status is JSON. Model/effort aliases are operator-configured, not a vendor catalog.
+build plan. Section 11 proposes signed billing-API readings, not dashboard scraping.
+Status is JSON. Model/effort aliases are operator-configured, not a vendor catalog.
 Money, input tokens and subscription utilization are distinct quantities; never convert
 tokens into subscription entitlement or sum percentages from seats on the same account.
 
@@ -364,7 +365,8 @@ persisted local probe guard defined in section 5.
 
 Seven ordered groups, explicitly split into small cards where necessary. Each **card** is
 one developer seat for one or two bounded turns; groups 6/7 are not single-seat turns.
-No live provider calls. Every card has `privacy_<card>`: Given injected secret/path/provider-ID
+No live provider calls except a separately approved card-2b reporter canary (section 11).
+Every card has `privacy_<card>`: Given injected secret/path/provider-ID
 sentinels, When status/error output is rendered, Then none appear. Only local aliases survive.
 Future acceptance tests below are requirements, not a claim that the product has passed them.
 
@@ -418,6 +420,7 @@ restart, identical status showing budget and allocated amount of 100000000 micro
 | Card | Tables/module, rules and errors | Demo and Given/When/Then tests |
 |---|---|---|
 | 2: reading reducer | readings/windows + gateway report/coverage columns; fixture CLI only. IDs deduplicate, source time preserved; ambiguous source UNKNOWN; confidence mapping explicit. Operator sets coverage_complete; every machine/team must report for idle proof. Incomplete coverage uses 600s wall cap. Same epoch never lowers high-water; new epoch needs post-reset observation; old gateway report METER_STALE. | Demo reordered/idle samples. `reading_replay`: Given same ID, When replay/collision, Then no-op/409. `stale_mapping`: Given stale, Then value/time/flag retained. `coverage_fallback`: Given incomplete coverage or missing reporter, When sample age>600s, Then stale; telemetry cannot set coverage_complete. `account_isolation`: Given ambiguous source, Then neither account updated. privacy_2. |
+| 2b: provider billing readings (PLANNED; decisions in section 11) | Extend readings kind CHECK/closed validation; billing_totals and billing_policies; pure reconciliation/opening proposal, OVH reporter adapter with local read-only keys. Depends on merged card 2; no window reduction, gateway writes or lease enforcement in the recommended first delivery. Errors BILLING_UNKNOWN/BILLING_STALE/BILLING_SCOPE_MISMATCH/BILLING_DIVERGENCE/OPENING_UNSAFE; existing replay/config/store errors. | Demo P=14.30, L=18.43, R=0.50, cap=100 gives 81.07 EUR headroom; replay, stale poll, rollover, then P=19.00 raises discrepancy without changing ledgers. Named Given/When/Then tests: billing_migration, billing_replay, billing_time, billing_rollover, billing_scope, billing_reconcile, billing_headroom, billing_opening, billing_adapter, privacy_2b (section 11). |
 | 3: policy arithmetic | models/profiles/projects/teams/seats/project_accounts/limits; pure fixtures, no wrapper. Calculate E/I/request-sized holds (fixed reserve only a comparison), composed limits, model ceiling, 80% sweep and fallback; INVALID_REQUEST/CONTEXT_PROJECTION_EXCEEDED/POLICY_DENIED. | Demo synthetic 1750000 vs 238000 input. `round_components`: Given five calls, When reserve formula, Then 68169. `projection_denied`: Given over-context projection, Then deny. `fallback_tier`: Given blocked Codex read/critical review, Then Qwen read/independent premium or park. privacy_3. |
 | 4: lease store | leases/holds/receipts/blocks/adjustments/audit/daily_totals; exact partial indexes above. Transactional grant/check/settle, one slot, uncertain expiry retains liability, receipt conflict blocks, same ID replays. Fixture gateway only; 409/410/429 contracts above. | Demo restart with unresolved hold. `null_uniqueness`: Given null-window/model duplicates, When insert, Then reject; final-receipt/live-lease duplicates also reject. `grant_race`: Given one budget, When concurrent grants, Then no overspend. `late_receipt`: Given expiry, When final receipt, Then reconcile original period once. privacy_4. |
 | 5: private HTTP | Thin /v1 handlers over tested store/policy, identity allowlist and host ingress adapter; no custom TLS stack/admin API. Loopback default; 401/403 cross-machine denial; 503 outage; status JSON only. | Demo two authenticated fixture machines share one block. `token_scope`: Given foreign identity, When check/report, Then deny. `replay_grant`: Given lost response, When retry, Then one hold/rotated token. `public_bind`: Given public binding, When start, Then refuse. privacy_5. |
@@ -483,3 +486,128 @@ Build handoff: all four lead choices are resolved. Confirm integration owners an
 numeric calibration fixtures; retain the named implementation/deployment gates. Coordinated
 subscription concurrency remains one; the offline per-machine default of two is explicitly
 uncoordinated. Acceptance for build does not claim deployed enforcement or passing product tests.
+
+## 11. Card 2b addendum: provider billing readings
+
+Status: PLANNED extension to accepted v3; the decisions below gate its build scope.
+Audience: Leasewise contributors and operators adding provider-side spend evidence.
+**DECIDED**: provider keys stay with a reporter beside the customer's credential, never in the
+coordinator. This is signed API access, not dashboard scraping; hosted tenancy is not added here.
+Supplied evidence: OVH project usage reported EUR 14.30 versus EUR 18.43 across two ledgers;
+updates are hourly. A dashboard opening figure lagged by about EUR 2. One Qwen call can
+emit about 30K output tokens. Neither hourly billing nor an input-only reserve bounds a call.
+
+### Source, schema and time (proposed)
+
+At card-2 revision 876458a, STEP-CARD-2 and migrate.py define readings.kind as cli_window or
+gateway_snapshot, windows as utilization, and gateway freshness as 120 seconds. Billing is
+a new provider_billing kind, not a percentage/window. Card 2's 600-second subscription cap
+and future coverage_complete idle exemption must not be applied to hourly provider billing.
+After card 2 merges, use the next transactional migration: rebuild readings' kind CHECK,
+preserve all rows/dedup IDs, add billing_totals and billing_policies; leave windows unchanged.
+Reuse the reading envelope: event_id (local UUID), machine/account aliases resolved to FKs,
+seat=null, observed_at, received_at and closed payload. Require an attributed metered account.
+Payload = {scope_alias,scope_revision,period_start,period_end,currency,total_micro_eur}; all
+fields required. Currency is EUR; amounts are nonnegative int64 micro-EUR, timestamps UTC ms,
+period is [start,end). Reject booleans, floats on the wire, unknown fields and ambiguous mapping.
+Reporter parses decimal money exactly, rounds upward to micro-EUR, never via binary floats.
+billing_totals PK(account_id,scope_revision,period_start): scope_alias,period_end,currency,
+latest_micro_eur,high_water_micro_eur,observed_at,source_event_id FK(readings),correction_pending.
+billing_policies PK(account_id): scope_alias,scope_revision,currency,poll_seconds,max_age_seconds,
+lag_seconds,tolerance_micro_eur,stale_action,divergence_action,mode; operator-owned, not telemetry.
+Register one active scope/reporter owner per account; redundant replicas report the same total,
+never additive totals. Scope changes require reconciliation before a new projection is activated.
+Reuse identical-ID replay/no-op and changed-ID-content IDEMPOTENCY_CONFLICT atomically. Older
+events cannot refresh time; same-time/different-total events flag reconciliation. Keep the period
+high-water even after a newer downward correction; show latest separately pending operator review.
+observed_at is provider lastUpdate, never poll/ingest time; reject >30s future observations.
+Successful unchanged polls preserve lastUpdate. A failed poll is local health metadata; it creates
+no zero-spend sample and does not refresh an earlier reading. No valid sample means unknown.
+Status derives age/current from lastUpdate and the billing max age; no idle-current exemption.
+New month starts unknown until a valid observation for that exact UTC month arrives; never carry
+last month's total into this month or infer a zero at midnight. Late prior-month readings update
+only that month. Validate lastUpdate within its period (an exclusive-end final sample is allowed);
+incompatible provider periods are BILLING_SCOPE_MISMATCH. A current-only API cannot finalize a
+missing prior-month bill; retain that month's reconciliation state rather than inventing closure.
+Retain billing financial evidence 13 months, overriding generic 30-day reading pruning for this kind.
+
+### Reporter boundary and adapters (proposed)
+
+Run one designated reporter on a customer-controlled machine with access to its credential.
+Keep keys in the local OS credential store or owner-restricted secret file, separate from the
+numeric outbox. Restrict the credential to required read-only GET routes; no mutation grants.
+Local mapping holds provider project IDs and secret references; only installation aliases,
+numbers and closed enums leave the reporter. Coordinator authentication is separate from provider
+authentication; authorize reporter/account binding (later via card 5), never trust an alias alone.
+OVH adapter: signed GET /cloud/project/{project}/usage/current; totalPrice is project-wide,
+lastUpdate supplies time, period supplies boundaries, resourcesUsage[].type identifies categories.
+AI Endpoints has type ai-endpoints. Do not equate project total with AI-only spend or invent an
+AI subtotal from category names. The tested /me/consumption/usage/current returned no reading;
+it is not a zero or a fallback source. Scope selection is B01 below.
+Adapter contract: local config + credential handle + injected transport/clock -> validated billing
+payload/time or closed failure enum (auth/transport/rate_limit/schema/currency/period). Poll once
+per configured interval with jitter; no immediate retry loop, honor later provider retry times.
+Validate TLS; never log signed headers, request URLs containing IDs, raw bodies or exception text.
+Malformed/partial results retain the old value; missing lastUpdate cannot become a fresh reading.
+Other providers use sanitized fixtures until a real account and matching scope/time evidence exist;
+no browser scraping or coordinator-side credential fallback. No live calls in automated tests.
+
+### Reconciliation, cap and opening balance (proposed)
+
+Compare one currency, account scope and exact period. P is provider high-water; L is the sum of
+settled gateway spend, including uniquely allocated opening/unattributed charges once. Read the
+latest accepted gateway snapshot per gateway/period from readings.payload: card 2's gateway
+columns contain report metadata, not monetary totals. Never sum successive cumulative snapshots.
+All configured gateway reports must be present, <=120s old, and free of epoch/hash uncertainty;
+otherwise comparison/headroom is unknown, not zero. Never add provider totals into L as receipts.
+For delta=P-L: delta<=0 is provider-behind/conservative-ledger evidence, normally expected;
+if it persists beyond the configured lag with no new ledger activity, alert for investigation,
+but do not refund the difference. 0<delta<=tolerance is rounding-sized, still counted in P.
+delta>tolerance on comparable snapshots is actionable: alert, propose an account hold, and ask
+the operator to investigate bypass, price drift, omitted charges or a ledger bug. It proves none
+of those causes. Missing scope/timing evidence yields reconciliation_required, not a bypass claim.
+Operator resolution may allocate proven external charges, repair a ledger, or approve a provider
+credit with a numeric audit record. Never auto-write a receipt, release an uncertain reserve, or
+clear a hold solely because a poll succeeds. Enforcement versus advisory action needs B03/B04.
+Headroom = cap - max(P,L) - R; return signed headroom and deny a new hold H if H>headroom.
+R is disjoint reserved plus uncertain exposure, counted once per gateway attempt; when leases
+exist also include unmaterialized service exposure, not both a full lease hold and its attempts.
+Provider lag for managed calls is covered by current L and full input/output R, not by adding a
+fixed EUR 2 cushion. P may already include uncertain calls: retain R until settlement even if
+temporarily conservative. Lagging invisible bypass is unbounded; no strict provider-bill ceiling
+is promised without exclusive mediated spending. Tolerance never increases available headroom.
+On stale P keep its high-water floor, label stale, and apply B03; missing P is unknown, never zero.
+In card 2b this arithmetic is a proposal; account admission/attempt enforcement remains gated by
+cards 3–6b/7d. Existing local ceilings and F05 remain authoritative throughout rollout.
+Opening proposal: freeze/drain the account and gather matching fresh provider/gateway readings;
+compute account opening floor O=max(P,L), never substitute a lower dashboard/provider value.
+For each gateway preserve its own recorded settled baseline B_g and every unresolved reserve;
+allocate only D=max(0,P-L) once across gateways using operator-approved nonnegative allocations
+A_g with sum(A_g)=D. Proposed opening B'_g=B_g+A_g is never below B_g; never copy O into both
+gateways or assign the entire account total to a new gateway. No provenance for prior spend,
+missing/stale readings, unresolved migration, or B'_g+R_g above its share => OPENING_UNSAFE.
+Output numeric proposal with snapshot event references and an idempotent allocation ID. Applying
+it must revalidate all references under a maintenance fence, preserve history, and record that ID
+once; partial multi-gateway application stays fenced for resume/reconciliation. B04 gates writes.
+
+### Card 2b demo and acceptance targets (planned, not executed)
+
+- billing_migration: Given v2 rows, When upgrading/restarting, Then rows/IDs survive and windows are unchanged.
+- billing_replay: Given same-ID replay/conflict or reordered samples, When imported, Then no double count/time refresh; conflict rolls back.
+- billing_time: Given unchanged lastUpdate, failed polls or complete coverage, When age exceeds billing max, Then stale, never refreshed; future/absent time rejected.
+- billing_rollover: Given old-month arrival, midnight or a credit, When reduced, Then periods stay isolated/new month unknown/high-water retained pending review.
+- billing_scope: Given mixed services, currency or period mismatch, When comparing, Then no AI/project conflation or usable headroom.
+- billing_reconcile: Given P=14.30/L=18.43 then P=19.00, When compared, Then lag versus actionable delta=0.57; missing gateway is unknown; ledgers unchanged.
+- billing_headroom: Given cap=100/P=14.30/L=18.43/R=0.50, When calculated, Then 81.07; mirrored lease/attempt reserves count once, 30K output stays bounded by its reserve.
+- billing_opening: Given two baselines totaling 18.43 and P=14.30, When proposing init, Then sum remains 18.43; excess allocated once; stale/missing inputs refused and replay cannot lower/duplicate balances.
+- billing_adapter: Given signed-GET fixtures and auth/timeout/empty/schema failures, When polled, Then exact decimal output or closed failure, no zero/default-time reading or retry storm.
+- privacy_2b: Given keys, provider IDs, paths and raw-error sentinels at every adapter boundary, When outbox/status/error is rendered, Then only registered aliases, numbers and closed enums survive.
+
+### Lead choices needed before extending accepted scope
+
+| ID | State | Options and recommendation |
+|---|---|---|
+| B01 Billing scope | LEAD DECISION | A: cap the whole OVH project, explicitly including non-AI spend; B: cap AI Endpoints only after a verified monetary subtotal contract. Recommend A for a dedicated project; never compare mismatched scopes. |
+| B02 Numeric policy | LEAD DECISION | A: approve proposed poll=900s, expected lag=3600s, max age=7200s and tolerance=10000 micro-EUR; B: supply different per-provider values. Recommend A as initial configurable values, not measured guarantees. |
+| B03 Billing unavailable or divergent | LEAD DECISION | A: hold new metered work when billing is unknown/stale or comparable P-L exceeds tolerance; B: alert while retaining max(P,L) and local ceilings. Recommend A once integrated; lower-than-ledger alone never triggers a spend hold. |
+| B04 Delivery boundary | LEAD DECISION | A: card 2b ships fixture ingestion/reconciliation plus a read-only OVH reporter; opening plans and holds are advisory, gateway writes get a separately sized integration card; B: include fenced multi-gateway opening application and enforced holds now. Recommend A; approve reporter canary separately and retain 6b's activation gate. |
