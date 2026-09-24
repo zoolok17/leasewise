@@ -20,6 +20,11 @@ python -m quota_balancer --db quota.db status --json
 
 (An installed copy exposes the same entry point as `quota`.)
 
+Note: `--db` is a global option and must precede the verb
+(`--db X init`, not `init --db X`). The store's SQL also requires
+SQLite >= 3.37 (STRICT tables); `init` reports a store error on an
+older SQLite instead of creating a half-specified schema.
+
 - `init` — create the store at migration version 1 (idempotent; WAL,
   foreign keys on). Re-running it is a no-op.
 - `config-import --file DOC` — validate a version-1 document (closed
@@ -50,5 +55,6 @@ budget and allocated amount of 100000000 micro-EUR. Fixtures:
 `docs/fixtures/card1-inventory-invalid.json` (g2 share 40000001, which
 pushes the share sum above the account budget).
 
-Tests: `python -m unittest discover -s tests -v` (9 tests, including
-the five card-named checks).
+Tests: `python -m unittest discover -s tests -v` (16 tests, including
+the five card-named checks; the fix round added mutation pins and
+store-integrity tests — see docs/STEP-CARD-1.md).
