@@ -33,12 +33,20 @@ VALID_DOC = {
     ],
 }
 
+# A card-1 store (no readings imported) projects an empty report per gateway.
+EMPTY_REPORT = (
+    '{"state":"none","last_report_at":null,"ledger_epoch":null,"last_seq":null,'
+    '"period_start":null,"period_end":null,"policy_hashes":null,"sized_ready":false}'
+)
+
 EXPECTED_STATUS = (
-    '{"schema_version":1,"accounts":[{"alias":"meter","kind":"metered",'
-    '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+    '{"schema_version":2,"accounts":[{"alias":"meter","kind":"metered",'
+    '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
+    '"coverage_complete":false,"windows":[]}],'
     '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
-    '"machine":"desktop","share_micro_eur":60000000},{"alias":"g2","account":"meter",'
-    '"machine":"worker","share_micro_eur":40000000}]}'
+    '"machine":"desktop","share_micro_eur":60000000,"report":' + EMPTY_REPORT + '},'
+    '{"alias":"g2","account":"meter","machine":"worker","share_micro_eur":40000000,'
+    '"report":' + EMPTY_REPORT + '}]}'
 )
 
 ERROR_INVALID_CONFIG = '{"error":{"code":"INVALID_CONFIG","message":"config document is invalid"}}'
@@ -104,8 +112,10 @@ class Card1Tests(_Base):
             }
         finally:
             conn.close()
-        self.assertEqual(version, 1)
-        self.assertEqual(tables, {"accounts", "machines", "gateways"})
+        self.assertEqual(version, 2)
+        self.assertEqual(
+            tables, {"accounts", "machines", "gateways", "readings", "windows"}
+        )
         self.assertEqual(journal.lower(), "wal")
 
     def test_shares_cannot_exceed_account(self):
@@ -188,12 +198,14 @@ class Card1Tests(_Base):
         # The status is exactly the documented projection: nothing beyond the
         # approved aliases and the static schema/field names may appear.
         expected = (
-            '{"schema_version":1,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
-            '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+            '{"schema_version":2,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
+            '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
+            '"coverage_complete":false,"windows":[]}],'
             '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
-            '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000},'
+            '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000,'
+            '"report":' + EMPTY_REPORT + '},'
             '{"alias":"priv-gw-9","account":"priv-acct-7","machine":"priv-mach-3",'
-            '"share_micro_eur":60000000}]}'
+            '"share_micro_eur":60000000,"report":' + EMPTY_REPORT + '}]}'
         )
         self.assertEqual(st.stdout.strip(), expected)
         self.assertNotIn("vendor", st.stdout)
@@ -221,6 +233,81 @@ class Card1Tests(_Base):
         self.assertNotIn(path_sentinel, bad.stderr + bad.stdout)
 
 
+class Card1CarryOverTests(_Base):
+    """Carry-over (card 1): concurrent `init` on a fresh store is idempotent.
+
+    Before the fix the WAL switch in `migrate.set_wal` ran outside the write
+    lock and, unlike ordinary statements, does not wait through the busy
+    handler: a concurrent init's DDL transaction could make it raise
+    "database is locked", so one of the parallel inits exited 3 (STORE_ERROR).
+    The fix retries the WAL switch on the busy condition until a bounded
+    deadline, so parallel inits serialize on the write lock and a latecomer
+    observes the current schema version as a no-op. The race is
+    timing-dependent, so the check
+    runs several init processes in parallel over repeated rounds on a fresh
+    store and requires every process to exit 0.
+    """
+
+    PROCS = 16
+    ROUNDS = 20
+
+    def _init_parallel(self):
+        """Launch PROCS `init` processes against the store; return exit codes."""
+        procs = [
+            subprocess.Popen(
+                [PYTHON, "-m", "quota_balancer", "--db", self.db, "init"],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(self.PROCS)
+        ]
+        codes = []
+        for p in procs:
+            # communicate() drains the pipes and waits, keeping the others
+            # running in parallel rather than serializing on the pipe buffer.
+            p.communicate()
+            codes.append(p.returncode)
+        return codes
+
+    def test_concurrent_init_all_exit_zero(self):
+        for round_no in range(self.ROUNDS):
+            # Fresh store each round: the race is on a version-0 file, so the
+            # -wal/-shm side files are removed too.
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(self.db + suffix)
+                except FileNotFoundError:
+                    pass
+            codes = self._init_parallel()
+            self.assertEqual(
+                codes,
+                [0] * self.PROCS,
+                f"round {round_no}: a parallel init did not exit 0 "
+                f"(sorted codes {sorted(codes)})",
+            )
+        # Converged on exactly the card-1 store: version 1, WAL, three tables.
+        conn = sqlite3.connect(self.db)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertEqual(version, 2)
+        self.assertEqual(journal.lower(), "wal")
+        self.assertEqual(
+            tables, {"accounts", "machines", "gateways", "readings", "windows"}
+        )
+
+
 class Card1FixRoundTests(_Base):
     """Fix-round tests for the 350478c cold reads.
 
@@ -232,12 +319,12 @@ class Card1FixRoundTests(_Base):
     def test_rejected_schema_store_left_unchanged(self):
         # A store at a newer, unknown user_version must be rejected by every
         # verb and left byte-for-byte unchanged: no header rewrite, no
-        # -wal/-shm side files (a v1 tool never modifies a rejected store).
+        # -wal/-shm side files (the tool never modifies a rejected store).
         run_cli("--db", self.db, "init")
         _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
         conn = sqlite3.connect(self.db)
-        conn.execute("PRAGMA user_version=2")
-        # Downgrade to delete journal mode: a v1 tool must not switch a
+        conn.execute("PRAGMA user_version=3")
+        # Downgrade to delete journal mode: the tool must not switch a
         # rejected store to WAL either (that rewrites the file header).
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.close()
@@ -354,14 +441,14 @@ class Card1FixRoundTests(_Base):
         ok = _import(self.db, self.tmp, doc)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         expected = (
-            '{"schema_version":1,"accounts":['
+            '{"schema_version":2,"accounts":['
             '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
-            '"allocated_micro_eur":100000000},'
+            '"allocated_micro_eur":100000000,"coverage_complete":false,"windows":[]},'
             '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'
-            '"allocated_micro_eur":0}],'
+            '"allocated_micro_eur":0,"coverage_complete":false,"windows":[]}],'
             '"machines":["desktop"],"gateways":['
             '{"alias":"g1","account":"meter","machine":"desktop",'
-            '"share_micro_eur":100000000}]}'
+            '"share_micro_eur":100000000,"report":' + EMPTY_REPORT + '}]}'
         )
         self.assertEqual(_status(self.db).stdout.strip(), expected)
         # A subscription account carrying a budget is invalid.
