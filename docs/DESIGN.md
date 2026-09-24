@@ -494,7 +494,7 @@ numeric calibration fixtures; retain the named implementation/deployment gates. 
 subscription concurrency remains one; the offline per-machine default of two is explicitly
 uncoordinated. Acceptance for build does not claim deployed enforcement or passing product tests.
 
-## 11. Card 2b addendum v3: provider billing evidence
+## 11. Card 2b addendum v4: provider billing evidence
 
 Status: PLANNED implementation; B01–B06 below are DECIDED. Audience: Leasewise builders/operators.
 Provider credentials remain reporter-side; the coordinator stores numeric evidence and local aliases only.
@@ -517,9 +517,9 @@ multi-hour, not bounded by source freshness. Duplicated openings are unproven; p
 ### Dependency and storage contract
 
 At 876458a, validate_readings.py accepts gateway metadata only, nullable periods, no money fields;
-migrate.py admits only cli_window/gateway_snapshot. Main remains de597a5: card 2 is not merged.
-Dispatch is blocked until the lead pins the reviewed, merged card-2 SHA and verifies config re-import
-with readings plus persistent epoch/hash reconciliation. Do not rebase this design commit or invent a SHA.
+migrate.py admitted only cli_window/gateway_snapshot. Card 2 is now merged at cf2476b and the design at
+8a54bce. X1's re-pointed-alias fix is assigned as the first commit of the dispatched 2b-1 build; validate
+that fix before using its money evidence. It must reset/reconcile report state when machine/account changes.
 2b-1 extends versioned reading-import (next document/schema versions fixed against that merge): old
 documents remain importable, but missing amounts/periods mean unusable money evidence, never zero.
 New gateway payload = existing metadata plus settled_micro_eur,reserved_micro_eur,uncertain_micro_eur,
@@ -569,10 +569,13 @@ Tolerance tau(L)=max(abs_tolerance_micro_eur,ceil(L*relative_tolerance_bps/10000
 50000 micro-EUR and 100 bps. Use L_now for gross/idle checks and L_asof for historical checks.
 Never add tolerance to headroom. Calibrate on a provenance-checked idle
 comparison after provider catch-up; four hours is an investigation delay, not proof of completeness.
+Latest means highest seq after restricting to the store-reconciled current epoch chain; observed_at is
+only freshness, not ordering. Other-chain rows cannot replace it; a reconciled switch selects a new chain.
 L_now=sum latest settled per gateway; R_now=sum latest reserved+uncertain, never add unattributed again.
-Every current gateway must have exact period, age<=120s, nondecreasing settled totals and no unresolved
-epoch/hash transition. Missing/stale/null/history-reset evidence => unresolved; do not trust a later
-ok snapshot to erase a historical transition. Heartbeats alone do not establish monetary completeness.
+Unresolved transitions are exactly unresolved_event_ids from the store's reconcile state, not inferred
+anew from historical transitions. History checks chain continuity only; an operator-cleared transition
+does not re-latch, and an ordinary ok snapshot cannot clear a listed transition. Every selected report
+needs exact period, age<=120s and nondecreasing totals within its chain; missing/ambiguous chains are unusable.
 Pure evaluation accepts per-reading coverage evidence {event_id,upper_at,complete_at,
 overlap_floor_micro_eur,matched_provenance}, with nullable times/overlap and an exact boolean. It is
 fixture/operator-owned, never billing telemetry. upper_at certifies no included charge occurred later;
@@ -582,8 +585,15 @@ upper, unknown/duplicate event references or times after now. The input contract
 OVH lastUpdate proves neither completeness nor an exact economic cutoff: the supplied evidence gives
 no such certificate. Small excesses hidden by later spending still require that evidence; gross excess
 does not. Time passage alone cannot fabricate a coverage certificate. No new certificate API.
-Before looking for certificates, test a fresh, conflict-free provider P_e against complete current
-gateway exposure: P_e>L_now+R_now+allowance+tau(L_now) => unexplained_excess, hold, comparable.
+Before looking for certificates, test fresh provider P_e against complete current gateway exposure:
+P_e>L_now+R_now+B+allowance+tau(L_now) => unexplained_excess, hold, comparable. When conflicted,
+P_e is latest_micro_eur with latest_event_id's time/receipt, never the retained high-water; run this
+gross check before the conflict ALERT row, without clearing the conflict or changing its stored floor.
+B is previous-period reserved+uncertain exposure at midnight that could be billed in this period;
+add it during the first lag_seconds window. Freeze that boundary amount (do not shrink it when old
+attempts settle), and retain it beyond that window until period attribution is reconciled; a timer alone
+cannot remove charges still present in cumulative P. Unknown boundary evidence disables excess checks
+as snapshot_skew (not B=0). A proved empty boundary gives B=0. B never increases admission headroom.
 Every gateway report used here must cover at least the provider event's received_at (allow the existing
 30s clock-skew margin by requiring observed_at>=received_at+30000), still be <=120s old, and pass
 epoch/hash/history checks. Otherwise refresh reports and classify snapshot_skew; freshness alone is not
@@ -594,8 +604,8 @@ For each certified upper_at T, bracket each gateway with last snapshot <=T and f
 require both within 120s of T, continuous epoch/hash and nondecreasing totals. L_asof is the sum of
 settled amounts in the upper snapshots; U_asof adds their reserved+uncertain. Use these historical
 amounts, not L_now, so subsequent spending cannot conceal excess. Treat allowance as an upper bound
-on permitted non-AI exposure: P>U_asof+allowance+tau(L_asof) is unexplained excess; it proves no cause.
-If P>L_asof+tau(L_asof) but <=U_asof+allowance+tau(L_asof), classify reserve_or_scope_covered.
+on permitted non-AI exposure: P>U_asof+B+allowance+tau(L_asof) is unexplained excess; it proves no cause.
+If P>L_asof+tau(L_asof) but <=U_asof+B+allowance+tau(L_asof), classify reserve_or_scope_covered.
 Within tolerance classify matched only with complete, conflict-free evidence and no uncertain overlap;
 otherwise temporally_unresolved. A material negative difference is provider_behind, never a refund.
 Persistent missing spend: from continuous history compute settled at/before T-lag_seconds; when P is
@@ -604,7 +614,8 @@ an idle diagnostic: now-last_financial_change>=lag_seconds and P<L_now-tau(L_now
 Derive last_financial_change read-only from stored amount/epoch changes on each evaluation; never write
 a timer or use report arrival. Identical stored history gives the same timer across restart. Reserve activity
 breaks idle. Equality never starts this timer. Missing history cannot establish elapsed idle time.
-Unknown/stale/conflicted billing => ALERT, never a new HOLD recommendation; missing bounds alone
+Unknown/stale billing => ALERT, never a new HOLD recommendation; fresh conflicted billing first runs
+the latest-value gross check and otherwise ALERTs. Missing bounds alone
 is a normal provisional observation with action=none. Keep
 an existing comparable excess latched for the later integration to resolve, not for a poll to clear.
 
@@ -620,17 +631,19 @@ Spend estimate E=max(L_now,max_e(P_e+L_now-O_e)); diagnostic E may over-count wh
 Only with complete overlap proofs for every contributing provider event and fresh conflict-free inputs
 is ordinary quality comparable. Excess is also comparable for HOLD purposes, even without overlap proof.
 For comparable billing, headroom=cap-E-R_now and admission_basis=billing_estimate; otherwise use
-headroom=cap-L_now-R_now and admission_basis=ledger_fallback, provided local ledger inputs are usable.
+headroom=cap-allowance-L_now-R_now and admission_basis=ledger_fallback, with usable local ledger inputs.
+This managed-work headroom preserves the separate non-AI allocation; allowance is not available for H.
 Keep E and known_floor for diagnostics; do not enforce them in fallback. This conditions §4's account
 inequality; fallback still runs the gross-excess hold predicate before admission. With cap=100,L=50,
-P=45,R=0 and no coverage, E=95 is diagnostic, effective headroom=50, action=none. No halved budget.
+P=45,R=0,allowance=0 and no coverage, E=95 is diagnostic, headroom=50, action=none; allowance=10 gives 40.
 Every hold recommendation denies requested H regardless of headroom; known integrated holds also deny.
 Example with certified overlap: P=80, O=50, L_now=60, cap=100, R=0 => E=90, headroom=10.
 This synthetic case includes allowance=30 and total gateway shares<=70, covering its known non-AI portion.
 With P=14.30,O=14.30,L_now=18.43,R=0.50,cap=100 => 81.07. These are proof-bearing fixtures.
 Missing P means estimate=null, not P=0; missing/unusable ledger means headroom=null and admission_basis=
 unavailable. Unknown/stale/conflicted P preserves known_floor=max(known P,L_now), with unknown operands
-omitted and null if neither is known. It uses ledger_fallback when available, never inventing a billing hold.
+omitted and null if neither is known. It uses ledger_fallback when available; a fresh latest-value gross
+excess may still recommend HOLD despite a latched conflict.
 R here is only disjoint gateway aggregates. Service-lease overlap belongs to cards 4/6a; 30K output
 reservation/enforcement belongs to 6b. Lagging invisible bypass remains unbounded by this estimate.
 Opening planner takes verified drain completion, snapshot/coverage references, per-gateway baselines,
@@ -652,10 +665,17 @@ audit and operator resolutions require a separately sized integration work order
 Pin evaluate_billing(context,request)->Evaluation and plan_opening(context,request)->Proposal. No
 new evaluator/planner CLI verbs or coverage-file discovery: fixtures call these pure functions directly.
 Closed JSON-compatible context={account,period_start,period_end,cap_micro_eur,gateways,policy,readings,
-unresolved_event_ids}; gateways=[{gateway,share_micro_eur}]. policy is the full billing-policy-import
+unresolved_event_ids,boundary_exposure_micro_eur,boundary_event_ids}; gateways=[{gateway,share_micro_eur,
+current_chain_event_ids}]. Current-chain IDs select store-accepted readings for that gateway's active ledger
+identity; epoch-number reuse after an alias move does not join two identities. No caller-selected chain.
+policy is the full billing-policy-import
 record with account and reporter_machine aliases replacing the two FKs. readings are validated reading
 envelopes plus received_at, all for this account; unresolved_event_ids are local UUID references to
-unresolved transitions. Include retained same-period history, not just the latest monetary totals.
+unresolved transitions copied from store reconcile state. Include retained same-period history and the
+previous-period boundary evidence referenced by boundary_event_ids; never add old-period totals to L_now.
+boundary_exposure_micro_eur is nullable nonnegative int64, derived from complete store boundary evidence,
+not user telemetry; null means unknown. References/chain membership are validated; contradictory same-seq
+amounts in one chain are unusable, while identical replays count once. Evaluator never mutates reconcile state.
 Evaluation request={version:1,account,now_ms,requested_micro_eur,coverage}; coverage is an array of the
 closed per-event evidence records above, [] when absent. requested_micro_eur is nonnegative int64;
 now_ms is injected UTC-ms, never read from a clock inside evaluation. Account must match context.
@@ -690,6 +710,9 @@ attempt=max(now+poll+jitter,valid Retry-After), jitter in [0,90]s injected; no i
 Transport contract refuses disabled TLS verification/non-HTTPS; fixtures test that refusal, not actual
 certificate verification. Later deployment checklist: tested TLS, exact GET-only grants, local secret
 ACLs, authenticated account binding (card 5), signed-header/URL redaction and separately approved canary.
+Runbook: set allowance to verified measured non-AI spend (normally zero for a dedicated project when
+non_ai_spend_present=false and no outstanding non-AI liability is known). Unused allowance masks bypass
+up to that unused amount. Recommend/review reductions; never let a lagged false flag auto-change policy.
 No raw exceptions, IDs, keys or bodies in documents/status/errors; only registered aliases, local UUIDs,
 numbers and closed enums. Other provider adapters/deployment plumbing need separate work orders.
 Evaluation output (all required): {state,action,reason,quality,admission_basis,known_floor_micro_eur,
@@ -706,8 +729,11 @@ Q=comparable only with complete overlap proof and fresh conflict-free inputs, ot
 | Condition | state / reason | action | quality |
 |---|---|---|---|
 | Invalid basis/scope or unusable ledger | unknown / basis_unknown,scope_mismatch,gateway_unusable (in that order) | alert | unknown |
-| No provider sample; stale sample; latched conflict (in that order) | unknown,stale,conflict / billing_unknown,billing_stale,source_conflict | alert | provisional |
-| Gross or certified historical excess beyond allowance+tolerance | unexplained_excess / provider_excess | hold | comparable |
+| No provider sample; stale sample (in that order) | unknown,stale / billing_unknown,billing_stale | alert | provisional |
+| Fresh gross excess beyond exposure+B+allowance+tolerance (latest value if conflicted) | unexplained_excess / provider_excess | hold | comparable |
+| Remaining latched conflict | conflict / source_conflict | alert | provisional |
+| Unknown midnight boundary exposure | temporally_unresolved / snapshot_skew | none | provisional |
+| Certified historical excess beyond exposure+B+allowance+tolerance | unexplained_excess / provider_excess | hold | comparable |
 | Certified P below old settled by material amount | provider_behind / missing_old_spend | alert | Q |
 | Idle material negative gap at >=lag_seconds | provider_behind / lag_investigate | alert | provisional |
 | No certificate, gross time guards absent | temporally_unresolved / snapshot_skew | none | provisional |
@@ -744,7 +770,13 @@ config/schema=400,idempotency=409,store=503. These add to §7; no HTTP implement
 | billing_owner_scope_revision; billing_scope / 2b-1 | Given foreign machine, inactive revision, bad alias, nondedicated project or shares+allowance>cap, When importing, Then reject; replica copies never add totals, policy changes with history refused. |
 | billing_replay; billing_same_time_conflict; billing_older_high_water / 2b-1 | Given same-ID replay/collision, equal-time different totals or older higher amount, When reordered, Then no double counting, collision rollback, deterministic conflict/high-water without time refresh. |
 | billing_time; billing_rollover / 2b-1 | Given failure/unchanged polls, source age=7200s/+1ms, future=30s/+1ms, midnight or late prior-month reading, When reduced, Then exact freshness/future boundaries, new month unknown/ALERT and independent periods; no idle exemption. |
-| billing_gateway_uncertainty / 2b-2 | Given absent/null/stale (>120s), epoch/hash transition or decreased ledger, When evaluated, Then no usable comparison; 120s valid, repeated ok cannot erase conflict, unattributed subset counted once. |
+| billing_gateway_uncertainty / 2b-2 | Given absent/null/stale (>120s), unresolved epoch/hash state or decreased in-chain ledger, When evaluated, Then admission_basis=unavailable, headroom=null and request_fits=null; 120s valid, unattributed subset counted once. |
+| billing_conflicted_latest_gross / 2b-2 | Given latched high-water=100, fresh latest=50 and L=50, When gross-tested, Then conflict ALERT only; latest=80 with L=50 and R/B/allowance=0 yields comparable HOLD without a certificate, using latest receipt guards and preserving conflict. |
+| billing_midnight_exposure / 2b-2 | Given previous-period boundary exposure=0.20 and new-period P=0.20/L=R=0, When evaluated before/at/after lag_seconds, Then no false excess; B stays after settlement/timer expiry until attribution reconciliation, unknown B cannot become zero, and P>R+L+B+allowance+tau still holds. |
+| billing_reconcile_state_precedence / 2b-2 | Given an old transition in history, When its ID is absent after store reconciliation, Then it does not re-latch; while listed, repeated ok reports leave the gateway unusable. No evaluator writes. |
+| billing_latest_chain_seq / 2b-2 | Given shuffled times, lower-seq replay, late old-epoch rows and a moved alias reusing its epoch number, When selecting latest, Then highest seq in the store-selected current chain wins; other identities/chains cannot supply current amounts without reconciliation. |
+| billing_fallback_allowance / 2b-2 | Given cap=100,L=50,R=0,allowance=10 and provisional billing, When evaluating H=40 and H=40.000001, Then headroom=40, fits=true/false; allowance remains separate from managed work. |
+| billing_allowance_runbook / later reporter | Given verified non-AI spend or a lagged false flag, When recommending allowance, Then use measured liability (zero only when none is known), disclose the blind band, and never mutate policy from telemetry. |
 | billing_tax_basis / 2b-1 | Given B06 ex_vat policy, unknown/mismatched bases and half-micro conversions, When importing/evaluating shared conversion, Then 100 EUR stays 100 before VAT, allocation checks use one basis, unknown alerts and conversion rounds upward. |
 | billing_tolerance / 2b-2 | Given approved configurable 50000 micro-EUR/100 bps and ledger 20 EUR, When calculating tau, Then 0.20 EUR; absolute floor at low totals, never budget credit. |
 | billing_eval_input; billing_overlap_precedence / 2b-2 | Given closed context/request and complete_at>upper_at, unknown IDs or O outside min(P,L_now,B_e), When evaluated, Then invalid input rejected; explicit valid overlap wins, absent overlap derives only with proof; injected now controls all time. |
@@ -806,5 +838,18 @@ config/schema=400,idempotency=409,store=503. These add to §7; no HTTP implement
 | C3 timer writes | ACCEPTED | last_financial_change derived read-only from retained history on each evaluation; restart needs no new state. |
 | C4 uncovered rules | ACCEPTED | Named input/overlap, gross-allowance, non-AI overlay and precedence fixtures cover each listed boundary. |
 
-No remaining lead choices in this addendum. Dispatch still requires the reviewed card-2 merge and
-captured OVH fixtures; first-invoice verification and real canary remain later deployment obligations.
+No remaining lead choices in this addendum. Card 2 is merged; X1 is assigned to 2b-1's first commit.
+Captured OVH fixtures, first-invoice verification and real canary retain their respective build/deployment gates.
+
+### Reader B v4 clarification disposition
+
+| Item | Disposition | Resolution |
+|---|---|---|
+| S1 conflicted gross check | ACCEPTED | Fresh latest value is tested before conflict ALERT; high-water cannot trigger that check; billing_conflicted_latest_gross. |
+| S2 midnight exposure | ACCEPTED | Add frozen previous-period boundary exposure to excess comparisons; retain until attribution resolves, not merely until lag expires; billing_midnight_exposure. |
+| S3 reconciliation precedence | ACCEPTED | Store reconcile state alone supplies unresolved_event_ids; history checks continuity without re-latching cleared transitions; billing_reconcile_state_precedence. |
+| S4 latest snapshot | ACCEPTED | Highest seq in the store-selected current epoch chain, never another chain or simply newest arrival; billing_latest_chain_seq. |
+| C1 fallback allowance | ACCEPTED | Managed fallback subtracts non-AI allowance from headroom/request_fits; billing_fallback_allowance. |
+| C2 allowance blind band | ACCEPTED | Runbook recommends verified measured non-AI liability, normally zero on a dedicated project; operator-only changes; billing_allowance_runbook. |
+| X1 alias identity gate | ASSIGNED | Lead placed alias report reset/reconciliation in 2b-1's first commit; this design records the dependency, not an implementation claim. |
+| Missing unavailable case | ACCEPTED | billing_gateway_uncertainty explicitly requires unavailable basis, null headroom and null request_fits. |
