@@ -1,0 +1,292 @@
+"""Card 1 acceptance tests: standalone inventory, exactly three tables.
+
+Run from the repository root:
+    python -m unittest discover -s tests -v
+
+Method names carry the card's check names with the unittest "test_" prefix,
+e.g. card check `init_is_idempotent` is method `test_init_is_idempotent`.
+"""
+
+import copy
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PYTHON = os.environ.get("AGENTTALK_PY") or sys.executable
+
+VALID_DOC = {
+    "version": 1,
+    "accounts": [
+        {"alias": "meter", "vendor": "ovh", "kind": "metered", "budget_micro_eur": 100000000}
+    ],
+    "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+    "gateways": [
+        {"alias": "g1", "account": "meter", "machine": "desktop",
+         "share_micro_eur": 60000000, "period": "utc_month"},
+        {"alias": "g2", "account": "meter", "machine": "worker",
+         "share_micro_eur": 40000000, "period": "utc_month"},
+    ],
+}
+
+EXPECTED_STATUS = (
+    '{"schema_version":1,"accounts":[{"alias":"meter","kind":"metered",'
+    '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+    '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
+    '"machine":"desktop","share_micro_eur":60000000},{"alias":"g2","account":"meter",'
+    '"machine":"worker","share_micro_eur":40000000}]}'
+)
+
+ERROR_INVALID_CONFIG = '{"error":{"code":"INVALID_CONFIG","message":"config document is invalid"}}'
+ERROR_SCHEMA = '{"error":{"code":"SCHEMA_UNSUPPORTED","message":"schema version is not supported"}}'
+ERROR_STORE_NOT_FOUND = '{"error":{"code":"STORE_ERROR","message":"database not found"}}'
+ERROR_STORE_FAILED = '{"error":{"code":"STORE_ERROR","message":"store operation failed"}}'
+
+
+def _write_json(path, doc):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+
+
+def run_cli(*args):
+    return subprocess.run(
+        [PYTHON, "-m", "quota_balancer", *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _import(db, tmp, doc):
+    cfg = os.path.join(tmp, "config.json")
+    _write_json(cfg, doc)
+    return run_cli("--db", db, "config-import", "--file", cfg)
+
+
+def _status(db):
+    return run_cli("--db", db, "status", "--json")
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        # Temporary work goes under $AGENTTALK_SCRATCH when the operator set it.
+        base = os.environ.get("AGENTTALK_SCRATCH")
+        if base:
+            os.makedirs(base, exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=base, prefix="quota-card1-")
+        self.tmp = self._tmp.name
+        self.db = os.path.join(self.tmp, "inventory.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+
+class Card1Tests(_Base):
+    def test_init_is_idempotent(self):
+        first = run_cli("--db", self.db, "init")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = run_cli("--db", self.db, "init")  # reopen
+        self.assertEqual(second.returncode, 0, second.stderr)
+        conn = sqlite3.connect(self.db)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertEqual(version, 1)
+        self.assertEqual(tables, {"accounts", "machines", "gateways"})
+        self.assertEqual(journal.lower(), "wal")
+
+    def test_shares_cannot_exceed_account(self):
+        run_cli("--db", self.db, "init")
+        ok = _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        invalid = copy.deepcopy(VALID_DOC)
+        invalid["gateways"][1]["share_micro_eur"] = 40000001  # sum 100000001 > 100000000
+        bad = _import(self.db, self.tmp, invalid)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(bad.stdout, "")
+        # Prior data intact.
+        st = _status(self.db)
+        self.assertEqual(st.returncode, 0)
+        self.assertEqual(st.stdout.strip(), EXPECTED_STATUS)
+
+    def test_invalid_config_rolls_back(self):
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        baseline = _status(self.db).stdout.strip()
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["machines"][0]["alias"] = "DeskTop"  # alias regex
+        cases = {"bad_alias": doc}
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["account"] = "ghost"  # dangling reference
+        cases["bad_reference"] = doc
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["weight"] = 1  # unknown key
+        cases["unknown_key"] = doc
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][1]["period"] = "weekly"  # wrong period
+        cases["bad_period"] = doc
+
+        for name, mutated in cases.items():
+            bad = _import(self.db, self.tmp, mutated)
+            self.assertEqual(bad.returncode, 2, name)
+            self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG, name)
+            self.assertEqual(_status(self.db).stdout.strip(), baseline, name)
+
+    def test_money_is_integer(self):
+        run_cli("--db", self.db, "init")
+        for value in (100000000.0, True, -5, 2 ** 63, 10 ** 20):
+            doc = copy.deepcopy(VALID_DOC)
+            doc["accounts"][0]["budget_micro_eur"] = value
+            bad = _import(self.db, self.tmp, doc)
+            self.assertEqual(bad.returncode, 2, repr(value))
+            self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG, repr(value))
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 60000000.0  # float share
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        # The integer fixture succeeds.
+        ok = _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(_status(self.db).stdout.strip(), EXPECTED_STATUS)
+
+    def test_privacy_1(self):
+        # Sentinel aliases are operator aliases: they may survive in status.
+        alias_sentinel = "priv-acct-7"
+        machine_sentinel = "priv-mach-3"
+        gateway_sentinel = "priv-gw-9"
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"][0]["alias"] = alias_sentinel
+        doc["machines"][0]["alias"] = machine_sentinel
+        doc["gateways"][0]["alias"] = gateway_sentinel
+        doc["gateways"][0]["account"] = alias_sentinel
+        doc["gateways"][0]["machine"] = machine_sentinel
+        doc["gateways"][1]["account"] = alias_sentinel
+        run_cli("--db", self.db, "init")
+        ok = _import(self.db, self.tmp, doc)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(ok.stdout, "")  # import prints nothing
+        st = _status(self.db)
+        self.assertEqual(st.returncode, 0)
+        # The status is exactly the documented projection: nothing beyond the
+        # approved aliases and the static schema/field names may appear.
+        expected = (
+            '{"schema_version":1,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
+            '"budget_micro_eur":100000000,"allocated_micro_eur":100000000}],'
+            '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
+            '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000},'
+            '{"alias":"priv-gw-9","account":"priv-acct-7","machine":"priv-mach-3",'
+            '"share_micro_eur":60000000}]}'
+        )
+        self.assertEqual(st.stdout.strip(), expected)
+        self.assertNotIn("vendor", st.stdout)
+        # Error path: a secret in a non-alias field must not be echoed.
+        secret = "secret-provider-id-zz9"
+        bad_doc = copy.deepcopy(VALID_DOC)
+        bad_doc["gateways"][0]["region"] = secret  # unknown key
+        bad = _import(self.db, self.tmp, bad_doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertNotIn(secret, bad.stderr)
+        self.assertNotIn(secret, bad.stdout)
+        # A secret used as a bad reference must not be echoed either.
+        bad_doc = copy.deepcopy(VALID_DOC)
+        bad_doc["gateways"][0]["account"] = secret
+        bad = _import(self.db, self.tmp, bad_doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertNotIn(secret, bad.stderr + bad.stdout)
+        # Store-IO path: a sentinel in the DB path must not be echoed.
+        path_sentinel = "db-path-sentinel-5f2e"
+        bad_db = os.path.join(self.tmp, path_sentinel, "inventory.db")
+        bad = run_cli("--db", bad_db, "init")
+        self.assertEqual(bad.returncode, 3)
+        self.assertEqual(bad.stderr.strip(), ERROR_STORE_FAILED)
+        self.assertNotIn(path_sentinel, bad.stderr + bad.stdout)
+
+
+class Card1ContractTests(_Base):
+    def test_status_shape_is_exact(self):
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        st = _status(self.db)
+        self.assertEqual(st.returncode, 0)
+        self.assertEqual(st.stdout.strip(), EXPECTED_STATUS)
+
+    def test_schema_version_rejected(self):
+        run_cli("--db", self.db, "init")
+        doc = copy.deepcopy(VALID_DOC)
+        doc["version"] = 2
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
+        doc["version"] = "1"  # wrong type
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
+        doc["version"] = True  # boolean is not the integer 1
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
+
+    def test_uuids_retained_for_retained_aliases(self):
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        conn = sqlite3.connect(self.db)
+        try:
+            account_id = conn.execute(
+                "SELECT id FROM accounts WHERE alias='meter'").fetchone()[0]
+            machine_id = conn.execute(
+                "SELECT id FROM machines WHERE alias='desktop'").fetchone()[0]
+        finally:
+            conn.close()
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["machines"].append({"alias": "laptop"})
+        ok = _import(self.db, self.tmp, doc)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
+        conn = sqlite3.connect(self.db)
+        try:
+            same_account = conn.execute(
+                "SELECT id FROM accounts WHERE alias='meter'").fetchone()[0]
+            same_machine = conn.execute(
+                "SELECT id FROM machines WHERE alias='desktop'").fetchone()[0]
+            new_machine = conn.execute(
+                "SELECT id FROM machines WHERE alias='laptop'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(same_account, account_id)
+        self.assertEqual(same_machine, machine_id)
+        self.assertTrue(new_machine)
+        self.assertNotEqual(new_machine, machine_id)
+
+    def test_uninit_store_errors(self):
+        st = _status(self.db)  # no file at all
+        self.assertEqual(st.returncode, 3)
+        self.assertEqual(st.stderr.strip(), ERROR_STORE_NOT_FOUND)
+        bad = _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))  # also no store
+        self.assertEqual(bad.returncode, 3)
+        self.assertEqual(bad.stderr.strip(), ERROR_STORE_NOT_FOUND)
+        # An existing but uninitialized (zero-byte) file is an unknown schema state.
+        with open(self.db, "wb"):
+            pass
+        st = _status(self.db)
+        self.assertEqual(st.returncode, 2)
+        self.assertEqual(st.stderr.strip(), ERROR_SCHEMA)

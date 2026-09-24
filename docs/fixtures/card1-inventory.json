@@ -1,0 +1,4 @@
+{"version":1,"accounts":[{"alias":"meter","vendor":"ovh","kind":"metered","budget_micro_eur":100000000}],
+ "machines":[{"alias":"desktop"},{"alias":"worker"}],"gateways":[
+ {"alias":"g1","account":"meter","machine":"desktop","share_micro_eur":60000000,"period":"utc_month"},
+ {"alias":"g2","account":"meter","machine":"worker","share_micro_eur":40000000,"period":"utc_month"}]}
