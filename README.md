@@ -2,7 +2,9 @@
 
 A quota and token balancer that agenttalk consumes: accounts, subscriptions and pay-per-token endpoints, limits, per-turn leases, meter readings and routing policy.
 
-Design (v3, accepted for build 2026-09-24): docs/DESIGN.md. Built card by card (section 8); card 1 = standalone inventory.
+Design (v3, accepted for build 2026-09-24): docs/DESIGN.md. Built card by
+card (section 8); card 1 = standalone inventory, card 2 = the reading
+reducer over it.
 
 ## Card 1 — standalone inventory, exactly three tables
 
@@ -55,6 +57,74 @@ budget and allocated amount of 100000000 micro-EUR. Fixtures:
 `docs/fixtures/card1-inventory-invalid.json` (g2 share 40000001, which
 pushes the share sum above the account budget).
 
-Tests: `python -m unittest discover -s tests -v` (16 tests, including
-the five card-named checks; the fix round added mutation pins and
-store-integrity tests — see docs/STEP-CARD-1.md).
+Tests: `python -m unittest discover -s tests -v` (28 tests across both
+cards — the card-1 suite, including the carry-over, plus the card-2 named
+checks and reducer rules; see docs/STEP-CARD-1.md and
+docs/STEP-CARD-2.md).
+
+## Card 2 — reading reducer
+
+The same standalone CLI, extended. It ingests reporter fixtures and
+reduces them into per-account windows and a per-gateway report, projected
+to aliases only. Standard library only. No agenttalk, no models, no
+scopes, no leases, no HTTP — still fixture only.
+
+The database migrates from version 1 to version 2 (a v1 store is brought
+up by `init`; a v0 store goes straight to 2). New tables `readings` and
+`windows`; `gateways` gains the report columns and `accounts` the
+coverage/idle-proof columns.
+
+```console
+python -m quota_balancer --db quota.db init
+python -m quota_balancer --db quota.db config-import --file docs/fixtures/card1-inventory.json
+python -m quota_balancer --db quota.db reading-import --file readings.json
+python -m quota_balancer --db quota.db set-coverage --account meter --complete true
+python -m quota_balancer --db quota.db status --json
+```
+
+- `reading-import --file DOC` — validate a version-2 document (closed key
+  shapes, machine/account aliases, exact integer `used_bps` in
+  0..10000, kind `cli_window` or `gateway_snapshot`, no observations more
+  than 30 seconds in the future) and, in one transaction, reduce it:
+  dedup by `event_id` (a replay with matching content is a no-op, the same
+  id with different content is `IDEMPOTENCY_CONFLICT`), keep the source
+  observation time, hold the high-water utilization per reset epoch (a
+  later epoch restarts from its first post-reset observation; an older
+  epoch is a no-op), map the legacy confidence states explicitly
+  (`stale` → observed value with `source_stale`, `unknown` stays
+  unknown), and advance the gateway report (monotonic `seq`; an epoch or
+  policy-hash change needs reconciliation). An ambiguous source (no
+  account) is recorded but reduced into no account.
+- `set-coverage --account A --complete {true,false}` — operator-only; the
+  only thing that ever writes `coverage_complete`. Telemetry never sets
+  it.
+- `status --json` — the card-1 inventory plus, per account,
+  `coverage_complete` and its windows (window key, `used_bps`,
+  `resets_at`, `confidence`, `source_stale`, `observed_at`, `age_ms`,
+  `current`, `freshness_reason`), and, per gateway, the report
+  (`state`, `last_report_at`, `ledger_epoch`, `last_seq`,
+  `period_start`, `period_end`, `policy_hashes`, `sized_ready`).
+  Freshness is fail-closed in this card: with coverage incomplete the
+  600-second wall cap always applies (a sample older than 600 seconds is
+  `current=false`, `freshness_reason=wall_cap`), and a gateway report
+  older than 120 seconds reads `state=stale` (METER_STALE); the
+  idle-current proof that would lift the cap is a later card's.
+
+Exit codes: 0 success; 2 invalid config/schema or an idempotency
+conflict; 3 store I/O failure. On failure the tool prints one JSON object
+to stderr — `{"error":{"code","message"}}` with code `INVALID_CONFIG`,
+`SCHEMA_UNSUPPORTED`, `STORE_ERROR` or `IDEMPOTENCY_CONFLICT` — with
+static messages only.
+
+Demo (reordered and idle samples): run `init`, `config-import`, then
+`reading-import` a document where the later observation arrives before
+the earlier one (the window takes the high-water usage and the latest
+source time regardless of arrival order), and a second document with a
+~700-second-old sample (the window reads `wall_cap`). A second `status
+--json` after a process restart re-reads the same reduced state — only the
+read-time `age_ms` advances. See docs/STEP-CARD-2.md for the transcript.
+
+Tests: the five named checks (`reading_replay`, `stale_mapping`,
+`coverage_fallback`, `account_isolation`, `privacy_2`) plus the reducer
+rules; the named tests are shown red at the migration-only commit and
+green with the reducer — see docs/STEP-CARD-2.md.
