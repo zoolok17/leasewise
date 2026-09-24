@@ -486,6 +486,48 @@ class ReducerRules(_Base):
         self.assertEqual(window["observed_at"], now - 10000)
         self.assertEqual(window["used_bps"], 6000)
 
+    def test_older_same_epoch_observation_keeps_newer_metadata(self):
+        # Card-2 carry-over: an older observation in the same reset epoch must
+        # apply the high-water on used_bps but must NOT overwrite the newer
+        # observation's metadata (observed_at, confidence, source_stale,
+        # covered_seq, source_event_id). The reducer's ordering guard
+        # (reduce.reduce_window) keeps the latest observation's metadata.
+        now = _now_ms()
+        epoch = now - 50000
+        # The NEWER observation arrives first and is stored (its metadata is
+        # the baseline the older one must not clobber).
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc([_cli_window(_eid("m-new"), "desktop", "meter", "wk-m", 4000,
+                              epoch, now - 10000, covered_seq=100)])).returncode, 0)
+        # The OLDER observation (same epoch) arrives second: a higher usage
+        # (8000, which raises the high-water) but an older source time and
+        # different metadata (source_stale=True, covered_seq=42, a new id).
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc([_cli_window(_eid("m-old"), "desktop", "meter", "wk-m", 8000,
+                              epoch, now - 40000, stale=True,
+                              covered_seq=42)])).returncode, 0)
+
+        window = self._window("wk-m")
+        # The high-water usage IS applied from the older (higher) sample ...
+        self.assertEqual(window["used_bps"], 8000)
+        # ... but the NEWER observation's metadata is kept, not overwritten.
+        self.assertEqual(window["observed_at"], now - 10000)
+        self.assertEqual(window["confidence"], "observed")
+        self.assertFalse(window["source_stale"])
+        # covered_seq / source_event_id are not in the status projection; read
+        # the stored row directly to pin that the newer event's metadata won.
+        conn = sqlite3.connect(self.db)
+        try:
+            covered_seq, source_event_id = conn.execute(
+                "SELECT covered_seq, source_event_id FROM windows "
+                "WHERE window_key=?", ("wk-m",)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(covered_seq, 100)
+        self.assertEqual(source_event_id, _eid("m-new"))
+
     def test_gateway_report_meter_stale(self):
         # A fresh gateway report resolves to ok; one older than the fail-closed
         # age (120s) resolves to stale (METER_STALE).
