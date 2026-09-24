@@ -221,6 +221,187 @@ class Card1Tests(_Base):
         self.assertNotIn(path_sentinel, bad.stderr + bad.stdout)
 
 
+class Card1FixRoundTests(_Base):
+    """Fix-round tests for the 350478c cold reads.
+
+    Mutation pins: the named checks go red under frontend-dev's surviving
+    mutations (M2: drop the metered-only gateway check; M5: drop duplicate
+    gateway alias check; M6: drop duplicate account alias check).
+    """
+
+    def test_rejected_schema_store_left_unchanged(self):
+        # A store at a newer, unknown user_version must be rejected by every
+        # verb and left byte-for-byte unchanged: no header rewrite, no
+        # -wal/-shm side files (a v1 tool never modifies a rejected store).
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        conn = sqlite3.connect(self.db)
+        conn.execute("PRAGMA user_version=2")
+        # Downgrade to delete journal mode: a v1 tool must not switch a
+        # rejected store to WAL either (that rewrites the file header).
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.close()
+        with open(self.db, "rb") as handle:
+            before = handle.read()
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(os.path.exists(self.db + suffix))
+
+        st = _status(self.db)
+        self.assertEqual(st.returncode, 2)
+        self.assertEqual(st.stderr.strip(), ERROR_SCHEMA)
+        bad = _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
+        bad = run_cli("--db", self.db, "init")
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
+
+        with open(self.db, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(os.path.exists(self.db + suffix))
+
+    def test_mid_migration_failure_leaves_no_half_store(self):
+        # A foreign table named like the third CREATE triggers a failure
+        # mid-migration (after accounts/machines were created). The failed
+        # migration must roll back: only the foreign table remains, and the
+        # store is still version 0.
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE gateways (x INTEGER)")
+        conn.close()
+        bad = run_cli("--db", self.db, "init")
+        self.assertEqual(bad.returncode, 3)
+        self.assertEqual(bad.stderr.strip(), ERROR_STORE_FAILED)
+        conn = sqlite3.connect(self.db)
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            foreign_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='gateways'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(tables, {"gateways"})
+        self.assertEqual(version, 0)
+        self.assertEqual(foreign_sql, "CREATE TABLE gateways (x INTEGER)")
+
+    def test_gateway_on_subscription_account_rejected(self):
+        # M2 pin: only metered accounts may carry gateway shares.
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        baseline = _status(self.db).stdout.strip()
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"][0]["kind"] = "subscription"
+        doc["accounts"][0]["budget_micro_eur"] = None
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_status(self.db).stdout.strip(), baseline)
+
+    def test_duplicate_gateway_alias_rejected(self):
+        # M5 pin: gateway aliases are unique.
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        baseline = _status(self.db).stdout.strip()
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][1]["alias"] = "g1"
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_status(self.db).stdout.strip(), baseline)
+
+    def test_duplicate_account_alias_rejected(self):
+        # M6 pin: account aliases are unique (machine aliases likewise).
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        baseline = _status(self.db).stdout.strip()
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"].append(copy.deepcopy(doc["accounts"][0]))
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        doc = copy.deepcopy(VALID_DOC)
+        doc["machines"].append(copy.deepcopy(doc["machines"][0]))
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_status(self.db).stdout.strip(), baseline)
+
+    def test_subscription_account_import(self):
+        # The kind='subscription' branch: budget must be null, and the
+        # status projects it as null with zero allocation.
+        run_cli("--db", self.db, "init")
+        doc = {
+            "version": 1,
+            "accounts": [
+                {"alias": "seat", "vendor": "openai", "kind": "subscription",
+                 "budget_micro_eur": None},
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 100000000, "period": "utc_month"},
+            ],
+        }
+        ok = _import(self.db, self.tmp, doc)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        expected = (
+            '{"schema_version":1,"accounts":['
+            '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
+            '"allocated_micro_eur":100000000},'
+            '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'
+            '"allocated_micro_eur":0}],'
+            '"machines":["desktop"],"gateways":['
+            '{"alias":"g1","account":"meter","machine":"desktop",'
+            '"share_micro_eur":100000000}]}'
+        )
+        self.assertEqual(_status(self.db).stdout.strip(), expected)
+        # A subscription account carrying a budget is invalid.
+        bad_doc = copy.deepcopy(doc)
+        bad_doc["accounts"][0]["budget_micro_eur"] = 5
+        bad = _import(self.db, self.tmp, bad_doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_status(self.db).stdout.strip(), expected)
+
+    def test_validation_edges(self):
+        # Remaining closed-shape edges: vendor enum, a missing key, and
+        # zero money values.
+        run_cli("--db", self.db, "init")
+        _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
+        baseline = _status(self.db).stdout.strip()
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"][0]["vendor"] = "aws"
+        cases = {"vendor_enum": doc}
+
+        doc = copy.deepcopy(VALID_DOC)
+        del doc["accounts"][0]["vendor"]
+        cases["missing_key"] = doc
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"][0]["budget_micro_eur"] = 0
+        cases["zero_budget"] = doc
+
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 0
+        cases["zero_share"] = doc
+
+        for name, mutated in cases.items():
+            bad = _import(self.db, self.tmp, mutated)
+            self.assertEqual(bad.returncode, 2, name)
+            self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG, name)
+        self.assertEqual(_status(self.db).stdout.strip(), baseline)
+
+
 class Card1ContractTests(_Base):
     def test_status_shape_is_exact(self):
         run_cli("--db", self.db, "init")

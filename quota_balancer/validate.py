@@ -59,13 +59,19 @@ def validate(doc):
       machines:  [alias, ...]
       gateways:  [(alias, account_alias, machine_alias, share, period), ...]
     """
-    if not isinstance(doc, dict) or frozenset(doc) != _TOP_KEYS:
+    if not isinstance(doc, dict):
         _invalid()
 
-    version = doc["version"]
-    if not _is_int(version) or version != SCHEMA_VERSION:
-        # Unknown or newer schema versions are a schema problem, not a config typo.
-        raise QuotaError(CODE_SCHEMA_UNSUPPORTED, MSG_SCHEMA_UNSUPPORTED)
+    # The schema version is checked before the full shape check: a document
+    # at an unknown or newer version is a schema problem even if its shape
+    # has drifted along with it.
+    if "version" in doc:
+        version = doc["version"]
+        if not _is_int(version) or version != SCHEMA_VERSION:
+            raise QuotaError(CODE_SCHEMA_UNSUPPORTED, MSG_SCHEMA_UNSUPPORTED)
+
+    if frozenset(doc) != _TOP_KEYS:
+        _invalid()
 
     for key in ("accounts", "machines", "gateways"):
         if not isinstance(doc[key], list):
