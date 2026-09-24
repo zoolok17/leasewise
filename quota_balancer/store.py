@@ -31,6 +31,7 @@ from .errors import (
 )
 from .migrate import SCHEMA_VERSION, migrate, require_supported, rollback_quietly
 from .reduce import (
+    GATEWAY_STATE_OK,
     gateway_report_state,
     reduce_gateway_report,
     reduce_window,
@@ -44,12 +45,19 @@ from .validate_readings import (
 )
 
 
+# Explicit busy timeout (seconds) for every store connection: a hot journal
+# left by a crashed writer, or a lock held by a concurrent writer, is waited
+# out for a bounded, documented duration instead of the driver's implicit
+# default, and then surfaces as STORE_ERROR rather than a raw driver fault.
+BUSY_TIMEOUT_S = 30.0
+
+
 def _connect(path, must_exist):
     """Open the store with foreign_keys=ON. Never raises sqlite3.Error."""
     if must_exist and not os.path.isfile(path):
         raise QuotaError(CODE_STORE_ERROR, MSG_STORE_NOT_FOUND)
     try:
-        conn = sqlite3.connect(path, isolation_level=None)
+        conn = sqlite3.connect(path, isolation_level=None, timeout=BUSY_TIMEOUT_S)
     except sqlite3.Error as exc:
         raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
     try:
@@ -364,9 +372,24 @@ def _reduce_cli_window(conn, reading, account_id):
 
 
 def _reduce_gateway_snapshot(conn, reading, gateway_ids):
-    """Reduce a gateway_snapshot reading into the gateway's report columns."""
+    """Reduce a gateway_snapshot reading into the gateway's report columns.
+
+    Section 5: both sources bind seat/machine/account explicitly. A snapshot
+    must bind to its gateway's owner - the gateway's own machine and
+    account. A different machine, or an ambiguous source (account null), is
+    a mismatch, not a different gateway: INVALID_CONFIG.
+    """
     gateway_id = gateway_ids.get(reading["gateway"])
     if gateway_id is None:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    owner = conn.execute(
+        "SELECT m.alias, a.alias FROM gateways g "
+        "JOIN machines m ON m.id = g.machine_id "
+        "JOIN accounts a ON a.id = g.account_id "
+        "WHERE g.id = ?",
+        (gateway_id,),
+    ).fetchone()
+    if owner[0] != reading["machine"] or owner[1] != reading["account"]:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
     row = conn.execute(
         "SELECT ledger_epoch, last_seq, period_start, period_end, policy_hashes, "
@@ -411,6 +434,38 @@ def set_coverage(path, account, complete):
             conn.execute(
                 "UPDATE accounts SET coverage_complete=? WHERE id=?",
                 (1 if complete else 0, row[0]),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def reconcile(path, gateway):
+    """Clear a gateway's reconciliation_required state (operator-only).
+
+    A ledger-epoch or policy-hash change sets reconciliation_required, which
+    is sticky: it is NOT cleared by the next matching report. Only this
+    explicit operator verb clears it (back to ok), adopting the current
+    report as the trusted baseline. Unknown gateway -> INVALID_CONFIG.
+    """
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            row = conn.execute(
+                "SELECT id FROM gateways WHERE alias = ?", (gateway,)
+            ).fetchone()
+            if row is None:
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            conn.execute(
+                "UPDATE gateways SET state=? WHERE id=?",
+                (GATEWAY_STATE_OK, row[0]),
             )
             conn.execute("COMMIT")
         except BaseException:

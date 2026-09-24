@@ -242,7 +242,8 @@ class Card1CarryOverTests(_Base):
     "database is locked", so one of the parallel inits exited 3 (STORE_ERROR).
     The fix retries the WAL switch on the busy condition until a bounded
     deadline, so parallel inits serialize on the write lock and a latecomer
-    observes version 1 as a no-op. The race is timing-dependent, so the check
+    observes the current schema version as a no-op. The race is
+    timing-dependent, so the check
     runs several init processes in parallel over repeated rounds on a fresh
     store and requires every process to exit 0.
     """

@@ -57,10 +57,10 @@ budget and allocated amount of 100000000 micro-EUR. Fixtures:
 `docs/fixtures/card1-inventory-invalid.json` (g2 share 40000001, which
 pushes the share sum above the account budget).
 
-Tests: `python -m unittest discover -s tests -v` (28 tests across both
+Tests: `python -m unittest discover -s tests -v` (46 tests across both
 cards — the card-1 suite, including the carry-over, plus the card-2 named
-checks and reducer rules; see docs/STEP-CARD-1.md and
-docs/STEP-CARD-2.md).
+checks, reducer rules, and validation/connectivity checks; see
+docs/STEP-CARD-1.md and docs/STEP-CARD-2.md).
 
 ## Card 2 — reading reducer
 
@@ -79,25 +79,35 @@ python -m quota_balancer --db quota.db init
 python -m quota_balancer --db quota.db config-import --file docs/fixtures/card1-inventory.json
 python -m quota_balancer --db quota.db reading-import --file readings.json
 python -m quota_balancer --db quota.db set-coverage --account meter --complete true
+python -m quota_balancer --db quota.db reconcile --gateway g1
 python -m quota_balancer --db quota.db status --json
 ```
 
 - `reading-import --file DOC` — validate a version-2 document (closed key
-  shapes, machine/account aliases, exact integer `used_bps` in
-  0..10000, kind `cli_window` or `gateway_snapshot`, no observations more
-  than 30 seconds in the future) and, in one transaction, reduce it:
-  dedup by `event_id` (a replay with matching content is a no-op, the same
-  id with different content is `IDEMPOTENCY_CONFLICT`), keep the source
-  observation time, hold the high-water utilization per reset epoch (a
-  later epoch restarts from its first post-reset observation; an older
-  epoch is a no-op), map the legacy confidence states explicitly
-  (`stale` → observed value with `source_stale`, `unknown` stays
-  unknown), and advance the gateway report (monotonic `seq`; an epoch or
-  policy-hash change needs reconciliation). An ambiguous source (no
-  account) is recorded but reduced into no account.
+  shapes, machine/account/window-key local aliases, `event_id` as a local
+  UUID, exact integer `used_bps` in 0..10000, every integer bounded to the
+  signed-64 range, policy hashes as fixed-length hex digests, kind
+  `cli_window` or `gateway_snapshot`, no observations more than 30 seconds
+  in the future) and, in one transaction, reduce it: dedup by `event_id`
+  (a replay with matching content is a no-op, the same id with different
+  content is `IDEMPOTENCY_CONFLICT`), keep the source observation time,
+  hold the high-water utilization per reset epoch (a later epoch restarts
+  from its first post-reset observation; an older epoch is a no-op), keep
+  the explicit confidence states (`observed` requires a value and a reset;
+  `unknown` carries nulls and never refreshes a window that already has a
+  known value; a legacy `stale` sample arrives pre-mapped by the reporter
+  as `observed` + `source_stale=true`, with its value and source time
+  preserved), and advance the gateway report (the snapshot must bind to
+  the gateway's own machine and account; monotonic `seq`; an epoch or
+  policy-hash change needs reconciliation, which stays set until the
+  operator's `reconcile` verb). An ambiguous source (no account) is
+  recorded but reduced into no account.
 - `set-coverage --account A --complete {true,false}` — operator-only; the
   only thing that ever writes `coverage_complete`. Telemetry never sets
   it.
+- `reconcile --gateway G` — operator-only; clears a gateway's
+  `reconciliation_required` state. Telemetry never clears it (an epoch or
+  policy-hash change re-raises it on the next report).
 - `status --json` — the card-1 inventory plus, per account,
   `coverage_complete` and its windows (window key, `used_bps`,
   `resets_at`, `confidence`, `source_stale`, `observed_at`, `age_ms`,

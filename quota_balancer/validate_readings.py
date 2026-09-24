@@ -10,6 +10,8 @@ inventory, so store.reading_import performs it inside the write transaction.
 This module only validates the self-contained shape and types.
 """
 
+import re
+
 from .errors import (
     CODE_INVALID_CONFIG,
     CODE_SCHEMA_UNSUPPORTED,
@@ -51,6 +53,25 @@ def _invalid():
     raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
 
+# Section 7: checked signed-64-bit arithmetic. Every integer in a reading
+# document is bounded to the non-negative signed-64 range BEFORE it can reach
+# a SQLite binding (an out-of-range Python int would otherwise raise a driver
+# OverflowError - a path-leaking traceback, not the error contract). The
+# range also rejects negative timestamps and sequences (section 7: reject
+# nonfinite/negative values).
+INT64_MAX = 2 ** 63 - 1
+
+# A policy hash is a fixed-length hex digest (SHA-256-style, 64 lowercase hex
+# chars): free text and paths cannot masquerade as one (privacy).
+_POLICY_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+# Section 7: IDs are local UUIDs (operator aliases are the exception) -
+# canonical lowercase form.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
 def _is_int(value):
     # bool is a subclass of int; the design rejects booleans-as-integers, so
     # the type check is exact (type(...) is int).
@@ -62,15 +83,20 @@ def _is_bool(value):
 
 
 def _is_nonneg_int(value):
-    return _is_int(value) and value >= 0
+    # Bounded non-negative signed-64 (see INT64_MAX).
+    return _is_int(value) and 0 <= value <= INT64_MAX
 
 
 def _is_alias(value):
     return isinstance(value, str) and ALIAS_RE.fullmatch(value) is not None
 
 
-def _is_nonempty_str(value):
-    return isinstance(value, str) and value != ""
+def _is_policy_hash(value):
+    return isinstance(value, str) and _POLICY_HASH_RE.fullmatch(value) is not None
+
+
+def _is_uuid(value):
+    return isinstance(value, str) and _UUID_RE.fullmatch(value) is not None
 
 
 def _validate_window_entry(entry):
@@ -79,13 +105,15 @@ def _validate_window_entry(entry):
     key = entry["key"]
     used_bps = entry["used_bps"]
     resets_at = entry["resets_at"]
-    if not _is_nonempty_str(key):
+    # A window key is a local alias (privacy): reporter free text cannot be
+    # echoed in the status projection.
+    if not _is_alias(key):
         _invalid()
     # used_bps is an integer basis-points value or null when unknown.
     if used_bps is not None and not (_is_int(used_bps) and 0 <= used_bps <= MAX_BPS):
         _invalid()
     # resets_at is an epoch-ms value or null when unknown.
-    if resets_at is not None and not _is_int(resets_at):
+    if resets_at is not None and not _is_nonneg_int(resets_at):
         _invalid()
     return (key, used_bps, resets_at)
 
@@ -101,8 +129,15 @@ def _validate_cli_window(payload):
         _invalid()
     if not _is_bool(payload["source_stale"]):
         _invalid()
+    # Section 7: "null percentage/reset only when unknown". An observed
+    # reading must carry both a value and a reset in every window; nulls
+    # are the unknown reading's.
+    if confidence == CONFIDENCE_OBSERVED:
+        for _key, used_bps, resets_at in windows:
+            if used_bps is None or resets_at is None:
+                _invalid()
     covered_seq = payload["covered_seq"]
-    if covered_seq is not None and not _is_int(covered_seq):
+    if covered_seq is not None and not _is_nonneg_int(covered_seq):
         _invalid()
     return {
         "windows": windows,
@@ -117,7 +152,9 @@ def _validate_policy_hashes(value):
         return None
     if not isinstance(value, dict) or frozenset(value) != _POLICY_HASH_KEYS:
         _invalid()
-    if not _is_nonempty_str(value["price"]) or not _is_nonempty_str(value["child_cap"]):
+    # Fixed-length hex digests (privacy): free text cannot be stored or
+    # projected.
+    if not _is_policy_hash(value["price"]) or not _is_policy_hash(value["child_cap"]):
         _invalid()
     return {"price": value["price"], "child_cap": value["child_cap"]}
 
@@ -136,9 +173,9 @@ def _validate_gateway_snapshot(payload):
         _invalid()
     if not _is_nonneg_int(ledger_epoch) or not _is_nonneg_int(seq):
         _invalid()
-    if period_start is not None and not _is_int(period_start):
+    if period_start is not None and not _is_nonneg_int(period_start):
         _invalid()
-    if period_end is not None and not _is_int(period_end):
+    if period_end is not None and not _is_nonneg_int(period_end):
         _invalid()
     if not _is_bool(sized_ready) or not _is_bool(reconciliation_required):
         _invalid()
@@ -188,7 +225,9 @@ def validate_readings(doc, now_ms):
         account = item["account"]
         kind = item["kind"]
         observed_at = item["observed_at"]
-        if not _is_nonempty_str(event_id):
+        # Section 7: reading IDs are local UUIDs (operator aliases are the
+        # exception); a non-UUID id is rejected, not stored.
+        if not _is_uuid(event_id):
             _invalid()
         if not _is_alias(machine):
             _invalid()
@@ -196,7 +235,7 @@ def validate_readings(doc, now_ms):
         # recorded but reduced into no account).
         if account is not None and not _is_alias(account):
             _invalid()
-        if not _is_int(observed_at):
+        if not _is_nonneg_int(observed_at):
             _invalid()
         # Reject future observations beyond the 30-second slop.
         if observed_at > now_ms + FUTURE_SLOP_MS:

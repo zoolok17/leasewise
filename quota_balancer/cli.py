@@ -1,5 +1,6 @@
 """Command line interface: init, config-import --file, status --json,
-reading-import --file, set-coverage --account --complete (Cards 1-2)."""
+reading-import --file, set-coverage --account --complete,
+reconcile --gateway (Cards 1-2)."""
 
 import argparse
 import json
@@ -8,7 +9,14 @@ import sys
 
 from . import errors
 from .errors import QuotaError
-from .store import import_config, init_db, reading_import, set_coverage, status
+from .store import (
+    import_config,
+    init_db,
+    reading_import,
+    reconcile,
+    set_coverage,
+    status,
+)
 
 
 def _emit_error(code, message):
@@ -50,6 +58,11 @@ def _build_parser():
     coverage.add_argument("--account", required=True, help="account alias")
     coverage.add_argument("--complete", required=True, type=_bool,
                           help="the coverage_complete value: 'true' or 'false'")
+    recon = sub.add_parser(
+        "reconcile",
+        help="clear a gateway's reconciliation_required state (operator-only)",
+    )
+    recon.add_argument("--gateway", required=True, help="gateway alias")
     return parser
 
 
@@ -64,6 +77,8 @@ def main(argv=None):
             reading_import(args.db, args.file)
         elif args.verb == "set-coverage":
             set_coverage(args.db, args.account, args.complete)
+        elif args.verb == "reconcile":
+            reconcile(args.db, args.gateway)
         else:
             print(json.dumps(status(args.db), separators=(",", ":")))
         return 0
@@ -72,6 +87,13 @@ def main(argv=None):
         return errors.EXIT_CODES[exc.code]
     except sqlite3.Error:
         # Last-resort guard: no raw driver text reaches the operator.
+        _emit_error(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+        return errors.EXIT_CODES[errors.CODE_STORE_ERROR]
+    except Exception:
+        # Last resort (defense in depth): an unexpected internal fault -
+        # e.g. a value that slips past validation and overflows a driver
+        # conversion - still emits the static error contract, never a
+        # traceback or a path.
         _emit_error(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
         return errors.EXIT_CODES[errors.CODE_STORE_ERROR]
 

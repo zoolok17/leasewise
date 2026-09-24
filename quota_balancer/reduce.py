@@ -69,7 +69,9 @@ def reduce_window(existing, used_bps, resets_at, observed_at, confidence,
       (used_bps, resets_at, observed_at, confidence, source_stale, covered_seq,
        source_event_id)
     or None when the reading is out of order (an older reset epoch) and must
-    not change the window.
+    not change the window. An unknown reading over a window that already has
+    a known value returns the row unchanged (the window keeps its value, its
+    observed_at, and its confidence).
 
     `existing` is None, or the current window row tuple of the same shape.
     `observed_at` is the reading's *source* observation time (preserved; the
@@ -81,14 +83,27 @@ def reduce_window(existing, used_bps, resets_at, observed_at, confidence,
 
     e_used, e_resets, e_obs, e_conf, e_stale, e_cov, e_ev = existing
 
+    # An unknown reading carries no value of its own. It must not move
+    # observed_at or relabel the confidence of a window that already has a
+    # known value: that would make a stale value look fresh (resetting the
+    # 600-second wall-cap age) and demote observed evidence to unknown.
+    # used_bps is null here, so nothing else can change either - the reading
+    # itself is still recorded in the readings table.
+    if confidence == CONFIDENCE_UNKNOWN and e_used is not None:
+        return existing
+
     # Reset-epoch ordering, when both epochs are known:
     #   * an older (lower) epoch is out of order -> no change;
-    #   * a later (higher) epoch is the post-reset observation -> restart the
-    #     high-water from this reading.
+    #   * a later (higher) epoch is the post-reset observation ONLY when the
+    #     sample was taken at or after the stored reset time -> restart the
+    #     high-water from this reading;
+    #   * a later (higher) epoch from a sample taken BEFORE the stored reset
+    #     time is just reset-time jitter, not a new epoch -> fall through to
+    #     the same-epoch high-water so an older sample cannot lower the mark.
     if e_resets is not None and resets_at is not None:
         if resets_at < e_resets:
             return None
-        if resets_at > e_resets:
+        if resets_at > e_resets and observed_at >= e_resets:
             return (used_bps, resets_at, observed_at, confidence,
                     source_stale, covered_seq, event_id)
 
@@ -113,13 +128,15 @@ def reduce_gateway_report(existing, ledger_epoch, seq, period_start, period_end,
     Returns the new stored report tuple
       (ledger_epoch, last_seq, period_start, period_end, policy_hashes_json,
        sized_ready, state)
-    or None when the report is out of order (a non-increasing ledger sequence)
-    and must not regress the report.
+    or None when the report is out of order (a same-ledger non-increasing
+    sequence) and must not regress the report.
 
     `existing` is None, or the current stored report tuple of the same shape.
     A gateway row carries NULL report columns until its first report, so a
     stored row with a NULL sequence is treated as 'no report yet'. A change of
-    ledger epoch or policy hashes between reports requires reconciliation.
+    ledger epoch or policy hashes requires reconciliation, which is STICKY:
+    once set it is not cleared by the next report, only by the operator's
+    explicit reconcile verb (store.reconcile).
     """
     new_hashes = _hashes_json(policy_hashes)
     e_seq = existing[1] if existing is not None else None
@@ -129,16 +146,30 @@ def reduce_gateway_report(existing, ledger_epoch, seq, period_start, period_end,
         return (ledger_epoch, seq, period_start, period_end, new_hashes,
                 sized_ready, state)
 
-    e_epoch, e_seq, e_start, e_end, e_hashes, e_sized, _e_state = existing
-    if seq <= e_seq:
-        # Duplicate or out-of-order sequence: replay is a no-op.
+    e_epoch, e_seq, _e_start, _e_end, e_hashes, _e_sized, e_state = existing
+    # m1: compare the ledger epoch BEFORE the sequence. A changed epoch is a
+    # new ledger with its own sequence counter, so it is accepted even when
+    # its first sequence is lower than the old ledger's; only a same-ledger
+    # non-increasing sequence is an out-of-order no-op.
+    epoch_changed = (e_epoch is not None and ledger_epoch is not None
+                     and ledger_epoch != e_epoch)
+    if not epoch_changed and seq <= e_seq:
+        # Same ledger, non-increasing sequence: replay is a no-op.
         return None
-    epoch_changed = ledger_epoch != e_epoch
-    hashes_changed = new_hashes != e_hashes
-    state = (GATEWAY_STATE_RECONCILE
-             if (reconciliation_required or epoch_changed or hashes_changed)
-             else GATEWAY_STATE_OK)
-    return (ledger_epoch, seq, period_start, period_end, new_hashes,
+
+    # Sticky (M2): once reconciliation is required it stays until the
+    # operator's explicit reconcile verb clears it. From a non-reconciled
+    # state, an epoch change, a hash change, or an explicit flag raises it.
+    if e_state == GATEWAY_STATE_RECONCILE:
+        state = GATEWAY_STATE_RECONCILE
+    else:
+        hashes_changed = new_hashes != e_hashes
+        state = (GATEWAY_STATE_RECONCILE
+                 if (reconciliation_required or epoch_changed or hashes_changed)
+                 else GATEWAY_STATE_OK)
+
+    new_epoch = (ledger_epoch if (e_epoch is None or epoch_changed) else e_epoch)
+    return (new_epoch, seq, period_start, period_end, new_hashes,
             sized_ready, state)
 
 
