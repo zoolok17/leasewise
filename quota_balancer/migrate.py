@@ -1,12 +1,14 @@
 """Schema migration for the quota inventory store.
 
-Card 1 is migration version 1 and card 2 is migration version 2. Each DDL
-block is normative: version 1 is copied byte for byte from docs/DESIGN.md
-section 8 ("Card 1"); version 2 adds the card-2 tables (readings, windows)
-and the gateway report / account coverage columns of section 7. A store at
-the current version is a no-op; a store at a newer, unknown version is
-rejected before anything is written or switched (left byte-for-byte
-unchanged).
+Card 1 is migration version 1, card 2 is version 2, and card 3 is version 3.
+Each DDL block is normative: version 1 is copied byte for byte from
+docs/DESIGN.md section 8 ("Card 1"); version 2 adds the card-2 tables
+(readings, windows) and the gateway report / account coverage columns of
+section 7; version 3 adds the card-3 policy tables (models, profiles,
+projects, teams, seats, project_accounts, limits) of section 7. Versions 1
+and 2 are kept byte for byte: a card adds only its own DDL. A store at the
+current version is a no-op; a store at a newer, unknown version is rejected
+before anything is written or switched (left byte-for-byte unchanged).
 
 Migration protocol (fix round): the preliminary version read takes no lock.
 A store below the current version is switched to WAL first (WAL is a
@@ -33,7 +35,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -110,8 +112,100 @@ _DDL_V2 = (
 # The canonical version-2 migration script, kept for byte-for-byte comparison.
 MIGRATION_V2 = "\n".join(_DDL_V2) + "\nPRAGMA user_version=2;\n"
 
+# Card 3 (migration version 3): the policy-arithmetic tables of section 7
+# (models, profiles, projects, teams, seats, project_accounts, limits) plus
+# the exact limits_scope uniqueness index. These are config-owned (loaded by
+# config-import as an upsert); the policy arithmetic itself is pure and does
+# not read the store in this card.
+_DDL_V3 = (
+    # projects: the top-level org unit.
+    "CREATE TABLE projects(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " alias TEXT NOT NULL UNIQUE) STRICT;",
+    # teams: a team belongs to a project.
+    "CREATE TABLE teams(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " project_id TEXT NOT NULL REFERENCES projects(id),\n"
+    " alias TEXT NOT NULL,\n"
+    " UNIQUE(project_id, alias)) STRICT;",
+    # project_accounts: the project<->account membership (composite PK).
+    "CREATE TABLE project_accounts(\n"
+    " project_id TEXT NOT NULL REFERENCES projects(id),\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " PRIMARY KEY(project_id, account_id)) STRICT;",
+    # seats: a seat binds a team to a machine.
+    "CREATE TABLE seats(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " team_id TEXT NOT NULL REFERENCES teams(id),\n"
+    " machine_id TEXT NOT NULL REFERENCES machines(id),\n"
+    " alias TEXT NOT NULL,\n"
+    " role TEXT NOT NULL,\n"
+    " enforcement TEXT NOT NULL CHECK(enforcement IN ("
+    "'metered','subscription_admission','subscription_warn','shadow',"
+    "'metered_advisory')),\n"
+    " last_seen_at INTEGER,\n"
+    " UNIQUE(machine_id, alias)) STRICT;",
+    # models: per-account model rows. The reserve rates/envelopes bind to the
+    # installed price policy_hash (section 3); the tariff rates are the
+    # settlement rates (section 4). context_ceiling is the input (context)
+    # ceiling; output_ceiling the total output ceiling.
+    "CREATE TABLE models(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " alias TEXT NOT NULL,\n"
+    " context_ceiling INTEGER NOT NULL CHECK(context_ceiling>0),\n"
+    " output_ceiling INTEGER NOT NULL CHECK(output_ceiling>0),\n"
+    " tariff_input_rate INTEGER NOT NULL CHECK(tariff_input_rate>=0),\n"
+    " tariff_output_rate INTEGER NOT NULL CHECK(tariff_output_rate>=0),\n"
+    " reserve_input_rate INTEGER NOT NULL CHECK(reserve_input_rate>=0),\n"
+    " reserve_output_rate INTEGER NOT NULL CHECK(reserve_output_rate>=0),\n"
+    " reservation_mode TEXT NOT NULL CHECK(reservation_mode IN ('sized','fixed')),\n"
+    " policy_hash TEXT NOT NULL,\n"
+    " effort_aliases TEXT NOT NULL,\n"
+    " UNIQUE(account_id, alias)) STRICT;",
+    # profiles: the per-task-class policy (section 6). candidates is the
+    # ordered tier list (last tier is 'park'); the numeric caps are the
+    # admission-plan defaults the arithmetic applies.
+    "CREATE TABLE profiles(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " task_class TEXT NOT NULL UNIQUE,\n"
+    " candidates TEXT NOT NULL,\n"
+    " context_rules TEXT NOT NULL,\n"
+    " calibration TEXT NOT NULL,\n"
+    " expected_calls INTEGER NOT NULL CHECK(expected_calls>0 AND expected_calls<=100),\n"
+    " growth_tokens INTEGER NOT NULL CHECK(growth_tokens>=0),\n"
+    " margin_bps INTEGER NOT NULL CHECK(margin_bps>=10000 AND margin_bps<=20000),\n"
+    " max_calls INTEGER NOT NULL CHECK(max_calls>0 AND max_calls<=100),\n"
+    " output_cap INTEGER NOT NULL CHECK(output_cap>=0),\n"
+    " per_call_output_cap INTEGER NOT NULL CHECK(per_call_output_cap>=0),\n"
+    " ttl_ms INTEGER NOT NULL CHECK(ttl_ms>0),\n"
+    " policy_revision INTEGER NOT NULL CHECK(policy_revision>=0)) STRICT;",
+    # limits: a scope/metric/period cap. soft is an optional warning bound
+    # that must not exceed hard; the effective cap is the tightest (min) hard
+    # across the applicable scopes (section 4).
+    "CREATE TABLE limits(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " scope TEXT NOT NULL CHECK(scope IN ('platform','project','team','seat')),\n"
+    " scope_id TEXT NOT NULL,\n"
+    " metric TEXT NOT NULL CHECK(metric IN ("
+    "'input_tokens','money_micro_eur','window_bps','concurrency')),\n"
+    " period TEXT NOT NULL CHECK(period IN ('turn','day','month','window')),\n"
+    " window_key TEXT,\n"
+    " soft INTEGER,\n"
+    " hard INTEGER NOT NULL CHECK(hard>=0),\n"
+    " CHECK(soft IS NULL OR soft>=0),\n"
+    " CHECK(soft IS NULL OR soft<=hard)) STRICT;",
+    # The exact uniqueness index of section 7 (empty string is not a valid
+    # window key; COALESCE makes a NULL window_key distinct from '').
+    "CREATE UNIQUE INDEX limits_scope ON limits("
+    "scope,scope_id,metric,period,COALESCE(window_key,''))",
+)
+
+# The canonical version-3 migration script, kept for byte-for-byte comparison.
+MIGRATION_V3 = "\n".join(_DDL_V3) + "\nPRAGMA user_version=3;\n"
+
 # Step N upgrades a store from version N-1 to version N.
-_STEPS = {1: _DDL_V1, 2: _DDL_V2}
+_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3}
 
 
 def schema_version(conn):
