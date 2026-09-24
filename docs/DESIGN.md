@@ -119,8 +119,9 @@ in addition to the canonical account budget, but never replace the gateway's spe
 Account budget has one home: accounts.budget_micro_eur. There is no account/month money
 limits row. Other limits compose by their tightest ceiling, never by adding duplicate caps.
 Admission transaction: settled charges + unresolved holds + new hold <= each applicable cap.
-After billing integration, section 11 replaces account settled charges with its aligned estimate E;
-R counts disjoint unresolved exposure once. Other scope ceilings retain their existing accounting.
+After billing integration, section 11 uses E only for comparable billing; otherwise admission uses
+L_now+R_now plus its gross-excess hold check. R counts disjoint unresolved exposure once; other scope
+ceilings retain their accounting. Unknown/stale billing alone never holds work or halves the budget.
 
 F05 selects option B: request-sized reservation in gated increment 6b. Small holds cannot
 use the existing fixed 231999-per-attempt path. Until 6b ships, metered quota leases are
@@ -423,9 +424,10 @@ restart, identical status showing budget and allocated amount of 100000000 micro
 | Card | Tables/module, rules and errors | Demo and Given/When/Then tests |
 |---|---|---|
 | 2: reading reducer | readings/windows + gateway report/coverage columns; fixture CLI only. IDs deduplicate, source time preserved; ambiguous source UNKNOWN; confidence mapping explicit. Operator sets coverage_complete; every machine/team must report for idle proof. Incomplete coverage uses 600s wall cap. Same epoch never lowers high-water; new epoch needs post-reset observation; old gateway report METER_STALE. | Demo reordered/idle samples. `reading_replay`: Given same ID, When replay/collision, Then no-op/409. `stale_mapping`: Given stale, Then value/time/flag retained. `coverage_fallback`: Given incomplete coverage or missing reporter, When sample age>600s, Then stale; telemetry cannot set coverage_complete. `account_isolation`: Given ambiguous source, Then neither account updated. privacy_2. |
-| 2b-1: billing ingestion (PLANNED) | After the reviewed card-2 merge is pinned: transactional reading CHECK migration, monetary gateway payloads, billing totals/policy import and source-time reducer. Fixtures only; section 11 defines closed shapes/errors. | Demo import/reorder/rollover without window changes; billing_dependency, billing_snapshot_schema, billing_migration_rollback, billing_retention, billing_validation, billing_policy_enums, billing_owner_scope_revision, billing_scope, billing_replay, billing_same_time_conflict, billing_older_high_water, billing_time, billing_rollover, billing_output_errors, privacy_2b. |
-| 2b-2: billing arithmetic and plans (PLANNED) | Depends on 2b-1; pure historical reconciliation, basis conversion, advisory headroom and deterministic opening proposals. No database/ledger mutation, leases, holds or operator resolution. | Demo busy as-of excess; P=80/O=50/L_now=60 gives 10 remaining under cap 100. billing_gateway_uncertainty, billing_tax_basis, billing_tolerance, billing_reconcile_snapshot_skew, billing_reconcile_busy, billing_reconcile_uncertain_overlap, billing_coverage, billing_reconcile_equal_idle, billing_reconcile_lag_timer, billing_headroom, billing_headroom_boundaries, billing_opening_uncertain_overlap, billing_opening_catchup, billing_opening_allocations, billing_proposal_only, billing_output_errors, privacy_2b. |
-| 2b-3: pure OVH adapter (PLANNED) | Depends on 2b-1 contract; injected credential/transport/clock/jitter, one read-only request -> reading-import document. No installation, real keys/network, credential store or delivery loop. | Demo two sanitized hourly responses and non-AI/failure fixtures; billing_adapter, billing_non_ai, billing_poll_schedule, billing_tls, billing_output_errors, privacy_2b. Real reporter canary separately approved; application/enforced holds get a separately sized integration card; 6b remains gated. |
+| 2b-1: billing ingestion (PLANNED) | After the reviewed card-2 merge is pinned: transactional CHECK migration, monetary gateway payloads, billing totals/policy import, source-time reducer and pure basis conversion shared with later cards. Fixtures only; section 11 defines closed shapes/errors. | Demo import/reorder/rollover without window changes; billing_snapshot_schema, billing_migration_rollback, billing_retention, billing_validation, billing_policy_enums, billing_owner_scope_revision, billing_scope, billing_replay, billing_same_time_conflict, billing_older_high_water, billing_time, billing_rollover, billing_tax_basis, billing_output_errors, privacy_2b. |
+| 2b-2: billing evaluation (PLANNED) | Depends on 2b-1; evaluate_billing over explicit immutable context/request, historical and gross-excess reconciliation, read-only lag timer, conditional advisory headroom. No opening planner, writes, leases, holds or resolutions. | Demo uncertified 30 EUR excess => HOLD recommendation; normal P=45/L=50 => fallback headroom 50. Tests: billing_eval_input, billing_overlap_precedence, billing_gross_allowance, billing_non_ai_alert, billing_precedence and all reconciliation/headroom rows owned by 2b-2 in section 11; billing_output_errors, privacy_2b. |
+| 2b-2b: opening planner (PLANNED) | Depends on 2b-2; plan_opening with closed input and deterministic proposal. No application, drain execution, financial writes or operator resolution. | Demo uncertain overlap refuses allocation; verified drain/provenance yields stable proposal. billing_opening_input, billing_opening_uncertain_overlap, billing_opening_catchup, billing_opening_allocations, billing_proposal_only, billing_output_errors, privacy_2b. |
+| 2b-3: pure OVH adapter (PLANNED) | Depends on 2b-1 contract AND lead-supplied sanitized captured responses/mapping before dispatch; injected credential/transport/clock/jitter, one request -> reading-import document. No installation, real keys/network, credential store or loop. | Demo both captured hourly responses and non-AI/failure fixtures; billing_adapter, billing_non_ai, billing_poll_schedule, billing_tls, billing_output_errors, privacy_2b. Real reporter canary separately approved; application/enforced holds get a separate integration card; 6b remains gated. |
 | 3: policy arithmetic | models/profiles/projects/teams/seats/project_accounts/limits; pure fixtures, no wrapper. Calculate E/I/request-sized holds (fixed reserve only a comparison), composed limits, model ceiling, 80% sweep and fallback; INVALID_REQUEST/CONTEXT_PROJECTION_EXCEEDED/POLICY_DENIED. | Demo synthetic 1750000 vs 238000 input. `round_components`: Given five calls, When reserve formula, Then 68169. `projection_denied`: Given over-context projection, Then deny. `fallback_tier`: Given blocked Codex read/critical review, Then Qwen read/independent premium or park. privacy_3. |
 | 4: lease store | leases/holds/receipts/blocks/adjustments/audit/daily_totals; exact partial indexes above. Transactional grant/check/settle, one slot, uncertain expiry retains liability, receipt conflict blocks, same ID replays. Fixture gateway only; 409/410/429 contracts above. | Demo restart with unresolved hold. `null_uniqueness`: Given null-window/model duplicates, When insert, Then reject; final-receipt/live-lease duplicates also reject. `grant_race`: Given one budget, When concurrent grants, Then no overspend. `late_receipt`: Given expiry, When final receipt, Then reconcile original period once. privacy_4. |
 | 5: private HTTP | Thin /v1 handlers over tested store/policy, identity allowlist and host ingress adapter; no custom TLS stack/admin API. Loopback default; 401/403 cross-machine denial; 503 outage; status JSON only. | Demo two authenticated fixture machines share one block. `token_scope`: Given foreign identity, When check/report, Then deny. `replay_grant`: Given lost response, When retry, Then one hold/rotated token. `public_bind`: Given public binding, When start, Then refuse. privacy_5. |
@@ -492,9 +494,9 @@ numeric calibration fixtures; retain the named implementation/deployment gates. 
 subscription concurrency remains one; the offline per-machine default of two is explicitly
 uncoordinated. Acceptance for build does not claim deployed enforcement or passing product tests.
 
-## 11. Card 2b addendum v2: provider billing evidence
+## 11. Card 2b addendum v3: provider billing evidence
 
-Status: PLANNED implementation; B01–B04 below are DECIDED. Audience: Leasewise builders/operators.
+Status: PLANNED implementation; B01–B06 below are DECIDED. Audience: Leasewise builders/operators.
 Provider credentials remain reporter-side; the coordinator stores numeric evidence and local aliases only.
 B01: whole-project cap only for an operator-designated dedicated AI Endpoints project; non-AI allowance
 is explicit, and sum(gateway shares)+allowance<=cap on the same tax basis. Never infer an AI subtotal.
@@ -502,7 +504,11 @@ B02: provisional configurable poll=900s, source max age=7200s, expected economic
 B03: unknown/stale billing => ALERT, retained floors/local ceilings, no availability hold. Comparable
 unexplained excess => HOLD after integration; in 2b these are advisory recommendations only.
 B04: fixtures only, one pure OVH adapter; no reporter daemon, credential-store integration, delivery,
-live calls, gateway writes, operator resolution or enforced holds. Split into three bounded cards (§8).
+live calls, gateway writes, operator resolution or enforced holds. Four bounded cards include 2b-2b (§8).
+B05: provisional configurable tolerance=max(50000 micro-EUR,100 bps of the relevant ledger figure).
+B06 (operator, 2026-09-24): cap=100 EUR before VAT; cap_basis=provider_basis=ledger_basis=ex_vat.
+Keep these explicit policy fields; verify the declared basis against the first real invoice in the
+later reporter runbook, recording a numeric result or mismatch for operator review, never storing it raw.
 Supplied observations: period [2026-09-01T00:00:00Z,2026-10-01T00:00:00Z); totalPrice 14.304598 at
 19:00:26Z then 14.318837 at 20:00:49Z. Amount/time changed together in these two samples only.
 Ledger 14.50 by 15:40Z still exceeded provider 14.30 at 19:00Z; later VM charges were absent. Lag is
@@ -552,56 +558,79 @@ Keep financial history 13 calendar months after period end and unresolved eviden
 
 ### Tax basis and comparable evidence
 
+The pure convert_basis(amount_micro_eur,source_basis,target_basis,vat_bps) helper belongs to 2b-1.
 Convert P and each gateway's amounts/shares to cap_basis before arithmetic; cap and allowance are
 configured in that basis. Unknown basis defers the share-allocation check with ALERT, not approval. Source
 bases are operator-declared, never guessed. Ex-VAT -> invoice: ceil(x*(10000+vat_bps)/10000);
 inverse: ceil(x*10000/(10000+vat_bps)); equal bases unchanged. No implicit VAT default is permitted.
 Convert each cumulative component once, not every imported delta. Use checked integers; unknown basis
 or missing required rate yields BILLING_BASIS_UNKNOWN, null comparison/headroom, advisory ALERT only.
-Tolerance tau=max(abs_tolerance_micro_eur,ceil(L_asof*relative_tolerance_bps/10000)); proposed pair
-10000 micro-EUR and 25 bps. Never add tolerance to headroom. Calibrate on a provenance-checked idle
+Tolerance tau(L)=max(abs_tolerance_micro_eur,ceil(L*relative_tolerance_bps/10000)); approved pair
+50000 micro-EUR and 100 bps. Use L_now for gross/idle checks and L_asof for historical checks.
+Never add tolerance to headroom. Calibrate on a provenance-checked idle
 comparison after provider catch-up; four hours is an investigation delay, not proof of completeness.
 L_now=sum latest settled per gateway; R_now=sum latest reserved+uncertain, never add unattributed again.
 Every current gateway must have exact period, age<=120s, nondecreasing settled totals and no unresolved
 epoch/hash transition. Missing/stale/null/history-reset evidence => unresolved; do not trust a later
 ok snapshot to erase a historical transition. Heartbeats alone do not establish monetary completeness.
-Pure evaluation accepts optional per-reading coverage evidence {event_id,upper_at,complete_at,
-overlap_floor_micro_eur}, with nullable last three fields and local event references. This evidence is
+Pure evaluation accepts per-reading coverage evidence {event_id,upper_at,complete_at,
+overlap_floor_micro_eur,matched_provenance}, with nullable times/overlap and an exact boolean. It is
 fixture/operator-owned, never billing telemetry. upper_at certifies no included charge occurred later;
-complete_at certifies all in-scope charges through that time are included. Reject complete_at>upper_at.
+complete_at certifies all in-scope charges through that time are included. matched_provenance attests
+matched monetary basis, prices and opening provenance. Reject complete_at>upper_at, complete without
+upper, unknown/duplicate event references or times after now. The input contract below fixes overlap use.
 OVH lastUpdate proves neither completeness nor an exact economic cutoff: the supplied evidence gives
-no such certificate. Live OVH comparisons therefore remain temporally unresolved until verified coverage
-or a verified idle comparison exists. Time passage alone cannot fabricate one. No new certificate API.
+no such certificate. Small excesses hidden by later spending still require that evidence; gross excess
+does not. Time passage alone cannot fabricate a coverage certificate. No new certificate API.
+Before looking for certificates, test a fresh, conflict-free provider P_e against complete current
+gateway exposure: P_e>L_now+R_now+allowance+tau(L_now) => unexplained_excess, hold, comparable.
+Every gateway report used here must cover at least the provider event's received_at (allow the existing
+30s clock-skew margin by requiring observed_at>=received_at+30000), still be <=120s old, and pass
+epoch/hash/history checks. Otherwise refresh reports and classify snapshot_skew; freshness alone is not
+as-of coverage. Managed charges observed by the provider must already be settled or still reserved/
+uncertain in these later reports. A fresh P=L_now+30 with zero R/allowance therefore triggers the hold
+recommendation without upper_at. Nonmonotonic/incomplete accounting invalidates this sufficient test.
 For each certified upper_at T, bracket each gateway with last snapshot <=T and first snapshot >=T;
 require both within 120s of T, continuous epoch/hash and nondecreasing totals. L_asof is the sum of
 settled amounts in the upper snapshots; U_asof adds their reserved+uncertain. Use these historical
 amounts, not L_now, so subsequent spending cannot conceal excess. Treat allowance as an upper bound
-on permitted non-AI exposure: P>U_asof+allowance+tau is unexplained excess; it still proves no cause.
-If P>L_asof+tau but <=U_asof+allowance+tau, classify reserve_or_scope_covered, not confirmed excess.
+on permitted non-AI exposure: P>U_asof+allowance+tau(L_asof) is unexplained excess; it proves no cause.
+If P>L_asof+tau(L_asof) but <=U_asof+allowance+tau(L_asof), classify reserve_or_scope_covered.
 Within tolerance classify matched only with complete, conflict-free evidence and no uncertain overlap;
 otherwise temporally_unresolved. A material negative difference is provider_behind, never a refund.
 Persistent missing spend: from continuous history compute settled at/before T-lag_seconds; when P is
-materially lower, ALERT missing_old_spend even during ongoing activity. Without certified T, use only
-an idle diagnostic: now-last_financial_change>=lag_seconds and P<L_now-tau => ALERT lag_investigate.
-Derive/persist last_financial_change from amount/epoch changes, not report arrival; reserve activity
+materially lower, ALERT missing_old_spend even during ongoing activity. Without certified T, also use
+an idle diagnostic: now-last_financial_change>=lag_seconds and P<L_now-tau(L_now) => ALERT lag_investigate.
+Derive last_financial_change read-only from stored amount/epoch changes on each evaluation; never write
+a timer or use report arrival. Identical stored history gives the same timer across restart. Reserve activity
 breaks idle. Equality never starts this timer. Missing history cannot establish elapsed idle time.
-Unknown/stale/conflicted billing or missing bounds => ALERT, never a new HOLD recommendation; keep
+Unknown/stale/conflicted billing => ALERT, never a new HOLD recommendation; missing bounds alone
+is a normal provisional observation with action=none. Keep
 an existing comparable excess latched for the later integration to resolve, not for a poll to clear.
 
 ### Advisory headroom and opening plan
 
-For each retained provider event e, O_e is a proved lower bound on managed settled money already in
-P_e, in the cap basis. With complete coverage and matched price/opening provenance it can use the
-last ledger snapshot at/before complete_at; never subtract the first snapshot after that time.
-Validate 0<=O_e<=min(P_e,L_now); without proof use O_e=0 (possible double counting is disclosed).
-Spend estimate E=max(L_now,max_e(P_e+L_now-O_e)); headroom=cap-E-R_now. Keep each event's own
-time/overlap; do not attach a newer timestamp to an old high-water. This replaces settled charges in
-§4's *account* inequality after integration: E+R+new hold<=cap; other scope accounting is unchanged.
+For each retained provider event e, O_e is a proved lower bound on managed settled money already in P_e.
+Let B_e be the sum of the last continuous ledger snapshots at/before complete_at (each within 120s).
+Explicit overlap_floor_micro_eur wins when present: require complete coverage, matched_provenance,
+usable B_e and 0<=O_e<=min(P_e,L_now,B_e); violation is INVALID_CONFIG, never clipped. If absent, derive
+O_e=B_e only under those proofs and B_e<=P_e; otherwise O_e=0 and overlap is unproved. Never subtract
+an upper snapshot. Zero without proof remains a conservative diagnostic, not comparable admission.
+Spend estimate E=max(L_now,max_e(P_e+L_now-O_e)); diagnostic E may over-count when overlap is unproved.
+Only with complete overlap proofs for every contributing provider event and fresh conflict-free inputs
+is ordinary quality comparable. Excess is also comparable for HOLD purposes, even without overlap proof.
+For comparable billing, headroom=cap-E-R_now and admission_basis=billing_estimate; otherwise use
+headroom=cap-L_now-R_now and admission_basis=ledger_fallback, provided local ledger inputs are usable.
+Keep E and known_floor for diagnostics; do not enforce them in fallback. This conditions §4's account
+inequality; fallback still runs the gross-excess hold predicate before admission. With cap=100,L=50,
+P=45,R=0 and no coverage, E=95 is diagnostic, effective headroom=50, action=none. No halved budget.
+Every hold recommendation denies requested H regardless of headroom; known integrated holds also deny.
 Example with certified overlap: P=80, O=50, L_now=60, cap=100, R=0 => E=90, headroom=10.
+This synthetic case includes allowance=30 and total gateway shares<=70, covering its known non-AI portion.
 With P=14.30,O=14.30,L_now=18.43,R=0.50,cap=100 => 81.07. These are proof-bearing fixtures.
-Missing P/history yields headroom=null plus known_floor=max(known P,L_now), not P=0. Stale/conflicted
-P retains the floor and any computable conservative estimate, quality=provisional; it cannot create
-a hold just because billing is unavailable. Existing local ceilings and confirmed financial holds stay.
+Missing P means estimate=null, not P=0; missing/unusable ledger means headroom=null and admission_basis=
+unavailable. Unknown/stale/conflicted P preserves known_floor=max(known P,L_now), with unknown operands
+omitted and null if neither is known. It uses ledger_fallback when available, never inventing a billing hold.
 R here is only disjoint gateway aggregates. Service-lease overlap belongs to cards 4/6a; 30K output
 reservation/enforcement belongs to 6b. Lagging invisible bypass remains unbounded by this estimate.
 Opening planner takes verified drain completion, snapshot/coverage references, per-gateway baselines,
@@ -618,14 +647,43 @@ Output deterministic proposal ID from canonical numeric inputs/references; repea
 contents and zero ledger writes. Application, revalidation/fencing, partial-write recovery, accept-correction
 audit and operator resolutions require a separately sized integration work order; 6b activation remains.
 
+### Pure input surfaces (2b-2 and 2b-2b)
+
+Pin evaluate_billing(context,request)->Evaluation and plan_opening(context,request)->Proposal. No
+new evaluator/planner CLI verbs or coverage-file discovery: fixtures call these pure functions directly.
+Closed JSON-compatible context={account,period_start,period_end,cap_micro_eur,gateways,policy,readings,
+unresolved_event_ids}; gateways=[{gateway,share_micro_eur}]. policy is the full billing-policy-import
+record with account and reporter_machine aliases replacing the two FKs. readings are validated reading
+envelopes plus received_at, all for this account; unresolved_event_ids are local UUID references to
+unresolved transitions. Include retained same-period history, not just the latest monetary totals.
+Evaluation request={version:1,account,now_ms,requested_micro_eur,coverage}; coverage is an array of the
+closed per-event evidence records above, [] when absent. requested_micro_eur is nonnegative int64;
+now_ms is injected UTC-ms, never read from a clock inside evaluation. Account must match context.
+Opening request={version:1,account,now_ms,drain_completed_at,drain_verified,billing_event_id,coverage,
+baselines,allocations,non_ai_allocation,proven_external}; drain_verified is an exact boolean attestation.
+baselines=[{gateway,snapshot_event_id,baseline_micro_eur}] covers every configured gateway exactly
+once and must equal its referenced settled snapshot. allocations=[{gateway,external_micro_eur,
+evidence_ids}]; non_ai_allocation={amount_micro_eur,evidence_ids}; evidence_ids are arrays of local UUIDs.
+proven_external=[{evidence_id,gateway,amount_micro_eur,disjoint_from_managed}]; gateway=null only for
+non-AI charges, disjoint_from_managed must be true. These operator/fixture assertions are not provider
+telemetry. Each proof must be consumed exactly once by its owner; sum of its amounts must equal the
+allocation. Missing gateway allocations mean zero; duplicate gateways/proof IDs are invalid.
+All fields required, no extra keys; reuse alias/int64/UTC-ms/boolean validation. Unknown references,
+bad ordering, invalid explicit overlap, account mismatch or unsupported version => INVALID_CONFIG.
+Validly shaped but unsafe opening evidence returns unsafe/empty allocations; evaluation always sets
+proposal=null. plan_opening returns the Proposal shape below and neither function reads files or writes.
+
 ### Pure OVH adapter, output and errors
 
+Dispatch prerequisite for 2b-3: the lead supplies sanitized captures of the 19:00:26Z and 20:00:49Z
+responses, including resource-category monetary fields, with the approved field mapping. Without them
+do not dispatch or invent fixtures; canary approval does not replace this build prerequisite.
 2b-3: one call with injected credential, transport, clock and jitter integer -> versioned reading-import
 document or closed failure; no loop, file credential access or outbox. Signed read-only GET of project
 usage/current uses totalPrice, lastUpdate and UTC period. No account-wide empty-result fallback.
 Return non_ai_spend_present=true iff any non-ai-endpoints category has nonzero billed amount; missing
 or unverified category-price shape fails schema rather than emitting false. Monetary field mapping must
-be pinned to a sanitized captured fixture before the canary; category names alone are insufficient.
+be pinned to those captures before implementation; category names alone are insufficient.
 Decimal parsing/ceil to micro-EUR, no binary floats. Failure={auth,transport,rate_limit,schema,currency,
 period,tls}; failure output {failure,next_attempt_at}, success {document,next_attempt_at}. Compute next
 attempt=max(now+poll+jitter,valid Retry-After), jitter in [0,90]s injected; no immediate transport retry.
@@ -634,21 +692,41 @@ certificate verification. Later deployment checklist: tested TLS, exact GET-only
 ACLs, authenticated account binding (card 5), signed-header/URL redaction and separately approved canary.
 No raw exceptions, IDs, keys or bodies in documents/status/errors; only registered aliases, local UUIDs,
 numbers and closed enums. Other provider adapters/deployment plumbing need separate work orders.
-Evaluation output (all required): {state,action,reason,quality,known_floor_micro_eur,estimate_micro_eur,
-headroom_micro_eur,request_fits,proposal}; nullable arithmetic when unknown, no enforcement capability.
+Evaluation output (all required): {state,action,reason,quality,admission_basis,known_floor_micro_eur,
+estimate_micro_eur,headroom_micro_eur,request_fits,proposal}; nullable arithmetic when unknown.
+admission_basis={billing_estimate,ledger_fallback,unavailable}; no enforcement capability in this result.
 state={matched,provider_behind,reserve_or_scope_covered,temporally_unresolved,unexplained_excess,
 unknown,stale,conflict}; action={none,alert,hold}; quality={comparable,provisional,unknown}.
 reason={matched,lag_expected,lag_investigate,missing_old_spend,reserve_or_scope_covered,snapshot_skew,
 coverage_unknown,provider_excess,billing_unknown,billing_stale,source_conflict,gateway_unusable,
 basis_unknown,scope_mismatch,non_ai_present}; non_ai_present requires ALERT at minimum.
-Precedence: invalid basis/scope or unusable gateways; unknown/stale/conflict; missing coverage;
-comparable excess; covered difference; missing-old lag; matched/behind. An idle lag diagnostic may
-replace coverage_unknown as the alert reason but leaves state unresolved/quality provisional. Keep evidence.
-request_fits is bool only for comparable quality and requested H>=0 (H<=headroom); otherwise null.
+Decision table is ordered, first matching base row wins; every gross check includes its time/ledger guards.
+Q=comparable only with complete overlap proof and fresh conflict-free inputs, otherwise provisional.
+
+| Condition | state / reason | action | quality |
+|---|---|---|---|
+| Invalid basis/scope or unusable ledger | unknown / basis_unknown,scope_mismatch,gateway_unusable (in that order) | alert | unknown |
+| No provider sample; stale sample; latched conflict (in that order) | unknown,stale,conflict / billing_unknown,billing_stale,source_conflict | alert | provisional |
+| Gross or certified historical excess beyond allowance+tolerance | unexplained_excess / provider_excess | hold | comparable |
+| Certified P below old settled by material amount | provider_behind / missing_old_spend | alert | Q |
+| Idle material negative gap at >=lag_seconds | provider_behind / lag_investigate | alert | provisional |
+| No certificate, gross time guards absent | temporally_unresolved / snapshot_skew | none | provisional |
+| No certificate, gross test passed without excess | temporally_unresolved / coverage_unknown | none | provisional |
+| Certified positive difference covered by reserves/allowance | reserve_or_scope_covered / reserve_or_scope_covered | none | Q |
+| Matched within tolerance and complete evidence, no uncertain overlap | matched / matched | none | Q |
+| Certified material negative gap without lag alarm | provider_behind / lag_expected | none | Q |
+| Otherwise incomplete certificate/brackets | temporally_unresolved / coverage_unknown | none | provisional |
+
+Overlay: any retained non_ai_spend_present in the current period raises none to alert with reason=
+non_ai_present; it never downgrades hold or replaces an earlier alert reason. A missing certificate alone
+is not anomalous. Existing holds are owned by later integration and never cleared by this pure output.
+request_fits=false for action=hold; else H<=effective headroom when non-null, else null. Both comparable
+and provisional results can therefore report a local fallback fit; this is advisory, never lease authority.
 proposal=null or {proposal_id,state,reason,source_events,allocations,non_ai_allocation_micro_eur};
 state={ready,unsafe}; reason={verified,opening_unsafe}; allocations=[{gateway,baseline_micro_eur,
 external_micro_eur,opening_micro_eur}]. Unsafe proposals have empty allocations; no inferred authority.
-CLI exit 0 for valid advisory evaluation/import, even action=hold; no process admission occurs in 2b.
+Existing reading/status CLI exits 0 on valid advisory output/import, even action=hold. Pure functions
+return results or typed errors; future thin CLI wrappers use the same mapping, not new verbs in 2b-2.
 Closed validation errors INVALID_CONFIG,SCHEMA_UNSUPPORTED,IDEMPOTENCY_CONFLICT exit 2;
 BILLING_SCOPE_MISMATCH,BILLING_BASIS_UNKNOWN,BILLING_UNKNOWN,BILLING_STALE,BILLING_DIVERGENCE,
 OPENING_UNSAFE also exit 2 if an explicit usable-plan request fails; STORE_ERROR exits 3. Successful
@@ -660,23 +738,29 @@ config/schema=400,idempotency=409,store=503. These add to §7; no HTTP implement
 
 | Named tests / owner | Given / When / Then |
 |---|---|
-| billing_dependency; billing_snapshot_schema / 2b-1 | Given unmerged card 2 or legacy metadata-only snapshots, When checking prerequisites/importing, Then dispatch is gated or money is unknown; new closed amounts/periods validate. |
+| billing_snapshot_schema / 2b-1 | Given legacy metadata-only snapshots, When importing/evaluating money evidence, Then amounts remain unknown; new closed amounts/periods validate. Merged-SHA and captured-fixture checks are dispatch prerequisites, not product tests. |
 | billing_migration_rollback; billing_retention / 2b-1 | Given v2 rows and interruption after each DDL, When migrate/restart, Then rollback/FKs/IDs/windows survive; eligibility keeps 30-day/13-month/unresolved evidence correctly, no pruning occurs. |
 | billing_validation; billing_policy_enums / 2b-1 | Given bool/float/negative/overflow/extra keys/wire seat/wrong account or unsupported enum, When importing, Then exit 2 and unchanged DB; telemetry cannot change any policy. |
 | billing_owner_scope_revision; billing_scope / 2b-1 | Given foreign machine, inactive revision, bad alias, nondedicated project or shares+allowance>cap, When importing, Then reject; replica copies never add totals, policy changes with history refused. |
 | billing_replay; billing_same_time_conflict; billing_older_high_water / 2b-1 | Given same-ID replay/collision, equal-time different totals or older higher amount, When reordered, Then no double counting, collision rollback, deterministic conflict/high-water without time refresh. |
 | billing_time; billing_rollover / 2b-1 | Given failure/unchanged polls, source age=7200s/+1ms, future=30s/+1ms, midnight or late prior-month reading, When reduced, Then exact freshness/future boundaries, new month unknown/ALERT and independent periods; no idle exemption. |
 | billing_gateway_uncertainty / 2b-2 | Given absent/null/stale (>120s), epoch/hash transition or decreased ledger, When evaluated, Then no usable comparison; 120s valid, repeated ok cannot erase conflict, unattributed subset counted once. |
-| billing_tax_basis; billing_tolerance / 2b-2 | Given unknown/VAT-mismatched bases and half-micro conversions, When evaluated, Then unknown alerts or exact upward conversion; tau=max(0.01 EUR,25bps*L_asof), never budget credit. |
+| billing_tax_basis / 2b-1 | Given B06 ex_vat policy, unknown/mismatched bases and half-micro conversions, When importing/evaluating shared conversion, Then 100 EUR stays 100 before VAT, allocation checks use one basis, unknown alerts and conversion rounds upward. |
+| billing_tolerance / 2b-2 | Given approved configurable 50000 micro-EUR/100 bps and ledger 20 EUR, When calculating tau, Then 0.20 EUR; absolute floor at low totals, never budget credit. |
+| billing_eval_input; billing_overlap_precedence / 2b-2 | Given closed context/request and complete_at>upper_at, unknown IDs or O outside min(P,L_now,B_e), When evaluated, Then invalid input rejected; explicit valid overlap wins, absent overlap derives only with proof; injected now controls all time. |
+| billing_reconcile_gross_excess_uncertified; billing_gross_allowance / 2b-2 | Given P=L_now+30 without certificates, When later complete gateway reports are fresh, Then comparable HOLD; older reports cannot hold. Given P at L+R+allowance+tau and +1 micro-EUR, Then no gross hold at equality, hold above; reserves/allowance prevent false excess. |
+| billing_non_ai_alert; billing_precedence / 2b-2 | Given normal missing bounds, non-AI flag, stale/conflict, or gross excess, When selecting ordered table/overlay, Then none for coverage alone, alert for non-AI, anomalies preserve earlier reason, and hold is never downgraded; historical excess precedes unresolved bounds. |
 | billing_reconcile_snapshot_skew; billing_reconcile_busy / 2b-2 | Given old current report or as-of L=10/P=13 then L_now=14 with valid brackets, When evaluated, Then skew unresolved or true 3 EUR excess despite continued spend. |
 | billing_reconcile_uncertain_overlap; billing_coverage / 2b-2 | Given L=18.43/P=19/R_asof=0.57 or uncertified lastUpdate, When evaluated, Then covered or unresolved, no excess HOLD; verified P>U+allowance+tau yields advisory HOLD only. |
 | billing_reconcile_equal_idle; billing_reconcile_lag_timer / 2b-2 | Given equality or fresh-source negative gap, When time reaches 4h across restart/heartbeats, Then equality stays matched and material gap alerts at >=4h; activity resets idle, historical missing-old still alerts in busy periods. |
-| billing_headroom; billing_headroom_boundaries / 2b-2 | Given both proof-bearing examples above, When computing, Then 81.07/10 EUR; upper bracket is never subtracted, no overlap proof uses zero, R retained once, H=headroom fits/+1 does not, overflow rejected, missing/stale provisional never becomes zero/automatic hold. |
-| billing_opening_uncertain_overlap; billing_opening_catchup / 2b-2 | Given 18.43/19/0.57 or early drain, When proposing, Then unsafe/no allocation until resolved and catch-up proved; eventual settled 19 produces no duplicate 0.57. |
-| billing_opening_allocations; billing_proposal_only / 2b-2 | Given missing provenance, wrong sums/owner, negative allocation or share overflow, When planning, Then unsafe; valid no-overlap plans preserve baselines, deterministic IDs, non-AI bucket once, no receipts/ledger writes/resolution command. |
+| billing_headroom; billing_headroom_boundaries / 2b-2 | Given both proof-bearing examples and cap=100/P=45/L=50/R=0 without proofs, When computing, Then comparable 81.07/10 and provisional fallback 50 (diagnostic E=95); no upper subtraction, R once, H=headroom fits/+1 does not, hold always false-fit, overflow rejected, missing provider never zeroed. |
+| billing_opening_input / 2b-2b | Given wrong baseline references, duplicate proof consumption, mismatched account or extra request keys, When planning, Then INVALID_CONFIG; well-shaped insufficient proof gives unsafe with empty allocations and no I/O. |
+| billing_opening_uncertain_overlap; billing_opening_catchup / 2b-2b | Given 18.43/19/0.57 or early drain, When proposing, Then unsafe/no allocation until resolved and catch-up proved; eventual settled 19 produces no duplicate 0.57. |
+| billing_opening_allocations; billing_proposal_only / 2b-2b | Given negative amounts, When validating, Then INVALID_CONFIG; Given well-shaped missing provenance, wrong sums/owner or share overflow, When planning, Then unsafe; valid plans preserve baselines, stable IDs, non-AI bucket once and no financial writes. |
 | billing_adapter; billing_non_ai; billing_poll_schedule; billing_tls / 2b-3 | Given signed-GET fixtures, fractional totals/category errors and all failure enums, When called once, Then ceil money, exact flag/no unknown-as-false, bounded jitter/Retry-After precedence and TLS-option refusal; no retry or credential storage. |
 | billing_output_errors; privacy_2b / all | Given every result/error branch and keys/IDs/paths/signed headers/URLs/raw failures, When serialized, Then closed shape/exit mappings and only approved aliases/numbers/enums; compare before/after snapshots for zero financial side effects. |
 | billing_accept_correction; billing_apply_fence; billing_no_poll_clear / later integration | Given overreport correction, uncertain overlap or interrupted multi-gateway apply, When audited resolution runs, Then no double liability, fence persists until complete, poll never clears holds or creates receipts. |
+| billing_invoice_basis / later reporter | Given the first real invoice and explicit ex_vat fields, When the operator verifies provider/ledger/cap basis, Then record a numeric pass or mismatch for review; do not store the raw invoice in coordinator metadata. |
 | billing_lease_overlap; billing_output_30k; billing_reporter_auth; billing_deployment / cards 4/6a,6b,5,later reporter | Given mirrored lease attempts, 30K output, foreign identity or real TLS/grants, When integrated, Then single exposure, bounded output, denied identity and verified deployment; no such claim in 2b. |
 
 ### Findings disposition and remaining choices
@@ -686,8 +770,8 @@ config/schema=400,idempotency=409,store=503. These add to §7; no HTTP implement
 | A1 opening uncertain overlap (BLOCKER) | ACCEPTED | Planner refuses any unresolved attempt and requires disjoint provenance; overlap test. |
 | A2; B-B1 as-of comparability (BLOCKERS) | ACCEPTED | Historical brackets, certified economic coverage, reserve/non-AI exposure and unresolved state; busy/skew tests. lastUpdate alone is insufficient. |
 | A3 equality/lag timer | ACCEPTED | Matched equality; financial-activity timer and historical lag threshold tested at boundary/restart. |
-| A4; B-B3 scope/input/dependency (BLOCKERS) | ACCEPTED | Three bounded fixture cards, explicit money-payload extension, merged-SHA gate; future integration tests moved. |
-| A5; B-S4 lag/tolerance | ACCEPTED | Four-hour lag separate from 7200s age; proposed absolute-plus-relative tolerance. |
+| A4; B-B3 scope/input/dependency (BLOCKERS) | ACCEPTED | Bounded fixture cards, explicit money-payload extension, merged-SHA gate; future integration tests moved. v3 further splits opening work. |
+| A5; B-S4 lag/tolerance | ACCEPTED | Four-hour lag separate from 7200s age; B05 now fixes provisional absolute-plus-relative values. |
 | A6; B-S1 missing named tests | ACCEPTED | Acceptance matrix covers validation, ownership, corrections, migration, retention eligibility, arithmetic, plans, scheduling and future ownership. |
 | B-B2 headroom (BLOCKER) | ACCEPTED | Add post-coverage spend using proved lower overlap; never subtract upper snapshot; update §4 account inequality. Missing proof uses conservative zero overlap. |
 | B-S2 owner column; B-C1 typed revision | ACCEPTED | reporter_machine_id FK, integer revision/registered aliases, closed local owner policy. |
@@ -695,14 +779,32 @@ config/schema=400,idempotency=409,store=503. These add to §7; no HTTP implement
 | B-S5 premature opening | ACCEPTED | Source time after drain+lag is necessary but not sufficient; require confirmed completeness and no uncertainty. |
 | B-S6 rollover outage | ACCEPTED | Unknown/stale alerts only; retain same-period floors and local ceilings. |
 | B-S7 migration order | ACCEPTED | CHECK rebuild precedes billing source FKs, transactional rollback tests. |
-| B-S7 pre-add usage kind | REJECTED | No closed usage consumer in this scope; accepting unsupported telemetry weakens validation merely to avoid a later migration. |
+| B-S7 pre-add usage kind | REJECTED | Keep schema support with its owning consumer card, accepting one later rebuild. Widening CHECK alone would not bypass the closed validator; the earlier validation rationale was incorrect. |
 | B-C2 fixture TLS versus deployment | ACCEPTED | Fixture refusal/signed-request checks separated from later actual TLS/grants/ACL checklist. |
 | B-C3 non-AI flag | ACCEPTED | Boolean flag, dedicated designation and allowance constraint; unknown category-price shape fails schema. |
 | B-C4 correction action | ACCEPTED | Audited accept-correction belongs to the separately sized resolution integration, not polling. |
 | B-Q1/Q2 live time/period | ACCEPTED | Exact supplied UTC period/two samples recorded; equal-time total changes remain possible/conflicted. |
-| B-Q3 provenance; B-Q4 VAT | ACCEPTED | Multi-hour lag accepted without declaring duplicated openings disproved; explicit common-basis conversion and pending operator choice. |
+| B-Q3 provenance; B-Q4 VAT | ACCEPTED | Multi-hour lag accepted without declaring duplicated openings disproved; B06 declares ex-VAT with first-invoice verification. |
 
-| ID | State | Choice needed |
+| ID | State | Recorded choice |
 |---|---|---|
-| B05 Tolerance pair | LEAD DECISION | Approve proposed absolute=10000 micro-EUR and relative=25 bps (max of both), or provide another calibrated pair. |
-| B06 Tax basis | LEAD DECISION | Operator to declare cap/provider/ledger bases and VAT rate if conversion is needed; until then billing comparison/plans remain unknown/advisory, existing local ceilings continue. |
+| B05 Tolerance pair | DECIDED | max(50000 micro-EUR,100 bps of the relevant ledger figure), provisional/configurable; no headroom credit. |
+| B06 Tax basis | DECIDED | 100 EUR before VAT; explicit cap/provider/ledger basis=ex_vat; verify against first real invoice in the later reporter runbook. |
+
+### Reader B delta disposition (v3)
+
+| Finding | Disposition | Resolution |
+|---|---|---|
+| N1 gross excess without certificate (BLOCKER) | ACCEPTED | Fresh P>L_now+R_now+allowance+tau holds without a certificate, provided complete gateway reports cover provider receipt time; gross/skew/allowance tests. |
+| N2 missing evaluation/planner inputs (BLOCKER) | ACCEPTED | Pure function signatures, closed context/request shapes, reference validation and explicit-overlap precedence; no invented CLI verbs. |
+| S1 permanent coverage alert / mapping | ACCEPTED | Ordered state/reason/action/quality table; missing bounds alone is none/provisional; anomaly overlay and precedence tests. |
+| S2 unconditional E admission | ACCEPTED | Sections 4/11 use E for comparable billing; otherwise ledger fallback plus gross-excess check. E=95 is diagnostic for P=45/L=50, effective headroom remains 50. |
+| S3 card size / conversion dependency | ACCEPTED | Opening planner moved to 2b-2b; shared pure conversion owned by 2b-1. |
+| S4 adapter captured input | ACCEPTED | Sanitized captures and approved category-price mapping required before 2b-3 dispatch, not merely before canary. |
+| C1 B05 values | ACCEPTED | 50000 micro-EUR/100 bps in policy decision, formula and fixture expectations. |
+| C2 process gate as test | ACCEPTED | Merged-SHA gate remains a dispatch prerequisite; billing_snapshot_schema tests only executable legacy/new snapshot behavior. |
+| C3 timer writes | ACCEPTED | last_financial_change derived read-only from retained history on each evaluation; restart needs no new state. |
+| C4 uncovered rules | ACCEPTED | Named input/overlap, gross-allowance, non-AI overlay and precedence fixtures cover each listed boundary. |
+
+No remaining lead choices in this addendum. Dispatch still requires the reviewed card-2 merge and
+captured OVH fixtures; first-invoice verification and real canary remain later deployment obligations.
