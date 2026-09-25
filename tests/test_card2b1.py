@@ -681,6 +681,16 @@ class BillingValidation(_Base):
         mid = self._good("val-mid", observed=SEP + 2 * _MS_PER_DAY)
         mid["payload"]["period_start"] = SEP + _MS_PER_DAY
         mutations.append(mid)
+        # Source time outside the period bounds: the source time must sit
+        # within [start, end) (the final sample exactly at the end is
+        # allowed, pinned below). An August period with the source time
+        # in September, and one before the start, are both rejected.
+        mutations.append(_billing(_eid("val-late"), "desktop", "meter",
+                                  "proj-ai", 1, AUG, SEP, 100, False,
+                                  SEP + 1000))
+        mutations.append(_billing(_eid("val-early"), "desktop", "meter",
+                                  "proj-ai", 1, AUG, SEP, 100, False,
+                                  AUG - 1000))
         # A future source time beyond the 30-second slop: the slop is
         # checked against the CLI's own now, which advances while the
         # earlier imports run, so the future reading is built at the moment
@@ -707,6 +717,12 @@ class BillingValidation(_Base):
         self.assertEqual(_readings_import(
             self.db, self.tmp,
             _doc_v3([self._good("val-after")])).returncode, 0)
+        # The final sample exactly at the period end is within the bounds.
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc_v3([_billing(_eid("val-at-end"), "desktop", "meter",
+                              "proj-ai", 1, AUG, SEP, 77, False, SEP)]
+        )).returncode, 0)
         self.assertEqual(self._import_policy(max_age=3600).returncode, 0)
         bad = _readings_import(
             self.db, self.tmp,
@@ -1270,13 +1286,15 @@ class BillingTime(_Base):
                 _doc_v3([bad]), fixed_now)
         self.assertEqual(ctx.exception.code, CODE_INVALID_CONFIG)
 
-        # Through the CLI (wall clock, with margin): a 7198 s old source is
-        # fresh under the 7200 s max_age, a months-old source ingested a
-        # moment ago is stale - the unchanged/failed poll never refreshes
-        # the source time, and there is no idle exemption.
+        # Through the CLI (wall clock, with margin): a 7000 s old source
+        # is fresh under the 7200 s max_age - a 200 s margin the runner
+        # cannot eat (the exact boundary is pinned above with the
+        # injected clock) - and a months-old source ingested a moment
+        # ago is stale: the unchanged/failed poll never refreshes the
+        # source time, and there is no idle exemption.
         self.assertEqual(self._import_policy().returncode, 0)
         now = _now_ms()
-        fresh_obs = now - 7_198_000
+        fresh_obs = now - 7_000_000
         fresh_start, fresh_end = _month_bounds_of(fresh_obs)
         stale_obs = _add_months(_month_start(now), -1) + 10 * _MS_PER_DAY
         stale_start = _month_start(stale_obs)
