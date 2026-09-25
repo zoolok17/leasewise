@@ -681,6 +681,12 @@ class BillingValidation(_Base):
         mid = self._good("val-mid", observed=SEP + 2 * _MS_PER_DAY)
         mid["payload"]["period_start"] = SEP + _MS_PER_DAY
         mutations.append(mid)
+        # A multi-month span: a provider period is exactly one UTC month
+        # (a span would fold distinct months into one row and leave its
+        # period_end stale once later months arrive).
+        multi = self._good("val-multimonth", observed=SEP + 2 * _MS_PER_DAY)
+        multi["payload"]["period_end"] = _add_months(SEP, 2)
+        mutations.append(multi)
         # Source time outside the period bounds: the source time must sit
         # within [start, end) (the final sample exactly at the end is
         # allowed, pinned below). An August period with the source time
@@ -1000,6 +1006,49 @@ class BillingConfigInvariant(_Base):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
         self.assertEqual(_fingerprint(self.db), before)
+
+    def test_billing_period_end_mismatch_refused(self):
+        # Row invariant: one (account, scope_revision, period_start) row
+        # carries one period_end. A reading for the same key with a
+        # different end is BILLING_SCOPE_MISMATCH (exit 2), never a
+        # silent fold into the stale row. The import path cannot reach
+        # this now that a period is exactly one UTC month; the guard is
+        # pinned here against other writers.
+        from quota_balancer import store
+        from quota_balancer.errors import (CODE_BILLING_SCOPE_MISMATCH,
+                                           QuotaError)
+        self.assertEqual(self._import_policy().returncode, 0)
+        conn = sqlite3.connect(self.db)
+        try:
+            meter = conn.execute(
+                "SELECT id FROM accounts WHERE alias='meter'").fetchone()[0]
+            desktop = conn.execute(
+                "SELECT id FROM machines WHERE alias='desktop'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO billing_totals(account_id, scope_revision, "
+                "period_start, period_end, latest_micro_eur, "
+                "observed_at, latest_event_id, high_water_micro_eur, "
+                "high_water_event_id, conflict) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (meter, 1, SEP, OCT + _MS_PER_DAY, 100,
+                 SEP + _MS_PER_DAY, _eid("pem-row"), 100, _eid("pem-row"),
+                 0))
+            conn.commit()
+            reading = {
+                "event_id": _eid("pem-read"),
+                "scope_alias": "proj-ai",
+                "scope_revision": 1,
+                "period_start": SEP,
+                "period_end": OCT,
+                "total_micro_eur": 100,
+                "observed_at": SEP + _MS_PER_DAY,
+            }
+            with self.assertRaises(QuotaError) as ctx:
+                store._reduce_provider_billing(conn, reading, meter, desktop)
+            self.assertEqual(ctx.exception.code, CODE_BILLING_SCOPE_MISMATCH)
+        finally:
+            conn.rollback()
+            conn.close()
 
 
 class BillingScope(_Base):

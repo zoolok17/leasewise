@@ -199,15 +199,47 @@ def _is_utc_month_start(ms):
         return False
 
 
+def _next_utc_month_start(ms):
+    """The first instant of the UTC month following the one `ms` is in;
+    None when that month start is not representable."""
+    try:
+        dt = datetime.datetime.fromtimestamp(ms // 1000,
+                                             datetime.timezone.utc)
+        year, month = dt.year, dt.month
+        if month == 12:
+            year, month = year + 1, 1
+        else:
+            month += 1
+        return int(datetime.datetime(year, month, 1,
+                                     tzinfo=datetime.timezone.utc)
+                   .timestamp()) * 1000
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _is_utc_month_period(start, end):
     """True when [start, end) is bounded by UTC month bounds, end > start.
 
-    The gateway period is 'utc_month'; the provider period is one UTC
-    month. Both are pinned to month boundaries here - a sub-month or
-    mid-month bound is not a UTC-month period.
+    The gateway v3 snapshot period is 'utc_month', pinned to month
+    boundaries - a sub-month or mid-month bound is not a UTC-month
+    period. (The provider billing period is stricter: exactly one month,
+    _is_one_utc_month_period.)
     """
     return (_is_utc_month_start(start) and _is_utc_month_start(end)
             and end > start)
+
+
+def _is_one_utc_month_period(start, end):
+    """True when [start, end) is exactly one UTC month: start is the
+    first instant of a UTC month and end the first instant of the month
+    that follows it.
+
+    A provider billing period is one UTC month - a multi-month span is
+    not a period: it would fold distinct months into one row and leave
+    the row's period_end stale once later months arrive.
+    """
+    return (_is_utc_month_start(start)
+            and _next_utc_month_start(start) == end)
 
 
 def _validate_gateway_snapshot(payload, billing):
@@ -289,9 +321,9 @@ def _validate_provider_billing(payload, observed_at):
     # Positive integer scope revision.
     if not _is_nonneg_int(scope_revision) or scope_revision <= 0:
         _invalid()
-    # period = [start, end); the source time is within the bounds (the
-    # final sample at end is allowed).
-    if not _is_utc_month_period(period_start, period_end):
+    # period = [start, end) is exactly one UTC month; the source time is
+    # within the bounds (the final sample at end is allowed).
+    if not _is_one_utc_month_period(period_start, period_end):
         _invalid()
     if not (period_start <= observed_at <= period_end):
         _invalid()
