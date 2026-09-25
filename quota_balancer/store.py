@@ -35,6 +35,7 @@ from .reduce import (
     GATEWAY_STATE_RECONCILE,
     billing_freshness,
     gateway_report_state,
+    reduce_billing_total,
     reduce_gateway_report,
     reduce_window,
     window_freshness,
@@ -43,6 +44,7 @@ from .validate import validate
 from .validate_readings import (
     KIND_CLI_WINDOW,
     KIND_GATEWAY_SNAPSHOT,
+    KIND_PROVIDER_BILLING,
     validate_readings,
 )
 
@@ -350,8 +352,85 @@ def _apply_reading(conn, reading, machine_ids, account_ids, gateway_ids, now_ms)
 
     if kind == KIND_CLI_WINDOW:
         _reduce_cli_window(conn, reading, account_id)
-    else:  # KIND_GATEWAY_SNAPSHOT
+    elif kind == KIND_GATEWAY_SNAPSHOT:
         _reduce_gateway_snapshot(conn, reading, gateway_ids)
+    else:  # KIND_PROVIDER_BILLING
+        _reduce_provider_billing(conn, reading, account_id, machine_id)
+
+
+def _reduce_provider_billing(conn, reading, account_id, machine_id):
+    """Reduce a provider_billing reading into billing_totals.
+
+    A provider bill is attributed money, so the account must be metered
+    (a subscription account has no spend to attribute). Where the account
+    has an operator billing policy, the reading must match it - reporter
+    machine, scope alias and scope revision (section 11): a foreign
+    machine, an inactive revision, or a scope alias the policy does not
+    designate is rejected,
+    and a replica copy never adds totals.
+
+    The row is keyed by (account_id, scope_revision, period_start); the
+    reduction is by SOURCE time (the pure reduce_billing_total): newer
+    observations set latest, an equal-time unequal total latches a
+    conflict, and an older higher total raises the high-water without
+    refreshing the latest time. The currency and the money basis live in
+    the policy, not the row.
+    """
+    account_kind = conn.execute(
+        "SELECT kind FROM accounts WHERE id = ?", (account_id,)
+    ).fetchone()[0]
+    if account_kind != "metered":
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+    policy = conn.execute(
+        "SELECT reporter_machine_id, scope_alias, scope_revision "
+        "FROM billing_policies WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    if policy is not None:
+        if (machine_id != policy[0]
+                or reading["scope_alias"] != policy[1]
+                or reading["scope_revision"] != policy[2]):
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+    period_start = reading["period_start"]
+    period_end = reading["period_end"]
+    scope_revision = reading["scope_revision"]
+    existing = conn.execute(
+        "SELECT latest_micro_eur, observed_at, latest_event_id, "
+        "high_water_micro_eur, high_water_event_id, conflict "
+        "FROM billing_totals WHERE account_id = ? AND scope_revision = ? "
+        "AND period_start = ?",
+        (account_id, scope_revision, period_start),
+    ).fetchone()
+    updated = reduce_billing_total(existing, reading["total_micro_eur"],
+                                   reading["observed_at"],
+                                   reading["event_id"])
+    if updated is None:
+        # The reading is recorded but changes nothing (a replay or an
+        # older total that does not beat the high-water).
+        return
+    (latest, observed_at, latest_event_id, high_water, high_water_event_id,
+     conflict) = updated
+    if existing is None:
+        conn.execute(
+            "INSERT INTO billing_totals(account_id, scope_revision, "
+            "period_start, period_end, latest_micro_eur, observed_at, "
+            "latest_event_id, high_water_micro_eur, high_water_event_id, "
+            "conflict) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (account_id, scope_revision, period_start, period_end, latest,
+             observed_at, latest_event_id, high_water, high_water_event_id,
+             conflict),
+        )
+    else:
+        conn.execute(
+            "UPDATE billing_totals SET latest_micro_eur=?, observed_at=?, "
+            "latest_event_id=?, high_water_micro_eur=?, "
+            "high_water_event_id=?, conflict=? "
+            "WHERE account_id=? AND scope_revision=? AND period_start=?",
+            (latest, observed_at, latest_event_id, high_water,
+             high_water_event_id, conflict,
+             account_id, scope_revision, period_start),
+        )
 
 
 def _reduce_cli_window(conn, reading, account_id):
