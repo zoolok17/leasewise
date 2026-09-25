@@ -40,7 +40,7 @@ EMPTY_REPORT = (
 )
 
 EXPECTED_STATUS = (
-    '{"schema_version":3,"accounts":[{"alias":"meter","kind":"metered",'
+    '{"schema_version":4,"accounts":[{"alias":"meter","kind":"metered",'
     '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
     '"coverage_complete":false,"windows":[]}],'
     '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
@@ -201,7 +201,7 @@ class Card1Tests(_Base):
         # The status is exactly the documented projection: nothing beyond the
         # approved aliases and the static schema/field names may appear.
         expected = (
-            '{"schema_version":3,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
+            '{"schema_version":4,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
             '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
             '"coverage_complete":false,"windows":[]}],'
             '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
@@ -449,7 +449,7 @@ class Card1FixRoundTests(_Base):
         ok = _import(self.db, self.tmp, doc)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         expected = (
-            '{"schema_version":3,"accounts":['
+            '{"schema_version":4,"accounts":['
             '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
             '"allocated_micro_eur":100000000,"coverage_complete":false,"windows":[]},'
             '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'
