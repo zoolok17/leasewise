@@ -318,13 +318,13 @@ class Card4EnforceFixTest(unittest.TestCase):
         # Above the 24h absolute maximum (section 6): a static
         # INVALID_REQUEST; the int64 overflow case must not leak a
         # raw OverflowError.
-        for bad in (2_073_600_001, 2 ** 62, 2 ** 63 - 1):
+        for bad in (86_400_001, 2 ** 62, 2 ** 63 - 1):
             with self.assertRaises(QuotaError) as ctx:
                 self._grant(db, NOW, ttl_ms=bad)
             self.assertEqual(ctx.exception.code,
                              errors.CODE_INVALID_REQUEST)
         # The 24h maximum itself is still a valid lease.
-        ok = self._grant(db, NOW, ttl_ms=2_073_600_000)
+        ok = self._grant(db, NOW, ttl_ms=86_400_000)
         self.assertEqual(ok["state"], "active")
 
 

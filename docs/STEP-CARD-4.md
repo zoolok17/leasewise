@@ -360,3 +360,73 @@ tests.test_card4_ops tests.test_card4_expiry
 tests.test_card4_settle_fix tests.test_card4_enforce_fix
 tests.test_card4_turn_c_fix` -> `Ran 49 tests ... OK` (6 + 16 + 11
 + 4 + 6 + 6).
+
+### Turn D (this commit) — `tests/test_card4_turn_d_fix.py` (5)
+
+Final pre-merge read (head 0144e2e): NOT READY on one finding, N1.
+This turn implements the work-ordered follow-ups (N1, N2, the lead
+ruling on A-MAJOR 7 part 2), plus N4 (left to my call):
+
+- N1 (MAJOR) — the turn-B ttl fix set `_MAX_TTL_MS = 24 * _DAY_MS`
+  (24 DAYS); the bound is 24 HOURS (DESIGN section 6). Fix:
+  `_MAX_TTL_MS = _DAY_MS`. `test_ttl_ms_bounded` corrected
+  (86_400_000 accepted; 86_400_001, 2**62, 2**63-1 refused); the
+  exact boundary is pinned by `test_ttl_24h_boundary` (24 h
+  admitted with `expires_at = granted_at + 24 h`; 24 h + 1 ms and
+  the old 24-day value refused). The profile TTLs (30m/2h/6h)
+  remain unapplied: they need task_class, covered by the
+  task_class deferral below.
+- N2 (MINOR) — the estimate freshness check was one-sided: a
+  future-dated `observed_at` was admitted. Fix: also refuse
+  `observed_at > now + FUTURE_SLOP_MS` (the readings' 30 s clock
+  skew, imported from `reduce`); exactly +30 s is still admitted.
+  Pin: `test_future_estimate_refused`.
+- A-MAJOR 7 part 2 (lead ruling: "receipt conflict blocks") — a
+  CONFLICTING FINAL receipt (a 2nd different final on a settled
+  lease, or a final naming a foreign gateway) now blocks further
+  work on the account: a live NULL-model `parked` block with
+  reason `receipt_conflict`, keyed to the conflicting event
+  (`source_event_id`), recorded like the overrun block (INSERT OR
+  IGNORE under the `blocks_live` index) plus a
+  `receipt_conflict_block` audit row; the park commits before the
+  RECEIPT_CONFLICT raise so it survives the settle rollback. A
+  conflicting NON-final is refused without parking. Pins:
+  `test_conflicting_final_blocks_account`,
+  `test_foreign_gateway_final_blocks`.
+- N4 (my call: implemented) — the overrun adjustment's period took
+  a hold's bucket and depended on holds row order (mutation F20
+  survived). Fix: the adjustment is stamped with the lease's own
+  grant-time period (`lease.period_start`, always the grant month:
+  "in the original period"), independent of the holds. Pin:
+  `test_overrun_adjustment_lease_period` (a single day-bucket hold
+  via a subscription account, whose NULL budget takes the
+  account-month hold out of the set).
+
+Deferred to the reconciliation card (lead ruling, one line each):
+- m7 — advisory (unsized gateway) leases never run the account-budget group; needs the "advisory only" ruling before 6b.
+- N3 — the overrun park's INSERT OR IGNORE silently skips a live NULL-model `probing` block, and concurrent overruns share one block keyed to the first event; clearing a block must scan every unresolved adjustments row of the account (not the block's source_event_id), and an overrun should turn a live block `parked` rather than skip it.
+- N5 — the `project_accounts` check runs before the idempotent replay, so a replay after the project loses the account gets POLICY_DENIED instead of its stored lease (replay-first, as in m2).
+- m3 clamp — `expires_at` is not clamped at a period boundary; still blocked on the design ruling on which boundary.
+- m4 — a `subscription_admission` seat on a METERED account skips money admission (a seat setting is a money bypass); needs the section-7 ruling, and seat enforcement must be validated against the account kind before card 5 exposes grants.
+- (The m3-clamp and m4 deferrals were already listed in turn B's Deferred section; restated here as the lead's reconciliation-card deferrals.)
+
+Mutation verification (turn D): each fix was reverted in isolation
+and its pinning test went red (N1 24-day bound, N2 one-sided
+freshness, the receipt-conflict park removed at both conflict
+sites, N4 hold-bucket period); the source was restored byte-exact
+after each.
+
+### Commands and counts (turn D)
+
+```console
+$ python -m unittest discover -s tests
+Ran 176 tests in 81.683s
+OK
+```
+
+171 (through turn C) + 5 (turn D) = 176.
+Card-4 modules in isolation: `python -m unittest tests.test_card4
+tests.test_card4_ops tests.test_card4_expiry
+tests.test_card4_settle_fix tests.test_card4_enforce_fix
+tests.test_card4_turn_c_fix tests.test_card4_turn_d_fix` ->
+`Ran 54 tests ... OK` (49 + 5).

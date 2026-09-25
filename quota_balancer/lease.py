@@ -53,9 +53,12 @@ the ORIGINAL grant period, exactly once (late_receipt): the holds
 keep their grant-time period_start, so the reconciliation lands in
 the original bucket even across a day/month boundary; the event_id
 makes a replay a no-op and a settled lease is terminal
-(RECEIPT_CONFLICT). A non-final receipt on an uncertain lease is
-still refused (LEASE_EXPIRED): only the gateway's closed-child final
-receipt resolves an unprovable outcome.
+(RECEIPT_CONFLICT). A conflicting FINAL receipt - a 2nd different
+final, or a final naming a foreign gateway - parks the account like
+an overrun block (section 4: receipt conflict blocks); a conflicting
+non-final is refused without parking. A non-final receipt on an
+uncertain lease is still refused (LEASE_EXPIRED): only the gateway's
+closed-child final receipt resolves an unprovable outcome.
 
 expire: the explicit expiry path of section 4 ("Expiry -> uncertain,
 never a refund"): an active lease whose TTL has elapsed is moved to
@@ -79,7 +82,7 @@ import json
 import sqlite3
 import uuid as _uuid
 
-from . import errors, policy
+from . import errors, policy, reduce
 from .errors import QuotaError
 from .migrate import rollback_quietly
 from .store import _connect
@@ -122,7 +125,7 @@ _PERIOD_RANK = {"month": 0, "day": 1, "turn": 2, "window": 0}
 _DAY_MS = 86_400_000
 # Section 6: profile TTLs are 30m/2h/6h with a 24h absolute maximum;
 # ttl_ms can shorten but never exceed it.
-_MAX_TTL_MS = 24 * _DAY_MS
+_MAX_TTL_MS = _DAY_MS
 # The platform singleton scope id: platform caps are the scope='platform'
 # limits rows carried by this reserved id. The scope spans every seat,
 # so the grant's chain always carries it and every platform row applies
@@ -550,8 +553,12 @@ def _grant(conn, request, now_ms):
 
         _parked_block_error(conn, account_id, model[0])
         # Section 7: the admission estimate must be at most 120 seconds
-        # old - a stale observed_at is a stale admission basis.
-        if now_ms - request["context"]["observed_at"] > _EST_FRESH_MS:
+        # old - a stale observed_at is a stale admission basis - and at
+        # most the readings' 30 s clock skew in the future: a
+        # future-dated estimate is no admission basis at all.
+        observed_at = request["context"]["observed_at"]
+        if (now_ms - observed_at > _EST_FRESH_MS
+                or observed_at > now_ms + reduce.FUTURE_SLOP_MS):
             _invalid()
 
         # Derive the caps through the card-3 arithmetic: the model row
@@ -847,6 +854,29 @@ def settle(path, receipt, now_ms):
         conn.close()
 
 
+def _receipt_conflict_park(conn, lease, event_id, now_ms):
+    # A conflicting FINAL receipt blocks further work on the account
+    # (section 4, card row "receipt conflict blocks"): recorded like
+    # the overrun park - one live NULL-model parked block keyed to
+    # the conflicting event. OR IGNORE: the account may already be
+    # parked (blocks_live allows one live block per (account,
+    # model-or-null)). The park commits before the conflict is
+    # raised: the raise rolls the settle transaction back, but the
+    # block must survive it.
+    conn.execute(
+        "INSERT OR IGNORE INTO blocks(id, account_id, model_id, reason, "
+        "retry_at, state, source_event_id, updated_at) "
+        "VALUES(?,?,?,?,NULL,'parked',?,?)",
+        (str(_uuid.uuid4()), lease["account_id"], None,
+         "receipt_conflict", event_id, now_ms))
+    conn.execute(
+        "INSERT INTO audit(actor_alias, action, object_id, at, "
+        "redacted_details) VALUES(?,?,?,?,?)",
+        ("coordinator", "receipt_conflict_block", event_id, now_ms,
+         json.dumps({"lease_id": lease["id"]})))
+    conn.execute("COMMIT")
+
+
 def _settle(conn, receipt, now_ms):
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -860,6 +890,11 @@ def _settle(conn, receipt, now_ms):
         # would otherwise take a foreign home.
         if receipt["gateway_id"] is not None and \
                 receipt["gateway_id"] != lease["gateway_id"]:
+            # A conflicting FINAL receipt blocks further work on the
+            # account (section 4, card row "receipt conflict blocks").
+            if receipt["final"]:
+                _receipt_conflict_park(conn, lease, receipt["event_id"],
+                                       now_ms)
             raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
                              errors.MSG_RECEIPT_CONFLICT)
         stored = conn.execute(
@@ -877,9 +912,14 @@ def _settle(conn, receipt, now_ms):
             return {"state": lease["state"], "replayed": True,
                     "released_micro_eur": 0, "retained_micro_eur": 0}
         if lease["state"] == "settled":
-            # Terminal rows cannot be reopened: a conflicting receipt
-            # blocks and preserves the conservative liability already
-            # recorded (reconciliation is turn 3).
+            # Terminal rows cannot be reopened: a conflicting FINAL
+            # receipt blocks further work on the account (section 4,
+            # card row "receipt conflict blocks") and preserves the
+            # conservative liability already recorded (reconciliation
+            # is the reconciliation card).
+            if receipt["final"]:
+                _receipt_conflict_park(conn, lease, receipt["event_id"],
+                                       now_ms)
             raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
                              errors.MSG_RECEIPT_CONFLICT)
         if not receipt["final"] and (lease["state"] == "uncertain"
@@ -911,8 +951,10 @@ def _settle(conn, receipt, now_ms):
              receipt["outcome"], receipt["final"], receipt["observed_at"],
              receipt["received_at"]))
         released = retained = 0
-        # Max money-hold overrun of this receipt: (period_start, amount).
-        # One adjustments row per receipt: source_event_id is UNIQUE.
+        # Max money-hold overrun of this receipt: (period_start,
+        # amount) - stamped with the lease's own grant-time period
+        # (the original period), not a hold's bucket. One adjustments
+        # row per receipt: source_event_id is UNIQUE.
         overrun = None
         if receipt["final"]:
             conn.execute(
@@ -945,7 +987,7 @@ def _settle(conn, receipt, now_ms):
                     if metric == "money_micro_eur":
                         amount = actual - reserved
                         if overrun is None or amount > overrun[1]:
-                            overrun = (period_start, amount)
+                            overrun = (lease["period_start"], amount)
             # The response contract is per lease (section 7): the
             # lease's own reservation, not the sum over its holds rows
             # (every money cap reserves the same hold size; the
