@@ -1,6 +1,6 @@
-"""Command line interface: init, config-import --file, status --json,
-reading-import --file, set-coverage --account --complete,
-reconcile --gateway (Cards 1-2)."""
+"""Command line interface: init, config-import --file,
+billing-policy-import --file, status --json, reading-import --file,
+set-coverage --account --complete, reconcile --gateway (Cards 1-2b-1)."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ import sys
 from . import errors
 from .errors import QuotaError
 from .store import (
+    billing_policy_import,
     import_config,
     init_db,
     reading_import,
@@ -36,8 +37,9 @@ def _bool(value):
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="quota",
-        description="Quota balancer inventory (Cards 1-2): "
-                    "init, config-import, status, reading-import, set-coverage.",
+        description="Quota balancer inventory (Cards 1-2b-1): "
+                    "init, config-import, billing-policy-import, status, "
+                    "reading-import, set-coverage.",
     )
     parser.add_argument("--db", required=True, help="path to the SQLite database file")
     sub = parser.add_subparsers(dest="verb", required=True)
@@ -46,6 +48,12 @@ def _build_parser():
         "config-import", help="replace the inventory from a version-1 document"
     )
     importer.add_argument("--file", required=True, help="path to the JSON document")
+    policy_importer = sub.add_parser(
+        "billing-policy-import",
+        help="apply the card 2b-1 billing policies (one per metered account)",
+    )
+    policy_importer.add_argument(
+        "--file", required=True, help="path to the JSON document")
     stater = sub.add_parser("status", help="print the inventory status")
     stater.add_argument("--json", action="store_true", required=True)
     reader = sub.add_parser(
@@ -73,6 +81,8 @@ def main(argv=None):
             init_db(args.db)
         elif args.verb == "config-import":
             import_config(args.db, args.file)
+        elif args.verb == "billing-policy-import":
+            billing_policy_import(args.db, args.file)
         elif args.verb == "reading-import":
             reading_import(args.db, args.file)
         elif args.verb == "set-coverage":

@@ -1,14 +1,17 @@
 """Schema migration for the quota inventory store.
 
-Card 1 is migration version 1, card 2 is version 2, and card 3 is version 3.
-Each DDL block is normative: version 1 is copied byte for byte from
-docs/DESIGN.md section 8 ("Card 1"); version 2 adds the card-2 tables
-(readings, windows) and the gateway report / account coverage columns of
-section 7; version 3 adds the card-3 policy tables (models, profiles,
-projects, teams, seats, project_accounts, limits) of section 7. Versions 1
-and 2 are kept byte for byte: a card adds only its own DDL. A store at the
-current version is a no-op; a store at a newer, unknown version is rejected
-before anything is written or switched (left byte-for-byte unchanged).
+Card 1 is migration version 1, card 2 is version 2, card 3 is version 3,
+and card 2b-1 is version 4. Each DDL block is normative: version 1 is
+copied byte for byte from docs/DESIGN.md section 8 ("Card 1"); version 2
+adds the card-2 tables (readings, windows) and the gateway report /
+account coverage columns of section 7; version 3 adds the card-3 policy
+tables (models, profiles, projects, teams, seats, project_accounts,
+limits) of section 7; version 4 (card 2b-1, section 11) rebuilds
+readings' kind CHECK to admit provider_billing and adds the billing
+policy/totals tables. Versions 1-3 are kept byte for byte: a card adds
+only its own DDL. A store at the current version is a no-op; a store at
+a newer, unknown version is rejected before anything is written or
+switched (left byte-for-byte unchanged).
 
 Migration protocol (fix round): the preliminary version read takes no lock.
 A store below the current version is switched to WAL first (WAL is a
@@ -35,7 +38,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -202,11 +205,79 @@ _DDL_V3 = (
     "scope,scope_id,metric,period,COALESCE(window_key,''))",
 )
 
+# Card 2b-1 (migration version 4): provider billing ingestion (section 11).
+#
+# The readings table is REBUILT, not altered: SQLite has no in-place CHECK
+# modification, and the kind CHECK must gain provider_billing. The rebuild
+# (new STRICT table, copy of every row, drop, rename) preserves old rows,
+# IDs, payloads, and the windows table byte for byte. It runs BEFORE
+# billing_totals is created, because billing_totals carries source FKs to
+# readings(event_id). The future usage kind is deliberately NOT admitted:
+# it ships with its own closed validator/consumer.
+#
+# billing_policies is operator-owned config (one policy per metered
+# account, closed enums; unknown basis is permitted configuration, not
+# permission to compare). billing_totals is the source-time reduced view:
+# latest (with its own source time and event), a retained high-water (with
+# its own event), and a conflict latch that only a later audited resolution
+# integration can clear. Currency and scope live in the policy.
+_DDL_V4 = (
+    "CREATE TABLE readings_new(\n"
+    " event_id TEXT PRIMARY KEY,\n"
+    " machine_id TEXT NOT NULL REFERENCES machines(id),\n"
+    " account_id TEXT REFERENCES accounts(id),\n"
+    " seat_id TEXT,\n"
+    " kind TEXT NOT NULL CHECK(kind IN ('cli_window','gateway_snapshot','provider_billing')),\n"
+    " observed_at INTEGER NOT NULL,\n"
+    " received_at INTEGER NOT NULL,\n"
+    " payload TEXT NOT NULL) STRICT;",
+    "INSERT INTO readings_new(event_id, machine_id, account_id, seat_id, kind,\n"
+    " observed_at, received_at, payload)\n"
+    " SELECT event_id, machine_id, account_id, seat_id, kind, observed_at,\n"
+    " received_at, payload FROM readings;",
+    "DROP TABLE readings;",
+    "ALTER TABLE readings_new RENAME TO readings;",
+    "CREATE TABLE billing_policies(\n"
+    " account_id TEXT PRIMARY KEY REFERENCES accounts(id),\n"
+    " reporter_machine_id TEXT NOT NULL REFERENCES machines(id),\n"
+    " scope_alias TEXT NOT NULL,\n"
+    " scope_revision INTEGER NOT NULL CHECK(scope_revision>0),\n"
+    " dedicated_ai INTEGER NOT NULL CHECK(dedicated_ai IN (0,1)),\n"
+    " non_ai_allowance_micro_eur INTEGER NOT NULL CHECK(non_ai_allowance_micro_eur>=0),\n"
+    " cap_basis TEXT NOT NULL CHECK(cap_basis IN ('unknown','ex_vat','invoice_total')),\n"
+    " provider_basis TEXT NOT NULL CHECK(provider_basis IN ('unknown','ex_vat','invoice_total')),\n"
+    " ledger_basis TEXT NOT NULL CHECK(ledger_basis IN ('unknown','ex_vat','invoice_total')),\n"
+    " vat_bps INTEGER CHECK(vat_bps IS NULL OR (vat_bps>=0 AND vat_bps<=10000)),\n"
+    " poll_seconds INTEGER NOT NULL CHECK(poll_seconds>0),\n"
+    " max_age_seconds INTEGER NOT NULL CHECK(max_age_seconds>0),\n"
+    " lag_seconds INTEGER NOT NULL CHECK(lag_seconds>0),\n"
+    " abs_tolerance_micro_eur INTEGER NOT NULL CHECK(abs_tolerance_micro_eur>=0),\n"
+    " relative_tolerance_bps INTEGER NOT NULL CHECK(relative_tolerance_bps>=0 AND relative_tolerance_bps<=10000),\n"
+    " mode TEXT NOT NULL CHECK(mode IN ('advisory')),\n"
+    " stale_action TEXT NOT NULL CHECK(stale_action IN ('alert')),\n"
+    " divergence_action TEXT NOT NULL CHECK(divergence_action IN ('hold'))) STRICT;",
+    "CREATE TABLE billing_totals(\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " scope_revision INTEGER NOT NULL CHECK(scope_revision>0),\n"
+    " period_start INTEGER NOT NULL,\n"
+    " period_end INTEGER NOT NULL,\n"
+    " latest_micro_eur INTEGER NOT NULL,\n"
+    " observed_at INTEGER NOT NULL,\n"
+    " latest_event_id TEXT NOT NULL REFERENCES readings(event_id),\n"
+    " high_water_micro_eur INTEGER NOT NULL,\n"
+    " high_water_event_id TEXT NOT NULL REFERENCES readings(event_id),\n"
+    " conflict INTEGER NOT NULL DEFAULT 0 CHECK(conflict IN (0,1)),\n"
+    " PRIMARY KEY(account_id, scope_revision, period_start)) STRICT;",
+)
+
 # The canonical version-3 migration script, kept for byte-for-byte comparison.
 MIGRATION_V3 = "\n".join(_DDL_V3) + "\nPRAGMA user_version=3;\n"
 
+# The canonical version-4 migration script, kept for byte-for-byte comparison.
+MIGRATION_V4 = "\n".join(_DDL_V4) + "\nPRAGMA user_version=4;\n"
+
 # Step N upgrades a store from version N-1 to version N.
-_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3}
+_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4}
 
 
 def schema_version(conn):
@@ -268,9 +339,10 @@ def migrate(conn):
     A store at the current version is a no-op. A store at a newer, unknown
     version is rejected before anything is written or switched (left
     byte-for-byte unchanged). A store below the current version (0 = fresh
-    or empty file, 1 = card 1) is brought up step by step: the pending
-    steps' DDL and the version stamp commit as one transaction, so a
-    failure (or a stop) between statements leaves no half-built store.
+    or empty file, 1 = card 1, 2 = card 2, 3 = card 3) is brought up step
+    by step to version 4 (card 2b-1): the
+    pending steps' DDL and the version stamp commit as one transaction, so
+    a failure (or a stop) between statements leaves no half-built store.
     """
     version = schema_version(conn)
     if version == SCHEMA_VERSION:

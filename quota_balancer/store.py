@@ -20,9 +20,11 @@ import time
 import uuid
 
 from .errors import (
+    CODE_BILLING_SCOPE_MISMATCH,
     CODE_IDEMPOTENCY_CONFLICT,
     CODE_INVALID_CONFIG,
     CODE_STORE_ERROR,
+    MSG_BILLING_SCOPE_MISMATCH,
     MSG_IDEMPOTENCY_CONFLICT,
     MSG_INVALID_CONFIG,
     MSG_STORE_FAILED,
@@ -32,15 +34,23 @@ from .errors import (
 from .migrate import SCHEMA_VERSION, migrate, require_supported, rollback_quietly
 from .reduce import (
     GATEWAY_STATE_OK,
+    GATEWAY_STATE_RECONCILE,
+    billing_freshness,
     gateway_report_state,
+    reduce_billing_total,
     reduce_gateway_report,
     reduce_window,
     window_freshness,
 )
 from .validate import validate
+from .validate_policies import (
+    allocation_within_cap,
+    validate_billing_policies,
+)
 from .validate_readings import (
     KIND_CLI_WINDOW,
     KIND_GATEWAY_SNAPSHOT,
+    KIND_PROVIDER_BILLING,
     validate_readings,
 )
 
@@ -83,10 +93,10 @@ def init_db(path):
     """Create or upgrade the store to the current schema version.
 
     The migration itself is transactional and ordered (see
-    migrate.migrate): a version-0 store runs steps 1 and 2, a card-1
-    (version-1) store runs step 2, a store at the current version is a
-    no-op, and a newer, unknown version is rejected before anything is
-    written or switched.
+    migrate.migrate): a version-0 store runs steps 1, 2 and 3, a card-1
+    (version-1) store runs steps 2 and 3, a card-2 (version-2) store runs
+    step 3, a store at the current version is a no-op, and a newer, unknown
+    version is rejected before anything is written or switched.
     """
     if sqlite3.sqlite_version_info < (3, 37, 0):
         # STRICT tables require SQLite >= 3.37; fail before touching the file.
@@ -193,16 +203,39 @@ def _upsert(conn, accounts, machines, gateways):
 
     # Gateways: update config-owned columns for retained aliases (the report
     # columns - ledger_epoch, last_seq, period_*, policy_hashes, last_report_at,
-    # state, sized_ready - are left untouched); insert new ones.
+    # state, sized_ready - are left untouched); insert new ones. Exception:
+    # a retained gateway re-pointed to a different machine or account has
+    # its report columns reset and is marked reconciliation_required. The
+    # new owner's ledger is a new ledger (its reports typically restart at
+    # seq 1); carrying the old owner's epoch/seq/hashes over would drop
+    # those reports as smaller seqs and then accept them as a continuation
+    # without reconciliation.
     for alias, account, machine, share, period in gateways:
         gateway_id = old_gateways.get(alias) or str(uuid.uuid4())
         if alias in old_gateways:
-            conn.execute(
-                "UPDATE gateways SET account_id=?, machine_id=?, "
-                "share_micro_eur=?, period=? WHERE id=?",
-                (account_ids[account], machine_ids[machine], share, period,
-                 gateway_id),
-            )
+            old = conn.execute(
+                "SELECT account_id, machine_id FROM gateways WHERE id=?",
+                (gateway_id,),
+            ).fetchone()
+            owner_changed = (old[0] != account_ids[account]
+                             or old[1] != machine_ids[machine])
+            if owner_changed:
+                conn.execute(
+                    "UPDATE gateways SET account_id=?, machine_id=?, "
+                    "share_micro_eur=?, period=?, ledger_epoch=NULL, "
+                    "last_seq=NULL, period_start=NULL, period_end=NULL, "
+                    "policy_hashes=NULL, last_report_at=NULL, state=?, "
+                    "sized_ready=0 WHERE id=?",
+                    (account_ids[account], machine_ids[machine], share,
+                     period, GATEWAY_STATE_RECONCILE, gateway_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE gateways SET account_id=?, machine_id=?, "
+                    "share_micro_eur=?, period=? WHERE id=?",
+                    (account_ids[account], machine_ids[machine], share,
+                     period, gateway_id),
+                )
         else:
             conn.execute(
                 "INSERT INTO gateways(id, alias, account_id, machine_id,"
@@ -222,6 +255,9 @@ def _upsert(conn, accounts, machines, gateways):
     for alias in set(old_machines) - set(machines):
         if (_references(conn, "readings", "machine_id", old_machines[alias])
                 or _references(conn, "seats", "machine_id",
+                               old_machines[alias])
+                or _references(conn, "billing_policies",
+                               "reporter_machine_id",
                                old_machines[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
@@ -232,6 +268,10 @@ def _upsert(conn, accounts, machines, gateways):
                 or _references(conn, "models", "account_id",
                                old_accounts[alias])
                 or _references(conn, "project_accounts", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "billing_policies", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "billing_totals", "account_id",
                                old_accounts[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))
@@ -244,6 +284,138 @@ def _references(conn, table, column, entity_id):
         (entity_id,),
     ).fetchone()
     return row is not None
+
+
+def billing_policy_import(path, file):
+    """Validate a billing-policy document and apply it atomically.
+
+    Validation (the closed shape, the closed enums, the B01 allocation
+    check) happens before or under the write lock, and the import is an
+    UPSERT - one policy per metered account. Once the account has a
+    provider billing reading, the protected fields (the reporter
+    machine, the scope alias/revision, and the three tax bases) are
+    frozen: a change to any of them is refused, while the operator-
+    tunable fields (allowance, rate, cadence, tolerances, actions)
+    still update.
+    """
+    try:
+        with open(file, "r", encoding="utf-8-sig") as handle:
+            doc = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError, RecursionError):
+        # Missing or unreadable file, malformed JSON, undecodable text, or
+        # pathologically deep nesting: a bad document, not a store fault.
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+    policies = validate_billing_policies(doc)
+
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            _apply_billing_policies(conn, policies)
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def _apply_billing_policies(conn, policies):
+    """Apply a validated billing-policy document, one upsert per policy.
+
+    Inside the import's BEGIN IMMEDIATE. The store-level rules: the
+    account exists and is METERED (a provider bill is attributed money;
+    a subscription account has no cap to bound an allowance), the
+    reporter machine exists, and the B01 allocation (shares + allowance
+    <= cap, on the cap's tax basis) fits. The protected fields are
+    frozen once a provider billing reading for the account exists.
+    """
+    accounts = {}
+    for (account_id, alias, kind, budget) in conn.execute(
+            "SELECT id, alias, kind, budget_micro_eur FROM accounts"):
+        accounts[alias] = (account_id, kind, budget)
+    machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
+    shares = {}
+    for (account_id, total) in conn.execute(
+            "SELECT account_id, SUM(share_micro_eur) FROM gateways "
+            "GROUP BY account_id"):
+        shares[account_id] = total
+
+    for policy in policies:
+        account = accounts.get(policy["account"])
+        if account is None or account[1] != "metered":
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        account_id, _kind, budget = account
+        reporter_id = machine_ids.get(policy["reporter_machine"])
+        if reporter_id is None:
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        allocation_within_cap(
+            budget, shares.get(account_id, 0),
+            policy["non_ai_allowance_micro_eur"],
+            policy["cap_basis"], policy["ledger_basis"],
+            policy["vat_bps"])
+
+        existing = conn.execute(
+            "SELECT reporter_machine_id, scope_alias, scope_revision, "
+            "cap_basis, provider_basis, ledger_basis "
+            "FROM billing_policies WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        has_history = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM readings WHERE kind = "
+            "'provider_billing' AND account_id = ?)",
+            (account_id,),
+        ).fetchone()[0]
+        if existing is not None and has_history:
+            protected = (reporter_id, policy["scope_alias"],
+                         policy["scope_revision"], policy["cap_basis"],
+                         policy["provider_basis"], policy["ledger_basis"])
+            if existing != protected:
+                # Owner/scope/basis changes are refused once a billing
+                # reading exists (section 11): the later audited
+                # resolution integration is the only path past them.
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+        conn.execute(
+            "INSERT INTO billing_policies(account_id, reporter_machine_id, "
+            "scope_alias, scope_revision, dedicated_ai, "
+            "non_ai_allowance_micro_eur, cap_basis, provider_basis, "
+            "ledger_basis, vat_bps, poll_seconds, max_age_seconds, "
+            "lag_seconds, abs_tolerance_micro_eur, relative_tolerance_bps, "
+            "mode, stale_action, divergence_action) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(account_id) DO UPDATE SET "
+            "reporter_machine_id=excluded.reporter_machine_id, "
+            "scope_alias=excluded.scope_alias, "
+            "scope_revision=excluded.scope_revision, "
+            "dedicated_ai=excluded.dedicated_ai, "
+            "non_ai_allowance_micro_eur=excluded.non_ai_allowance_micro_eur, "
+            "cap_basis=excluded.cap_basis, "
+            "provider_basis=excluded.provider_basis, "
+            "ledger_basis=excluded.ledger_basis, "
+            "vat_bps=excluded.vat_bps, "
+            "poll_seconds=excluded.poll_seconds, "
+            "max_age_seconds=excluded.max_age_seconds, "
+            "lag_seconds=excluded.lag_seconds, "
+            "abs_tolerance_micro_eur=excluded.abs_tolerance_micro_eur, "
+            "relative_tolerance_bps=excluded.relative_tolerance_bps, "
+            "mode=excluded.mode, "
+            "stale_action=excluded.stale_action, "
+            "divergence_action=excluded.divergence_action",
+            (account_id, reporter_id, policy["scope_alias"],
+             policy["scope_revision"], 1,
+             policy["non_ai_allowance_micro_eur"], policy["cap_basis"],
+             policy["provider_basis"], policy["ledger_basis"],
+             policy["vat_bps"], policy["poll_seconds"],
+             policy["max_age_seconds"], policy["lag_seconds"],
+             policy["abs_tolerance_micro_eur"],
+             policy["relative_tolerance_bps"], policy["mode"],
+             policy["stale_action"], policy["divergence_action"]),
+        )
 
 
 def reading_import(path, file):
@@ -335,8 +507,122 @@ def _apply_reading(conn, reading, machine_ids, account_ids, gateway_ids, now_ms)
 
     if kind == KIND_CLI_WINDOW:
         _reduce_cli_window(conn, reading, account_id)
-    else:  # KIND_GATEWAY_SNAPSHOT
+    elif kind == KIND_GATEWAY_SNAPSHOT:
         _reduce_gateway_snapshot(conn, reading, gateway_ids)
+    else:  # KIND_PROVIDER_BILLING
+        _reduce_provider_billing(conn, reading, account_id, machine_id)
+
+
+def _reduce_provider_billing(conn, reading, account_id, machine_id):
+    """Reduce a provider_billing reading into billing_totals.
+
+    A provider bill is attributed money, so the account must be metered
+    (a subscription account has no spend to attribute). The account must
+    have an operator billing policy: with no policy the owner is unknown,
+    so a reading from any machine, scope alias or revision is rejected
+    and nothing is reduced into billing_totals. Where the policy exists,
+    the reading must match it - reporter machine, scope alias and scope
+    revision (section 11): a foreign machine, an inactive revision, or a
+    scope alias the policy does not designate is rejected,
+    and a replica copy never adds totals.
+
+    The metered kind and the B01 allocation invariant are re-checked
+    against the current config on every reading: a config-import that
+    broke either refuses the reading (exit 2) until the operator repairs
+    it.
+
+    The row is keyed by (account_id, scope_revision, period_start); the
+    reduction is by SOURCE time (the pure reduce_billing_total): newer
+    observations set latest (a newer total below the high-water latches
+    a conflict), an equal-time unequal total latches a conflict, and an
+    older total above the latest latches one too (raising the
+    high-water where it beats it) without refreshing the latest time.
+    The conflict is sticky: only a later audited resolution clears it.
+    The currency and the money basis live in the policy, not the row.
+    """
+    account = conn.execute(
+        "SELECT kind, budget_micro_eur FROM accounts WHERE id = ?",
+        (account_id,)).fetchone()
+    if account[0] != "metered":
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+    policy = conn.execute(
+        "SELECT reporter_machine_id, scope_alias, scope_revision, "
+        "non_ai_allowance_micro_eur, cap_basis, ledger_basis, vat_bps "
+        "FROM billing_policies WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    if policy is None:
+        # No policy, no owner: nothing is accepted until the operator
+        # designates the reporter, scope and revision.
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if (machine_id != policy[0]
+            or reading["scope_alias"] != policy[1]
+            or reading["scope_revision"] != policy[2]):
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    # B01 is enforced at ingest as well as at policy import: config-
+    # import is a full replacement, so the shares, the cap or the
+    # account kind may have moved since the policy was checked. The
+    # reading is accepted only while the CURRENT config still holds
+    # shares + non-AI allowance <= cap on the cap basis; an unknown tax
+    # basis defers the check (the reading is recorded, never approved).
+    shares = conn.execute(
+        "SELECT COALESCE(SUM(share_micro_eur), 0) FROM gateways "
+        "WHERE account_id = ?", (account_id,)).fetchone()[0]
+    allocation_within_cap(
+        account[1], shares, policy[3], policy[4], policy[5], policy[6])
+
+    period_start = reading["period_start"]
+    period_end = reading["period_end"]
+    scope_revision = reading["scope_revision"]
+    row = conn.execute(
+        "SELECT period_end, latest_micro_eur, observed_at, "
+        "latest_event_id, high_water_micro_eur, high_water_event_id, "
+        "conflict "
+        "FROM billing_totals WHERE account_id = ? AND scope_revision = ? "
+        "AND period_start = ?",
+        (account_id, scope_revision, period_start),
+    ).fetchone()
+    if row is not None:
+        if row[0] != period_end:
+            # Row invariant: one (account, scope_revision, period_start)
+            # row carries one period_end. A different end on the same key
+            # is a scope mismatch, not a second period (the import path
+            # cannot reach this now that a period is exactly one UTC
+            # month; the guard pins the invariant against other writers).
+            raise QuotaError(CODE_BILLING_SCOPE_MISMATCH,
+                              MSG_BILLING_SCOPE_MISMATCH)
+        existing = row[1:]
+    else:
+        existing = None
+    updated = reduce_billing_total(existing, reading["total_micro_eur"],
+                                   reading["observed_at"],
+                                   reading["event_id"])
+    if updated is None:
+        # The reading is recorded but changes nothing (a replay or an
+        # older total at or below the latest).
+        return
+    (latest, observed_at, latest_event_id, high_water, high_water_event_id,
+     conflict) = updated
+    if existing is None:
+        conn.execute(
+            "INSERT INTO billing_totals(account_id, scope_revision, "
+            "period_start, period_end, latest_micro_eur, observed_at, "
+            "latest_event_id, high_water_micro_eur, high_water_event_id, "
+            "conflict) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (account_id, scope_revision, period_start, period_end, latest,
+             observed_at, latest_event_id, high_water, high_water_event_id,
+             conflict),
+        )
+    else:
+        conn.execute(
+            "UPDATE billing_totals SET latest_micro_eur=?, observed_at=?, "
+            "latest_event_id=?, high_water_micro_eur=?, "
+            "high_water_event_id=?, conflict=? "
+            "WHERE account_id=? AND scope_revision=? AND period_start=?",
+            (latest, observed_at, latest_event_id, high_water,
+             high_water_event_id, conflict,
+             account_id, scope_revision, period_start),
+        )
 
 
 def _reduce_cli_window(conn, reading, account_id):
@@ -510,12 +796,96 @@ def _project_windows(conn, account_id, now_ms):
     return windows
 
 
+def _project_billing(conn, now_ms):
+    """Project the card-2b-1 billing state, one entry per account that has a
+    billing policy or reduced totals, sorted by account alias.
+
+    Only local aliases and numbers appear (privacy). Freshness is evaluated
+    at read time against the policy's max_age; an account with totals but no
+    policy projects an unknown freshness (never assumed fresh).
+    """
+    machine_alias = dict(conn.execute("SELECT id, alias FROM machines"))
+    account_alias = dict(conn.execute("SELECT id, alias FROM accounts"))
+
+    policies = {}
+    for (account_id, reporter_id, scope_alias, scope_rev, dedicated,
+         allowance, cap_basis, provider_basis, ledger_basis, vat_bps,
+         poll_s, max_age_s, lag_s, abs_tol, rel_tol, mode, stale_action,
+         divergence_action) in conn.execute(
+            "SELECT account_id, reporter_machine_id, scope_alias, "
+            "scope_revision, dedicated_ai, non_ai_allowance_micro_eur, "
+            "cap_basis, provider_basis, ledger_basis, vat_bps, poll_seconds, "
+            "max_age_seconds, lag_seconds, abs_tolerance_micro_eur, "
+            "relative_tolerance_bps, mode, stale_action, divergence_action "
+            "FROM billing_policies"):
+        policies[account_id] = {
+            "reporter_machine": machine_alias.get(reporter_id),
+            "scope_alias": scope_alias,
+            "scope_revision": scope_rev,
+            "dedicated_ai": bool(dedicated),
+            "non_ai_allowance_micro_eur": allowance,
+            "cap_basis": cap_basis,
+            "provider_basis": provider_basis,
+            "ledger_basis": ledger_basis,
+            "vat_bps": vat_bps,
+            "poll_seconds": poll_s,
+            "max_age_seconds": max_age_s,
+            "lag_seconds": lag_s,
+            "abs_tolerance_micro_eur": abs_tol,
+            "relative_tolerance_bps": rel_tol,
+            "mode": mode,
+            "stale_action": stale_action,
+            "divergence_action": divergence_action,
+        }
+
+    totals_by_account = {}
+    for (account_id, scope_rev, p_start, p_end, latest, obs, _latest_ev,
+         hw, _hw_ev, conflict) in conn.execute(
+            "SELECT account_id, scope_revision, period_start, period_end, "
+            "latest_micro_eur, observed_at, latest_event_id, "
+            "high_water_micro_eur, high_water_event_id, conflict "
+            "FROM billing_totals"):
+        totals_by_account.setdefault(account_id, []).append(
+            (scope_rev, p_start, p_end, latest, obs, hw, conflict))
+
+    entries = []
+    account_ids = sorted(set(policies) | set(totals_by_account),
+                         key=lambda aid: account_alias.get(aid, ""))
+    for account_id in account_ids:
+        policy = policies.get(account_id)
+        max_age_ms = (policy["max_age_seconds"] * 1000) if policy else None
+        totals = []
+        for (scope_rev, p_start, p_end, latest, obs, hw, conflict) in sorted(
+                totals_by_account.get(account_id, []), key=lambda t: (t[0], t[1])):
+            fresh, reason = billing_freshness(obs, max_age_ms, now_ms)
+            totals.append({
+                "scope_revision": scope_rev,
+                "period_start": p_start,
+                "period_end": p_end,
+                "latest_micro_eur": latest,
+                "observed_at": obs,
+                "high_water_micro_eur": hw,
+                "conflict": bool(conflict),
+                "age_ms": (now_ms - obs) if obs is not None else None,
+                "fresh": fresh,
+                "freshness_reason": reason,
+            })
+        entries.append({
+            "account": account_alias.get(account_id),
+            "policy": policy,
+            "totals": totals,
+        })
+    return entries
+
+
 def status(path):
-    """Project the inventory plus card-2 windows/reports, sorted by alias.
+    """Project the inventory plus card-2 windows/reports and the card-2b-1
+    billing state, sorted by alias.
 
     One read transaction: the version check and all projections share a
-    single snapshot. Freshness (window age/current and the gateway report
-    state) is evaluated against the wall clock at read time.
+    single snapshot. Freshness (window age/current, the gateway report
+    state, and the billing total's age against its policy's max_age) is
+    evaluated against the wall clock at read time.
     """
     now_ms = int(time.time() * 1000)
     conn = _connect(path, must_exist=True)
@@ -576,6 +946,7 @@ def status(path):
                 "accounts": accounts,
                 "machines": machines,
                 "gateways": gateways,
+                "billing": _project_billing(conn, now_ms),
             }
             conn.execute("COMMIT")
             return result

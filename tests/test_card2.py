@@ -1038,6 +1038,112 @@ class ConfigImportUpsert(_Base):
         self.assertEqual(retained["desktop"], ids["desktop"])
 
 
+class ConfigImportRepoint(_Base):
+    """Gate fix: re-pointing a retained gateway to another machine or
+    account must reset its report state. Carrying the old owner's
+    ledger_epoch/last_seq/policy_hashes/state over would let the new
+    owner's first report (a new ledger, typically seq 1) be dropped as a
+    smaller seq, then accepted as a continuation without reconciliation.
+    The new owner's seq 1 must be accepted and the gateway must stay
+    reconciliation_required until an operator runs reconcile."""
+
+    def _reports(self):
+        return {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
+
+    def test_repoint_machine_resets_report_state(self):
+        # g1 (desktop/meter) has reported seq 500, state ok.
+        now = _now_ms()
+        self.assertEqual(_readings_import(self.db, self.tmp,
+            _doc([_gateway_snapshot(_eid("rp1"), "desktop", "meter", "g1", 7, 500,
+                                     now - 1000,
+                                     policy_hashes={"price": PRICE_HASH,
+                                                    "child_cap": CAP_HASH})])).returncode, 0)
+        reports = self._reports()
+        self.assertEqual(reports["g1"]["last_seq"], 500)
+        self.assertEqual(reports["g1"]["state"], "ok")
+
+        # Re-point the retained gateway to the other machine (same account).
+        re_pointed = copy.deepcopy(VALID_DOC)
+        re_pointed["gateways"][0]["machine"] = "worker"
+        self.assertEqual(_config_import(self.db, self.tmp, re_pointed).returncode, 0)
+
+        # The old owner's report state is gone: no seq, epoch, or hashes
+        # are carried over, and read-time the gateway has no report yet.
+        reports = self._reports()
+        self.assertIsNone(reports["g1"]["last_seq"])
+        self.assertIsNone(reports["g1"]["ledger_epoch"])
+        self.assertIsNone(reports["g1"]["policy_hashes"])
+        self.assertIsNone(reports["g1"]["last_report_at"])
+        self.assertEqual(reports["g1"]["state"], "none")
+
+        # The new owner's first report (a new ledger, seq 1) is neither
+        # silently dropped as a smaller seq nor silently continued: it is
+        # accepted, and the gateway stays reconciliation_required until an
+        # operator runs reconcile.
+        self.assertEqual(_readings_import(self.db, self.tmp,
+            _doc([_gateway_snapshot(_eid("rp2"), "worker", "meter", "g1", 7, 1,
+                                     now - 500,
+                                     policy_hashes={"price": PRICE_HASH,
+                                                    "child_cap": CAP_HASH})])).returncode, 0)
+        reports = self._reports()
+        self.assertEqual(reports["g1"]["last_seq"], 1)
+        self.assertEqual(reports["g1"]["state"], "reconciliation_required")
+
+    def test_repoint_account_resets_report_state(self):
+        doc = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100_000_000},
+                {"alias": "meter2", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100_000_000},
+            ],
+            "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60_000_000, "period": "utc_month"},
+                {"alias": "g2", "account": "meter", "machine": "worker",
+                 "share_micro_eur": 40_000_000, "period": "utc_month"},
+            ],
+        }
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
+
+        # g1 (meter/desktop) has reported seq 500.
+        now = _now_ms()
+        self.assertEqual(_readings_import(self.db, self.tmp,
+            _doc([_gateway_snapshot(_eid("ra1"), "desktop", "meter", "g1", 7, 500,
+                                     now - 1000,
+                                     policy_hashes={"price": PRICE_HASH,
+                                                    "child_cap": CAP_HASH})])).returncode, 0)
+        self.assertEqual(self._reports()["g1"]["last_seq"], 500)
+
+        # Re-point the retained gateway to the other account (same machine).
+        re_pointed = copy.deepcopy(doc)
+        re_pointed["gateways"][0]["account"] = "meter2"
+        self.assertEqual(_config_import(self.db, self.tmp, re_pointed).returncode, 0)
+        self.assertIsNone(self._reports()["g1"]["last_seq"])
+
+        # The new account's reporter is the same machine; its first report
+        # (seq 1) is accepted and latches reconciliation_required.
+        self.assertEqual(_readings_import(self.db, self.tmp,
+            _doc([_gateway_snapshot(_eid("ra2"), "desktop", "meter2", "g1", 7, 1,
+                                     now - 500,
+                                     policy_hashes={"price": PRICE_HASH,
+                                                    "child_cap": CAP_HASH})])).returncode, 0)
+        reports = self._reports()
+        self.assertEqual(reports["g1"]["last_seq"], 1)
+        self.assertEqual(reports["g1"]["state"], "reconciliation_required")
+
+    def test_repoint_without_reports_keeps_none(self):
+        # Re-pointing a gateway that never reported stays clean: no report
+        # state to reset, state none.
+        re_pointed = copy.deepcopy(VALID_DOC)
+        re_pointed["gateways"][0]["machine"] = "worker"
+        self.assertEqual(_config_import(self.db, self.tmp, re_pointed).returncode, 0)
+        self.assertEqual(self._reports()["g1"]["state"], "none")
+        self.assertIsNone(self._reports()["g1"]["last_seq"])
+
+
 class StoreConnectivity(_Base):
     """READ A (MAJOR): the store connection carries an explicit busy
     timeout, so a hot journal left by a crashed writer - or a lock held by
