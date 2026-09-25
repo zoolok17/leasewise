@@ -74,6 +74,7 @@ under the write lock, after every earlier grant committed.
 """
 
 import datetime
+import hashlib
 import json
 import sqlite3
 import uuid as _uuid
@@ -119,6 +120,14 @@ _METRIC_RANK = {"money_micro_eur": 0, "input_tokens": 1, "window_bps": 2,
 _PERIOD_RANK = {"month": 0, "day": 1, "turn": 2, "window": 0}
 
 _DAY_MS = 86_400_000
+# Section 6: profile TTLs are 30m/2h/6h with a 24h absolute maximum;
+# ttl_ms can shorten but never exceed it.
+_MAX_TTL_MS = 24 * _DAY_MS
+# The platform singleton scope id: platform caps are the scope='platform'
+# limits rows carried by this reserved id. The scope spans every seat,
+# so the grant's chain always carries it and every platform row applies
+# to every lease (card-3: a chain scope id is always a UUID).
+_PLATFORM_ID = "00000000-0000-0000-0000-000000000000"
 
 _LEASE_COLS = (
     "id", "machine_id", "seat_id", "account_id", "model_id", "gateway_id",
@@ -207,7 +216,9 @@ def _validate_grant_request(request):
         _invalid()
     policy._check_int(request["output_cap"])
     policy._check_int(request["per_call_output_cap"])
-    policy._check_int(request["ttl_ms"], 1)
+    # Static: a ttl above the 24h maximum is a permanent hold, not a
+    # lease (section 6).
+    policy._check_int(request["ttl_ms"], 1, _MAX_TTL_MS)
 
 
 def _validate_settle_receipt(receipt):
@@ -235,13 +246,34 @@ def _validate_settle_receipt(receipt):
 
 def _chain_pred(scope):
     # A predicate over the leases table `l` selecting the leases of the
-    # named scope; it binds exactly one `?` (the scope id, bound last).
+    # named scope; the caller binds the scope id last via _chain_bind
+    # (the platform scope spans every lease and binds nothing).
+    if scope == "platform":
+        return "1=1"
     if scope == "seat":
         return "l.seat_id = ?"
     if scope == "team":
         return "l.seat_id IN (SELECT id FROM seats WHERE team_id = ?)"
     return ("l.seat_id IN (SELECT id FROM seats WHERE team_id IN "
             "(SELECT id FROM teams WHERE project_id = ?))")
+
+
+def _chain_bind(scope, scope_id):
+    # The scope id the matching _chain_pred binds (the platform
+    # predicate spans every lease and binds nothing).
+    return () if scope == "platform" else (scope_id,)
+
+
+def _content_hash(request):
+    # The idempotency content hash, computed server-side: every request
+    # field except the client-supplied request_hash, canonically
+    # serialized. A changed field changes the hash; the client cannot
+    # choose one.
+    canonical = {k: v for k, v in request.items()
+                 if k != "request_hash"}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest()
 
 
 def _lease_row(conn, lease_id):
@@ -333,7 +365,8 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
     else:
         new = 0  # advisory: no reservation
     usage = {}
-    scope_ids = [(s, chain[s]) for s in ("project", "team", "seat")
+    scope_ids = [(s, chain[s]) for s in ("platform", "project",
+                                         "team", "seat")
                  if chain[s] is not None]
     if metric == "window_bps":
         # Window usage is account-level (windows table): one usage for
@@ -357,7 +390,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
             count = conn.execute(
                 "SELECT COUNT(*) FROM leases l WHERE l.state IN "
                 "('active','uncertain') AND " + _chain_pred(scope),
-                (scope_id,)).fetchone()[0]
+                _chain_bind(scope, scope_id)).fetchone()[0]
             usage[(scope, scope_id)] = (count, 0)
     else:
         column = ("r.actual_micro_eur" if metric == "money_micro_eur"
@@ -376,10 +409,14 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                 "SELECT COALESCE(SUM(" + column + "),0) FROM receipts r "
                 "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
                 + settled_bucket + "=? AND " + _chain_pred(scope),
-                (ps, scope_id)).fetchone()[0]
+                (ps,) + _chain_bind(scope, scope_id)).fetchone()[0]
+            # The platform singleton matches every platform row loaded
+            # for this group (the query only selects the singleton).
             limit_ids = [r["id"] for r in limit_rows
-                         if r["scope"] == scope and r["scope_id"] == scope_id
-                         and r["metric"] == metric and r["period"] == period]
+                         if r["metric"] == metric and r["period"] == period
+                         and (scope == "platform"
+                              or (r["scope"] == scope
+                                  and r["scope_id"] == scope_id))]
             holds = 0
             if limit_ids:
                 placeholders = ",".join("?" * len(limit_ids))
@@ -393,7 +430,8 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                     "AND h.limit_id IN (" + placeholders + ") AND "
                     "l.state IN ('active','uncertain') AND "
                     + _chain_pred(scope),
-                    (ps, *limit_ids, scope_id)).fetchone()[0]
+                    (ps, *limit_ids) + _chain_bind(scope,
+                                                   scope_id)).fetchone()[0]
             usage[(scope, scope_id)] = (settled, holds)
     # The account budget: the one mandatory (money, month) cap, enforced
     # against the account's own settled charges and synthetic holds.
@@ -469,19 +507,34 @@ def _grant(conn, request, now_ms):
             _not_found()
         machine_id = seat[1]
         account_id, _kind, budget = account
-        chain = {"platform": None, "project": project[0], "team": team[0],
-                 "seat": seat[0]}
+        # Project authorization (section 7: children share project
+        # authorization; the server derives membership): the model's
+        # account must be one the seat's project has been given.
+        if conn.execute(
+                "SELECT 1 FROM project_accounts WHERE project_id=? "
+                "AND account_id=?", (project[0], account_id)).fetchone() \
+                is None:
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
+        # The platform singleton: platform caps are the
+        # scope='platform' rows carried by the reserved singleton id
+        # (the scope spans every seat, so it applies to all of them).
+        chain = {"platform": _PLATFORM_ID, "project": project[0],
+                 "team": team[0], "seat": seat[0]}
 
         _parked_block_error(conn, account_id, model[0])
 
         # Idempotency: same (machine, request_id) + same content replays
         # the stored lease without adding a hold; different content is a
-        # conflict.
+        # conflict. The content hash is computed server-side over the
+        # canonical request - a client-supplied hash cannot make a
+        # changed replay look identical.
+        content_hash = _content_hash(request)
         existing = conn.execute(
             "SELECT id, request_hash FROM leases WHERE machine_id=? AND "
             "request_id=?", (machine_id, request["request_id"])).fetchone()
         if existing is not None:
-            if existing[1] != request["request_hash"]:
+            if existing[1] != content_hash:
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
@@ -513,17 +566,27 @@ def _grant(conn, request, now_ms):
 
         # Enforcement is derived, never requested: a metered seat grants
         # a sized hold only through a sized-ready gateway; otherwise the
-        # lease is metered_advisory (null money_hold, no holds).
+        # lease is metered_advisory (null money_hold, no holds). A
+        # supplied gateway must be this account's on this seat's
+        # machine: a foreign one cannot bind (much less upgrade the
+        # enforcement of) the lease.
         enforcement = seat[3]
-        if enforcement == "metered":
-            if request["gateway_id"] is None:
-                _invalid()  # gateway is null only for subscriptions
-            sized = conn.execute("SELECT sized_ready FROM gateways "
-                                 "WHERE id=?",
-                                 (request["gateway_id"],)).fetchone()
-            if sized is None:
+        sized_ready = None
+        if request["gateway_id"] is not None:
+            gw = conn.execute(
+                "SELECT account_id, machine_id, sized_ready FROM "
+                "gateways WHERE id=?",
+                (request["gateway_id"],)).fetchone()
+            if gw is None:
                 _not_found()
-            if not sized[0]:
+            if gw[0] != account_id or gw[1] != machine_id:
+                raise QuotaError(errors.CODE_POLICY_DENIED,
+                                 errors.MSG_POLICY_DENIED)
+            sized_ready = gw[2]
+        if enforcement == "metered":
+            if sized_ready is None:
+                _invalid()  # gateway is null only for subscriptions
+            if not sized_ready:
                 enforcement = "metered_advisory"
         metered = enforcement == "metered"
         money_hold = hold_sized if metered else None
@@ -538,10 +601,12 @@ def _grant(conn, request, now_ms):
             for r in conn.execute(
                 "SELECT id, scope, scope_id, metric, period, window_key, "
                 "soft, hard FROM limits WHERE "
+                "(scope='platform' AND scope_id=:platform) OR "
                 "(scope='project' AND scope_id=:project) OR "
                 "(scope='team' AND scope_id=:team) OR "
                 "(scope='seat' AND scope_id=:seat)",
-                {"project": chain["project"], "team": chain["team"],
+                {"platform": chain["platform"],
+                 "project": chain["project"], "team": chain["team"],
                  "seat": chain["seat"]})
         ]
         groups = {}
@@ -570,6 +635,11 @@ def _grant(conn, request, now_ms):
 
         lease_id = str(_uuid.uuid4())
         period_start = _month_start_ms(now_ms)
+        # The capped ttl cannot overflow, but the sum is still checked
+        # against int64: a raw OverflowError is not a typed refusal.
+        expires_at = now_ms + request["ttl_ms"]
+        if expires_at > policy.INT64_MAX:
+            _invalid()
         policy_snapshot = json.dumps({
             "policy_hash": model[10],
             "reservation_mode": model[9],
@@ -596,11 +666,11 @@ def _grant(conn, request, now_ms):
             (lease_id, machine_id, seat[0], account_id, model[0],
              request["gateway_id"], request["parent_lease_id"],
              request["turn_id"], request["request_id"],
-             request["request_hash"], None, request["effort"],
+             content_hash, None, request["effort"],
              context["mode"], enforcement, json.dumps(est, sort_keys=True),
              policy_snapshot, input_cap, request["output_cap"],
              request["max_calls"], request["per_call_output_cap"],
-             money_hold, now_ms, now_ms + request["ttl_ms"], period_start,
+             money_hold, now_ms, expires_at, period_start,
              "active"))
         # One holds row per applicable input/money limit (reserved = I or
         # H); only a sized metered lease reserves.
@@ -797,8 +867,13 @@ def _settle(conn, receipt, now_ms):
             # holds at their original, grant-time period_start.)
             raise QuotaError(errors.CODE_LEASE_EXPIRED,
                              errors.MSG_LEASE_EXPIRED)
-        if receipt["final"] and receipt["actual_micro_eur"] is None:
-            _invalid()  # unknown spend is not a zero final receipt
+        # A final receipt on a METERED lease must carry the money:
+        # unknown spend is not a zero final receipt. Leases that
+        # reserved no money (advisory/subscription/shadow) settle with
+        # money=None - their termination confirmation carries no figure.
+        if (receipt["final"] and receipt["actual_micro_eur"] is None
+                and lease["enforcement"] == "metered"):
+            _invalid()
         conn.execute(
             "INSERT INTO receipts(event_id, lease_id, gateway_id, seq, "
             "calls, input_tokens, cached_input_tokens, output_tokens, "

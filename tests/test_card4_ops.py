@@ -131,6 +131,11 @@ def _build_store(tmp, name, budget, gateway_sized=1):
                      (gateway_sized, GATEWAY))
         conn.execute("INSERT INTO projects(id, alias) VALUES(?,?)",
                      (PROJECT, "org"))
+        # Project authorization: the project is given the fixture
+        # account (section 7).
+        conn.execute(
+            "INSERT INTO project_accounts(project_id, account_id) "
+            "VALUES(?,?)", (PROJECT, ACCOUNT))
         conn.execute("INSERT INTO teams(id, project_id, alias) "
                      "VALUES(?,?,?)", (TEAM, PROJECT, "dev"))
         conn.execute(
