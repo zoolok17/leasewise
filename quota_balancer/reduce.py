@@ -300,18 +300,21 @@ def reduce_billing_total(existing, total, observed_at, event_id):
     Returns the new stored tuple
       (latest_micro_eur, observed_at, latest_event_id,
        high_water_micro_eur, high_water_event_id, conflict)
-    or None when the reading changes nothing (an older total that does not
-    beat the high-water).
+    or None when the reading changes nothing (an older total at or
+    below the latest).
 
     Ordering is by SOURCE time (observed_at), never arrival order
     (section 11):
-      * a newer observation sets latest - a newer downward correction
-        retains the high-water and any latched conflict;
+      * a newer observation sets latest - a newer total below the
+        retained high-water latches conflict (an unexplained drop: a
+        provider credit or correction);
       * an equal-time unequal total latches conflict; the latest event is
         the UUID-sort winner so the display is deterministic, and its
         amount is the latest amount;
-      * an older higher total raises the high-water AND latches conflict,
-        without refreshing the stored (latest) time;
+      * an older total above the high-water raises the high-water AND
+        latches conflict, without refreshing the stored (latest) time;
+        an older total above the latest but below the high-water latches
+        conflict and changes nothing else;
       * the high-water is the maximum total ever observed; each amount
         retains its own source time and event.
     The conflict is sticky: only a later audited resolution integration
@@ -323,10 +326,13 @@ def reduce_billing_total(existing, total, observed_at, event_id):
     if observed_at > e_obs:
         new_hw, new_hw_ev = ((total, event_id) if total > e_hw
                              else (e_hw, e_hw_ev))
-        return (total, observed_at, event_id, new_hw, new_hw_ev, e_conf)
+        conflict = 1 if (e_conf or total < e_hw) else 0
+        return (total, observed_at, event_id, new_hw, new_hw_ev, conflict)
     if observed_at < e_obs:
         if total > e_hw:
             return (e_latest, e_obs, e_ev, total, event_id, 1)
+        if total > e_latest:
+            return (e_latest, e_obs, e_ev, e_hw, e_hw_ev, 1)
         return None
     # Equal source time: unequal totals are a conflict.
     if total == e_latest:

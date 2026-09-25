@@ -46,14 +46,17 @@ provider calls, no HTTP, no network. The card's acceptance-matrix rows
   Interrupting after any single DDL step and restarting rolls back to a
   working store (FKs, IDs and windows survive) — `billing_migration_rollback`.
 - **Pure billing primitives (commit 5, `reduce.py`).** `reduce_billing_total`
-  implements the section-11 reducer: newer observations set `latest`,
+  implements the section-11 reducer: newer observations set `latest`
+  (a newer total below the retained high-water latches `conflict`),
   equal-time unequal totals latch `conflict` (latest event chosen by
-  UUID sort for deterministic display), older HIGHER totals raise the
-  high-water and latch the conflict WITHOUT refreshing the stored source
-  time, and a newer downward correction retains high-water/conflict.
+  UUID sort for deterministic display), and an older total above the
+  latest latches the conflict too - raising the high-water where it
+  beats it - WITHOUT refreshing the stored source time; the conflict is
+  sticky, only a later audited resolution clears it.
   `convert_basis(amount, source_basis, target_basis, vat_bps)` is the
   shared pure VAT conversion: explicit bases, unknown defers (never
-  approves), half-micros round upward. `billing_freshness` with the exact
+  approves, and nothing is converted from it - not even to itself),
+  half-micros round upward. `billing_freshness` with the exact
   `age <= max_age` boundary and no idle exemption.
 - **Reading document version 3 (commit 6, `validate_readings.py`).**
   Version-3 documents carry the `provider_billing` kind; version 2 (and

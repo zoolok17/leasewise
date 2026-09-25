@@ -519,10 +519,12 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
 
     The row is keyed by (account_id, scope_revision, period_start); the
     reduction is by SOURCE time (the pure reduce_billing_total): newer
-    observations set latest, an equal-time unequal total latches a
-    conflict, and an older higher total raises the high-water without
-    refreshing the latest time. The currency and the money basis live in
-    the policy, not the row.
+    observations set latest (a newer total below the high-water latches
+    a conflict), an equal-time unequal total latches a conflict, and an
+    older total above the latest latches one too (raising the
+    high-water where it beats it) without refreshing the latest time.
+    The conflict is sticky: only a later audited resolution clears it.
+    The currency and the money basis live in the policy, not the row.
     """
     account_kind = conn.execute(
         "SELECT kind FROM accounts WHERE id = ?", (account_id,)
@@ -558,7 +560,7 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
                                    reading["event_id"])
     if updated is None:
         # The reading is recorded but changes nothing (a replay or an
-        # older total that does not beat the high-water).
+        # older total at or below the latest).
         return
     (latest, observed_at, latest_event_id, high_water, high_water_event_id,
      conflict) = updated

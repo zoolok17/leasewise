@@ -1173,6 +1173,60 @@ class BillingOlderHighWater(_Base):
         self.assertEqual(row[0], t0)
         self.assertEqual(json.loads(row[1])["total_micro_eur"], 50)
 
+    def test_billing_downward_correction_latches(self):
+        # The ruling: a newer total below the retained high-water latches
+        # conflict (a provider credit or correction is not explained
+        # away), and an older total above the latest but below the
+        # high-water latches it too; only a later audited resolution
+        # clears the flag.
+        self.assertEqual(self._import_policy().returncode, 0)
+        t1 = SEP + 10 * _MS_PER_DAY
+        t2 = SEP + 20 * _MS_PER_DAY
+        start, end = _month_bounds_of(t1)
+        ev_20, ev_15, ev_17 = (_eid("dc-20"), _eid("dc-15"), _eid("dc-17"))
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc_v3([_billing(ev_20, "desktop", "meter", "proj-ai", 1,
+                              start, end, 20, False, t1)]
+        )).returncode, 0)
+        # A newer, LOWER total: latest 15, high-water 20, and the
+        # unexplained drop latches the conflict.
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc_v3([_billing(ev_15, "desktop", "meter", "proj-ai", 1,
+                              start, end, 15, False, t2)]
+        )).returncode, 0)
+        total = self._billing()[("meter", start)]
+        self.assertEqual(total["latest_micro_eur"], 15)
+        self.assertEqual(total["observed_at"], t2)
+        self.assertEqual(total["high_water_micro_eur"], 20)
+        self.assertTrue(total["conflict"])
+        # An older total above the latest (17 at t1+1h) but below the
+        # high-water: the conflict stays latched, and the row otherwise
+        # changes nothing (no latest change, no time refresh).
+        before = {t: rows for t, rows in _fingerprint(self.db)
+                  if t != "readings"}
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc_v3([_billing(ev_17, "desktop", "meter", "proj-ai", 1,
+                              start, end, 17, False, t1 + _MS_PER_DAY)]
+        )).returncode, 0)
+        after = {t: rows for t, rows in _fingerprint(self.db)
+                 if t != "readings"}
+        self.assertEqual(after, before)
+        total = self._billing()[("meter", start)]
+        self.assertEqual(total["latest_micro_eur"], 15)
+        self.assertEqual(total["observed_at"], t2)
+        self.assertEqual(total["high_water_micro_eur"], 20)
+        self.assertTrue(total["conflict"])
+        # Pure-function pin: once a later audited resolution has cleared
+        # the flag, the same older total re-latches it.
+        from quota_balancer.reduce import reduce_billing_total
+        cleared = (15, t2, ev_15, 20, ev_20, 0)
+        self.assertEqual(
+            reduce_billing_total(cleared, 17, t1 + _MS_PER_DAY, ev_17),
+            (15, t2, ev_15, 20, ev_20, 1))
+
 
 class BillingTime(_Base):
     """billing_time: the exact freshness and future boundaries (injected
