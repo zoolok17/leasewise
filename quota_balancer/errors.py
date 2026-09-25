@@ -22,6 +22,20 @@ CODE_BILLING_STALE = "BILLING_STALE"
 CODE_BILLING_DIVERGENCE = "BILLING_DIVERGENCE"
 CODE_OPENING_UNSAFE = "OPENING_UNSAFE"
 
+# Card 4 lease-store errors (docs/DESIGN.md section 7). All are
+# client-side request conditions (refuse, re-estimate, wait out the
+# retry_at, or send a different id/content) - the card-1 "invalid
+# request" class, exit 2. None is a store fault (exit 3).
+CODE_NOT_FOUND = "NOT_FOUND"
+CODE_RECEIPT_CONFLICT = "RECEIPT_CONFLICT"
+CODE_LEASE_EXPIRED = "LEASE_EXPIRED"
+CODE_LEASE_CLOSED = "LEASE_CLOSED"
+CODE_INPUT_LIMIT = "INPUT_LIMIT"
+CODE_MONEY_LIMIT = "MONEY_LIMIT"
+CODE_WINDOW_LIMIT = "WINDOW_LIMIT"
+CODE_ACCOUNT_PARKED = "ACCOUNT_PARKED"
+CODE_CONCURRENCY_LIMIT = "CONCURRENCY_LIMIT"
+
 EXIT_CODES = {
     CODE_INVALID_CONFIG: 2,
     CODE_SCHEMA_UNSUPPORTED: 2,
@@ -39,6 +53,17 @@ EXIT_CODES = {
     CODE_INVALID_REQUEST: 2,
     CODE_CONTEXT_PROJECTION_EXCEEDED: 2,
     CODE_POLICY_DENIED: 2,
+    # Card 4: the 404/409/410/429 contract of section 7 (exit 2: the
+    # request, its id or its timing is the problem, not the store).
+    CODE_NOT_FOUND: 2,
+    CODE_RECEIPT_CONFLICT: 2,
+    CODE_LEASE_EXPIRED: 2,
+    CODE_LEASE_CLOSED: 2,
+    CODE_INPUT_LIMIT: 2,
+    CODE_MONEY_LIMIT: 2,
+    CODE_WINDOW_LIMIT: 2,
+    CODE_ACCOUNT_PARKED: 2,
+    CODE_CONCURRENCY_LIMIT: 2,
 }
 
 MSG_INVALID_CONFIG = "config document is invalid"
@@ -57,12 +82,26 @@ MSG_CONTEXT_PROJECTION_EXCEEDED = (
     "the projected context exceeds the model input ceiling"
 )
 MSG_POLICY_DENIED = "the request is denied by policy"
+MSG_NOT_FOUND = "the requested object was not found"
+MSG_RECEIPT_CONFLICT = "a receipt for this lease conflicts with a stored receipt"
+MSG_LEASE_EXPIRED = "the lease is expired"
+MSG_LEASE_CLOSED = "the lease is settled and closed"
+MSG_INPUT_LIMIT = "the input token limit is reached"
+MSG_MONEY_LIMIT = "the money limit is reached"
+MSG_WINDOW_LIMIT = "the window limit is reached"
+MSG_ACCOUNT_PARKED = "the account is parked"
+MSG_CONCURRENCY_LIMIT = "the concurrency limit is reached"
 
 
 class QuotaError(Exception):
-    """An expected, reportable failure carrying a stable code and message."""
+    """An expected, reportable failure carrying a stable code and message.
 
-    def __init__(self, code, message):
+    `retry_at` (epoch milliseconds or None) is the 429 retry hint of the
+    section-7 error shape; None means no timed retry.
+    """
+
+    def __init__(self, code, message, retry_at=None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.retry_at = retry_at

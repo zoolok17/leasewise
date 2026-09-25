@@ -1,0 +1,785 @@
+"""Card 4 lease-store operations: transactional grant, check, settle.
+
+Everything here runs against a schema-v5 store (see migrate.py). The
+store is a fixture of the coordinator: there is no HTTP layer in this
+card (card 5), so these are the store-level operations the HTTP
+handlers will wrap. Connections are autocommit (isolation_level=None);
+every mutation is one explicit BEGIN IMMEDIATE transaction, so a
+concurrent grant serializes behind it and re-reads usage/holds under
+the write lock (section 4: "Admission transaction: settled charges +
+unresolved holds + new hold <= each applicable cap").
+
+grant: derives the seat's chain (seat -> team -> project), the account
+from the model, and the caps from the request context through the
+card-3 arithmetic (policy.estimate: E, I, the sized hold H). It then
+enforces every applicable limit through policy.check_admission - one
+call per (metric, period[, window_key]) - mapping a denial to the
+section-7 429 code of the metric that failed (INPUT_LIMIT /
+MONEY_LIMIT / WINDOW_LIMIT / CONCURRENCY_LIMIT). The account budget
+(accounts.budget_micro_eur, F04) is the one mandatory (money_micro_eur,
+month) cap. A parked/probing block on the account (its model, or
+model-less) refuses with ACCOUNT_PARKED and the block's retry_at.
+Idempotency is by (machine_id, request_id) - the lease's UNIQUE: the
+same request_id with the same request_hash replays the stored lease
+without adding a hold; a different hash is IDEMPOTENCY_CONFLICT. One
+live slot per (seat, turn) is the lease_live partial index: a second
+live grant on the same seat+turn is IDEMPOTENCY_CONFLICT. A granted
+lease gets one holds row per applicable input/money limit (reserved =
+I or H) and, on a metered account, one row for the synthetic
+account-limit id ("account:<account_id>" - section 7: account holds use
+a reserved synthetic identifier, not a duplicate limits row). Only a
+sized metered lease (enforcement=metered) records holds;
+metered_advisory / subscription / shadow leases are recorded with
+null money_hold and no holds, and admit with zero new hold.
+
+check: re-evaluates on every call (never caches permission, never
+extends the TTL): a result only for an active/uncertain lease that is
+unexpired and unblocked; settled is LEASE_CLOSED (410), expired is
+LEASE_EXPIRED (410), blocked is ACCOUNT_PARKED (429), missing is
+NOT_FOUND (404).
+
+settle: records a receipt for the lease. A duplicate event_id with
+identical content is a no-op replay; different content is
+IDEMPOTENCY_CONFLICT. A final receipt (exactly one per lease - the
+receipt_final index) moves the lease to settled, releases every hold
+into settled_actual = min(actual, reserved) - never below zero, never
+above the hold - and records an observed overrun as liability: a money
+overrun becomes an adjustments row (unattributed_micro_eur,
+resolved_at NULL: it needs reconciliation, turn 3 blocks on it) plus an
+audit row; an input overrun gets an audit row. "Unknown spend is not a
+zero final receipt": a final receipt requires actual_micro_eur. Late
+receipts on an expired (uncertain) lease land in turn 3 (late_receipt:
+reconcile the original period once); this turn settles only active
+leases, and a settled lease is terminal: RECEIPT_CONFLICT.
+
+The read-check-insert sequence is one transaction, so the grant_race
+property holds: under concurrent grants the sum of unresolved holds
+never exceeds a cap, because every grant's admission read happens
+under the write lock, after every earlier grant committed.
+"""
+
+import datetime
+import json
+import sqlite3
+import uuid as _uuid
+
+from . import errors, policy
+from .errors import QuotaError
+from .migrate import rollback_quietly
+from .store import _connect
+
+# --- request shapes (closed) ---------------------------------------------------
+
+_GRANT_KEYS = frozenset((
+    "request_id", "request_hash", "turn_id", "seat_id", "model_id",
+    "effort", "gateway_id", "parent_lease_id", "context",
+    "expected_calls", "max_calls", "output_cap", "per_call_output_cap",
+    "ttl_ms"))
+_CONTEXT_KEYS = frozenset((
+    "mode", "initial_tokens", "dispatch_tokens", "source", "observed_at",
+    "growth_tokens_per_call"))
+# Closed enums (section 7): the context mode and its token source.
+_MODES = frozenset(("FRESH", "SUMMARY", "RESUME"))
+_SOURCES = frozenset(("tokenizer", "cli_observed", "conservative_bound"))
+
+_SETTLE_KEYS = frozenset((
+    "event_id", "lease_id", "outcome", "calls", "input_tokens",
+    "cached_input_tokens", "output_tokens", "actual_micro_eur",
+    "gateway_id", "seq", "final", "observed_at", "received_at"))
+_OUTCOMES = frozenset(("completed", "cancelled", "failed",
+                       "provider_limit"))
+
+# The 429 code of the metric that failed admission (section 7).
+_LIMIT_CODES = {
+    "input_tokens": (errors.CODE_INPUT_LIMIT, errors.MSG_INPUT_LIMIT),
+    "money_micro_eur": (errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT),
+    "window_bps": (errors.CODE_WINDOW_LIMIT, errors.MSG_WINDOW_LIMIT),
+    "concurrency": (errors.CODE_CONCURRENCY_LIMIT,
+                    errors.MSG_CONCURRENCY_LIMIT),
+}
+# Deterministic refusal order: the mandatory money month first, then
+# money, input, windows (by key), concurrency last.
+_METRIC_RANK = {"money_micro_eur": 0, "input_tokens": 1, "window_bps": 2,
+                "concurrency": 3}
+_PERIOD_RANK = {"month": 0, "day": 1, "turn": 2, "window": 0}
+
+_DAY_MS = 86_400_000
+
+_LEASE_COLS = (
+    "id", "machine_id", "seat_id", "account_id", "model_id", "gateway_id",
+    "parent_lease_id", "turn_id", "request_id", "request_hash", "token_hash",
+    "task_class", "context_mode", "enforcement", "estimate",
+    "policy_snapshot", "input_cap", "output_cap", "max_calls",
+    "per_call_output_cap", "money_hold", "granted_at", "expires_at",
+    "activity_seq", "period_start", "state", "outcome")
+
+
+def _account_limit_id(account_id):
+    """The synthetic account-limit identifier of section 7 (account holds
+    use a reserved identifier, not a duplicate limits row)."""
+    return "account:" + account_id
+
+
+# --- period buckets -------------------------------------------------------------
+
+def _day_start_ms(now_ms):
+    return (now_ms // _DAY_MS) * _DAY_MS
+
+
+def _month_start_ms(now_ms):
+    first_day = datetime.datetime.fromtimestamp(
+        now_ms // 1000, tz=datetime.timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int(first_day.timestamp()) * 1000
+
+
+def _period_start_for(period, now_ms):
+    # The month/day bucket a hold settles against; a turn-period limit is
+    # per-request, so its bucket is this grant itself (stored usage for
+    # it is always empty: the check reduces to new <= hard).
+    if period == "month":
+        return _month_start_ms(now_ms)
+    if period == "day":
+        return _day_start_ms(now_ms)
+    return now_ms
+
+
+# --- small helpers ---------------------------------------------------------------
+
+def _invalid():
+    raise QuotaError(errors.CODE_INVALID_REQUEST,
+                     errors.MSG_INVALID_REQUEST)
+
+
+def _not_found():
+    raise QuotaError(errors.CODE_NOT_FOUND, errors.MSG_NOT_FOUND)
+
+
+def _store_error(exc):
+    raise QuotaError(errors.CODE_STORE_ERROR,
+                     errors.MSG_STORE_FAILED) from exc
+
+
+def _validate_grant_request(request):
+    if not isinstance(request, dict) or set(request) != _GRANT_KEYS:
+        _invalid()
+    policy._check_uuid(request["request_id"])
+    policy._check_uuid(request["turn_id"])
+    policy._check_uuid(request["seat_id"])
+    policy._check_uuid(request["model_id"])
+    if (not isinstance(request["request_hash"], str)
+            or not policy._HASH_RE.fullmatch(request["request_hash"])):
+        _invalid()
+    policy._check_alias(request["effort"])
+    for key in ("gateway_id", "parent_lease_id"):
+        value = request[key]
+        if value is not None:
+            policy._check_uuid(value)
+    context = request["context"]
+    if not isinstance(context, dict) or set(context) != _CONTEXT_KEYS:
+        _invalid()
+    if context["mode"] not in _MODES:
+        _invalid()
+    for key in ("initial_tokens", "dispatch_tokens",
+                "growth_tokens_per_call"):
+        policy._check_int(context[key])
+    if context["source"] not in _SOURCES:
+        _invalid()
+    policy._check_int(context["observed_at"], 1)
+    n = policy._check_int(request["expected_calls"], 1, policy.MAX_CALLS)
+    m = policy._check_int(request["max_calls"], 1, policy.MAX_CALLS)
+    if n > m:
+        _invalid()
+    policy._check_int(request["output_cap"])
+    policy._check_int(request["per_call_output_cap"])
+    policy._check_int(request["ttl_ms"], 1)
+
+
+def _validate_settle_receipt(receipt):
+    if not isinstance(receipt, dict) or set(receipt) != _SETTLE_KEYS:
+        _invalid()
+    policy._check_uuid(receipt["event_id"])
+    policy._check_uuid(receipt["lease_id"])
+    if receipt["outcome"] not in _OUTCOMES:
+        _invalid()
+    policy._check_int(receipt["calls"])
+    policy._check_int(receipt["input_tokens"])
+    policy._check_int(receipt["cached_input_tokens"])
+    policy._check_int(receipt["output_tokens"])
+    if receipt["actual_micro_eur"] is not None:
+        policy._check_int(receipt["actual_micro_eur"])
+    if receipt["gateway_id"] is not None:
+        policy._check_uuid(receipt["gateway_id"])
+    if receipt["seq"] is not None:
+        policy._check_int(receipt["seq"])
+    if isinstance(receipt["final"], bool) or receipt["final"] not in (0, 1):
+        _invalid()
+    policy._check_int(receipt["observed_at"], 1)
+    policy._check_int(receipt["received_at"], 1)
+
+
+def _chain_pred(scope):
+    # A predicate over the leases table `l` selecting the leases of the
+    # named scope; it binds exactly one `?` (the scope id, bound last).
+    if scope == "seat":
+        return "l.seat_id = ?"
+    if scope == "team":
+        return "l.seat_id IN (SELECT id FROM seats WHERE team_id = ?)"
+    return ("l.seat_id IN (SELECT id FROM seats WHERE team_id IN "
+            "(SELECT id FROM teams WHERE project_id = ?))")
+
+
+def _lease_row(conn, lease_id):
+    row = conn.execute(
+        "SELECT " + ",".join(_LEASE_COLS) + " FROM leases WHERE id=?",
+        (lease_id,)).fetchone()
+    if row is None:
+        return None
+    return dict(zip(_LEASE_COLS, row))
+
+
+def _lease_dict(row, replayed=False):
+    est = json.loads(row["estimate"])
+    return {
+        "lease_id": row["id"],
+        "state": row["state"],
+        "enforcement": row["enforcement"],
+        "money_hold": row["money_hold"],
+        "caps": {
+            "expected_input": est["expected_input"],
+            "input_cap": row["input_cap"],
+            "output_cap": row["output_cap"],
+            "max_calls": row["max_calls"],
+            "per_call_output_cap": row["per_call_output_cap"],
+        },
+        "granted_at": row["granted_at"],
+        "expires_at": row["expires_at"],
+        "replayed": replayed,
+    }
+
+
+def _parked_block_error(conn, account_id, model_id):
+    # A parked or probing block on the account (its model, or any model)
+    # refuses the grant: 429 parks until retry_at or explicit recovery;
+    # a NULL retry_at means no timed retry but the block still stands.
+    rows = conn.execute(
+        "SELECT retry_at FROM blocks WHERE account_id=? AND "
+        "(model_id IS NULL OR model_id=?) AND state IN ('parked','probing')",
+        (account_id, model_id)).fetchall()
+    if not rows:
+        return
+    retry_ats = [row[0] for row in rows if row[0] is not None]
+    raise QuotaError(errors.CODE_ACCOUNT_PARKED, errors.MSG_ACCOUNT_PARKED,
+                     max(retry_ats) if retry_ats else None)
+
+
+# --- grant ----------------------------------------------------------------------
+
+def grant(path, request, now_ms):
+    """Admit and record one lease, or refuse it with a section-7 code.
+
+    One BEGIN IMMEDIATE transaction: read the chain, the account and
+    the model; refuse on a parked block (ACCOUNT_PARKED); replay/refuse
+    by (machine_id, request_id); compute the caps through the card-3
+    arithmetic; re-read usage and holds and enforce every applicable
+    limit through policy.check_admission (a denial maps to the 429 code
+    of the failing metric); refuse a taken (seat, turn) live slot; then
+    insert the lease and its holds. Returns a dict {lease_id, state,
+    enforcement, money_hold, caps, granted_at, expires_at, replayed};
+    a replay re-returns the stored lease with replayed=True and adds no
+    hold.
+    """
+    policy._check_int(now_ms, 1)
+    _validate_grant_request(request)
+    conn = _connect(path, must_exist=True)
+    try:
+        return _grant(conn, request, now_ms)
+    except QuotaError:
+        raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
+
+
+def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
+                 input_cap, hold_sized, concurrency_new, now_ms):
+    """Enforce one (metric, period[, window_key]) group through the
+    card-3 admission rule; a POLICY_DENIED maps to the group's 429 code.
+    A non-metered lease admits with zero new hold (advisory: no
+    reservation), and a shadow lease consumes no concurrency slot."""
+    metric, period, window_key = key
+    if metric == "window_bps":
+        new = 0  # window usage is observed, not reserved
+    elif metric == "concurrency":
+        new = concurrency_new  # one live lease; a shadow one consumes none
+    elif metered:
+        new = input_cap if metric == "input_tokens" else hold_sized
+    else:
+        new = 0  # advisory: no reservation
+    usage = {}
+    scope_ids = [(s, chain[s]) for s in ("project", "team", "seat")
+                 if chain[s] is not None]
+    if metric == "window_bps":
+        # Window usage is account-level (windows table): one usage for
+        # every applicable scope; a missing window is no observation
+        # (0 bps), a NULL used_bps is unknown usage and fails closed.
+        w = conn.execute(
+            "SELECT used_bps FROM windows WHERE account_id=? AND "
+            "window_key=?", (account_id, window_key)).fetchone()
+        if w is None:
+            used = 0
+        elif w[0] is None:
+            code, msg = _LIMIT_CODES["window_bps"]
+            raise QuotaError(code, msg)
+        else:
+            used = w[0]
+        for scope, scope_id in scope_ids:
+            usage[(scope, scope_id)] = (used, 0)
+    elif metric == "concurrency":
+        # Concurrency counts the live and uncertain leases of the scope.
+        for scope, scope_id in scope_ids:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM leases l WHERE l.state IN "
+                "('active','uncertain') AND " + _chain_pred(scope),
+                (scope_id,)).fetchone()[0]
+            usage[(scope, scope_id)] = (count, 0)
+    else:
+        column = ("r.actual_micro_eur" if metric == "money_micro_eur"
+                  else "r.input_tokens")
+        ps = _period_start_for(period, now_ms)
+        for scope, scope_id in scope_ids:
+            settled = conn.execute(
+                "SELECT COALESCE(SUM(" + column + "),0) FROM receipts r "
+                "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
+                "l.period_start=? AND " + _chain_pred(scope),
+                (ps, scope_id)).fetchone()[0]
+            limit_ids = [r["id"] for r in limit_rows
+                         if r["scope"] == scope and r["scope_id"] == scope_id
+                         and r["metric"] == metric and r["period"] == period]
+            holds = 0
+            if limit_ids:
+                placeholders = ",".join("?" * len(limit_ids))
+                holds = conn.execute(
+                    "SELECT COALESCE(SUM(h.reserved - "
+                    "COALESCE(h.settled_actual,0)),0) FROM holds h JOIN "
+                    "leases l ON l.id=h.lease_id WHERE h.period_start=? "
+                    "AND h.limit_id IN (" + placeholders + ") AND "
+                    + _chain_pred(scope),
+                    (ps, *limit_ids, scope_id)).fetchone()[0]
+            usage[(scope, scope_id)] = (settled, holds)
+    # The account budget: the one mandatory (money, month) cap, enforced
+    # against the account's own settled charges and synthetic holds.
+    with_account = ((metric, period) == ("money_micro_eur", "month")
+                    and budget is not None)
+    if with_account:
+        month = _month_start_ms(now_ms)
+        acct_settled = conn.execute(
+            "SELECT COALESCE(SUM(r.actual_micro_eur),0) FROM receipts r "
+            "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
+            "l.period_start=? AND l.account_id=?",
+            (month, account_id)).fetchone()[0]
+        acct_holds = conn.execute(
+            "SELECT COALESCE(SUM(h.reserved - COALESCE(h.settled_actual,0)),0) "
+            "FROM holds h JOIN leases l ON l.id=h.lease_id WHERE "
+            "h.period_start=? AND h.limit_id=? AND l.account_id=?",
+            (month, _account_limit_id(account_id),
+             account_id)).fetchone()[0]
+        usage[("account", account_id)] = (acct_settled, acct_holds)
+    # check_admission validates closed shapes: its rows carry exactly the
+    # limit columns (the store's limit id stays out of the arithmetic).
+    admission_rows = [
+        {"scope": r["scope"], "scope_id": r["scope_id"], "metric": r["metric"],
+         "period": r["period"], "window_key": r["window_key"], "soft": r["soft"],
+         "hard": r["hard"]} for r in limit_rows]
+    try:
+        policy.check_admission(
+            rows=admission_rows, metric=metric, period=period, usage=usage,
+            new=new, window_key=window_key, chain=chain,
+            account_id=account_id if with_account else None,
+            account_budget=budget if with_account else None)
+    except QuotaError as exc:
+        if exc.code != errors.CODE_POLICY_DENIED:
+            raise  # INVALID_REQUEST: propagate as-is
+        code, msg = _LIMIT_CODES[metric]
+        raise QuotaError(code, msg)
+
+
+def _grant(conn, request, now_ms):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        seat = conn.execute(
+            "SELECT id, machine_id, team_id, enforcement FROM seats "
+            "WHERE id=?", (request["seat_id"],)).fetchone()
+        if seat is None:
+            _not_found()
+        team = conn.execute("SELECT id, project_id FROM teams WHERE id=?",
+                            (seat[2],)).fetchone()
+        if team is None:
+            _not_found()
+        project = conn.execute("SELECT id FROM projects WHERE id=?",
+                               (team[1],)).fetchone()
+        if project is None:
+            _not_found()
+        model = conn.execute(
+            "SELECT id, account_id, alias, context_ceiling, output_ceiling, "
+            "tariff_input_rate, tariff_output_rate, reserve_input_rate, "
+            "reserve_output_rate, reservation_mode, policy_hash, "
+            "effort_aliases FROM models WHERE id=?",
+            (request["model_id"],)).fetchone()
+        if model is None:
+            _not_found()
+        account = conn.execute(
+            "SELECT id, kind, budget_micro_eur FROM accounts WHERE id=?",
+            (model[1],)).fetchone()
+        if account is None:
+            _not_found()
+        machine_id = seat[1]
+        account_id, _kind, budget = account
+        chain = {"platform": None, "project": project[0], "team": team[0],
+                 "seat": seat[0]}
+
+        _parked_block_error(conn, account_id, model[0])
+
+        # Idempotency: same (machine, request_id) + same content replays
+        # the stored lease without adding a hold; different content is a
+        # conflict.
+        existing = conn.execute(
+            "SELECT id, request_hash FROM leases WHERE machine_id=? AND "
+            "request_id=?", (machine_id, request["request_id"])).fetchone()
+        if existing is not None:
+            if existing[1] != request["request_hash"]:
+                raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                 errors.MSG_IDEMPOTENCY_CONFLICT)
+            row = _lease_row(conn, existing[0])
+            conn.execute("COMMIT")
+            return _lease_dict(row, replayed=True)
+
+        # Derive the caps through the card-3 arithmetic: the model row
+        # feeds the pure estimate; the request carries the context.
+        context = request["context"]
+        model_dict = {
+            "alias": model[2],
+            "context_ceiling": model[3],
+            "output_ceiling": model[4],
+            "tariff_input_rate": model[5],
+            "tariff_output_rate": model[6],
+            "reserve_input_rate": model[7],
+            "reserve_output_rate": model[8],
+            "reservation_mode": model[9],
+            "policy_hash": model[10],
+            "effort_aliases": model[11],
+        }
+        est = policy.estimate(
+            context["initial_tokens"] + context["dispatch_tokens"],
+            request["expected_calls"], context["growth_tokens_per_call"],
+            request["output_cap"], request["max_calls"], model_dict)
+        policy.check_per_call_output_cap(
+            model_dict, request["per_call_output_cap"])
+        input_cap, hold_sized = est["input_cap"], est["hold_sized"]
+
+        # Enforcement is derived, never requested: a metered seat grants
+        # a sized hold only through a sized-ready gateway; otherwise the
+        # lease is metered_advisory (null money_hold, no holds).
+        enforcement = seat[3]
+        if enforcement == "metered":
+            if request["gateway_id"] is None:
+                _invalid()  # gateway is null only for subscriptions
+            sized = conn.execute("SELECT sized_ready FROM gateways "
+                                 "WHERE id=?",
+                                 (request["gateway_id"],)).fetchone()
+            if sized is None:
+                _not_found()
+            if not sized[0]:
+                enforcement = "metered_advisory"
+        metered = enforcement == "metered"
+        money_hold = hold_sized if metered else None
+
+        # Admission: re-read usage and holds under the write lock and
+        # enforce every applicable limit (each cap against its own
+        # scope's usage, plus the account budget as the mandatory
+        # (money, month) cap).
+        limit_rows = [
+            {"id": r[0], "scope": r[1], "scope_id": r[2], "metric": r[3],
+             "period": r[4], "window_key": r[5], "soft": r[6], "hard": r[7]}
+            for r in conn.execute(
+                "SELECT id, scope, scope_id, metric, period, window_key, "
+                "soft, hard FROM limits WHERE "
+                "(scope='project' AND scope_id=:project) OR "
+                "(scope='team' AND scope_id=:team) OR "
+                "(scope='seat' AND scope_id=:seat)",
+                {"project": chain["project"], "team": chain["team"],
+                 "seat": chain["seat"]})
+        ]
+        groups = {}
+        for row in limit_rows:
+            key = (row["metric"], row["period"], row["window_key"])
+            groups.setdefault(key, []).append(row)
+        if metered and budget is not None:
+            groups.setdefault(("money_micro_eur", "month", None), [])
+        concurrency_new = 0 if enforcement == "shadow" else 1
+        for key in sorted(groups, key=lambda k: (
+                _METRIC_RANK[k[0]], _PERIOD_RANK[k[1]], k[2] or "")):
+            _admit_group(conn, key, limit_rows, chain, account_id, budget,
+                         metered, input_cap, hold_sized, concurrency_new,
+                         now_ms)
+
+        # One live slot per (seat, turn): the lease_live partial index.
+        # Checked explicitly so the refusal is a typed conflict, not a
+        # raw constraint fault.
+        live = conn.execute(
+            "SELECT id FROM leases WHERE seat_id=? AND turn_id=? AND "
+            "state IN ('active','uncertain')",
+            (seat[0], request["turn_id"])).fetchone()
+        if live is not None:
+            raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                             errors.MSG_IDEMPOTENCY_CONFLICT)
+
+        lease_id = str(_uuid.uuid4())
+        period_start = _month_start_ms(now_ms)
+        policy_snapshot = json.dumps({
+            "policy_hash": model[10],
+            "reservation_mode": model[9],
+            "rates": {
+                "tariff_input": model[5], "tariff_output": model[6],
+                "reserve_input": model[7], "reserve_output": model[8],
+            },
+            "chain": dict(chain, account=account_id),
+            "effort": request["effort"],
+            "caps": {"input_cap": input_cap, "hold_sized": hold_sized,
+                     "output_cap": request["output_cap"],
+                     "max_calls": request["max_calls"],
+                     "per_call_output_cap": request["per_call_output_cap"]},
+            "period_start": period_start,
+        }, sort_keys=True)
+        conn.execute(
+            "INSERT INTO leases(id, machine_id, seat_id, account_id, "
+            "model_id, gateway_id, parent_lease_id, turn_id, request_id, "
+            "request_hash, token_hash, task_class, context_mode, "
+            "enforcement, estimate, policy_snapshot, input_cap, output_cap, "
+            "max_calls, per_call_output_cap, money_hold, granted_at, "
+            "expires_at, period_start, state) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lease_id, machine_id, seat[0], account_id, model[0],
+             request["gateway_id"], request["parent_lease_id"],
+             request["turn_id"], request["request_id"],
+             request["request_hash"], None, request["effort"],
+             context["mode"], enforcement, json.dumps(est, sort_keys=True),
+             policy_snapshot, input_cap, request["output_cap"],
+             request["max_calls"], request["per_call_output_cap"],
+             money_hold, now_ms, now_ms + request["ttl_ms"], period_start,
+             "active"))
+        # One holds row per applicable input/money limit (reserved = I or
+        # H); only a sized metered lease reserves.
+        for row in limit_rows:
+            if row["metric"] == "input_tokens":
+                reserved, limit_id = input_cap, row["id"]
+            elif row["metric"] == "money_micro_eur":
+                reserved, limit_id = hold_sized, row["id"]
+            else:
+                continue  # window_bps / concurrency carry no hold
+            if not metered:
+                continue
+            conn.execute(
+                "INSERT INTO holds(lease_id, limit_id, period_start, "
+                "reserved) VALUES(?,?,?,?)",
+                (lease_id, limit_id,
+                 _period_start_for(row["period"], now_ms), reserved))
+        if metered and budget is not None:
+            conn.execute(
+                "INSERT INTO holds(lease_id, limit_id, period_start, "
+                "reserved) VALUES(?,?,?,?)",
+                (lease_id, _account_limit_id(account_id),
+                 _month_start_ms(now_ms), hold_sized))
+        conn.execute(
+            "INSERT INTO audit(actor_alias, action, object_id, at, "
+            "redacted_details) VALUES(?,?,?,?,?)",
+            ("coordinator", "lease_granted", lease_id, now_ms,
+             json.dumps({"final": 0})))
+        conn.execute("COMMIT")
+        return _lease_dict(_lease_row(conn, lease_id))
+    except BaseException:
+        rollback_quietly(conn)
+        raise
+
+
+# --- check ------------------------------------------------------------------------
+
+def check(path, lease_id, now_ms):
+    """Re-evaluate one lease (no write, no caching, no TTL extension).
+
+    Returns {state, expires_at, caps, enforcement, money_hold} only for
+    an active/uncertain lease that is unexpired and unblocked. Settled
+    is LEASE_CLOSED (410), expired is LEASE_EXPIRED (410), blocked is
+    ACCOUNT_PARKED (429, with the block's retry_at), missing is
+    NOT_FOUND (404).
+    """
+    policy._check_int(now_ms, 1)
+    policy._check_uuid(lease_id)
+    conn = _connect(path, must_exist=True)
+    try:
+        row = _lease_row(conn, lease_id)
+        if row is None:
+            _not_found()
+        if row["state"] == "settled":
+            raise QuotaError(errors.CODE_LEASE_CLOSED,
+                             errors.MSG_LEASE_CLOSED)
+        if now_ms >= row["expires_at"]:
+            raise QuotaError(errors.CODE_LEASE_EXPIRED,
+                             errors.MSG_LEASE_EXPIRED)
+        _parked_block_error(conn, row["account_id"], row["model_id"])
+        return _lease_dict(row)
+    except QuotaError:
+        raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
+
+
+# --- settle ------------------------------------------------------------------------
+
+_RECEIPT_FIELDS = ("lease_id", "gateway_id", "seq", "calls", "input_tokens",
+                   "cached_input_tokens", "output_tokens", "actual_micro_eur",
+                   "outcome", "final", "observed_at", "received_at")
+
+
+def _hold_metric(conn, limit_id):
+    if limit_id.startswith("account:"):
+        return "money_micro_eur"
+    row = conn.execute("SELECT metric FROM limits WHERE id=?",
+                       (limit_id,)).fetchone()
+    if row is None:
+        _invalid()  # a hold pointing at no limit: corrupt, fail closed
+    return row[0]
+
+
+def settle(path, receipt, now_ms):
+    """Record a receipt for a lease; a final receipt settles it.
+
+    One BEGIN IMMEDIATE transaction. A duplicate event_id with identical
+    content replays as a no-op; different content is
+    IDEMPOTENCY_CONFLICT. A final receipt (exactly one per lease - the
+    receipt_final index) moves the lease to settled and releases every
+    hold into settled_actual = min(actual, reserved) - never below zero,
+    never above the hold; an observed overrun is recorded as liability
+    (money: an adjustments row with resolved_at NULL plus an audit row;
+    input: an audit row). Returns {state, released_micro_eur,
+    retained_micro_eur, replayed}: released is the hold headroom freed
+    by settlement, retained the money that stays as settled liability.
+    """
+    policy._check_int(now_ms, 1)
+    _validate_settle_receipt(receipt)
+    conn = _connect(path, must_exist=True)
+    try:
+        return _settle(conn, receipt, now_ms)
+    except QuotaError:
+        raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
+
+
+def _settle(conn, receipt, now_ms):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        lease = _lease_row(conn, receipt["lease_id"])
+        if lease is None:
+            _not_found()
+        stored = conn.execute(
+            "SELECT event_id," + ",".join(_RECEIPT_FIELDS) +
+            " FROM receipts WHERE event_id=?",
+            (receipt["event_id"],)).fetchone()
+        if stored is not None:
+            # A duplicate event_id: identical content is a no-op replay,
+            # different content is an idempotency conflict.
+            if any(receipt[a] != b for a, b in
+                   zip(_RECEIPT_FIELDS, stored[1:])):
+                raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                 errors.MSG_IDEMPOTENCY_CONFLICT)
+            conn.execute("COMMIT")
+            return {"state": lease["state"], "replayed": True,
+                    "released_micro_eur": 0, "retained_micro_eur": 0}
+        if lease["state"] == "settled":
+            # Terminal rows cannot be reopened: a conflicting receipt
+            # blocks and preserves the conservative liability already
+            # recorded (reconciliation is turn 3).
+            raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
+                             errors.MSG_RECEIPT_CONFLICT)
+        if lease["state"] == "uncertain":
+            # Late receipts on an expired lease land in turn 3
+            # (late_receipt: reconcile the original period once).
+            raise QuotaError(errors.CODE_LEASE_EXPIRED,
+                             errors.MSG_LEASE_EXPIRED)
+        if receipt["final"] and receipt["actual_micro_eur"] is None:
+            _invalid()  # unknown spend is not a zero final receipt
+        conn.execute(
+            "INSERT INTO receipts(event_id, lease_id, gateway_id, seq, "
+            "calls, input_tokens, cached_input_tokens, output_tokens, "
+            "actual_micro_eur, outcome, final, observed_at, received_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (receipt["event_id"], receipt["lease_id"],
+             receipt["gateway_id"], receipt["seq"], receipt["calls"],
+             receipt["input_tokens"], receipt["cached_input_tokens"],
+             receipt["output_tokens"], receipt["actual_micro_eur"],
+             receipt["outcome"], receipt["final"], receipt["observed_at"],
+             receipt["received_at"]))
+        released = retained = 0
+        if receipt["final"]:
+            conn.execute(
+                "UPDATE leases SET state='settled', outcome=? WHERE id=?",
+                (receipt["outcome"], receipt["lease_id"]))
+            hold_rows = conn.execute(
+                "SELECT lease_id, limit_id, period_start, reserved, "
+                "settled_actual FROM holds WHERE lease_id=?",
+                (receipt["lease_id"],)).fetchall()
+            for _lease_id, limit_id, period_start, reserved, _actual in \
+                    hold_rows:
+                metric = _hold_metric(conn, limit_id)
+                actual = (receipt["actual_micro_eur"]
+                          if metric == "money_micro_eur"
+                          else receipt["input_tokens"])
+                # Never below zero, never above the hold without
+                # recording the overrun as liability.
+                settled_actual = min(actual, reserved)
+                conn.execute(
+                    "UPDATE holds SET settled_actual=? WHERE lease_id=? "
+                    "AND limit_id=?",
+                    (settled_actual, receipt["lease_id"], limit_id))
+                if actual > reserved:
+                    conn.execute(
+                        "INSERT INTO audit(actor_alias, action, object_id, "
+                        "at, redacted_details) VALUES(?,?,?,?,?)",
+                        ("coordinator", "overrun_recorded",
+                         receipt["lease_id"], now_ms,
+                         json.dumps({"metric": metric})))
+                    if metric == "money_micro_eur":
+                        gateway_id = (receipt["gateway_id"]
+                                      if receipt["gateway_id"] is not None
+                                      else lease["gateway_id"])
+                        if gateway_id is None:
+                            _invalid()  # the liability needs a home gateway
+                        conn.execute(
+                            "INSERT INTO adjustments(id, account_id, "
+                            "gateway_id, source_event_id, period_start, "
+                            "unattributed_micro_eur, reason, resolved_at) "
+                            "VALUES(?,?,?,?,?,?,?,NULL)",
+                            (str(_uuid.uuid4()), lease["account_id"],
+                             gateway_id, receipt["event_id"], period_start,
+                             actual - reserved, "overrun"))
+                if metric == "money_micro_eur":
+                    released += reserved - settled_actual
+                    retained += settled_actual
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("coordinator", "lease_settled", receipt["lease_id"],
+                 now_ms, json.dumps({"final": 1})))
+        conn.execute("COMMIT")
+        return {"state": "settled" if receipt["final"] else lease["state"],
+                "released_micro_eur": released,
+                "retained_micro_eur": retained, "replayed": False}
+    except BaseException:
+        rollback_quietly(conn)
+        raise
