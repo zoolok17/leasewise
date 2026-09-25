@@ -18,7 +18,17 @@ Freshness rules (docs/DESIGN.md sections 5 and 7):
     older than 120 seconds fails closed as stale (METER_STALE).
 """
 
+import calendar
+import datetime
 import json
+
+from .errors import (
+    CODE_BILLING_BASIS_UNKNOWN,
+    CODE_INVALID_CONFIG,
+    MSG_BILLING_BASIS_UNKNOWN,
+    MSG_INVALID_CONFIG,
+    QuotaError,
+)
 
 # 600-second wall cap for window freshness (section 5).
 WALL_CAP_MS = 600_000
@@ -221,11 +231,136 @@ def billing_freshness(observed_at, max_age_ms, now_ms):
     """Return (fresh, reason) for a billing total at status time.
 
     `observed_at` is the source time (lastUpdate), not the poll receipt time;
-    it is never refreshed by an unchanged re-import. `max_age_ms` is the
-    policy's max_age_seconds * 1000, or None when there is no policy.
+    it is never refreshed by an unchanged re-import (a failed or unchanged
+    poll produces no reading, and a replay is a no-op). There is no idle
+    exemption: the age is the source age, full stop.
     """
     if observed_at is None or max_age_ms is None:
         return None, FRESH_BILLING_UNKNOWN
     if now_ms - observed_at <= max_age_ms:
         return True, FRESH_BILLING_FRESH
     return False, FRESH_BILLING_STALE
+
+
+# Tax bases (section 11): operator-declared, closed set. Unknown is a
+# permitted configuration, not permission to compare.
+BASIS_UNKNOWN = "unknown"
+BASIS_EX_VAT = "ex_vat"
+BASIS_INVOICE_TOTAL = "invoice_total"
+KNOWN_BASES = (BASIS_EX_VAT, BASIS_INVOICE_TOTAL)
+CLOSED_BASES = (BASIS_UNKNOWN,) + KNOWN_BASES
+
+# Checked signed-64 arithmetic (section 7): every amount is bounded before
+# and after conversion.
+INT64_MAX = 2 ** 63 - 1
+VAT_BPS_MAX = 10_000  # basis points; 10000 == 100%
+
+
+def convert_basis(amount, source_basis, target_basis, vat_bps):
+    """Pure tax-basis conversion, shared by the later 2b cards.
+
+    Convert a non-negative integer micro-EUR amount between two
+    operator-declared bases. Both directions round UP (a half-micro
+    fraction is never dropped), in checked integer arithmetic:
+      ex_vat -> invoice_total: ceil(x * (10000 + vat_bps) / 10000)
+      invoice_total -> ex_vat: ceil(x * 10000 / (10000 + vat_bps))
+      equal bases: unchanged (no rate is needed, so vat_bps may be None)
+    Bases are never guessed: an unknown (closed) basis, or a missing/
+    out-of-range required rate, yields BILLING_BASIS_UNKNOWN - deferral,
+    not approval. A non-closed basis, a non-integer/negative amount, or an
+    overflowing result is INVALID_CONFIG.
+    """
+    if type(amount) is not int or amount < 0 or amount > INT64_MAX:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if source_basis not in CLOSED_BASES or target_basis not in CLOSED_BASES:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if source_basis == target_basis:
+        return amount
+    if source_basis == BASIS_UNKNOWN or target_basis == BASIS_UNKNOWN:
+        raise QuotaError(CODE_BILLING_BASIS_UNKNOWN, MSG_BILLING_BASIS_UNKNOWN)
+    if type(vat_bps) is not int or not 0 <= vat_bps <= VAT_BPS_MAX:
+        # A missing or unusable required rate: no implicit VAT default is
+        # permitted.
+        raise QuotaError(CODE_BILLING_BASIS_UNKNOWN, MSG_BILLING_BASIS_UNKNOWN)
+    if source_basis == BASIS_EX_VAT:
+        numerator, denominator = amount * (10_000 + vat_bps), 10_000
+    else:
+        numerator, denominator = amount * 10_000, 10_000 + vat_bps
+    result = (numerator + denominator - 1) // denominator  # ceil
+    if result > INT64_MAX:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    return result
+
+
+def reduce_billing_total(existing, total, observed_at, event_id):
+    """Fold one provider_billing reading into a billing_totals row.
+
+    Returns the new stored tuple
+      (latest_micro_eur, observed_at, latest_event_id,
+       high_water_micro_eur, high_water_event_id, conflict)
+    or None when the reading changes nothing (an older total that does not
+    beat the high-water).
+
+    Ordering is by SOURCE time (observed_at), never arrival order
+    (section 11):
+      * a newer observation sets latest - a newer downward correction
+        retains the high-water and any latched conflict;
+      * an equal-time unequal total latches conflict; the latest event is
+        the UUID-sort winner so the display is deterministic, and its
+        amount is the latest amount;
+      * an older higher total raises the high-water AND latches conflict,
+        without refreshing the stored (latest) time;
+      * the high-water is the maximum total ever observed; each amount
+        retains its own source time and event.
+    The conflict is sticky: only a later audited resolution integration
+    clears it, never a poll.
+    """
+    if existing is None:
+        return (total, observed_at, event_id, total, event_id, 0)
+    e_latest, e_obs, e_ev, e_hw, e_hw_ev, e_conf = existing
+    if observed_at > e_obs:
+        new_hw, new_hw_ev = ((total, event_id) if total > e_hw
+                             else (e_hw, e_hw_ev))
+        return (total, observed_at, event_id, new_hw, new_hw_ev, e_conf)
+    if observed_at < e_obs:
+        if total > e_hw:
+            return (e_latest, e_obs, e_ev, total, event_id, 1)
+        return None
+    # Equal source time: unequal totals are a conflict.
+    if total == e_latest:
+        return None
+    winner_event, winner_total = ((event_id, total) if event_id > e_ev
+                                  else (e_ev, e_latest))
+    new_hw, new_hw_ev = ((total, event_id) if total > e_hw
+                         else (e_hw, e_hw_ev))
+    return (winner_total, e_obs, winner_event, new_hw, new_hw_ev, 1)
+
+
+def _add_calendar_months_ms(ms, months):
+    """Add calendar months to a UTC epoch-ms timestamp (day clamped)."""
+    dt = datetime.datetime.fromtimestamp(ms // 1000, datetime.timezone.utc)
+    year, month = divmod(dt.year * 12 + dt.month - 1 + months, 12)
+    month += 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return int(datetime.datetime(year, month, day, tzinfo=datetime.timezone.utc)
+               .timestamp() * 1000)
+
+
+def billing_retention_eligible(period_end_ms, unresolved, now_ms):
+    """Pure retention-eligibility predicate (section 11); 2b does no
+    deletion.
+
+    A record is eligible for the later pruning owner's deletion only when
+    it is resolved and its period ended at least 13 calendar months before
+    `now_ms`. Unresolved (conflicted) evidence is retained indefinitely,
+    and financial history is never eligible before the 13-month mark.
+    """
+    if unresolved or period_end_ms > now_ms:
+        # A period that has not ended yet is never eligible.
+        return False
+    try:
+        return now_ms >= _add_calendar_months_ms(period_end_ms, 13)
+    except (OverflowError, OSError, ValueError):
+        # A period end so far in the past that the proleptic calendar
+        # cannot represent it: it is well past the 13-month mark.
+        return True
