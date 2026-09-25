@@ -165,6 +165,101 @@ different total exits 2 with the static `IDEMPOTENCY_CONFLICT` error
 and leaves the store untouched; a `-5` total or a foreign scope alias
 exits 2 with the static `INVALID_CONFIG` error, likewise untouched.)
 
+## Fix rounds (lead cold reads, 2026-09-25)
+
+Two cold reads were run against the card (READ A by sonnet; READ B by
+opus at the older head `6dff56c`). The earlier fix commit `4b9b999`
+(before this round, by the previous developer) addressed READ A MAJOR 1
+(fixture race) and MAJOR 2 (policy-less fail-open) - those repros no
+longer hold (re-verified in round 1). Finding -> fix -> pinning test:
+
+Round 1 (turn 1):
+
+- **READ A MAJOR 4 / READ B m4 - unknown tax bases compared.**
+  `convert_basis` now checks the unknown source basis BEFORE the
+  equal-basis shortcut, and `allocation_within_cap` defers (returns
+  None) when the cap or a share basis is unknown: an unknown basis
+  makes the comparison unknown/advisory - never a conversion, never a
+  pass (`bd07a97`). Pinned by `billing_tax_basis`.
+- **Conflict-latch ruling (lead).** A newer total below the retained
+  high-water AND an older total above the latest both latch `conflict`;
+  only a later audited resolution clears it (`fa9bf03`). Pinned by
+  `billing_older_high_water` (`test_billing_downward_correction_latches`).
+- **READ B m5 / m6.** Source-time-in-period bounds (val-late/val-early
+  mutations) and the 2 s freshness margin pinned (`145f49b`).
+
+Round 2 (turn 2):
+
+- **READ A MAJOR 3 / READ B m2 - B01 and the metered kind enforced
+  only at policy import.** `store._reduce_provider_billing` now
+  re-checks the metered kind and the B01 allocation (shares + non-AI
+  allowance <= cap, on the cap basis, via `allocation_within_cap`
+  against the CURRENT config) at billing-reading ingest; an unknown
+  basis defers (the reading is recorded, never approved). A
+  config-import that broke either imports (it is the operator's full
+  replacement), and the next reading is refused (INVALID_CONFIG,
+  exit 2) until the operator repairs the config. Pinned by
+  `test_billing_config_invariant`, rewritten to the ingest semantics
+  (config rc 0 -> reading rc 2 -> config restored -> reading rc 0, for
+  both the B01 break and the kind flip; the flip document drops the
+  gateways because card 1 admits no gateway on a subscription
+  account).
+- **READ A MINOR 7 / READ B m3 - removal -> STORE_ERROR 3.** The
+  config-import removal guards now also cover
+  `billing_policies.reporter_machine_id`, `billing_policies.account_id`
+  and `billing_totals.account_id`: removing a referenced account or
+  machine is INVALID_CONFIG (exit 2), not a foreign-key fault (exit
+  3). Pinned by the removal parts of `test_billing_config_invariant`.
+- **READ A MINOR 6 / READ B m1 - multi-month period accepted.**
+  `_is_one_utc_month_period` (validate_readings.py) requires the
+  provider period to be exactly one UTC month (end = first instant of
+  the following month); the gateway v3 snapshot keeps the looser
+  month-bound rule. The store row guard refuses a reading whose
+  `period_end` differs from the stored row for the same
+  (account, scope_revision, period_start) key - BILLING_SCOPE_MISMATCH,
+  exit 2 (unreachable through the import path now that a period is one
+  month; pinned against other writers). Pinned by the `val-multimonth`
+  mutation and `test_billing_period_end_mismatch_refused`.
+- **READ A MINOR 5 - order-dependent conflict flag.** The two-reading
+  case is arrival-order independent and is pinned
+  (`test_billing_two_reading_order_independence`: the same two
+  readings, in either order, land in the identical `billing_totals`
+  row). Full set-independence is NOT achievable with the bounded row
+  state: the flag latches at arrival time from (latest, high-water),
+  which cannot replay an unbounded (source-time, total) history
+  (residual: Y(50,t2), X(100,t1), W(200,t3) arrive Y,W,X -> conflict
+  0, but X,Y,W -> conflict 1). Recorded, not fixed.
+- **READ A MINOR 8 - 30-day tier unpinned.** `reduce.py` gains
+  `READINGS_RETENTION_MS` (30 fixed days) and
+  `readings_retention_eligible(received_at_ms, now_ms)` - the pure
+  predicate for the 30-day readings tier (receipt-aged, inclusive
+  boundary); 2b still deletes nothing. Pinned by
+  `test_readings_retention_30_day`.
+- **READ A NIT 10 - status billing list / age_ms.** No change: the
+  status projection is wall-clock by design; the tables are the
+  byte-stable evidence (as the existing tests already note).
+
+Commands and counts (from the repo root):
+
+    python3 -m unittest discover -s tests 2>&1 | tail -30
+
+    Ran 122 tests in ~68 s - OK
+
+Breakdown: `tests/test_card1.py` 17, `tests/test_card2.py` 32,
+`tests/test_card2b1.py` 73. Round 2 adds three test methods
+(`test_billing_period_end_mismatch_refused`,
+`test_billing_two_reading_order_independence`,
+`test_readings_retention_30_day`) and rewrites
+`test_billing_config_invariant` in place to the ingest semantics - it
+was the one pre-existing red (written for the config-import semantics
+the lead replaced) and is now green.
+
+Mutation verification (round 2): six mutants, all caught - B01-at-
+ingest disabled, period-end row guard disabled, one-month rule relaxed
+to the month-bound span, 30-day boundary off-by-one (>= to >), machine
+removal guard dropped, account removal guards dropped; the source tree
+restored byte-identical after each.
+
 ## Judged not testable on this card (and why)
 
 - **Live provider behavior (OVH).** Owned by 2b-3, which needs
