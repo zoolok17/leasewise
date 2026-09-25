@@ -32,6 +32,7 @@ from .errors import (
 from .migrate import SCHEMA_VERSION, migrate, require_supported, rollback_quietly
 from .reduce import (
     GATEWAY_STATE_OK,
+    GATEWAY_STATE_RECONCILE,
     gateway_report_state,
     reduce_gateway_report,
     reduce_window,
@@ -192,16 +193,39 @@ def _upsert(conn, accounts, machines, gateways):
 
     # Gateways: update config-owned columns for retained aliases (the report
     # columns - ledger_epoch, last_seq, period_*, policy_hashes, last_report_at,
-    # state, sized_ready - are left untouched); insert new ones.
+    # state, sized_ready - are left untouched); insert new ones. Exception:
+    # a retained gateway re-pointed to a different machine or account has
+    # its report columns reset and is marked reconciliation_required. The
+    # new owner's ledger is a new ledger (its reports typically restart at
+    # seq 1); carrying the old owner's epoch/seq/hashes over would drop
+    # those reports as smaller seqs and then accept them as a continuation
+    # without reconciliation.
     for alias, account, machine, share, period in gateways:
         gateway_id = old_gateways.get(alias) or str(uuid.uuid4())
         if alias in old_gateways:
-            conn.execute(
-                "UPDATE gateways SET account_id=?, machine_id=?, "
-                "share_micro_eur=?, period=? WHERE id=?",
-                (account_ids[account], machine_ids[machine], share, period,
-                 gateway_id),
-            )
+            old = conn.execute(
+                "SELECT account_id, machine_id FROM gateways WHERE id=?",
+                (gateway_id,),
+            ).fetchone()
+            owner_changed = (old[0] != account_ids[account]
+                             or old[1] != machine_ids[machine])
+            if owner_changed:
+                conn.execute(
+                    "UPDATE gateways SET account_id=?, machine_id=?, "
+                    "share_micro_eur=?, period=?, ledger_epoch=NULL, "
+                    "last_seq=NULL, period_start=NULL, period_end=NULL, "
+                    "policy_hashes=NULL, last_report_at=NULL, state=?, "
+                    "sized_ready=0 WHERE id=?",
+                    (account_ids[account], machine_ids[machine], share,
+                     period, GATEWAY_STATE_RECONCILE, gateway_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE gateways SET account_id=?, machine_id=?, "
+                    "share_micro_eur=?, period=? WHERE id=?",
+                    (account_ids[account], machine_ids[machine], share,
+                     period, gateway_id),
+                )
         else:
             conn.execute(
                 "INSERT INTO gateways(id, alias, account_id, machine_id,"

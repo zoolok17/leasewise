@@ -141,7 +141,17 @@ def reduce_gateway_report(existing, ledger_epoch, seq, period_start, period_end,
     new_hashes = _hashes_json(policy_hashes)
     e_seq = existing[1] if existing is not None else None
     if existing is None or e_seq is None:
-        state = (GATEWAY_STATE_RECONCILE if reconciliation_required
+        # A stored row can hold a NULL sequence while carrying a sticky
+        # reconciliation mark: store.import_config resets a re-pointed
+        # gateway's report columns (machine or account changed) and marks it
+        # reconciliation_required. The new owner's first report is a new
+        # ledger's first report, not a continuation, so it is accepted here
+        # - and the stored mark is preserved: this is not a normal first
+        # report for a brand-new gateway.
+        e_state = existing[6] if existing is not None else None
+        state = (GATEWAY_STATE_RECONCILE
+                 if (reconciliation_required
+                     or e_state == GATEWAY_STATE_RECONCILE)
                  else GATEWAY_STATE_OK)
         return (ledger_epoch, seq, period_start, period_end, new_hashes,
                 sized_ready, state)
