@@ -41,6 +41,10 @@ from .reduce import (
     window_freshness,
 )
 from .validate import validate
+from .validate_policies import (
+    allocation_within_cap,
+    validate_billing_policies,
+)
 from .validate_readings import (
     KIND_CLI_WINDOW,
     KIND_GATEWAY_SNAPSHOT,
@@ -261,6 +265,138 @@ def _references(conn, table, column, entity_id):
         (entity_id,),
     ).fetchone()
     return row is not None
+
+
+def billing_policy_import(path, file):
+    """Validate a billing-policy document and apply it atomically.
+
+    Validation (the closed shape, the closed enums, the B01 allocation
+    check) happens before or under the write lock, and the import is an
+    UPSERT - one policy per metered account. Once the account has a
+    provider billing reading, the protected fields (the reporter
+    machine, the scope alias/revision, and the three tax bases) are
+    frozen: a change to any of them is refused, while the operator-
+    tunable fields (allowance, rate, cadence, tolerances, actions)
+    still update.
+    """
+    try:
+        with open(file, "r", encoding="utf-8-sig") as handle:
+            doc = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError, RecursionError):
+        # Missing or unreadable file, malformed JSON, undecodable text, or
+        # pathologically deep nesting: a bad document, not a store fault.
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+    policies = validate_billing_policies(doc)
+
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            _apply_billing_policies(conn, policies)
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def _apply_billing_policies(conn, policies):
+    """Apply a validated billing-policy document, one upsert per policy.
+
+    Inside the import's BEGIN IMMEDIATE. The store-level rules: the
+    account exists and is METERED (a provider bill is attributed money;
+    a subscription account has no cap to bound an allowance), the
+    reporter machine exists, and the B01 allocation (shares + allowance
+    <= cap, on the cap's tax basis) fits. The protected fields are
+    frozen once a provider billing reading for the account exists.
+    """
+    accounts = {}
+    for (account_id, alias, kind, budget) in conn.execute(
+            "SELECT id, alias, kind, budget_micro_eur FROM accounts"):
+        accounts[alias] = (account_id, kind, budget)
+    machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
+    shares = {}
+    for (account_id, total) in conn.execute(
+            "SELECT account_id, SUM(share_micro_eur) FROM gateways "
+            "GROUP BY account_id"):
+        shares[account_id] = total
+
+    for policy in policies:
+        account = accounts.get(policy["account"])
+        if account is None or account[1] != "metered":
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        account_id, _kind, budget = account
+        reporter_id = machine_ids.get(policy["reporter_machine"])
+        if reporter_id is None:
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        allocation_within_cap(
+            budget, shares.get(account_id, 0),
+            policy["non_ai_allowance_micro_eur"],
+            policy["cap_basis"], policy["provider_basis"],
+            policy["ledger_basis"], policy["vat_bps"])
+
+        existing = conn.execute(
+            "SELECT reporter_machine_id, scope_alias, scope_revision, "
+            "cap_basis, provider_basis, ledger_basis "
+            "FROM billing_policies WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        has_history = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM readings WHERE kind = "
+            "'provider_billing' AND account_id = ?)",
+            (account_id,),
+        ).fetchone()[0]
+        if existing is not None and has_history:
+            protected = (reporter_id, policy["scope_alias"],
+                         policy["scope_revision"], policy["cap_basis"],
+                         policy["provider_basis"], policy["ledger_basis"])
+            if existing != protected:
+                # Owner/scope/basis changes are refused once a billing
+                # reading exists (section 11): the later audited
+                # resolution integration is the only path past them.
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+
+        conn.execute(
+            "INSERT INTO billing_policies(account_id, reporter_machine_id, "
+            "scope_alias, scope_revision, dedicated_ai, "
+            "non_ai_allowance_micro_eur, cap_basis, provider_basis, "
+            "ledger_basis, vat_bps, poll_seconds, max_age_seconds, "
+            "lag_seconds, abs_tolerance_micro_eur, relative_tolerance_bps, "
+            "mode, stale_action, divergence_action) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(account_id) DO UPDATE SET "
+            "reporter_machine_id=excluded.reporter_machine_id, "
+            "scope_alias=excluded.scope_alias, "
+            "scope_revision=excluded.scope_revision, "
+            "dedicated_ai=excluded.dedicated_ai, "
+            "non_ai_allowance_micro_eur=excluded.non_ai_allowance_micro_eur, "
+            "cap_basis=excluded.cap_basis, "
+            "provider_basis=excluded.provider_basis, "
+            "ledger_basis=excluded.ledger_basis, "
+            "vat_bps=excluded.vat_bps, "
+            "poll_seconds=excluded.poll_seconds, "
+            "max_age_seconds=excluded.max_age_seconds, "
+            "lag_seconds=excluded.lag_seconds, "
+            "abs_tolerance_micro_eur=excluded.abs_tolerance_micro_eur, "
+            "relative_tolerance_bps=excluded.relative_tolerance_bps, "
+            "mode=excluded.mode, "
+            "stale_action=excluded.stale_action, "
+            "divergence_action=excluded.divergence_action",
+            (account_id, reporter_id, policy["scope_alias"],
+             policy["scope_revision"], 1,
+             policy["non_ai_allowance_micro_eur"], policy["cap_basis"],
+             policy["provider_basis"], policy["ledger_basis"],
+             policy["vat_bps"], policy["poll_seconds"],
+             policy["max_age_seconds"], policy["lag_seconds"],
+             policy["abs_tolerance_micro_eur"],
+             policy["relative_tolerance_bps"], policy["mode"],
+             policy["stale_action"], policy["divergence_action"]),
+        )
 
 
 def reading_import(path, file):
