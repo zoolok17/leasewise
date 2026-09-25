@@ -486,6 +486,48 @@ class ReducerRules(_Base):
         self.assertEqual(window["observed_at"], now - 10000)
         self.assertEqual(window["used_bps"], 6000)
 
+    def test_older_same_epoch_observation_keeps_newer_metadata(self):
+        # Card-2 carry-over: an older observation in the same reset epoch must
+        # apply the high-water on used_bps but must NOT overwrite the newer
+        # observation's metadata (observed_at, confidence, source_stale,
+        # covered_seq, source_event_id). The reducer's ordering guard
+        # (reduce.reduce_window) keeps the latest observation's metadata.
+        now = _now_ms()
+        epoch = now - 50000
+        # The NEWER observation arrives first and is stored (its metadata is
+        # the baseline the older one must not clobber).
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc([_cli_window(_eid("m-new"), "desktop", "meter", "wk-m", 4000,
+                              epoch, now - 10000, covered_seq=100)])).returncode, 0)
+        # The OLDER observation (same epoch) arrives second: a higher usage
+        # (8000, which raises the high-water) but an older source time and
+        # different metadata (source_stale=True, covered_seq=42, a new id).
+        self.assertEqual(_readings_import(
+            self.db, self.tmp,
+            _doc([_cli_window(_eid("m-old"), "desktop", "meter", "wk-m", 8000,
+                              epoch, now - 40000, stale=True,
+                              covered_seq=42)])).returncode, 0)
+
+        window = self._window("wk-m")
+        # The high-water usage IS applied from the older (higher) sample ...
+        self.assertEqual(window["used_bps"], 8000)
+        # ... but the NEWER observation's metadata is kept, not overwritten.
+        self.assertEqual(window["observed_at"], now - 10000)
+        self.assertEqual(window["confidence"], "observed")
+        self.assertFalse(window["source_stale"])
+        # covered_seq / source_event_id are not in the status projection; read
+        # the stored row directly to pin that the newer event's metadata won.
+        conn = sqlite3.connect(self.db)
+        try:
+            covered_seq, source_event_id = conn.execute(
+                "SELECT covered_seq, source_event_id FROM windows "
+                "WHERE window_key=?", ("wk-m",)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(covered_seq, 100)
+        self.assertEqual(source_event_id, _eid("m-new"))
+
     def test_gateway_report_meter_stale(self):
         # A fresh gateway report resolves to ok; one older than the fail-closed
         # age (120s) resolves to stale (METER_STALE).
@@ -848,6 +890,111 @@ class ConfigImportUpsert(_Base):
         status = self._status_json()
         self.assertEqual(status["machines"], ["desktop", "worker"])
         self.assertEqual([g["alias"] for g in status["gateways"]], ["g1", "g2"])
+
+    def test_reimport_removed_alias_referenced_by_card3_tables(self):
+        # The v3 policy tables (card 3) reference accounts/machines: a
+        # models row pointing at a removed account, or a seats row pointing
+        # at a removed machine, makes the re-import INVALID_CONFIG (the
+        # card-2 reference guard now covers the v3 tables - A MINOR 6 /
+        # B n5).
+        conn = sqlite3.connect(self.db)
+        try:
+            account_id = conn.execute(
+                "SELECT id FROM accounts WHERE alias='meter'").fetchone()[0]
+            machine_id = conn.execute(
+                "SELECT id FROM machines WHERE alias='worker'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO models(id, account_id, alias, context_ceiling,"
+                " output_ceiling, tariff_input_rate, tariff_output_rate,"
+                " reserve_input_rate, reserve_output_rate, reservation_mode,"
+                " policy_hash, effort_aliases)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m1", account_id, "claude", 200000, 64000, 400000,
+                 2700000, 480000, 3240000, "sized", PRICE_HASH, "standard"),
+            )
+            conn.execute(
+                "INSERT INTO projects(id, alias) VALUES(?,?)", ("p1", "org"))
+            conn.execute(
+                "INSERT INTO teams(id, project_id, alias) VALUES(?,?,?)",
+                ("t1", "p1", "team-a"))
+            conn.execute(
+                "INSERT INTO seats(id, team_id, machine_id, alias, role,"
+                " enforcement) VALUES(?,?,?,?,?,?)",
+                ("s1", "t1", machine_id, "seat-a", "dev", "metered"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        without_worker = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+            ],
+        }
+        bad = _config_import(self.db, self.tmp, without_worker)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The machine survives (its seat still references it).
+        self.assertEqual(self._status_json()["machines"], ["desktop", "worker"])
+
+        # And the account survives while its models row references it.
+        without_meter = {
+            "version": 1,
+            "accounts": [],
+            "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+            "gateways": [],
+        }
+        bad = _config_import(self.db, self.tmp, without_meter)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        status = self._status_json()
+        self.assertEqual([a["alias"] for a in status["accounts"]], ["meter"])
+
+    def test_reimport_removed_account_referenced_by_project_accounts(self):
+        # T1: the project_accounts arm of the card-3 reference guard. An
+        # account referenced only by a project_accounts row is not deletable
+        # by a re-import: INVALID_CONFIG (exit 2), and the account survives.
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO projects(id, alias) VALUES(?,?)", ("p1", "org"))
+            conn.execute(
+                "INSERT INTO accounts(id, alias, vendor, kind,"
+                " budget_micro_eur) VALUES(?,?,?,?,?)",
+                ("a2", "meter2", "ovh", "metered", 50000000))
+            conn.execute(
+                "INSERT INTO project_accounts(project_id, account_id)"
+                " VALUES(?,?)", ("p1", "a2"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        without_meter2 = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+                {"alias": "g2", "account": "meter", "machine": "worker",
+                 "share_micro_eur": 40000000, "period": "utc_month"},
+            ],
+        }
+        bad = _config_import(self.db, self.tmp, without_meter2)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        status = self._status_json()
+        self.assertEqual([a["alias"] for a in status["accounts"]],
+                         ["meter", "meter2"])
 
     def test_reimport_removed_alias_unreferenced(self):
         # A removed alias that nothing references IS deleted; the rest of the

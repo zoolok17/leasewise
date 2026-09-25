@@ -422,9 +422,10 @@ class BillingSnapshotSchema(_Base):
 
 class BillingMigrationRollback(_Base):
     """billing_migration_rollback: a version-2 store with card-2 rows, an
-    interruption after each (externally forceable) DDL of the version-3
-    step - the step rolls back whole and the v2 rows, IDs, payloads and
-    windows survive; the clean upgrade preserves them into v3."""
+    interruption after each (externally forceable) DDL of the version-4
+    step - the upgrade rolls back whole and the v2 rows, IDs, payloads and
+    windows survive; the clean upgrade (v2 -> v3 card 3 -> v4) preserves
+    them into v4."""
 
     def _build_v2_store(self, name):
         import quota_balancer.migrate as migrate
@@ -504,7 +505,7 @@ class BillingMigrationRollback(_Base):
             conn.close()
 
     def test_billing_migration_rollback(self):
-        # A foreign object colliding with each forceable DDL of step 3:
+        # A foreign object colliding with each forceable DDL of step 4:
         # before the rebuild, after the rebuild, and after billing_policies.
         foreign_tables = (
             "CREATE TABLE readings_new (x INTEGER)",
@@ -522,7 +523,7 @@ class BillingMigrationRollback(_Base):
             self.assertEqual(bad.stderr.strip(), ERROR_STORE_FAILED)
             self._assert_v2_intact(db, ev1, ev2)
 
-        # The clean upgrade: v2 -> v3 preserves rows, IDs, payloads and
+        # The clean upgrade: v2 -> v4 (through card 3's v3) preserves rows, IDs, payloads and
         # windows, and the new kind CHECK admits provider_billing while
         # still refusing the future usage kind.
         db, ev1, ev2 = self._build_v2_store("clean.db")
@@ -530,7 +531,7 @@ class BillingMigrationRollback(_Base):
         self.assertEqual(good.returncode, 0, good.stderr)
         conn = sqlite3.connect(db)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             readings_sql = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE name='readings'"
             ).fetchone()[0]
