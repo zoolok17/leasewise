@@ -347,8 +347,8 @@ def _apply_billing_policies(conn, policies):
         allocation_within_cap(
             budget, shares.get(account_id, 0),
             policy["non_ai_allowance_micro_eur"],
-            policy["cap_basis"], policy["provider_basis"],
-            policy["ledger_basis"], policy["vat_bps"])
+            policy["cap_basis"], policy["ledger_basis"],
+            policy["vat_bps"])
 
         existing = conn.execute(
             "SELECT reporter_machine_id, scope_alias, scope_revision, "

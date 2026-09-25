@@ -264,20 +264,22 @@ def convert_basis(amount, source_basis, target_basis, vat_bps):
     fraction is never dropped), in checked integer arithmetic:
       ex_vat -> invoice_total: ceil(x * (10000 + vat_bps) / 10000)
       invoice_total -> ex_vat: ceil(x * 10000 / (10000 + vat_bps))
-      equal bases: unchanged (no rate is needed, so vat_bps may be None)
-    Bases are never guessed: an unknown (closed) basis, or a missing/
-    out-of-range required rate, yields BILLING_BASIS_UNKNOWN - deferral,
-    not approval. A non-closed basis, a non-integer/negative amount, or an
-    overflowing result is INVALID_CONFIG.
+      equal KNOWN bases: unchanged (no rate is needed, so vat_bps may be
+      None)
+    Bases are never guessed: an unknown (closed) basis - even one that
+    "equals" itself - or a missing/out-of-range required rate, yields
+    BILLING_BASIS_UNKNOWN - deferral, not approval. Nothing is converted
+    from an unknown basis. A non-closed basis, a non-integer/negative
+    amount, or an overflowing result is INVALID_CONFIG.
     """
     if type(amount) is not int or amount < 0 or amount > INT64_MAX:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
     if source_basis not in CLOSED_BASES or target_basis not in CLOSED_BASES:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
-    if source_basis == target_basis:
-        return amount
     if source_basis == BASIS_UNKNOWN or target_basis == BASIS_UNKNOWN:
         raise QuotaError(CODE_BILLING_BASIS_UNKNOWN, MSG_BILLING_BASIS_UNKNOWN)
+    if source_basis == target_basis:
+        return amount
     if type(vat_bps) is not int or not 0 <= vat_bps <= VAT_BPS_MAX:
         # A missing or unusable required rate: no implicit VAT default is
         # permitted.

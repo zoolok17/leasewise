@@ -142,34 +142,38 @@ def validate_billing_policies(doc):
 
 
 def allocation_within_cap(budget, shares_micro_eur, allowance_micro_eur,
-                          cap_basis, provider_basis, ledger_basis,
-                          vat_bps):
+                          cap_basis, ledger_basis, vat_bps):
     """B01: gateway shares + the non-AI allowance <= the account cap.
 
     The comparison runs on the CAP's tax basis: `budget` is the account
-    cap on cap_basis, the gateway shares are ledger-basis money, and the
-    non-AI allowance is provider-basis money (the provider bills in its
-    own basis). A conversion is needed only where a known basis differs
-    from the cap basis, and it then requires a usable rate: a missing or
-    unusable vat_bps is an invalid document, never a default. An unknown
-    (closed) basis DEFERS the check - permitted configuration, not
-    permission to compare. The sum is checked: an overflow is invalid.
+    cap and `allowance_micro_eur` is the non-AI allowance, both
+    configured in the cap basis (section 11: cap and allowance are
+    configured in that basis), and the gateway shares are ledger-basis
+    money. A conversion is needed only where the known ledger basis
+    differs from the cap basis, and it then requires a usable rate: a
+    missing or unusable vat_bps is an invalid document, never a default.
+    An unknown (closed) basis DEFERS the check - permitted
+    configuration, not permission to compare: an unknown cap basis is
+    nothing to compare against, and an unknown share basis is nothing to
+    convert from, so neither is approved nor rejected. The sum is
+    checked: an overflow is invalid.
     """
     def _in_cap_basis(amount, source_basis):
+        if cap_basis == BASIS_UNKNOWN or source_basis == BASIS_UNKNOWN:
+            # A comparison on an unknown basis is not possible: defer -
+            # even a basis that "equals" itself is not a basis to
+            # compare on.
+            return None
         if source_basis == cap_basis:
             return amount
-        if source_basis == BASIS_UNKNOWN or cap_basis == BASIS_UNKNOWN:
-            # A comparison on an unknown basis is not possible: defer.
-            return None
         if not (_is_int(vat_bps) and 0 <= vat_bps <= VAT_BPS_MAX):
             _invalid()
         # convert_basis raises INVALID_CONFIG on overflow.
         return convert_basis(amount, source_basis, cap_basis, vat_bps)
 
     shares = _in_cap_basis(shares_micro_eur, ledger_basis)
-    allowance = _in_cap_basis(allowance_micro_eur, provider_basis)
-    if shares is None or allowance is None:
+    if shares is None:
         return  # deferred: no comparison was possible
-    total = shares + allowance
+    total = shares + allowance_micro_eur
     if total > INT64_MAX or budget is None or total > budget:
         _invalid()

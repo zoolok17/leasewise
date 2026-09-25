@@ -1335,8 +1335,10 @@ class BillingTaxBasis(_Base):
             convert_basis(10001, "invoice_total", "ex_vat", 1), 10000)
 
         # An unknown basis defers (a BILLING_BASIS_UNKNOWN), it never
-        # approves: no comparison is possible.
-        for source, target in (("unknown", "ex_vat"), ("ex_vat", "unknown")):
+        # approves: no comparison is possible - even an unknown basis
+        # "equals" itself, nothing is converted from it.
+        for source, target in (("unknown", "ex_vat"), ("ex_vat", "unknown"),
+                               ("unknown", "unknown")):
             with self.assertRaises(QuotaError) as ctx:
                 convert_basis(100, source, target, 1900)
             self.assertEqual(ctx.exception.code, CODE_BILLING_BASIS_UNKNOWN)
@@ -1361,26 +1363,32 @@ class BillingTaxBasis(_Base):
             convert_basis(100, "gross", "ex_vat", 1900)
         self.assertEqual(ctx.exception.code, CODE_INVALID_CONFIG)
 
-        # Import level: the allocation check uses one tax basis. A second,
-        # gateway-less metered account with a 100 EUR cap: an allowance of
-        # 119 EUR invoice-total converts to exactly 100 EUR ex-VAT (the
-        # cap) and passes; one micro-EUR more fails.
+        # Import level: the allocation check runs on the CAP's basis. A
+        # second metered account "big" carries a 119 EUR invoice-total
+        # cap and one 100 EUR ex-VAT gateway share: the share converts
+        # to exactly the cap (19%), so an allowance of 0 fits and 1
+        # micro-EUR more fails.
         doc = copy.deepcopy(VALID_DOC)
         doc["accounts"].append(
             {"alias": "big", "vendor": "ovh", "kind": "metered",
-             "budget_micro_eur": 100_000_000})
+             "budget_micro_eur": 119_000_000})
+        doc["gateways"].append(
+            {"alias": "g3", "account": "big", "machine": "worker",
+             "share_micro_eur": 100_000_000, "period": "utc_month"})
         self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
         ok = _policy_doc([
             _billing_policy(account="big", reporter="worker",
-                            provider_basis="invoice_total", vat_bps=1900,
-                            allowance=119_000_000),
+                            cap_basis="invoice_total",
+                            ledger_basis="ex_vat", vat_bps=1900,
+                            allowance=0),
         ])
         self.assertEqual(_billing_policy_import(
             self.db, self.tmp, ok).returncode, 0)
         over = _policy_doc([
             _billing_policy(account="big", reporter="worker",
-                            provider_basis="invoice_total", vat_bps=1900,
-                            allowance=119_000_001),
+                            cap_basis="invoice_total",
+                            ledger_basis="ex_vat", vat_bps=1900,
+                            allowance=1),
         ])
         result = _billing_policy_import(self.db, self.tmp, over)
         self.assertEqual(result.returncode, 2)
@@ -1388,12 +1396,66 @@ class BillingTaxBasis(_Base):
         # A needed conversion without a rate is an invalid document.
         norate = _policy_doc([
             _billing_policy(account="big", reporter="worker",
-                            provider_basis="invoice_total",
-                            allowance=0),
+                            cap_basis="invoice_total",
+                            ledger_basis="ex_vat"),
         ])
         result = _billing_policy_import(self.db, self.tmp, norate)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The allowance is configured in the cap basis, never converted
+        # from the provider basis: 75 ex-VAT shares against a 100 ex-VAT
+        # cap plus a 30 ex-VAT allowance is 105 > 100 - refused, even
+        # though the provider bills invoice-total at 20%. The config
+        # document is a full replacement, so big (policy-bearing) is
+        # carried over alongside the new mid account.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"].extend([
+            {"alias": "big", "vendor": "ovh", "kind": "metered",
+             "budget_micro_eur": 119_000_000},
+            {"alias": "mid", "vendor": "ovh", "kind": "metered",
+             "budget_micro_eur": 100_000_000},
+        ])
+        doc["gateways"].extend([
+            {"alias": "g3", "account": "big", "machine": "worker",
+             "share_micro_eur": 100_000_000, "period": "utc_month"},
+            {"alias": "g4", "account": "mid", "machine": "desktop",
+             "share_micro_eur": 75_000_000, "period": "utc_month"},
+        ])
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
+        over_allowance = _policy_doc([
+            _billing_policy(account="mid", reporter="desktop",
+                            provider_basis="invoice_total", vat_bps=2000,
+                            allowance=30_000_000),
+        ])
+        result = _billing_policy_import(self.db, self.tmp, over_allowance)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The same shape with the cap-basis sum within the cap (75 + 25
+        # = 100) is accepted: nothing is converted from the provider
+        # basis.
+        fits = _policy_doc([
+            _billing_policy(account="mid", reporter="desktop",
+                            provider_basis="invoice_total", vat_bps=2000,
+                            allowance=25_000_000),
+        ])
+        self.assertEqual(_billing_policy_import(
+            self.db, self.tmp, fits).returncode, 0)
+        # An unknown basis defers the check entirely: nothing is
+        # compared, so an allowance above the cap is permitted
+        # configuration (an advisory ALERT at evaluation), never an
+        # approval - and never rejected on an unknown-basis sum either.
+        for bases in (
+            {"cap_basis": "unknown", "provider_basis": "unknown",
+             "ledger_basis": "unknown"},
+            {"cap_basis": "ex_vat", "provider_basis": "ex_vat",
+             "ledger_basis": "unknown"},
+        ):
+            deferred = _policy_doc([
+                _billing_policy(account="meter", reporter="desktop",
+                                allowance=150_000_000, **bases),
+            ])
+            self.assertEqual(_billing_policy_import(
+                self.db, self.tmp, deferred).returncode, 0, bases)
 
 
 class BillingOutputErrors(_Base):
