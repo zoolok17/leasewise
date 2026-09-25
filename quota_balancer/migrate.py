@@ -1,15 +1,18 @@
 """Schema migration for the quota inventory store.
 
 Card 1 is migration version 1, card 2 is version 2, card 3 is version 3,
-and card 2b-1 is version 4. Each DDL block is normative: version 1 is
-copied byte for byte from docs/DESIGN.md section 8 ("Card 1"); version 2
-adds the card-2 tables (readings, windows) and the gateway report /
-account coverage columns of section 7; version 3 adds the card-3 policy
-tables (models, profiles, projects, teams, seats, project_accounts,
-limits) of section 7; version 4 (card 2b-1, section 11) rebuilds
-readings' kind CHECK to admit provider_billing and adds the billing
-policy/totals tables. Versions 1-3 are kept byte for byte: a card adds
-only its own DDL. A store at the current version is a no-op; a store at
+card 2b-1 is version 4, and card 4 is version 5. Each DDL block is
+normative: version 1 is copied byte for byte from docs/DESIGN.md section
+8 ("Card 1"); version 2 adds the card-2 tables (readings, windows) and
+the gateway report / account coverage columns of section 7; version 3
+adds the card-3 policy tables (models, profiles, projects, teams, seats,
+project_accounts, limits) of section 7; version 4 (card 2b-1, section
+11) rebuilds readings' kind CHECK to admit provider_billing and adds
+the billing policy/totals tables; version 5 (card 4, section 7) adds
+the lease-store tables (blocks, leases, holds, receipts, adjustments,
+audit, daily_totals) and the exact partial indexes (blocks_live,
+receipt_final, lease_live). Versions 1-3 are kept byte for byte: a card
+adds only its own DDL. A store at the current version is a no-op; a store at
 a newer, unknown version is rejected before anything is written or
 switched (left byte-for-byte unchanged).
 
@@ -38,7 +41,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -202,7 +205,7 @@ _DDL_V3 = (
     # The exact uniqueness index of section 7 (empty string is not a valid
     # window key; COALESCE makes a NULL window_key distinct from '').
     "CREATE UNIQUE INDEX limits_scope ON limits("
-    "scope,scope_id,metric,period,COALESCE(window_key,''))",
+    "scope,scope_id,metric,period,COALESCE(window_key,''));",
 )
 
 # Card 2b-1 (migration version 4): provider billing ingestion (section 11).
@@ -276,8 +279,116 @@ MIGRATION_V3 = "\n".join(_DDL_V3) + "\nPRAGMA user_version=3;\n"
 # The canonical version-4 migration script, kept for byte-for-byte comparison.
 MIGRATION_V4 = "\n".join(_DDL_V4) + "\nPRAGMA user_version=4;\n"
 
+# Card 4 (migration version 5): the lease store (section 7). The seven
+# tables - blocks, leases, holds, receipts, adjustments, audit,
+# daily_totals - and the exact partial indexes of section 7
+# (blocks_live, receipt_final, lease_live). They are created EMPTY in
+# this turn: the transactional grant/check/settle API lands in a later
+# turn, so no writer of these tables exists yet in this commit.
+#
+# holds.limit_id carries no foreign key: an account hold reserves a
+# synthetic account-limit identifier, not a duplicate limits row
+# (section 7). The partial indexes keep one parked/probing block per
+# (account, model-or-null), one active/uncertain lease per (seat, turn)
+# and one final receipt per lease; cleared/settled rows keep no slot.
+_DDL_V5 = (
+    "CREATE TABLE blocks(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " model_id TEXT REFERENCES models(id),\n"
+    " reason TEXT NOT NULL,\n"
+    " retry_at INTEGER,\n"
+    " state TEXT NOT NULL CHECK(state IN ('parked','probing','cleared')),\n"
+    " source_event_id TEXT,\n"
+    " updated_at INTEGER NOT NULL) STRICT;",
+    "CREATE UNIQUE INDEX blocks_live ON blocks("
+    "account_id,COALESCE(model_id,'')) WHERE state IN ('parked','probing');",
+    "CREATE TABLE leases(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " machine_id TEXT NOT NULL REFERENCES machines(id),\n"
+    " seat_id TEXT NOT NULL REFERENCES seats(id),\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " model_id TEXT NOT NULL REFERENCES models(id),\n"
+    " gateway_id TEXT REFERENCES gateways(id),\n"
+    " parent_lease_id TEXT REFERENCES leases(id),\n"
+    " turn_id TEXT NOT NULL,\n"
+    " request_id TEXT NOT NULL,\n"
+    " request_hash TEXT NOT NULL,\n"
+    " token_hash TEXT,\n"
+    " task_class TEXT NOT NULL,\n"
+    " context_mode TEXT NOT NULL,\n"
+    " enforcement TEXT NOT NULL,\n"
+    " estimate TEXT NOT NULL,\n"
+    " policy_snapshot TEXT NOT NULL,\n"
+    " input_cap INTEGER NOT NULL CHECK(input_cap>=0),\n"
+    " output_cap INTEGER NOT NULL CHECK(output_cap>=0),\n"
+    " max_calls INTEGER NOT NULL CHECK(max_calls>0),\n"
+    " per_call_output_cap INTEGER NOT NULL CHECK(per_call_output_cap>=0),\n"
+    " money_hold INTEGER CHECK(money_hold IS NULL OR money_hold>=0),\n"
+    " granted_at INTEGER NOT NULL,\n"
+    " expires_at INTEGER NOT NULL,\n"
+    " activity_seq INTEGER NOT NULL DEFAULT 0,\n"
+    " period_start INTEGER NOT NULL,\n"
+    " state TEXT NOT NULL CHECK(state IN ('active','uncertain','settled')),\n"
+    " outcome TEXT,\n"
+    " UNIQUE(machine_id, request_id)) STRICT;",
+    "CREATE UNIQUE INDEX lease_live ON leases(seat_id,turn_id) "
+    "WHERE state IN ('active','uncertain');",
+    "CREATE TABLE holds(\n"
+    " lease_id TEXT NOT NULL REFERENCES leases(id),\n"
+    " limit_id TEXT NOT NULL,\n"
+    " period_start INTEGER NOT NULL,\n"
+    " reserved INTEGER NOT NULL CHECK(reserved>=0),\n"
+    " settled_actual INTEGER "
+    "CHECK(settled_actual IS NULL OR settled_actual>=0),\n"
+    " PRIMARY KEY(lease_id, limit_id, period_start)) STRICT;",
+    "CREATE TABLE receipts(\n"
+    " event_id TEXT PRIMARY KEY,\n"
+    " lease_id TEXT NOT NULL REFERENCES leases(id),\n"
+    " gateway_id TEXT REFERENCES gateways(id),\n"
+    " seq INTEGER,\n"
+    " calls INTEGER NOT NULL CHECK(calls>=0),\n"
+    " input_tokens INTEGER NOT NULL CHECK(input_tokens>=0),\n"
+    " cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens>=0),\n"
+    " output_tokens INTEGER NOT NULL CHECK(output_tokens>=0),\n"
+    " actual_micro_eur INTEGER "
+    "CHECK(actual_micro_eur IS NULL OR actual_micro_eur>=0),\n"
+    " outcome TEXT,\n"
+    " final INTEGER NOT NULL DEFAULT 0 CHECK(final IN (0,1)),\n"
+    " observed_at INTEGER NOT NULL,\n"
+    " received_at INTEGER NOT NULL) STRICT;",
+    "CREATE UNIQUE INDEX receipt_final ON receipts(lease_id) WHERE final=1;",
+    "CREATE TABLE adjustments(\n"
+    " id TEXT PRIMARY KEY,\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " source_event_id TEXT NOT NULL UNIQUE,\n"
+    " period_start INTEGER NOT NULL,\n"
+    " unattributed_micro_eur INTEGER NOT NULL,\n"
+    " reason TEXT NOT NULL,\n"
+    " resolved_at INTEGER) STRICT;",
+    "CREATE TABLE audit(\n"
+    " actor_alias TEXT NOT NULL,\n"
+    " action TEXT NOT NULL,\n"
+    " object_id TEXT,\n"
+    " at INTEGER NOT NULL,\n"
+    " redacted_details TEXT NOT NULL) STRICT;",
+    "CREATE TABLE daily_totals(\n"
+    " scope TEXT NOT NULL,\n"
+    " scope_id TEXT NOT NULL,\n"
+    " utc_day TEXT NOT NULL,\n"
+    " tokens INTEGER NOT NULL CHECK(tokens>=0),\n"
+    " calls INTEGER NOT NULL CHECK(calls>=0),\n"
+    " money_micro_eur INTEGER NOT NULL CHECK(money_micro_eur>=0),\n"
+    " unmanaged_turns INTEGER NOT NULL CHECK(unmanaged_turns>=0),\n"
+    " PRIMARY KEY(scope, scope_id, utc_day)) STRICT;",
+)
+
+# The canonical version-5 migration script, kept for byte-for-byte comparison.
+MIGRATION_V5 = "\n".join(_DDL_V5) + "\nPRAGMA user_version=5;\n"
+
 # Step N upgrades a store from version N-1 to version N.
-_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4}
+_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5}
 
 
 def schema_version(conn):
@@ -339,8 +450,8 @@ def migrate(conn):
     A store at the current version is a no-op. A store at a newer, unknown
     version is rejected before anything is written or switched (left
     byte-for-byte unchanged). A store below the current version (0 = fresh
-    or empty file, 1 = card 1, 2 = card 2, 3 = card 3) is brought up step
-    by step to version 4 (card 2b-1): the
+    or empty file, 1 = card 1, 2 = card 2, 3 = card 3, 4 = card 2b-1) is
+    brought up step by step to version 5 (card 4): the
     pending steps' DDL and the version stamp commit as one transaction, so
     a failure (or a stop) between statements leaves no half-built store.
     """
