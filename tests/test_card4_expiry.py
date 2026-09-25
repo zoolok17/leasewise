@@ -76,7 +76,8 @@ def _error_payload(exc):
                       separators=(",", ":"))
 
 
-def _grant_request(request_id, turn_id, request_hash):
+def _grant_request(request_id, turn_id, request_hash,
+                   observed_at=NOW - 1000):
     return {
         "request_id": request_id,
         "request_hash": request_hash,
@@ -91,7 +92,7 @@ def _grant_request(request_id, turn_id, request_hash):
             "initial_tokens": 1000,
             "dispatch_tokens": 0,
             "source": "tokenizer",
-            "observed_at": NOW - 1000,
+            "observed_at": observed_at,
             "growth_tokens_per_call": 0,
         },
         "expected_calls": 1,
@@ -205,7 +206,8 @@ class Card4Turn3Test(unittest.TestCase):
                 request_id or str(uuid.uuid4()),
                 turn_id or str(uuid.uuid4()),
                 request_hash or hashlib.sha256(
-                    ("x" + str(uuid.uuid4())).encode("utf-8")).hexdigest()),
+                    ("x" + str(uuid.uuid4())).encode("utf-8")).hexdigest(),
+                observed_at=now_ms - 1000),
             now_ms)
 
     # --- expiry --------------------------------------------------------------------

@@ -200,7 +200,8 @@ class Card4SettleFixTest(unittest.TestCase):
             db, _grant_request(
                 str(uuid.uuid4()), str(uuid.uuid4()),
                 hashlib.sha256(
-                    ("x" + uuid.uuid4().hex).encode()).hexdigest()),
+                    ("x" + uuid.uuid4().hex).encode()).hexdigest(),
+                observed_at=now_ms - 1000),
             now_ms)
 
     # --- READ B B1 / READ A BLOCKER 1 ---------------------------------------------
@@ -277,7 +278,9 @@ class Card4SettleFixTest(unittest.TestCase):
         settled = lease.settle(
             db, _receipt(str(uuid.uuid4()), lease_id, HOLD + 500), NOW)
         self.assertEqual(settled["state"], "settled")
-        self.assertEqual(settled["retained_micro_eur"], 2 * HOLD)
+        # The response is per lease: the lease's own hold (the 500
+        # overrun is the adjustments row below, not retained).
+        self.assertEqual(settled["retained_micro_eur"], HOLD)
         # Exactly one adjustment: the max overrun over the money holds,
         # in the original period.
         self.assertEqual(

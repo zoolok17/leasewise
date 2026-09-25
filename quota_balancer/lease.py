@@ -128,6 +128,8 @@ _MAX_TTL_MS = 24 * _DAY_MS
 # so the grant's chain always carries it and every platform row applies
 # to every lease (card-3: a chain scope id is always a UUID).
 _PLATFORM_ID = "00000000-0000-0000-0000-000000000000"
+# Section 7: the admission estimate must be at most 120 seconds old.
+_EST_FRESH_MS = 120_000
 
 _LEASE_COLS = (
     "id", "machine_id", "seat_id", "account_id", "model_id", "gateway_id",
@@ -326,8 +328,10 @@ def grant(path, request, now_ms):
     """Admit and record one lease, or refuse it with a section-7 code.
 
     One BEGIN IMMEDIATE transaction: read the chain, the account and
-    the model; refuse on a parked block (ACCOUNT_PARKED); replay/refuse
-    by (machine_id, request_id); compute the caps through the card-3
+    the model; replay/refuse by (machine_id, request_id) - a replay
+    returns the stored lease even if the account is parked since;
+    refuse on a parked block (ACCOUNT_PARKED); compute the caps through
+    the card-3
     arithmetic; re-read usage and holds and enforce every applicable
     limit through policy.check_admission (a denial maps to the 429 code
     of the failing metric); refuse a taken (seat, turn) live slot; then
@@ -385,11 +389,13 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         for scope, scope_id in scope_ids:
             usage[(scope, scope_id)] = (used, 0)
     elif metric == "concurrency":
-        # Concurrency counts the live and uncertain leases of the scope.
+        # Concurrency counts the live and uncertain leases of the
+        # scope; a shadow lease consumes no slot.
         for scope, scope_id in scope_ids:
             count = conn.execute(
                 "SELECT COUNT(*) FROM leases l WHERE l.state IN "
-                "('active','uncertain') AND " + _chain_pred(scope),
+                "('active','uncertain') AND l.enforcement <> 'shadow' "
+                "AND " + _chain_pred(scope),
                 _chain_bind(scope, scope_id)).fetchone()[0]
             usage[(scope, scope_id)] = (count, 0)
     else:
@@ -522,13 +528,14 @@ def _grant(conn, request, now_ms):
         chain = {"platform": _PLATFORM_ID, "project": project[0],
                  "team": team[0], "seat": seat[0]}
 
-        _parked_block_error(conn, account_id, model[0])
-
         # Idempotency: same (machine, request_id) + same content replays
         # the stored lease without adding a hold; different content is a
         # conflict. The content hash is computed server-side over the
         # canonical request - a client-supplied hash cannot make a
-        # changed replay look identical.
+        # changed replay look identical. The replay comes before the
+        # parked check: a lost-response retry of a granted lease
+        # replays the stored lease (section 7: replay returns 200)
+        # even if the account parked since the grant.
         content_hash = _content_hash(request)
         existing = conn.execute(
             "SELECT id, request_hash FROM leases WHERE machine_id=? AND "
@@ -540,6 +547,12 @@ def _grant(conn, request, now_ms):
             row = _lease_row(conn, existing[0])
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
+
+        _parked_block_error(conn, account_id, model[0])
+        # Section 7: the admission estimate must be at most 120 seconds
+        # old - a stale observed_at is a stale admission basis.
+        if now_ms - request["context"]["observed_at"] > _EST_FRESH_MS:
+            _invalid()
 
         # Derive the caps through the card-3 arithmetic: the model row
         # feeds the pure estimate; the request carries the context.
@@ -840,6 +853,15 @@ def _settle(conn, receipt, now_ms):
         lease = _lease_row(conn, receipt["lease_id"])
         if lease is None:
             _not_found()
+        # The receipt must be attributed to the lease's own gateway
+        # (a NULL names no other): a report naming a foreign gateway
+        # is a conflicting account of this lease (static
+        # RECEIPT_CONFLICT), never a settle - the overrun liability
+        # would otherwise take a foreign home.
+        if receipt["gateway_id"] is not None and \
+                receipt["gateway_id"] != lease["gateway_id"]:
+            raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
+                             errors.MSG_RECEIPT_CONFLICT)
         stored = conn.execute(
             "SELECT event_id," + ",".join(_RECEIPT_FIELDS) +
             " FROM receipts WHERE event_id=?",
@@ -860,11 +882,14 @@ def _settle(conn, receipt, now_ms):
             # recorded (reconciliation is turn 3).
             raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
                              errors.MSG_RECEIPT_CONFLICT)
-        if lease["state"] == "uncertain" and not receipt["final"]:
+        if not receipt["final"] and (lease["state"] == "uncertain"
+                                     or now_ms >= lease["expires_at"]):
             # Only the gateway's closed-child final receipt resolves an
-            # unprovable outcome; interim usage never settles money.
-            # (A late FINAL receipt is accepted below and settles the
-            # holds at their original, grant-time period_start.)
+            # unprovable outcome; a non-final report on a lease whose
+            # TTL has elapsed (explicitly, or by the clock) is
+            # refused. (A late FINAL receipt is accepted below and
+            # settles the holds at their original, grant-time
+            # period_start.)
             raise QuotaError(errors.CODE_LEASE_EXPIRED,
                              errors.MSG_LEASE_EXPIRED)
         # A final receipt on a METERED lease must carry the money:
@@ -921,9 +946,14 @@ def _settle(conn, receipt, now_ms):
                         amount = actual - reserved
                         if overrun is None or amount > overrun[1]:
                             overrun = (period_start, amount)
-                if metric == "money_micro_eur":
-                    released += reserved - settled_actual
-                    retained += settled_actual
+            # The response contract is per lease (section 7): the
+            # lease's own reservation, not the sum over its holds rows
+            # (every money cap reserves the same hold size; the
+            # overrun above it is the adjustments row, not retained).
+            money_hold = lease["money_hold"]
+            if money_hold is not None:
+                retained = min(receipt["actual_micro_eur"], money_hold)
+                released = money_hold - retained
             if overrun is not None:
                 gateway_id = (receipt["gateway_id"]
                               if receipt["gateway_id"] is not None

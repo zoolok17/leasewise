@@ -212,3 +212,151 @@ behavior is what the card pins.)
   `grant_race` uses real `multiprocessing` worker processes against one
   store file and proves no overspend at the store level. Concurrency
   across machines through the HTTP layer is card 5's concern.
+
+## Fix round (turns A/B/C — the two reads)
+
+Two independent reads of the card-4 store: READ A
+(`card4-read-sonnet.md`) and READ B (`card4-read-opus.md`). Each
+finding is handled finding -> fix -> pinning test. Turn A is
+`7d78204` (settlement accounting), turn B is `41c2c5a` (enforcement
+and binding), turn C is this commit (gateway on settle + the minors +
+this section).
+
+### Turn A (`7d78204`) — `tests/test_card4_settle_fix.py` (4)
+
+- READ A BLOCKER 1 / READ B B1 — settled hold headroom was not
+  returned. Fix: the final receipt's holds loop settles
+  `min(actual, reserved)` per holds row; the unspent remainder of the
+  reservation comes back to the caps. Pin:
+  `test_settled_lease_releases_hold_headroom` (a budget that fits
+  exactly 3 holds; after three small settles, a 4th grant is
+  admitted).
+- READ A MAJOR 3 / READ B B2 — day caps settled against the month
+  start. Fix: a (metric, day) hold takes the grant-day bucket. Pin:
+  `test_day_limit_counts_settled_spend`.
+- READ A BLOCKER 2 / READ B M1 — an overrun wrote one adjustments
+  row per money hold. Fix: exactly one row for the max overrun, in
+  the original period. Pin:
+  `test_overrun_two_money_holds_one_adjustment` (two money holds,
+  exactly one adjustments row).
+- READ A MAJOR 7 (the blocking side) — an overrun must park the
+  account. Fix: an overrun final inserts the parked block; the next
+  grant is refused ACCOUNT_PARKED. Pin: `test_overrun_blocks_account`.
+  (The reconciliation reading of `resolved_at` is turn 3's scope.)
+
+### Turn B (`41c2c5a`) — `tests/test_card4_enforce_fix.py` (6)
+
+- READ B B3 — platform limits were never enforced. Fix: the platform
+  singleton (the null UUID `_PLATFORM_ID`) rides in every grant's
+  chain and in the limits query. Pin:
+  `test_platform_limit_enforced`.
+- READ A MAJOR 5 (grant side) — the gateway/account were not tied to
+  the seat's project. Fix: the account must be in the project's
+  `project_accounts` (POLICY_DENIED), and the grant's gateway must
+  be one of the project's gateways. Pins:
+  `test_foreign_account_rejected`, `test_foreign_gateway_rejected`.
+- READ B M2 — `request_hash` was client-provided. Fix: the
+  server-side content hash over the canonical request JSON (every
+  field except `request_hash`); same id + changed content is
+  IDEMPOTENCY_CONFLICT, unchanged content replays. Pin:
+  `test_replay_changed_content_conflicts`.
+- READ A MAJOR 4 — a subscription/advisory lease that reserved no
+  money could not settle a null amount. Fix: a final receipt with a
+  null `actual_micro_eur` is accepted when the lease reserved no
+  money. Pin: `test_advisory_settle_null_money`.
+- READ A MAJOR 6 / READ B m3 — `ttl_ms` (the lifetime bound) was
+  unbounded. Fix:
+  `_check_int(ttl_ms, 1, _MAX_TTL_MS)` with `_MAX_TTL_MS` = 24 h,
+  plus the int64 overflow guard on `expires_at`. Pin:
+  `test_ttl_ms_bounded` (2_073_600_000 accepted; 2_073_600_001,
+  2**62, 2**63-1 refused).
+- Inherited-draft corrections found while pinning: the platform
+  singleton was the string `"platform"` (card-3 requires UUID chain
+  ids; 32 reds) and the ttl test used a 1-day bound where the max is
+  24 h.
+
+### Turn C (this commit) — `tests/test_card4_turn_c_fix.py` (6)
+
+- READ A MAJOR 5 (settle side) — the receipt's `gateway_id` must
+  match the lease's gateway. Fix: `_settle` refuses a foreign gateway
+  with a static RECEIPT_CONFLICT (a NULL names no other gateway);
+  the lease stays untouched. Pin:
+  `test_settle_foreign_gateway_conflicts`.
+- READ A MINOR 8 / READ B m1 — the settle response summed over the
+  holds rows (every money cap reserves the same hold size, so the
+  lease was double-billed). Fix: released/retained is per lease,
+  from `lease["money_hold"]`; the overrun stays in the adjustments
+  row. Pins: `test_settle_release_retained_per_lease` and the
+  turn-A assertion in `test_overrun_two_money_holds_one_adjustment`
+  updated from `2 * HOLD` to `HOLD`.
+- READ A MINOR 11 / READ B m2 — a parked block recorded after a
+  grant blocked the legitimate replay. Fix: the idempotency replay
+  now comes before the parked check. Pin:
+  `test_parked_replay_returns_stored_lease`.
+- READ A MINOR 10 — estimate freshness. Fix:
+  `observed_at` must be at most 120 s old at the grant
+  (`_EST_FRESH_MS`), else INVALID_REQUEST. Pin:
+  `test_stale_estimate_refused`. Fixture note: the two modules that
+  grant at a later injected clock (the day-cap test in
+  `test_card4_settle_fix`, the October grant in
+  `test_card4_expiry`) now derive `observed_at` from that clock so
+  their grants stay fresh — they test bucketing/reconciliation, not
+  estimate age.
+- READ A MINOR 12 (concurrency) — a shadow lease consumed a slot.
+  Fix: the live-slot count excludes `enforcement = 'shadow'`. Pin:
+  `test_shadow_consumes_no_concurrency_slot`.
+- READ B m6 — a non-final receipt past the TTL was accepted on an
+  active lease. Fix: a non-final receipt is refused once the lease
+  is uncertain or its TTL has elapsed; a late FINAL still settles.
+  Pin: `test_nonfinal_past_ttl_refused`.
+
+Mutation verification (turn C): each of the six fixes was reverted
+in isolation and its pinning test went red (settle-foreign-gateway,
+settle-nonfinal-past-ttl, settle-retained-per-hold,
+grant-replay-after-parked, grant-estimate-freshness,
+concurrency-shadow-counted); the source was restored byte-exact
+after each.
+
+### Deferred (with reasons)
+
+- READ A NIT 13 / READ B n1 — "card 4 added a trailing `;` to
+  card-3's v3 index": verified `_DDL_V1/_V2/_V3` are byte-identical
+  to the card-3 base `db39746`; the `;` is in the original. No
+  change. NIT 13's second half (no card-4 exact-fit-at-cap test):
+  the equality boundary is pinned at store level by card 3's
+  `test_admission_at_cap_ok_over_cap_denied` and by the third of the
+  three exact-fit grants in
+  `test_settled_lease_releases_hold_headroom`.
+- READ B n2 — `adjustments.unattributed_micro_eur` has no CHECK >=
+  0: the value is server-computed as actual - reserved under
+  `actual > reserved` (structurally non-negative), and adding the
+  constraint needs a v6 table rebuild; the read's READY list
+  excludes the NITs.
+- READ A MINOR 9 — the store's `final` is int 0/1 (schema CHECK);
+  the wire's `true` converts in card 5's HTTP layer.
+- The clamp sub-item of READ A MAJOR 6 / READ B m3 — `expires_at` is
+  not clamped at a period boundary (section 4 requires it); needs a
+  design ruling on which boundary.
+- READ A m4 — the enforcement x account-kind matrix needs the full
+  section-7 ruling plus a refusal-code choice.
+- READ A MINOR 12 (remainder) — task_class has no design taxonomy
+  in card-4 scope (the column stores the effort alias);
+  daily_totals' derivation point is unspecified; token_hash is card
+  5 per the read. Its platform-scope bullet is covered by the turn-B
+  B3 fix, and its last bullet (settled non-final interim receipts)
+  is marked "as designed" in the read itself.
+
+### Commands and counts (fix round)
+
+```console
+$ python -m unittest discover -s tests
+Ran 171 tests in 79.935s
+OK
+```
+
+155 (original card 4) + 4 (turn A) + 6 (turn B) + 6 (turn C) = 171.
+Card-4 modules in isolation: `python -m unittest tests.test_card4
+tests.test_card4_ops tests.test_card4_expiry
+tests.test_card4_settle_fix tests.test_card4_enforce_fix
+tests.test_card4_turn_c_fix` -> `Ran 49 tests ... OK` (6 + 16 + 11
++ 4 + 6 + 6).
