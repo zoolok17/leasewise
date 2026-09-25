@@ -20,9 +20,11 @@ import time
 import uuid
 
 from .errors import (
+    CODE_BILLING_SCOPE_MISMATCH,
     CODE_IDEMPOTENCY_CONFLICT,
     CODE_INVALID_CONFIG,
     CODE_STORE_ERROR,
+    MSG_BILLING_SCOPE_MISMATCH,
     MSG_IDEMPOTENCY_CONFLICT,
     MSG_INVALID_CONFIG,
     MSG_STORE_FAILED,
@@ -253,6 +255,9 @@ def _upsert(conn, accounts, machines, gateways):
     for alias in set(old_machines) - set(machines):
         if (_references(conn, "readings", "machine_id", old_machines[alias])
                 or _references(conn, "seats", "machine_id",
+                               old_machines[alias])
+                or _references(conn, "billing_policies",
+                               "reporter_machine_id",
                                old_machines[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
@@ -263,6 +268,10 @@ def _upsert(conn, accounts, machines, gateways):
                 or _references(conn, "models", "account_id",
                                old_accounts[alias])
                 or _references(conn, "project_accounts", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "billing_policies", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "billing_totals", "account_id",
                                old_accounts[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))
@@ -517,6 +526,11 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
     scope alias the policy does not designate is rejected,
     and a replica copy never adds totals.
 
+    The metered kind and the B01 allocation invariant are re-checked
+    against the current config on every reading: a config-import that
+    broke either refuses the reading (exit 2) until the operator repairs
+    it.
+
     The row is keyed by (account_id, scope_revision, period_start); the
     reduction is by SOURCE time (the pure reduce_billing_total): newer
     observations set latest (a newer total below the high-water latches
@@ -526,14 +540,15 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
     The conflict is sticky: only a later audited resolution clears it.
     The currency and the money basis live in the policy, not the row.
     """
-    account_kind = conn.execute(
-        "SELECT kind FROM accounts WHERE id = ?", (account_id,)
-    ).fetchone()[0]
-    if account_kind != "metered":
+    account = conn.execute(
+        "SELECT kind, budget_micro_eur FROM accounts WHERE id = ?",
+        (account_id,)).fetchone()
+    if account[0] != "metered":
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
     policy = conn.execute(
-        "SELECT reporter_machine_id, scope_alias, scope_revision "
+        "SELECT reporter_machine_id, scope_alias, scope_revision, "
+        "non_ai_allowance_micro_eur, cap_basis, ledger_basis, vat_bps "
         "FROM billing_policies WHERE account_id = ?", (account_id,)
     ).fetchone()
     if policy is None:
@@ -544,17 +559,41 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
             or reading["scope_alias"] != policy[1]
             or reading["scope_revision"] != policy[2]):
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    # B01 is enforced at ingest as well as at policy import: config-
+    # import is a full replacement, so the shares, the cap or the
+    # account kind may have moved since the policy was checked. The
+    # reading is accepted only while the CURRENT config still holds
+    # shares + non-AI allowance <= cap on the cap basis; an unknown tax
+    # basis defers the check (the reading is recorded, never approved).
+    shares = conn.execute(
+        "SELECT COALESCE(SUM(share_micro_eur), 0) FROM gateways "
+        "WHERE account_id = ?", (account_id,)).fetchone()[0]
+    allocation_within_cap(
+        account[1], shares, policy[3], policy[4], policy[5], policy[6])
 
     period_start = reading["period_start"]
     period_end = reading["period_end"]
     scope_revision = reading["scope_revision"]
-    existing = conn.execute(
-        "SELECT latest_micro_eur, observed_at, latest_event_id, "
-        "high_water_micro_eur, high_water_event_id, conflict "
+    row = conn.execute(
+        "SELECT period_end, latest_micro_eur, observed_at, "
+        "latest_event_id, high_water_micro_eur, high_water_event_id, "
+        "conflict "
         "FROM billing_totals WHERE account_id = ? AND scope_revision = ? "
         "AND period_start = ?",
         (account_id, scope_revision, period_start),
     ).fetchone()
+    if row is not None:
+        if row[0] != period_end:
+            # Row invariant: one (account, scope_revision, period_start)
+            # row carries one period_end. A different end on the same key
+            # is a scope mismatch, not a second period (the import path
+            # cannot reach this now that a period is exactly one UTC
+            # month; the guard pins the invariant against other writers).
+            raise QuotaError(CODE_BILLING_SCOPE_MISMATCH,
+                              MSG_BILLING_SCOPE_MISMATCH)
+        existing = row[1:]
+    else:
+        existing = None
     updated = reduce_billing_total(existing, reading["total_micro_eur"],
                                    reading["observed_at"],
                                    reading["event_id"])

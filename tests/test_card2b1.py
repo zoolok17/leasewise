@@ -897,41 +897,71 @@ class BillingConfigInvariant(_Base):
         self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
         self.assertEqual(self._import_policy(
             allowance=20_000_000).returncode, 0)
-        before = _fingerprint(self.db)
+        now = _now_ms()
+        start, end = _month_bounds_of(now - 1000)
 
-        # B01 at config-import: raising g1 to 50M keeps the shares within
-        # the account cap (card 1: 50 + 40 = 90 <= 100) but
-        # shares + allowance (90 + 20 = 110) exceeds it - the policy's
-        # allocation invariant must refuse it.
+        def reading(label):
+            return _billing(_eid(label), "desktop", "meter", "proj-ai", 1,
+                            start, end, 100, False, now - 1000)
+
+        # B01 is enforced at BILLING-READING INGEST, not at config-import:
+        # config-import is the operator's full replacement, and a policy
+        # row cannot be checked against a config that may still move.
+        # Raising g1 to 50M keeps the shares card-1-legal (50 + 40 = 90
+        # <= 100) but shares + allowance (90 + 20 = 110) exceeds the cap
+        # - the config imports, and the next reading is refused (exit 2).
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 50_000_000
-        result = _config_import(self.db, self.tmp, doc)
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
+        result = _readings_import(
+            self.db, self.tmp, _doc_v3([reading("cfg-b01-a")]))
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
-        # Lowering the cap below shares + allowance (while still above the
-        # shares: 70 <= 85) is refused the same way: 70 + 20 > 85.
-        doc = copy.deepcopy(VALID_DOC)
-        doc["gateways"][0]["share_micro_eur"] = 30_000_000
-        doc["accounts"][0]["budget_micro_eur"] = 85_000_000
-        result = _config_import(self.db, self.tmp, doc)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
-        # A share change that keeps shares + allowance within the cap
-        # imports: 20 + 40 = 60, 60 + 20 <= 100.
+        # Restoring a valid allocation (20 + 40 = 60; 60 + 20 <= 100)
+        # lets the next reading through again.
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 20_000_000
-        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
-        # An account with a policy cannot be turned into a subscription
-        # (a non-metered account has no cap to bound an allowance; policy
-        # import itself would refuse it).
-        before = _fingerprint(self.db)
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
+        self.assertEqual(_readings_import(
+            self.db, self.tmp, _doc_v3([reading("cfg-b01-b")])).returncode,
+            0)
+        # Lowering the cap below shares + allowance (60 + 20 = 80 > 75,
+        # while the shares 60 <= 75 stay card-1-legal) is the same shape:
+        # the config imports, the reading is refused.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 20_000_000
+        doc["accounts"][0]["budget_micro_eur"] = 75_000_000
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
+        result = _readings_import(
+            self.db, self.tmp, _doc_v3([reading("cfg-b01-c")]))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 20_000_000
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
+        # The metered kind is enforced at ingest the same way: card 1
+        # admits no gateway on a subscription account, so the flip
+        # document drops the gateways as well. The config imports (the
+        # config is the operator's), and the next reading is refused -
+        # a non-metered account has no spend to attribute.
         doc = copy.deepcopy(VALID_DOC)
         doc["accounts"][0]["kind"] = "subscription"
         doc["accounts"][0]["budget_micro_eur"] = None
-        result = _config_import(self.db, self.tmp, doc)
+        doc["gateways"] = []
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
+        result = _readings_import(
+            self.db, self.tmp, _doc_v3([reading("cfg-kind")]))
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
-        self.assertEqual(_fingerprint(self.db), before)
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 20_000_000
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
+                         0)
 
         # A reduced total exists now, so the billing tables reference the
         # account (and the policy references its reporter machine): a
