@@ -299,6 +299,90 @@ reproduces the section-3 anchor numbers exactly (68169 / 56809 /
   lease-lifecycle behaviors (cards 4-5); card 3's arithmetic has no
   clock.
 
+## Fix round (two cold reads, tk-e44908311861)
+
+Both cold reads (A and B) came back NOT READY; the lead's dispositions
+are binding. New commits on top of d0a9edf (no rewrite), stdlib only.
+Every new behavior test was red before its fix (evidence below); all 13
+verified mutants are killed.
+
+### Fixed (with tests)
+
+| Finding (read) | Fix | Test(s) |
+|---|---|---|
+| A MAJOR 3 / B M1 — window_key dropped in composed_limits/check_admission | Cap identity is (metric, period, window_key); composed_limits keeps different windows separate; check_admission takes window_key (required for period "window", rejected otherwise) and only rows of the requested window apply | WindowSeparation (2 tests) |
+| B M2 — admission compared one figure against the collapsed min across scopes | check_admission enforces EVERY applicable row against its own scope's (settled, holds); usage is keyed (scope, scope_id) and fails closed — a missing scope's usage is INVALID_REQUEST, not zero | AdmissionPerScope (4), incl. the lead's one-scope-passes/one-fails case |
+| A MAJOR 1 / B m4 — rounding direction untested (the ceil mutants survived) | Tests pin both ceilings on non-exact multiples (the behavior was already ceil; the tests are the fix) | RoundingDirection (2) |
+| A MAJOR 2 / B m2 — `^...$` + re.match accepts a trailing newline | fullmatch on the alias/UUID/hash checks | TrailingNewlineRejection (3) |
+| B m1 / A MINOR 5 — metric/period/window_key pairing unvalidated | _validate_limit enforces: input/money use turn/day/month with no window; window_bps uses window with a window_key and hard <= 10000 bps; concurrency uses turn with no window | MetricPeriodPairing (2) |
+| B m3 — reserve rates not required >= tariff rates | _validate_model rejects a reserve rate below the tariff rate (per component); the design's rates are 1.2x the tariff | ReserveAtLeastTariff (2) |
+| B m5 — soft>hard normalization untested (X9 survived) | Test pins the drop: min soft above the tightest hard carries no information and becomes None | LimitRules.test_composed_soft_above_hard_is_dropped |
+| A MINOR 4 — estimate() left O unbounded | O is the TOTAL output (section 3): bounded by M calls at the model output ceiling (section 7: the per-call cap <= model ceiling) | EstimateRules.test_output_total_bounded_by_model_ceiling |
+| A MINOR 6 / B n5 — the config-import reference guard missed the v3 tables | The removal guard now also checks seats.machine_id, models.account_id and project_accounts.account_id: a referenced account/machine is INVALID_CONFIG (exit 2), not an FK fault STORE_ERROR (exit 3) | tests/test_card2.py ConfigImportUpsert.test_reimport_removed_alias_referenced_by_card3_tables |
+| A NIT 9 — "park" passes as a model alias | 'park' is the fallback sentinel (model None): rejected as a candidate or a blocked entry | SweepRules.test_park_is_reserved_for_fallback |
+| A NIT 8 — fixture reserve rates off the design's | Fixture rates are now the design's 480000/3240000 (both sets pin 68169; the design's is the traceable one) | (no behavior change: NamedChecks still pin 68169/56809/1159995) |
+| B n1 — the v3 comment said the tables are "loaded by config-import" | Reworded: the tables stay EMPTY in this card (no policy config-import exists yet) | (comment) |
+| B n3 — sweep_deferred takes one window | Docstring: section 5 defers when ANY selected window is >80%; the caller passes the max across the selected windows | (docstring) |
+| B n4 — check_admission ignores soft | Docstring: soft bounds annotate the grant (card 4's job), admission consults hard only | (docstring) |
+
+### Deferred (with reasons)
+
+- **B m6 — seats.enforcement vocabulary.** The DDL CHECK mirrors the
+  section-7 lease-enforcement enums exactly; "unmanaged" in section 5
+  describes consumers outside coordinator coverage, not a seat
+  enforcement value. The table is empty in this card; the vocabulary is
+  settled by the card that loads seats (the lease enums are the current
+  reading).
+- **A MINOR 7 — profiles DDL CHECKs (N<=M, per_call_output_cap <=
+  output_cap).** The profiles table is empty in this card (no loader);
+  the loader card validates the document before any write (the
+  card-1/2 validate()-before-write pattern). DDL CHECKs on an empty
+  table would cost a schema-version bump for nothing.
+- **B n2 — profiles.ttl_ms upper bound (section 6: 24h max) and
+  expected_calls <= max_calls.** Same reason: empty table; the loader
+  card owns document validation.
+- **A NIT 9 — int64 intermediate products.** Every RETURNED quantity is
+  bounded to INT64_MAX after the computation (E, I, the holds, the
+  projection). Intermediate products (e.g. I * rate) are computed in
+  arbitrary-precision Python and the result is checked; the rates come
+  from the operator's models fixture (validated), not request input.
+  The signed-64 contract lives at the boundary (section 7).
+- **A NIT 9 — unknown utilization in sweep_deferred.** The pure
+  function takes a known 0..10000 bps; what an UNKNOWN utilization
+  means (never observed) is a readings-layer decision (section 5:
+  "missing fields stay unknown"), not the arithmetic's. Documented in
+  the docstring.
+
+### Red-before evidence (at d0a9edf)
+
+11 errors + 7 failures across the new and updated card-3 tests (the
+contract changes and the behavior gaps), plus the new card-2 guard test
+failing `3 != 2` (the FK fault surfaced as STORE_ERROR exit 3 instead
+of INVALID_CONFIG exit 2 — exactly A MINOR 6).
+
+### Mutation verification (all 13 killed, on the fixed code)
+
+| Mutant | Killed by |
+|---|---|
+| margin ceil -> floor | RoundingDirection.test_input_margin_rounds_up |
+| hold ceil -> floor | RoundingDirection.test_hold_rounds_up |
+| fullmatch -> match (alias) | TrailingNewlineRejection (3) |
+| composed key drops window_key | WindowSeparation.test_composed_keeps_windows_apart |
+| admission filter drops window_key | WindowSeparation.test_admission_checks_the_requested_window |
+| per-scope -> first scope vs collapsed min | AdmissionPerScope (2) |
+| pairing rules removed | MetricPeriodPairing.test_bad_pairings_rejected |
+| reserve >= tariff removed | ReserveAtLeastTariff.test_reserve_below_tariff_rejected |
+| O bound removed | EstimateRules.test_output_total_bounded_by_model_ceiling |
+| park sentinel removed (candidate) / (blocked) | SweepRules.test_park_is_reserved_for_fallback |
+| store guard drops the models check | the new card-2 guard test |
+| soft>hard normalization removed | LimitRules.test_composed_soft_above_hard_is_dropped |
+
+### Tests after the fix round
+
+65 -> 84 (18 new card-3 tests + 1 new card-2 guard test), all green:
+`python -m unittest discover -s tests` — `Ran 84 tests ... OK`,
+foreground, CPython 3.14.6 / SQLite 3.50.4.
+
 ## Commits on `card-3`
 
 - 05c18af base (origin/main, cards 1 and 2 merged plus the card-2b design)
@@ -306,4 +390,5 @@ reproduces the section-3 anchor numbers exactly (68169 / 56809 /
 - c7f9fba feat(card-3): schema v3 — policy tables (models/profiles/projects/teams/seats/project_accounts/limits)
 - 57243e4 feat(card-3): pure policy arithmetic (estimates, holds, limits, sweep, fallback)
 - 8031aec test(card-3): named checks and policy rules
-- (this step record and README section commit)
+- d0a9edf docs(card-3): step record and README section (head before the fix round)
+- (fix round: the code+tests commit, then this updated step record)

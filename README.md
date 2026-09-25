@@ -160,12 +160,15 @@ seven policy tables `projects`, `teams`, `project_accounts`, `seats`,
   fixed per-attempt path is never the selected lease mode.
 - **Model ceiling.** `C + G*(N-1)` above the model input ceiling denies
   `CONTEXT_PROJECTION_EXCEEDED`; oversized bounds are never clipped.
-  The per-call output cap must not exceed the model output ceiling.
+  The per-call output cap must not exceed the model output ceiling, and
+  O (the total output) must not exceed M calls at that ceiling.
 - **Composed limits (section 4).** the tightest hard ceiling per
-  (metric, period) across platform/project/team/seat (never adding
-  duplicate caps), the account budget as the one money home for
-  (money, month), and the admission rule settled + unresolved holds +
-  new hold <= cap, else `POLICY_DENIED`.
+  (metric, period, window_key) across platform/project/team/seat (never
+  adding duplicate caps; limits for different windows stay separate),
+  the account budget as the one money home for (money, month, no
+  window), and the admission rule: each applicable cap is enforced
+  against its own scope's settled + unresolved holds + new hold, else
+  `POLICY_DENIED`.
 - **The 80% sweep and fallback (section 6).** a cold sweep defers
   strictly above 8000 bps; fallback tiers walk candidates then the
   ordered fallback (alias or terminal 'park') — a fallback hit is a new
