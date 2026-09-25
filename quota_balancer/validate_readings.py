@@ -10,6 +10,7 @@ inventory, so store.reading_import performs it inside the write transaction.
 This module only validates the self-contained shape and types.
 """
 
+import datetime
 import re
 
 from .errors import (
@@ -26,8 +27,14 @@ from .reduce import (
 )
 from .validate import ALIAS_RE
 
-# The card-2 reading document version.
+# The card-2 reading document version; card 2b-1 extends it to version 3
+# (section 11): the gateway payload gains the money fields and its periods
+# become required UTC-month bounds, and the provider_billing kind appears.
+# Version-2 documents remain importable (their snapshots carry no money
+# fields and nullable periods; the money evidence stays unknown, never
+# zero).
 DOC_VERSION = 2
+DOC_VERSION_BILLING = 3
 
 MAX_BPS = 10_000  # basis points; 10000 == 100%
 
@@ -43,10 +50,29 @@ _GATEWAY_SNAPSHOT_KEYS = frozenset(
         "policy_hashes", "sized_ready", "reconciliation_required",
     }
 )
+# Version-3 gateway payload: existing metadata plus the four money fields.
+# The first three are disjoint spend categories; unattributed is a subset
+# of settled (the only arithmetic the closed shape can pin).
+_GATEWAY_SNAPSHOT_KEYS_V3 = _GATEWAY_SNAPSHOT_KEYS | frozenset(
+    {"settled_micro_eur", "reserved_micro_eur",
+     "uncertain_micro_eur", "unattributed_micro_eur"}
+)
 _POLICY_HASH_KEYS = frozenset({"price", "child_cap"})
+# Closed provider_billing payload (section 11): numbers and local aliases
+# only; no provider IDs on the wire, no seat field at any level.
+_BILLING_PAYLOAD_KEYS = frozenset(
+    {"scope_alias", "scope_revision", "period_start", "period_end",
+     "currency", "total_micro_eur", "non_ai_spend_present"}
+)
 
 KIND_CLI_WINDOW = "cli_window"
 KIND_GATEWAY_SNAPSHOT = "gateway_snapshot"
+KIND_PROVIDER_BILLING = "provider_billing"
+
+# The provider bills in exactly one currency (section 11).
+CURRENCY_EUR = "EUR"
+
+_MS_PER_DAY = 86_400_000
 
 
 def _invalid():
@@ -159,8 +185,34 @@ def _validate_policy_hashes(value):
     return {"price": value["price"], "child_cap": value["child_cap"]}
 
 
-def _validate_gateway_snapshot(payload):
-    if not isinstance(payload, dict) or frozenset(payload) != _GATEWAY_SNAPSHOT_KEYS:
+def _is_utc_month_start(ms):
+    """True when ms is the first instant (00:00:00Z) of a UTC month."""
+    if not _is_nonneg_int(ms) or ms % 1000 or ms % _MS_PER_DAY:
+        return False
+    try:
+        return (datetime.datetime.fromtimestamp(ms // 1000,
+                                                datetime.timezone.utc)
+                .day == 1)
+    except (OverflowError, OSError, ValueError):
+        # A day-multiple outside the proleptic calendar: not a
+        # representable month start.
+        return False
+
+
+def _is_utc_month_period(start, end):
+    """True when [start, end) is bounded by UTC month bounds, end > start.
+
+    The gateway period is 'utc_month'; the provider period is one UTC
+    month. Both are pinned to month boundaries here - a sub-month or
+    mid-month bound is not a UTC-month period.
+    """
+    return (_is_utc_month_start(start) and _is_utc_month_start(end)
+            and end > start)
+
+
+def _validate_gateway_snapshot(payload, billing):
+    keys = _GATEWAY_SNAPSHOT_KEYS_V3 if billing else _GATEWAY_SNAPSHOT_KEYS
+    if not isinstance(payload, dict) or frozenset(payload) != keys:
         _invalid()
     gateway = payload["gateway"]
     ledger_epoch = payload["ledger_epoch"]
@@ -177,10 +229,34 @@ def _validate_gateway_snapshot(payload):
         _invalid()
     if period_end is not None and not _is_nonneg_int(period_end):
         _invalid()
+    normalized = None
+    if billing:
+        # Version 3: the periods are REQUIRED UTC-month bounds, and the
+        # four money fields are present: non-negative int64 micro-EUR, the
+        # first three disjoint categories, unattributed a subset of
+        # settled. A legacy (v2) snapshot carries no money fields: its
+        # money evidence stays unknown, never zero.
+        if not _is_utc_month_period(period_start, period_end):
+            _invalid()
+        settled = payload["settled_micro_eur"]
+        reserved = payload["reserved_micro_eur"]
+        uncertain = payload["uncertain_micro_eur"]
+        unattributed = payload["unattributed_micro_eur"]
+        for value in (settled, reserved, uncertain, unattributed):
+            if not _is_nonneg_int(value):
+                _invalid()
+        if unattributed > settled:
+            _invalid()
+        normalized = {
+            "settled_micro_eur": settled,
+            "reserved_micro_eur": reserved,
+            "uncertain_micro_eur": uncertain,
+            "unattributed_micro_eur": unattributed,
+        }
     if not _is_bool(sized_ready) or not _is_bool(reconciliation_required):
         _invalid()
     policy_hashes = _validate_policy_hashes(payload["policy_hashes"])
-    return {
+    result = {
         "gateway": gateway,
         "ledger_epoch": ledger_epoch,
         "seq": seq,
@@ -190,14 +266,65 @@ def _validate_gateway_snapshot(payload):
         "sized_ready": sized_ready,
         "reconciliation_required": reconciliation_required,
     }
+    if normalized is not None:
+        result.update(normalized)
+    return result
+
+
+def _validate_provider_billing(payload, observed_at):
+    """Closed provider_billing payload (section 11): local aliases,
+    integer micro-EUR, UTC-ms timestamps, one exact boolean. No provider
+    IDs, no seat field, no free text."""
+    if not isinstance(payload, dict) or frozenset(payload) != _BILLING_PAYLOAD_KEYS:
+        _invalid()
+    scope_alias = payload["scope_alias"]
+    scope_revision = payload["scope_revision"]
+    period_start = payload["period_start"]
+    period_end = payload["period_end"]
+    currency = payload["currency"]
+    total = payload["total_micro_eur"]
+    non_ai = payload["non_ai_spend_present"]
+    if not _is_alias(scope_alias):
+        _invalid()
+    # Positive integer scope revision.
+    if not _is_nonneg_int(scope_revision) or scope_revision <= 0:
+        _invalid()
+    # period = [start, end); the source time is within the bounds (the
+    # final sample at end is allowed).
+    if not _is_utc_month_period(period_start, period_end):
+        _invalid()
+    if not (period_start <= observed_at <= period_end):
+        _invalid()
+    if currency != CURRENCY_EUR:
+        _invalid()
+    if not _is_nonneg_int(total):
+        _invalid()
+    # Exact boolean: an unverified non-AI scan is a schema failure, never
+    # a false negative.
+    if not _is_bool(non_ai):
+        _invalid()
+    return {
+        "scope_alias": scope_alias,
+        "scope_revision": scope_revision,
+        "period_start": period_start,
+        "period_end": period_end,
+        "currency": currency,
+        "total_micro_eur": total,
+        "non_ai_spend_present": non_ai,
+    }
 
 
 def validate_readings(doc, now_ms):
-    """Validate a card-2 reading document; return the normalized readings.
+    """Validate a reading document (card-2 version 2, or card 2b-1
+    version 3); return the normalized readings.
 
     `now_ms` is the wall clock at ingest (epoch ms). A reading whose
     observed_at is more than FUTURE_SLOP_MS in the future is rejected
     (docs/DESIGN.md section 7).
+
+    Version 3 extends the gateway snapshot payload with the money fields
+    (whose periods are required UTC-month bounds) and adds the
+    provider_billing kind, which is attributed to an account.
 
     Returns a list of normalized reading dicts, each carrying:
       event_id, machine (alias), account (alias or None), kind, observed_at,
@@ -206,10 +333,15 @@ def validate_readings(doc, now_ms):
     if not isinstance(doc, dict):
         _invalid()
 
+    version = DOC_VERSION
     if "version" in doc:
         version = doc["version"]
-        if not _is_int(version) or version != DOC_VERSION:
+        if not _is_int(version) or version not in (
+                DOC_VERSION, DOC_VERSION_BILLING):
             raise QuotaError(CODE_SCHEMA_UNSUPPORTED, MSG_SCHEMA_UNSUPPORTED)
+    # Version 3 documents carry the money fields and the provider_billing
+    # kind; version 2 (or an absent version, as in card 2) does not.
+    billing = version == DOC_VERSION_BILLING
 
     if frozenset(doc) != _TOP_KEYS:
         _invalid()
@@ -254,7 +386,16 @@ def validate_readings(doc, now_ms):
         if kind == KIND_CLI_WINDOW:
             reading.update(_validate_cli_window(item["payload"]))
         elif kind == KIND_GATEWAY_SNAPSHOT:
-            reading.update(_validate_gateway_snapshot(item["payload"]))
+            reading.update(_validate_gateway_snapshot(item["payload"],
+                                                      billing))
+        elif kind == KIND_PROVIDER_BILLING:
+            # The provider billing kind exists in version-3 documents only,
+            # and a billing reading is attributed to an account (the
+            # metered account the provider bill is for) - never ambiguous.
+            if not billing or account is None:
+                _invalid()
+            reading.update(_validate_provider_billing(
+                item["payload"], observed_at))
         else:
             _invalid()
         readings.append(reading)
