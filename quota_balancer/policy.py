@@ -304,7 +304,14 @@ def _validate_limit(row):
 
 
 def composed_limits(rows, account_budget=None):
-    """The effective cap per (metric, period, window_key): the tightest
+    """VIEW ONLY - never feed this to admission: it collapses the tightest
+    ceiling across scopes into one figure, which cannot be enforced
+    against per-scope usage (feeding it to a check would reintroduce the
+    d0a9edf defect). Admission goes through check_admission, which
+    enforces each cap against its own scope's usage plus the account
+    budget.
+
+    The effective cap per (metric, period, window_key): the tightest
     hard ceiling across the applicable scopes (section 4: limits compose
     by their tightest ceiling, never by adding duplicate caps). Limits for
     different windows stay separate - window_key is part of the cap
@@ -350,13 +357,17 @@ def composed_limits(rows, account_budget=None):
     return caps
 
 
-def check_admission(rows, metric, period, usage, new, window_key=None):
+def check_admission(rows, metric, period, usage, new, window_key=None,
+                    chain=None, account_id=None, account_budget=None):
     """The admission rule (section 4): for EVERY limit row applicable to
-    this (metric, period[, window_key]), that scope's settled charges +
-    unresolved holds + the new hold must fit the row's hard cap ("settled
-    charges + unresolved holds + new hold <= each applicable cap"); else
-    POLICY_DENIED. Caps from different scopes are never collapsed into one
-    figure: each is enforced against its own scope's usage.
+    this (metric, period[, window_key]) AND to this requester, that
+    scope's settled charges + unresolved holds + the new hold must fit the
+    row's hard cap; the account budget (accounts.budget_micro_eur, F04)
+    is the one mandatory (money_micro_eur, month) cap - section 4 says
+    there is NO account/month limits row, so it is passed in, not read
+    from `rows`. Else POLICY_DENIED. Caps from different scopes are never
+    collapsed into one figure: each is enforced against its own scope's
+    usage.
 
     `rows` are limits rows (fixture dicts, validated as in
     composed_limits). `usage` maps (scope, scope_id) to the (settled,
@@ -365,8 +376,28 @@ def check_admission(rows, metric, period, usage, new, window_key=None):
     zero. Entries for non-applicable scopes are ignored. `new` is the new
     hold size for this request. For period "window" the caller must name
     the window (window_key); for other periods window_key must be None.
+
+    `chain` maps each scope name to the requester's scope id there (or
+    None: the requester has no such scope), e.g.
+    {"platform": P, "project": Pr, "team": T-or-None, "seat": S}. With a
+    chain, a row applies only when row.scope_id == chain[row.scope]; a
+    row whose scope is not a key of the chain cannot be verified and is
+    INVALID_REQUEST. Without a chain (None) the caller must pass exactly
+    the rows applicable to the requester: rows for other seats/teams/
+    projects would be enforced against this request, and their missing
+    usage would fail closed.
+
+    `account_id`/`account_budget` (both, or neither): the account's UUID
+    and its canonical monthly money budget in micro-EUR (accounts.
+    budget_micro_eur, F04). Enforced on a (money_micro_eur, month) check
+    as an extra hard cap on usage[("account", account_id)], whose entry
+    is required (missing fails closed); the budget never applies to any
+    other (metric, period), and passing it there is INVALID_REQUEST.
+
     Soft bounds are not consulted here: they annotate the grant (card 4).
-    A (metric, period, window_key) with no cap is unbounded.
+    A (metric, period, window_key) with no cap is unbounded. composed_
+    limits is a view, never an input to this function (see its
+    docstring).
     """
     if metric not in LIMIT_METRICS or period not in LIMIT_PERIODS:
         _invalid()
@@ -379,10 +410,42 @@ def check_admission(rows, metric, period, usage, new, window_key=None):
         _invalid()
     if not isinstance(usage, dict):
         _invalid()
+    # The account budget (N1): the one mandatory (money_micro_eur, month)
+    # cap. Validate it with the other contract checks; enforce its cap
+    # with the other policy decisions, after the rows.
+    if (account_id is None) != (account_budget is None):
+        _invalid()
+    budget_settled = budget_holds = None
+    if account_budget is not None:
+        if (metric, period) != ("money_micro_eur", "month"):
+            _invalid()  # the budget is a monthly money cap, not a general one
+        _check_uuid(account_id)
+        _check_int(account_budget, 1)
+        key = ("account", account_id)
+        if key not in usage:
+            _invalid()  # fail closed: unknown usage is not zero
+        pair = usage[key]
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            _invalid()
+        budget_settled = _check_int(pair[0])
+        budget_holds = _check_int(pair[1])
+    if chain is not None:
+        if not isinstance(chain, dict):
+            _invalid()
+        for scope, scope_id in chain.items():
+            if scope not in LIMIT_SCOPES:
+                _invalid()
+            if scope_id is not None:
+                _check_uuid(scope_id)
     for row in rows:
         scope, m, p, wk, _soft, hard = _validate_limit(row)
         if (m, p, wk) != (metric, period, window_key):
             continue  # not applicable to this check
+        if chain is not None:
+            if scope not in chain:
+                _invalid()  # fail closed: applicability is unverifiable
+            if chain[scope] is None or row["scope_id"] != chain[scope]:
+                continue  # the row's scope is not the requester's
         key = (scope, row["scope_id"])
         if key not in usage:
             _invalid()  # fail closed: unknown usage is not zero
@@ -392,6 +455,10 @@ def check_admission(rows, metric, period, usage, new, window_key=None):
         settled = _check_int(pair[0])
         holds = _check_int(pair[1])
         if settled + holds + new > hard:
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
+    if account_budget is not None:
+        if budget_settled + budget_holds + new > account_budget:
             raise QuotaError(errors.CODE_POLICY_DENIED,
                              errors.MSG_POLICY_DENIED)
 

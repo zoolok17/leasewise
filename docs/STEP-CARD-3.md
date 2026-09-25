@@ -383,6 +383,41 @@ of INVALID_CONFIG exit 2 — exactly A MINOR 6).
 `python -m unittest discover -s tests` — `Ran 84 tests ... OK`,
 foreground, CPython 3.14.6 / SQLite 3.50.4.
 
+## Fix round 2 (final pre-merge read, tk-3c0507a82fa3)
+
+The final pre-merge read of fc62ce1 closed every fix-round finding but
+flagged ONE new MAJOR (N1) introduced by the fix round, plus N2 (a
+contract gap), T1 (a test gap) and one NIT. All four fixed this round:
+
+| Finding | Fix | Test |
+|---|---|---|
+| N1 MAJOR: the account budget was no longer enforced by admission (a fix-round regression: check_admission lost its budget) | check_admission takes `account_id`/`account_budget` (both, or neither); the budget is enforced as the one mandatory (money_micro_eur, month) hard cap on usage[("account", account_id)] - there is no account/month limits row (section 4, F04), so it is passed in, not read from `rows`. Missing account usage fails closed; a budget of 0/negative/non-int is INVALID_REQUEST; passing the budget on any other (metric, period) is INVALID_REQUEST (a caller bug, never a silently ignored cap) | AccountBudgetAdmission (6), incl. the read's scenario: within every scoped cap, over the budget -> POLICY_DENIED; no rows at all, 200M new vs 100M budget -> POLICY_DENIED |
+| N2 MINOR: "applicable" matched metric/period/window but never the requester's scope - a foreign seat's row denied the request and its missing usage failed closed | new `chain` parameter: a row applies only when row.scope_id == chain[row.scope]; a row whose scope is not a key of chain is INVALID_REQUEST (applicability unverifiable - fail closed); chain[scope] is None = the requester has no such scope (its rows are skipped, no usage required); chain values are UUID-or-None, keys are the four limit scopes. Without a chain the docstring states the pre-filter obligation (the caller must pass exactly the requester's rows) | AdmissionScopeChain (6), incl. the read's scenario: foreign seat's row neither denies nor requires usage; the unfiltered set without a chain still fails closed |
+| T1 MINOR: the project_accounts arm of the config-import reference guard was untested (the read's mutant Y7 survived) | the guard existed; the test now covers the arm: an account referenced ONLY by a project_accounts row cannot be removed by a re-import - exit 2 INVALID_CONFIG, the account survives | test_card2.ConfigImportUpsert.test_reimport_removed_account_referenced_by_project_accounts |
+| NIT: composed_limits is a pure "tightest ceiling" VIEW that still collapses across scopes; card 4 must not feed it to admission | docstring: VIEW ONLY - never feed this to admission (it would reintroduce the d0a9edf defect); admission goes through check_admission | (docstring) |
+
+### Red-before evidence (at fc62ce1)
+
+11 of the 13 new tests errored (check_admission has no
+account_budget/chain parameters yet); the other 2 pass by design,
+pinning pre-existing behavior: the fail-closed pre-filter obligation
+without a chain, and the project_accounts guard that already exists.
+
+### Mutation verification (all 10 killed, on the fixed code)
+
+budget cap removed; budget usage fail-open (missing treated as zero);
+budget allowed on any (metric, period); budget minimum 1 -> 0;
+id/budget drift allowed; chain scope-filter removed; chain
+missing-scope skip instead of INVALID_REQUEST; chain values unchecked;
+unknown chain scope keys allowed; store guard drops the
+project_accounts arm. Each restored byte-exact.
+
+### Tests after fix round 2
+
+84 -> 97 (12 new card-3 tests + 1 new card-2 guard test), all green:
+`python -m unittest discover -s tests` - `Ran 97 tests ... OK`,
+foreground, CPython 3.14.6 / SQLite 3.50.4.
+
 ## Commits on `card-3`
 
 - 05c18af base (origin/main, cards 1 and 2 merged plus the card-2b design)
@@ -391,4 +426,6 @@ foreground, CPython 3.14.6 / SQLite 3.50.4.
 - 57243e4 feat(card-3): pure policy arithmetic (estimates, holds, limits, sweep, fallback)
 - 8031aec test(card-3): named checks and policy rules
 - d0a9edf docs(card-3): step record and README section (head before the fix round)
-- (fix round: the code+tests commit, then this updated step record)
+- a159902 fix(card-3): per-scope admission, window-keyed caps, fullmatch, pairing (fix round)
+- fc62ce1 docs(card-3): fix-round record and README contract update (head after fix round 1)
+- (fix round 2: this single commit - code, tests, docs; the new head)

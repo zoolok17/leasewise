@@ -587,6 +587,164 @@ class AdmissionPerScope(unittest.TestCase):
             self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
 
 
+class AccountBudgetAdmission(unittest.TestCase):
+    """The account budget (accounts.budget_micro_eur, F04) is the one
+    mandatory (money_micro_eur, month) admission cap: section 4 says there
+    is NO account/month limits row, so the budget is passed to
+    check_admission - it cannot ride in the limits rows. A request within
+    every scoped cap but over the budget must be denied (N1: the fix round
+    dropped it from admission)."""
+
+    ACCOUNT = _uid("acct")
+
+    def test_within_every_scoped_cap_over_budget_denied(self):
+        # The platform row (500M) is far from binding; the budget (100M)
+        # is: 95M settled + 10M new = 105M > 100M.
+        rows = [_limit("platform", _uid("pl"), "money_micro_eur", "month",
+                       500_000_000)]
+        usage = {("platform", _uid("pl")): (10_000_000, 0),
+                 ("account", self.ACCOUNT): (95_000_000, 0)}
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(rows, "money_micro_eur", "month", usage,
+                                   10_000_000, account_id=self.ACCOUNT,
+                                   account_budget=100_000_000)
+        self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
+
+    def test_within_budget_admitted(self):
+        # The same rows/usage with a 105M budget: 95M + 10M = 105M
+        # <= 105M and the platform row still fits - no false rejection.
+        rows = [_limit("platform", _uid("pl"), "money_micro_eur", "month",
+                       500_000_000)]
+        usage = {("platform", _uid("pl")): (10_000_000, 0),
+                 ("account", self.ACCOUNT): (95_000_000, 0)}
+        policy.check_admission(rows, "money_micro_eur", "month", usage,
+                               10_000_000, account_id=self.ACCOUNT,
+                               account_budget=105_000_000)
+
+    def test_budget_stands_alone_without_rows(self):
+        # The final read's scenario: no limits rows at all, a 100M budget,
+        # and a 200M new hold - denied, not admitted (at fc62ce1 this
+        # exact call is admitted).
+        usage = {("account", self.ACCOUNT): (0, 0)}
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission([], "money_micro_eur", "month", usage,
+                                   200_000_000, account_id=self.ACCOUNT,
+                                   account_budget=100_000_000)
+        self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
+
+    def test_budget_usage_missing_fails_closed(self):
+        # The account's own (settled, holds) must be supplied: unknown is
+        # not zero.
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission([], "money_micro_eur", "month", {}, 1,
+                                   account_id=self.ACCOUNT,
+                                   account_budget=100_000_000)
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_budget_and_id_move_together(self):
+        for kwargs in (
+            {"account_id": self.ACCOUNT},                       # id, no budget
+            {"account_budget": 100_000_000},                    # budget, no id
+            {"account_id": "not-a-uuid",
+             "account_budget": 100_000_000},                    # bad id
+            {"account_id": self.ACCOUNT, "account_budget": 0},  # not > 0
+            {"account_id": self.ACCOUNT, "account_budget": "1"},
+        ):
+            with self.assertRaises(QuotaError) as cm:
+                policy.check_admission([], "money_micro_eur", "month",
+                                       {("account", self.ACCOUNT): (0, 0)},
+                                       1, **kwargs)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_budget_is_the_monthly_money_cap_only(self):
+        # The budget never applies to any other (metric, period): passing
+        # it there is a caller bug, not a silently ignored cap.
+        for metric, period in (("money_micro_eur", "day"),
+                               ("money_micro_eur", "turn"),
+                               ("input_tokens", "month")):
+            with self.assertRaises(QuotaError) as cm:
+                policy.check_admission([], metric, period,
+                                       {("account", self.ACCOUNT): (0, 0)},
+                                       1, account_id=self.ACCOUNT,
+                                       account_budget=100_000_000)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+
+class AdmissionScopeChain(unittest.TestCase):
+    """A row constrains a request only from the requester's own scope
+    chain (N2): with `chain`, a row applies only when
+    row.scope_id == chain[row.scope] - a foreign seat's row neither denies
+    the request nor requires its usage. Without a chain the caller must
+    pass exactly the requester's rows (pre-filtered)."""
+
+    SA = _uid("sa")
+    SB = _uid("sb")
+
+    def _rows(self):
+        return [
+            _limit("seat", self.SA, "money_micro_eur", "day", 10_000_000),
+            _limit("seat", self.SB, "money_micro_eur", "day", 10_000_000),
+        ]
+
+    def test_foreign_seat_row_not_enforced_with_chain(self):
+        # Seat A's request: B's row does not apply, so B's usage is not
+        # required and cannot deny (the read's scenario: 2M + 3M fits A's
+        # own row, and B is 9M used - irrelevant to A).
+        chain = {"platform": _uid("pl"), "project": _uid("p"),
+                 "team": None, "seat": self.SA}
+        usage = {("seat", self.SA): (2_000_000, 0)}
+        policy.check_admission(self._rows(), "money_micro_eur", "day",
+                               usage, 3_000_000, chain=chain)
+
+    def test_foreign_seat_row_would_fail_closed_without_chain(self):
+        # No chain: the caller must pre-filter to the requester's rows.
+        # The unfiltered set is enforced as-is, so B's missing usage fails
+        # closed (documents the pre-filter obligation for card 4).
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(self._rows(), "money_micro_eur", "day",
+                                   {("seat", self.SA): (2_000_000, 0)},
+                                   3_000_000)
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_chain_scope_not_in_chain_fails_closed(self):
+        # A platform row exists but the chain cannot state the requester's
+        # platform: applicability is unverifiable -> INVALID_REQUEST.
+        rows = [_limit("platform", _uid("pl"), "money_micro_eur", "day",
+                       10_000_000)]
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(rows, "money_micro_eur", "day", {}, 1,
+                                   chain={"seat": self.SA})
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_chain_none_scope_skips_that_scope_rows(self):
+        # The requester has no team (chain["team"] is None): the team row
+        # applies to no one here and needs no usage - 10M new is admitted
+        # over a 1 hard cap.
+        rows = [_limit("team", _uid("t"), "money_micro_eur", "day", 1)]
+        chain = {"platform": _uid("pl"), "project": _uid("p"),
+                 "team": None, "seat": self.SA}
+        policy.check_admission(rows, "money_micro_eur", "day", {}, 10_000_000,
+                               chain=chain)
+
+    def test_chain_applies_matching_scope_row(self):
+        # The chain's own seat row still binds: 8M + 3M = 11M > 10M is
+        # denied while B's row stays irrelevant.
+        chain = {"seat": self.SA}
+        usage = {("seat", self.SA): (8_000_000, 0)}
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(self._rows(), "money_micro_eur", "day",
+                                   usage, 3_000_000, chain=chain)
+        self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
+
+    def test_chain_shape_is_validated(self):
+        for chain in ("sa", [self.SA], {"seat": "not-a-uuid"},
+                      {"bogus": self.SA}):
+            with self.assertRaises(QuotaError) as cm:
+                policy.check_admission([], "money_micro_eur", "day", {}, 1,
+                                       chain=chain)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+
 class MetricPeriodPairing(unittest.TestCase):
     """The metric/period/window_key pairing the section-7 limits row
     implies: input/money use turn/day/month, window_bps uses window with

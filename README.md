@@ -162,13 +162,19 @@ seven policy tables `projects`, `teams`, `project_accounts`, `seats`,
   `CONTEXT_PROJECTION_EXCEEDED`; oversized bounds are never clipped.
   The per-call output cap must not exceed the model output ceiling, and
   O (the total output) must not exceed M calls at that ceiling.
-- **Composed limits (section 4).** the tightest hard ceiling per
-  (metric, period, window_key) across platform/project/team/seat (never
-  adding duplicate caps; limits for different windows stay separate),
-  the account budget as the one money home for (money, month, no
-  window), and the admission rule: each applicable cap is enforced
-  against its own scope's settled + unresolved holds + new hold, else
-  `POLICY_DENIED`.
+- **Composed limits and admission (section 4).** `composed_limits` is a
+  view only - the tightest hard ceiling per (metric, period,
+  window_key) across platform/project/team/seat (never adding duplicate
+  caps; limits for different windows stay separate), the account budget
+  folded in as the one money home for (money, month, no window) - and
+  must never feed admission. Admission is `check_admission`: each limit
+  row applicable to the requester (matching metric/period/window AND
+  scope_id on the requester's scope chain - foreign rows neither deny
+  nor require usage) is enforced against its own scope's settled +
+  unresolved holds + new hold, and the account budget (F04; there is no
+  account/month limits row, so it is passed in) stands as the one
+  mandatory (money_micro_eur, month) cap on the account's own settled +
+  holds. Unknown usage fails closed; else `POLICY_DENIED`.
 - **The 80% sweep and fallback (section 6).** a cold sweep defers
   strictly above 8000 bps; fallback tiers walk candidates then the
   ordered fallback (alias or terminal 'park') — a fallback hit is a new

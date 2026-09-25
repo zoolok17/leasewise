@@ -956,6 +956,46 @@ class ConfigImportUpsert(_Base):
         status = self._status_json()
         self.assertEqual([a["alias"] for a in status["accounts"]], ["meter"])
 
+    def test_reimport_removed_account_referenced_by_project_accounts(self):
+        # T1: the project_accounts arm of the card-3 reference guard. An
+        # account referenced only by a project_accounts row is not deletable
+        # by a re-import: INVALID_CONFIG (exit 2), and the account survives.
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO projects(id, alias) VALUES(?,?)", ("p1", "org"))
+            conn.execute(
+                "INSERT INTO accounts(id, alias, vendor, kind,"
+                " budget_micro_eur) VALUES(?,?,?,?,?)",
+                ("a2", "meter2", "ovh", "metered", 50000000))
+            conn.execute(
+                "INSERT INTO project_accounts(project_id, account_id)"
+                " VALUES(?,?)", ("p1", "a2"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        without_meter2 = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+                {"alias": "g2", "account": "meter", "machine": "worker",
+                 "share_micro_eur": 40000000, "period": "utc_month"},
+            ],
+        }
+        bad = _config_import(self.db, self.tmp, without_meter2)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        status = self._status_json()
+        self.assertEqual([a["alias"] for a in status["accounts"]],
+                         ["meter", "meter2"])
+
     def test_reimport_removed_alias_unreferenced(self):
         # A removed alias that nothing references IS deleted; the rest of the
         # inventory is retained (with its UUIDs).
