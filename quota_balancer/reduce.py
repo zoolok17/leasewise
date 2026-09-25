@@ -372,3 +372,21 @@ def billing_retention_eligible(period_end_ms, unresolved, now_ms):
         # A period end so far in the past that the proleptic calendar
         # cannot represent it: it is well past the 13-month mark.
         return True
+
+
+# Normalized readings are kept 30 days, then reduced to numeric daily
+# totals (the design's retention tiers).
+READINGS_RETENTION_MS = 30 * 86_400_000
+
+
+def readings_retention_eligible(received_at_ms, now_ms):
+    """Pure retention-eligibility predicate for the 30-day readings tier
+    (design: 'normalized readings 30 days then numeric daily totals');
+    2b does no deletion - this pins the boundary for the later pruning
+    owner.
+
+    A reading is eligible once it is at least 30 days old (inclusive),
+    aged from RECEIPT, not source time: received_at is ingest-owned and
+    is when the store took custody of the evidence.
+    """
+    return (now_ms - received_at_ms) >= READINGS_RETENTION_MS

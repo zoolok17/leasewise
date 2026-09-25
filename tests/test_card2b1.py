@@ -594,6 +594,20 @@ class BillingRetention(_Base):
         self.assertFalse(
             billing_retention_eligible(end, True, _add_months(due, 12)))
 
+    def test_readings_retention_30_day(self):
+        # The 30-day readings tier: a normalized reading is eligible for
+        # the later pruning owner once it is 30 days old (inclusive),
+        # aged from receipt, not source time. 2b itself deletes nothing.
+        from quota_balancer.reduce import (READINGS_RETENTION_MS,
+                                           readings_retention_eligible)
+        # A fixed 30 days, not calendar months.
+        self.assertEqual(READINGS_RETENTION_MS, 30 * _MS_PER_DAY)
+        received = _ms(2026, 9)
+        self.assertTrue(readings_retention_eligible(
+            received, received + READINGS_RETENTION_MS))
+        self.assertFalse(readings_retention_eligible(
+            received, received + READINGS_RETENTION_MS - 1))
+
     def test_no_pruning_in_card_2b_1(self):
         # 2b does no deletion: a reading older than the 30-day readings
         # retention and a resolved total whose period ended more than 13
@@ -1321,6 +1335,43 @@ class BillingOlderHighWater(_Base):
         self.assertEqual(
             reduce_billing_total(cleared, 17, t1 + _MS_PER_DAY, ev_17),
             (15, t2, ev_15, 20, ev_20, 1))
+
+    def test_billing_two_reading_order_independence(self):
+        # The two-reading case is arrival-order independent: the same two
+        # readings, in either order, land in the same billing_totals row
+        # (latest 90 at t2, high-water 100 at t1's event, conflict
+        # latched by the unexplained drop). A residual order-dependence
+        # exists only with three or more readings: the flag latches at
+        # arrival time from the bounded row state, which cannot replay an
+        # unbounded (source-time, total) history (recorded in the step
+        # record).
+        self.assertEqual(self._import_policy().returncode, 0)
+        t1 = SEP + 10 * _MS_PER_DAY
+        t2 = SEP + 20 * _MS_PER_DAY
+        start, end = _month_bounds_of(t1)
+        e1 = _billing(_eid("oi-e1"), "desktop", "meter", "proj-ai", 1,
+                      start, end, 100, False, t1)
+        e2 = _billing(_eid("oi-e2"), "desktop", "meter", "proj-ai", 1,
+                      start, end, 90, False, t2)
+        db = self._fresh_db("oi-b.db")
+        self.assertEqual(self._import_policy(db=db).returncode, 0)
+        self.assertEqual(_readings_import(
+            self.db, self.tmp, _doc_v3([e1, e2])).returncode, 0)
+        self.assertEqual(_readings_import(
+            db, self.tmp, _doc_v3([e2, e1])).returncode, 0)
+        a = self._billing()[("meter", start)]
+        self.assertEqual(a["latest_micro_eur"], 90)
+        self.assertEqual(a["observed_at"], t2)
+        self.assertEqual(a["high_water_micro_eur"], 100)
+        self.assertTrue(a["conflict"])
+        # The row is identical in the second store too (compare the table,
+        # not the status: the status carries wall-clock age; the account
+        # id is a per-store UUID, so it is dropped from the comparison).
+        fp_a = {t: rows for t, rows in _fingerprint(self.db)}
+        fp_b = {t: rows for t, rows in _fingerprint(db)}
+        self.assertEqual(
+            [row[1:] for row in fp_a["billing_totals"]],
+            [row[1:] for row in fp_b["billing_totals"]])
 
 
 class BillingTime(_Base):
