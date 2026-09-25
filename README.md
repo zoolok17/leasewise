@@ -138,3 +138,53 @@ Tests: the five named checks (`reading_replay`, `stale_mapping`,
 `coverage_fallback`, `account_isolation`, `privacy_2`) plus the reducer
 rules; the named tests are shown red at the migration-only commit and
 green with the reducer — see docs/STEP-CARD-2.md.
+
+## Card 3 — policy arithmetic (pure)
+
+No new CLI verb: this card is pure arithmetic over fixtures — no
+wrapper, no HTTP, no store access in the arithmetic. Standard library
+only (`re`). The database migrates from version 2 to version 3: the
+seven policy tables `projects`, `teams`, `project_accounts`, `seats`,
+`models`, `profiles`, `limits` and the `limits_scope` uniqueness index
+(version-1/2 DDL byte for byte; same transactional discipline).
+
+`quota_balancer/policy.py` implements docs/DESIGN.md sections 3, 4 and
+6 as total functions over validated integer inputs:
+
+- **Estimates and holds (section 3).** `E = N*C + G*N*(N-1)/2`, `I =
+  ceil(E*margin_bps/10000)` (margin 10000..20000, default 12500), and
+  the request-sized hold `H = ceil((I*input_rate + O*output_rate)/1e6)
+  + 2*M - 1` at the model's reserve rates (rates: integer micro-EUR per
+  1,000,000 tokens, bound to the model `policy_hash`). The tariff-rate
+  figure and the fixed reserve `M*231999` are comparisons only — the
+  fixed per-attempt path is never the selected lease mode.
+- **Model ceiling.** `C + G*(N-1)` above the model input ceiling denies
+  `CONTEXT_PROJECTION_EXCEEDED`; oversized bounds are never clipped.
+  The per-call output cap must not exceed the model output ceiling.
+- **Composed limits (section 4).** the tightest hard ceiling per
+  (metric, period) across platform/project/team/seat (never adding
+  duplicate caps), the account budget as the one money home for
+  (money, month), and the admission rule settled + unresolved holds +
+  new hold <= cap, else `POLICY_DENIED`.
+- **The 80% sweep and fallback (section 6).** a cold sweep defers
+  strictly above 8000 bps; fallback tiers walk candidates then the
+  ordered fallback (alias or terminal 'park') — a fallback hit is a new
+  estimate/request/session, and cold_sweep never routes to a premium
+  automatically.
+
+Errors: `INVALID_REQUEST` / `CONTEXT_PROJECTION_EXCEEDED` /
+`POLICY_DENIED`, all static `{"error":{"code","message"}}` with exit 2
+(client-side request conditions). Closed shapes throughout: exact
+integers (booleans rejected), signed-64 bounds, local aliases, local
+UUIDs, 64-char hex policy hashes, enum checks.
+
+Demo (synthetic 1750000 vs 238000 input): a seven-call RESUME at
+C=250000, G=0 expects 1750000 input but its projection (250000) exceeds
+the 200000 ceiling and is denied; the rotated plan (C=25000, G=3000,
+same seven calls) expects 238000 input and is admitted with its
+request-sized hold. See docs/STEP-CARD-3.md for the transcript.
+
+Tests: the four named checks (`round_components`, `projection_denied`,
+`fallback_tier`, `privacy_3`) plus the arithmetic rules; the named tests
+are shown red at the migration-only commit and green with the
+arithmetic — see docs/STEP-CARD-3.md.
