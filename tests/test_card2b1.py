@@ -598,6 +598,7 @@ class BillingRetention(_Base):
         # 2b does no deletion: a reading older than the 30-day readings
         # retention and a resolved total whose period ended more than 13
         # months ago both survive init and status.
+        self.assertEqual(self._import_policy().returncode, 0)
         now = _now_ms()
         # Reading one: observed 40 days ago (past the 30-day mark).
         old_obs = now - 40 * _MS_PER_DAY
@@ -680,10 +681,19 @@ class BillingValidation(_Base):
         mid = self._good("val-mid", observed=SEP + 2 * _MS_PER_DAY)
         mid["payload"]["period_start"] = SEP + _MS_PER_DAY
         mutations.append(mid)
-        # A future source time beyond the 30-second slop.
-        mutations.append(self._good("val-future", observed=_now_ms() + 31_000))
+        # A future source time beyond the 30-second slop: the slop is
+        # checked against the CLI's own now, which advances while the
+        # earlier imports run, so the future reading is built at the moment
+        # of its own import (the exact 30 s / +1 ms boundary is pinned with
+        # an injected clock in billing_time).
+        def _future_reading():
+            return self._good("val-future", observed=_now_ms() + 31_000)
+
+        mutations.append(_future_reading)
 
         for doc in mutations:
+            if callable(doc):
+                doc = doc()
             result = _readings_import(self.db, self.tmp, _doc_v3([doc]))
             self.assertEqual(result.returncode, 2,
                              json.dumps(doc["payload"]))
@@ -780,11 +790,28 @@ class BillingPolicyEnums(_Base):
 
 
 class BillingOwnerScopeRevision(_Base):
-    """billing_owner_scope_revision: a foreign machine, an inactive
-    revision, a bad alias, a non-dedicated project, or
-    shares+allowance>cap is rejected on import."""
+    """billing_owner_scope_revision: a reading for an account with no
+    policy, a foreign machine, an inactive revision, a bad alias, a
+    non-dedicated project, or shares+allowance>cap is rejected on
+    import."""
 
     def test_billing_owner_scope_revision(self):
+        # A provider_billing reading for an account with NO policy is
+        # rejected from any machine, scope alias or revision: with no
+        # policy the owner is unknown, so no foreign total may enter
+        # billing_totals (section 11: one active scope/reporter owner per
+        # account).
+        now = _now_ms()
+        start, end = _month_bounds_of(now - 1000)
+        before = _fingerprint(self.db)
+        no_policy = _billing(_eid("osr-nopolicy"), "worker", "meter",
+                             "other-proj", 7, start, end, 50_000_000,
+                             False, now - 1000)
+        result = _readings_import(self.db, self.tmp, _doc_v3([no_policy]))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_fingerprint(self.db), before)
+
         # Policy-import rejections, before any policy exists.
         result = self._import_policy(dedicated=False)
         self.assertEqual(result.returncode, 2)
@@ -837,6 +864,96 @@ class BillingOwnerScopeRevision(_Base):
             self.db, self.tmp, _doc_v3([ok])).returncode, 0)
         self.assertEqual(self._billing()[("meter", start)]["latest_micro_eur"],
                          100)
+
+
+class BillingConfigInvariant(_Base):
+    """billing_config_invariant: config-import cannot break the invariants
+    a billing policy depends on - the account stays metered, its gateway
+    shares plus the allowance stay within the cap (B01, re-checked on the
+    policy's cap basis), and an account or machine the billing tables
+    reference cannot be removed (INVALID_CONFIG, not a store fault)."""
+
+    def test_billing_config_invariant(self):
+        # Start with headroom: shares 70M (30 + 40) leave room for a
+        # 20M allowance - 70 + 20 <= 100, so the policy imports.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 30_000_000
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
+        self.assertEqual(self._import_policy(
+            allowance=20_000_000).returncode, 0)
+        before = _fingerprint(self.db)
+
+        # B01 at config-import: raising g1 to 50M keeps the shares within
+        # the account cap (card 1: 50 + 40 = 90 <= 100) but
+        # shares + allowance (90 + 20 = 110) exceeds it - the policy's
+        # allocation invariant must refuse it.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 50_000_000
+        result = _config_import(self.db, self.tmp, doc)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # Lowering the cap below shares + allowance (while still above the
+        # shares: 70 <= 85) is refused the same way: 70 + 20 > 85.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 30_000_000
+        doc["accounts"][0]["budget_micro_eur"] = 85_000_000
+        result = _config_import(self.db, self.tmp, doc)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # A share change that keeps shares + allowance within the cap
+        # imports: 20 + 40 = 60, 60 + 20 <= 100.
+        doc = copy.deepcopy(VALID_DOC)
+        doc["gateways"][0]["share_micro_eur"] = 20_000_000
+        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode, 0)
+        # An account with a policy cannot be turned into a subscription
+        # (a non-metered account has no cap to bound an allowance; policy
+        # import itself would refuse it).
+        before = _fingerprint(self.db)
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"][0]["kind"] = "subscription"
+        doc["accounts"][0]["budget_micro_eur"] = None
+        result = _config_import(self.db, self.tmp, doc)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_fingerprint(self.db), before)
+
+        # A reduced total exists now, so the billing tables reference the
+        # account (and the policy references its reporter machine): a
+        # config-import removing either is INVALID_CONFIG (exit 2), not a
+        # foreign-key fault (exit 3).
+        now = _now_ms()
+        start, end = _month_bounds_of(now - 1000)
+        ok = _billing(_eid("cfg-ok"), "desktop", "meter", "proj-ai", 1,
+                      start, end, 100, False, now - 1000)
+        self.assertEqual(_readings_import(
+            self.db, self.tmp, _doc_v3([ok])).returncode, 0)
+        before = _fingerprint(self.db)
+        # Remove the policy's reporter machine: on a store where no
+        # reading references it (the reference is the policy row alone),
+        # the removal is INVALID_CONFIG (exit 2), not a foreign-key fault
+        # (exit 3).
+        db = self._fresh_db("cfg-machine.db")
+        self.assertEqual(self._import_policy(db=db,
+                                             reporter="worker").returncode, 0)
+        doc = copy.deepcopy(VALID_DOC)
+        doc["machines"] = [{"alias": "desktop"}]
+        doc["gateways"] = [g for g in doc["gateways"]
+                           if g["machine"] == "desktop"]
+        result = _config_import(db, self.tmp, doc)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # Remove the account the billing tables reference (the document
+        # itself stays valid with an unrelated account).
+        doc = copy.deepcopy(VALID_DOC)
+        doc["accounts"] = [
+            {"alias": "other", "vendor": "ovh", "kind": "metered",
+             "budget_micro_eur": 1_000_000}
+        ]
+        doc["gateways"] = []
+        result = _config_import(self.db, self.tmp, doc)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        self.assertEqual(_fingerprint(self.db), before)
 
 
 class BillingScope(_Base):

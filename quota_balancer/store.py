@@ -508,11 +508,13 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
     """Reduce a provider_billing reading into billing_totals.
 
     A provider bill is attributed money, so the account must be metered
-    (a subscription account has no spend to attribute). Where the account
-    has an operator billing policy, the reading must match it - reporter
-    machine, scope alias and scope revision (section 11): a foreign
-    machine, an inactive revision, or a scope alias the policy does not
-    designate is rejected,
+    (a subscription account has no spend to attribute). The account must
+    have an operator billing policy: with no policy the owner is unknown,
+    so a reading from any machine, scope alias or revision is rejected
+    and nothing is reduced into billing_totals. Where the policy exists,
+    the reading must match it - reporter machine, scope alias and scope
+    revision (section 11): a foreign machine, an inactive revision, or a
+    scope alias the policy does not designate is rejected,
     and a replica copy never adds totals.
 
     The row is keyed by (account_id, scope_revision, period_start); the
@@ -532,11 +534,14 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
         "SELECT reporter_machine_id, scope_alias, scope_revision "
         "FROM billing_policies WHERE account_id = ?", (account_id,)
     ).fetchone()
-    if policy is not None:
-        if (machine_id != policy[0]
-                or reading["scope_alias"] != policy[1]
-                or reading["scope_revision"] != policy[2]):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if policy is None:
+        # No policy, no owner: nothing is accepted until the operator
+        # designates the reporter, scope and revision.
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if (machine_id != policy[0]
+            or reading["scope_alias"] != policy[1]
+            or reading["scope_revision"] != policy[2]):
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
     period_start = reading["period_start"]
     period_end = reading["period_end"]
