@@ -363,11 +363,19 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         column = ("r.actual_micro_eur" if metric == "money_micro_eur"
                   else "r.input_tokens")
         ps = _period_start_for(period, now_ms)
+        # Scope accounting uses the grant-day/month (section 4): a
+        # lease's period_start is always the grant-month, so a day
+        # window buckets settled spend on the day of granted_at.
+        if period == "day":
+            settled_bucket = ("((l.granted_at/" + str(_DAY_MS) + ")*"
+                               + str(_DAY_MS) + ")")
+        else:
+            settled_bucket = "l.period_start"
         for scope, scope_id in scope_ids:
             settled = conn.execute(
                 "SELECT COALESCE(SUM(" + column + "),0) FROM receipts r "
                 "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
-                "l.period_start=? AND " + _chain_pred(scope),
+                + settled_bucket + "=? AND " + _chain_pred(scope),
                 (ps, scope_id)).fetchone()[0]
             limit_ids = [r["id"] for r in limit_rows
                          if r["scope"] == scope and r["scope_id"] == scope_id
@@ -375,11 +383,15 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
             holds = 0
             if limit_ids:
                 placeholders = ",".join("?" * len(limit_ids))
+                # Only unresolved exposure: a settled lease's spend is
+                # counted through its receipt, its released headroom is
+                # gone (the hold no longer reserves anything).
                 holds = conn.execute(
                     "SELECT COALESCE(SUM(h.reserved - "
                     "COALESCE(h.settled_actual,0)),0) FROM holds h JOIN "
                     "leases l ON l.id=h.lease_id WHERE h.period_start=? "
                     "AND h.limit_id IN (" + placeholders + ") AND "
+                    "l.state IN ('active','uncertain') AND "
                     + _chain_pred(scope),
                     (ps, *limit_ids, scope_id)).fetchone()[0]
             usage[(scope, scope_id)] = (settled, holds)
@@ -397,7 +409,8 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         acct_holds = conn.execute(
             "SELECT COALESCE(SUM(h.reserved - COALESCE(h.settled_actual,0)),0) "
             "FROM holds h JOIN leases l ON l.id=h.lease_id WHERE "
-            "h.period_start=? AND h.limit_id=? AND l.account_id=?",
+            "h.period_start=? AND h.limit_id=? AND l.account_id=? AND "
+            "l.state IN ('active','uncertain')",
             (month, _account_limit_id(account_id),
              account_id)).fetchone()[0]
         usage[("account", account_id)] = (acct_settled, acct_holds)
@@ -798,6 +811,9 @@ def _settle(conn, receipt, now_ms):
              receipt["outcome"], receipt["final"], receipt["observed_at"],
              receipt["received_at"]))
         released = retained = 0
+        # Max money-hold overrun of this receipt: (period_start, amount).
+        # One adjustments row per receipt: source_event_id is UNIQUE.
+        overrun = None
         if receipt["final"]:
             conn.execute(
                 "UPDATE leases SET state='settled', outcome=? WHERE id=?",
@@ -827,22 +843,38 @@ def _settle(conn, receipt, now_ms):
                          receipt["lease_id"], now_ms,
                          json.dumps({"metric": metric})))
                     if metric == "money_micro_eur":
-                        gateway_id = (receipt["gateway_id"]
-                                      if receipt["gateway_id"] is not None
-                                      else lease["gateway_id"])
-                        if gateway_id is None:
-                            _invalid()  # the liability needs a home gateway
-                        conn.execute(
-                            "INSERT INTO adjustments(id, account_id, "
-                            "gateway_id, source_event_id, period_start, "
-                            "unattributed_micro_eur, reason, resolved_at) "
-                            "VALUES(?,?,?,?,?,?,?,NULL)",
-                            (str(_uuid.uuid4()), lease["account_id"],
-                             gateway_id, receipt["event_id"], period_start,
-                             actual - reserved, "overrun"))
+                        amount = actual - reserved
+                        if overrun is None or amount > overrun[1]:
+                            overrun = (period_start, amount)
                 if metric == "money_micro_eur":
                     released += reserved - settled_actual
                     retained += settled_actual
+            if overrun is not None:
+                gateway_id = (receipt["gateway_id"]
+                              if receipt["gateway_id"] is not None
+                              else lease["gateway_id"])
+                if gateway_id is None:
+                    _invalid()  # the liability needs a home gateway
+                conn.execute(
+                    "INSERT INTO adjustments(id, account_id, "
+                    "gateway_id, source_event_id, period_start, "
+                    "unattributed_micro_eur, reason, resolved_at) "
+                    "VALUES(?,?,?,?,?,?,?,NULL)",
+                    (str(_uuid.uuid4()), lease["account_id"],
+                     gateway_id, receipt["event_id"], overrun[0],
+                     overrun[1], "overrun"))
+                # An observed overrun blocks further work on the account
+                # until reconciled (section 4): parked, no timed retry.
+                # OR IGNORE: the account may already be parked (the
+                # blocks_live index allows one live block per
+                # (account, model-or-null)).
+                conn.execute(
+                    "INSERT OR IGNORE INTO blocks(id, account_id, "
+                    "model_id, reason, retry_at, state, "
+                    "source_event_id, updated_at) "
+                    "VALUES(?,?,?,?,NULL,'parked',?,?)",
+                    (str(_uuid.uuid4()), lease["account_id"], None,
+                     "overrun", receipt["event_id"], now_ms))
             conn.execute(
                 "INSERT INTO audit(actor_alias, action, object_id, at, "
                 "redacted_details) VALUES(?,?,?,?,?)",
