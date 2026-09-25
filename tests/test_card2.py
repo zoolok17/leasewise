@@ -891,6 +891,71 @@ class ConfigImportUpsert(_Base):
         self.assertEqual(status["machines"], ["desktop", "worker"])
         self.assertEqual([g["alias"] for g in status["gateways"]], ["g1", "g2"])
 
+    def test_reimport_removed_alias_referenced_by_card3_tables(self):
+        # The v3 policy tables (card 3) reference accounts/machines: a
+        # models row pointing at a removed account, or a seats row pointing
+        # at a removed machine, makes the re-import INVALID_CONFIG (the
+        # card-2 reference guard now covers the v3 tables - A MINOR 6 /
+        # B n5).
+        conn = sqlite3.connect(self.db)
+        try:
+            account_id = conn.execute(
+                "SELECT id FROM accounts WHERE alias='meter'").fetchone()[0]
+            machine_id = conn.execute(
+                "SELECT id FROM machines WHERE alias='worker'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO models(id, account_id, alias, context_ceiling,"
+                " output_ceiling, tariff_input_rate, tariff_output_rate,"
+                " reserve_input_rate, reserve_output_rate, reservation_mode,"
+                " policy_hash, effort_aliases)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("m1", account_id, "claude", 200000, 64000, 400000,
+                 2700000, 480000, 3240000, "sized", PRICE_HASH, "standard"),
+            )
+            conn.execute(
+                "INSERT INTO projects(id, alias) VALUES(?,?)", ("p1", "org"))
+            conn.execute(
+                "INSERT INTO teams(id, project_id, alias) VALUES(?,?,?)",
+                ("t1", "p1", "team-a"))
+            conn.execute(
+                "INSERT INTO seats(id, team_id, machine_id, alias, role,"
+                " enforcement) VALUES(?,?,?,?,?,?)",
+                ("s1", "t1", machine_id, "seat-a", "dev", "metered"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        without_worker = {
+            "version": 1,
+            "accounts": [
+                {"alias": "meter", "vendor": "ovh", "kind": "metered",
+                 "budget_micro_eur": 100000000},
+            ],
+            "machines": [{"alias": "desktop"}],
+            "gateways": [
+                {"alias": "g1", "account": "meter", "machine": "desktop",
+                 "share_micro_eur": 60000000, "period": "utc_month"},
+            ],
+        }
+        bad = _config_import(self.db, self.tmp, without_worker)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The machine survives (its seat still references it).
+        self.assertEqual(self._status_json()["machines"], ["desktop", "worker"])
+
+        # And the account survives while its models row references it.
+        without_meter = {
+            "version": 1,
+            "accounts": [],
+            "machines": [{"alias": "desktop"}, {"alias": "worker"}],
+            "gateways": [],
+        }
+        bad = _config_import(self.db, self.tmp, without_meter)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        status = self._status_json()
+        self.assertEqual([a["alias"] for a in status["accounts"]], ["meter"])
+
     def test_reimport_removed_alias_unreferenced(self):
         # A removed alias that nothing references IS deleted; the rest of the
         # inventory is retained (with its UUIDs).

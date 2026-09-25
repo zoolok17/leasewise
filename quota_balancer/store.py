@@ -108,8 +108,9 @@ def import_config(path, file):
     UPSERT, not a delete-and-reinsert: retained aliases keep their stored
     UUID and every card-2 state column (coverage_complete, the gateway
     report); new aliases get new UUIDs; and a removed alias is deleted only
-    when nothing references it (a reading or window still pointing at a
-    removed account/machine is INVALID_CONFIG). A delete-and-reinsert would
+    when nothing references it (a reading, window, or card-3 policy-table
+    row still pointing at a removed account/machine is INVALID_CONFIG). A
+    delete-and-reinsert would
     fail on the foreign keys once any reading exists and would silently reset
     the operator-owned state. Future cards: an active-lease check will gate
     this reconciliation.
@@ -212,16 +213,25 @@ def _upsert(conn, accounts, machines, gateways):
 
     # Removed aliases, children before parents. validate() guarantees no
     # retained/new gateway references a removed account or machine, so the
-    # only live references to a removed alias are readings and windows.
+    # only live references to a removed alias are readings, windows, and
+    # the card-3 policy tables (seats.machine_id, models.account_id,
+    # project_accounts.account_id - empty in this card, guarded from the
+    # moment the tables exist).
     for alias in set(old_gateways) - {g[0] for g in gateways}:
         conn.execute("DELETE FROM gateways WHERE id=?", (old_gateways[alias],))
     for alias in set(old_machines) - set(machines):
-        if _references(conn, "readings", "machine_id", old_machines[alias]):
+        if (_references(conn, "readings", "machine_id", old_machines[alias])
+                or _references(conn, "seats", "machine_id",
+                               old_machines[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
     for alias in set(old_accounts) - {a[0] for a in accounts}:
         if (_references(conn, "readings", "account_id", old_accounts[alias])
                 or _references(conn, "windows", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "models", "account_id",
+                               old_accounts[alias])
+                or _references(conn, "project_accounts", "account_id",
                                old_accounts[alias])):
             raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
         conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))

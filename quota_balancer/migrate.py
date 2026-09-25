@@ -114,9 +114,10 @@ MIGRATION_V2 = "\n".join(_DDL_V2) + "\nPRAGMA user_version=2;\n"
 
 # Card 3 (migration version 3): the policy-arithmetic tables of section 7
 # (models, profiles, projects, teams, seats, project_accounts, limits) plus
-# the exact limits_scope uniqueness index. These are config-owned (loaded by
-# config-import as an upsert); the policy arithmetic itself is pure and does
-# not read the store in this card.
+# the exact limits_scope uniqueness index. These are config-owned and stay
+# EMPTY in this card (no policy config-import exists yet; a later card
+# loads them); the policy arithmetic itself is pure and reads plain fixture
+# rows, not the store.
 _DDL_V3 = (
     # projects: the top-level org unit.
     "CREATE TABLE projects(\n"

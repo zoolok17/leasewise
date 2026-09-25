@@ -21,18 +21,19 @@ from quota_balancer import errors, policy
 from quota_balancer.errors import QuotaError
 
 # --- The card-3 fixture model (a models-table row, closed shape). The rates
-# are integer micro-EUR per 1,000,000 tokens; the reserve rates are chosen
-# so the section-3 worked example pins exactly:
-# C=20000, N=4, G=2000, O=4000, M=5 -> E=92000, I=115000, H_sized=68169 at
-# reserve rates, the analogous tariff-rate estimate 56809, H_fixed=1159995.
+# are integer micro-EUR per 1,000,000 tokens; the reserve rates are the
+# design's section-3 rates (1.2x the tariff) and pin the worked example
+# exactly: C=20000, N=4, G=2000, O=4000, M=5 -> E=92000, I=115000,
+# H_sized=68169 at reserve rates, the analogous tariff-rate estimate 56809,
+# H_fixed=1159995.
 MODEL = {
     "alias": "claude",
     "context_ceiling": 200000,
     "output_ceiling": 64000,
     "tariff_input_rate": 400000,
     "tariff_output_rate": 2700000,
-    "reserve_input_rate": 460000,
-    "reserve_output_rate": 3815000,
+    "reserve_input_rate": 480000,
+    "reserve_output_rate": 3240000,
     "reservation_mode": "sized",
     "policy_hash": "0123456789abcdef" * 4,
     "effort_aliases": "standard,deep",
@@ -264,7 +265,7 @@ class EstimateRules(unittest.TestCase):
     def test_hold_allowance(self):
         # The 2*M-1 allowance: M=1 adds exactly 1 to the rate part.
         self.assertEqual(
-            policy.hold_at_rates(115000, 4000, 1, 460000, 3815000), 68160 + 1
+            policy.hold_at_rates(115000, 4000, 1, 480000, 3240000), 68160 + 1
         )
         # The fixed reserve is a comparison: M*231999.
         self.assertEqual(policy.hold_fixed(5), 1159995)
@@ -277,6 +278,16 @@ class EstimateRules(unittest.TestCase):
             with self.assertRaises(QuotaError) as cm:
                 policy.check_per_call_output_cap(model, bad)
             self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_output_total_bounded_by_model_ceiling(self):
+        # O is the TOTAL output of the estimate (section 3): it cannot
+        # exceed M calls at the model output ceiling (section 7: the
+        # per-call cap <= model ceiling) (A MINOR 4).
+        model = copy.deepcopy(MODEL)  # output ceiling 64000, M=5
+        policy.estimate(20000, 4, 2000, 5 * 64000, 5, model)
+        with self.assertRaises(QuotaError) as cm:
+            policy.estimate(20000, 4, 2000, 5 * 64000 + 1, 5, model)
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
 
     def test_model_shape_closed(self):
         # A missing key, an extra key, a short hash, a bad reservation
@@ -306,7 +317,8 @@ class EstimateRules(unittest.TestCase):
 class LimitRules(unittest.TestCase):
     def test_tightest_ceiling_composition(self):
         # Limits compose by their tightest ceiling, never by adding
-        # duplicate caps (section 4); periods do not mix.
+        # duplicate caps (section 4); periods and windows do not mix. The
+        # cap identity is (metric, period, window_key).
         caps = policy.composed_limits([
             _limit("platform", _uid("pl"), "input_tokens", "day", 1000000,
                    soft=200000),
@@ -317,62 +329,77 @@ class LimitRules(unittest.TestCase):
             _limit("platform", _uid("pl"), "money_micro_eur", "turn", 5000000),
         ])
         self.assertEqual(
-            caps[("input_tokens", "day")], {"hard": 400000, "soft": 200000}
+            caps[("input_tokens", "day", None)],
+            {"hard": 400000, "soft": 200000},
         )
         self.assertEqual(
-            caps[("input_tokens", "turn")], {"hard": 250000, "soft": None}
+            caps[("input_tokens", "turn", None)], {"hard": 250000, "soft": None}
         )
         self.assertEqual(
-            caps[("money_micro_eur", "turn")], {"hard": 5000000, "soft": None}
+            caps[("money_micro_eur", "turn", None)],
+            {"hard": 5000000, "soft": None},
+        )
+
+    def test_composed_soft_above_hard_is_dropped(self):
+        # A soft bound carries only while it sits at or below the
+        # effective (tightest) hard: min soft 100 against min hard 50
+        # carries no information and is dropped (B m5).
+        caps = policy.composed_limits([
+            _limit("team", _uid("t"), "input_tokens", "day", 100, soft=100),
+            _limit("platform", _uid("pl"), "input_tokens", "day", 50),
+        ])
+        self.assertEqual(
+            caps[("input_tokens", "day", None)], {"hard": 50, "soft": None}
         )
 
     def test_account_budget_tightens_month_money(self):
         # The account budget is the one money home (F04): it tightens the
-        # (money, month) cap, and a tighter money limit still wins.
+        # (money, month, None) cap, and a tighter money limit still wins.
         caps = policy.composed_limits(
             [_limit("project", _uid("p"), "money_micro_eur", "month", 150000000)],
             account_budget=100000000,
         )
         self.assertEqual(
-            caps[("money_micro_eur", "month")], {"hard": 100000000, "soft": None}
+            caps[("money_micro_eur", "month", None)],
+            {"hard": 100000000, "soft": None},
         )
         caps = policy.composed_limits(
             [_limit("project", _uid("p"), "money_micro_eur", "month", 50000000)],
             account_budget=100000000,
         )
         self.assertEqual(
-            caps[("money_micro_eur", "month")], {"hard": 50000000, "soft": None}
+            caps[("money_micro_eur", "month", None)],
+            {"hard": 50000000, "soft": None},
         )
         caps = policy.composed_limits([], account_budget=100000000)
         self.assertEqual(
-            caps[("money_micro_eur", "month")], {"hard": 100000000, "soft": None}
+            caps[("money_micro_eur", "month", None)],
+            {"hard": 100000000, "soft": None},
         )
 
     def test_admission_at_cap_ok_over_cap_denied(self):
-        # Admission (section 4): settled + unresolved holds + new hold <=
-        # each applicable cap; one unit over is POLICY_DENIED, exit 2.
-        caps = policy.composed_limits(
-            [_limit("team", _uid("t"), "money_micro_eur", "turn", 5000)]
-        )
-        policy.check_admission(caps, "money_micro_eur", "turn", 1000, 2000, 2000)
+        # Admission (section 4): that scope's settled + unresolved holds +
+        # the new hold <= the cap; one unit over is POLICY_DENIED, exit 2.
+        rows = [_limit("team", _uid("t"), "money_micro_eur", "turn", 5000)]
+        usage = {("team", _uid("t")): (1000, 2000)}
+        policy.check_admission(rows, "money_micro_eur", "turn", usage, 2000)
         with self.assertRaises(QuotaError) as cm:
-            policy.check_admission(caps, "money_micro_eur", "turn", 1000, 2000, 2001)
+            policy.check_admission(rows, "money_micro_eur", "turn", usage, 2001)
         self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
         self.assertEqual(errors.EXIT_CODES[errors.CODE_POLICY_DENIED], 2)
         self.assertEqual(_error_payload(cm.exception), ERROR_DENIED)
         # Input tokens compose the same way.
-        caps_in = policy.composed_limits(
-            [_limit("seat", _uid("s"), "input_tokens", "turn", 115000)]
-        )
-        policy.check_admission(caps_in, "input_tokens", "turn", 0, 0, 115000)
+        rows_in = [_limit("seat", _uid("s"), "input_tokens", "turn", 115000)]
+        policy.check_admission(rows_in, "input_tokens", "turn",
+                               {("seat", _uid("s")): (0, 0)}, 115000)
         with self.assertRaises(QuotaError) as cm:
-            policy.check_admission(caps_in, "input_tokens", "turn", 0, 0, 115001)
+            policy.check_admission(rows_in, "input_tokens", "turn",
+                                   {("seat", _uid("s")): (0, 0)}, 115001)
         self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
 
     def test_admission_unbounded_without_cap(self):
-        # A (metric, period) with no cap is unbounded.
-        caps = policy.composed_limits([])
-        policy.check_admission(caps, "money_micro_eur", "turn", 0, 0, 10 ** 12)
+        # A (metric, period, window_key) with no cap is unbounded.
+        policy.check_admission([], "money_micro_eur", "turn", {}, 10 ** 12)
 
     def test_limit_row_contract(self):
         good = _limit("team", _uid("t"), "input_tokens", "day", 1000000)
@@ -408,6 +435,219 @@ class LimitRules(unittest.TestCase):
             self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
 
 
+class RoundingDirection(unittest.TestCase):
+    """Both money ceilings round UP (A MAJOR 1 / B m4). The section-3
+    worked example divides exactly and cannot catch a flipped direction;
+    these fixtures do not."""
+
+    def test_input_margin_rounds_up(self):
+        # 1*12500/10000 = 1.25 -> 2 (a floor would give 1);
+        # 3*10001/10000 = 3.0003 -> 4 (a floor would give 3);
+        # 2*12500/10000 = 2.5 -> 3 (a floor would give 2).
+        self.assertEqual(policy.input_with_margin(1, 12500), 2)
+        self.assertEqual(policy.input_with_margin(3, 10001), 4)
+        self.assertEqual(policy.input_with_margin(2, 12500), 3)
+
+    def test_hold_rounds_up(self):
+        # ceil(1/1e6) = 1, + 2*1-1 -> 2 (flooring the rate part would
+        # give 1); the same from the output side.
+        self.assertEqual(policy.hold_at_rates(1, 0, 1, 1, 0), 2)
+        self.assertEqual(policy.hold_at_rates(0, 1, 1, 0, 1), 2)
+        # Both sides: ceil(2/1e6) = 1, + 2*2-1 -> 4 (a floor would give 3).
+        self.assertEqual(policy.hold_at_rates(1, 1, 2, 1, 1), 4)
+
+
+class TrailingNewlineRejection(unittest.TestCase):
+    """A $-anchored pattern checked with re.match accepts a trailing
+    newline (A MAJOR 2): every alias/UUID/hash check is a fullmatch."""
+
+    def test_model_fields(self):
+        for field, value in (
+            ("alias", "claude\n"),
+            ("policy_hash", "0123456789abcdef" * 4 + "\n"),
+            ("effort_aliases", "standard\n"),
+        ):
+            bad = copy.deepcopy(MODEL)
+            bad[field] = value
+            with self.assertRaises(QuotaError) as cm:
+                policy.estimate(20000, 4, 2000, 4000, 5, bad)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_limit_fields(self):
+        # A scope_id UUID with a trailing newline...
+        row = _limit("team", _uid("t") + "\n", "input_tokens", "day", 100)
+        with self.assertRaises(QuotaError) as cm:
+            policy.composed_limits([row])
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+        # ...and a window_key with one.
+        row = _limit("platform", _uid("pl"), "window_bps", "window", 8000,
+                     window_key="w1\n")
+        with self.assertRaises(QuotaError) as cm:
+            policy.composed_limits([row])
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_tier_aliases(self):
+        for call in (
+            lambda: policy.select_tier(["qwen\n"], ["park"], set()),
+            lambda: policy.select_tier(["qwen"], ["sonnet\n", "park"], set()),
+            lambda: policy.select_tier(["qwen"], ["park"], {"codex\n"}),
+        ):
+            with self.assertRaises(QuotaError) as cm:
+                call()
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+
+class WindowSeparation(unittest.TestCase):
+    """Limits for different windows stay separate (A MAJOR 3 / B M1):
+    window_key is part of the cap identity, never dropped."""
+
+    def test_composed_keeps_windows_apart(self):
+        caps = policy.composed_limits([
+            _limit("platform", _uid("pl"), "window_bps", "window", 5000,
+                   window_key="w1"),
+            _limit("platform", _uid("pl"), "window_bps", "window", 9000,
+                   window_key="w2"),
+        ])
+        self.assertEqual(
+            caps[("window_bps", "window", "w1")], {"hard": 5000, "soft": None}
+        )
+        self.assertEqual(
+            caps[("window_bps", "window", "w2")], {"hard": 9000, "soft": None}
+        )
+        self.assertNotIn(("window_bps", "window"), caps)
+
+    def test_admission_checks_the_requested_window(self):
+        rows = [
+            _limit("platform", _uid("pl"), "window_bps", "window", 10000,
+                   window_key="w1"),
+            _limit("platform", _uid("pl"), "window_bps", "window", 5000,
+                   window_key="w2"),
+        ]
+        usage = {("platform", _uid("pl")): (0, 0)}
+        # The w1 window admits 7000 bps ...
+        policy.check_admission(rows, "window_bps", "window", usage, 7000,
+                               window_key="w1")
+        # ... but the same 7000 over the w2 cap is denied.
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(rows, "window_bps", "window", usage, 7000,
+                                   window_key="w2")
+        self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
+        # A window-period check without a window_key is not representable.
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(rows, "window_bps", "window", usage, 1)
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+
+class AdmissionPerScope(unittest.TestCase):
+    """Admission enforces EACH applicable cap against its own scope's
+    usage (B M2, section 4): settled + unresolved holds + new hold <=
+    each applicable cap - never one figure against the collapsed min."""
+
+    def _rows(self):
+        return [
+            _limit("seat", _uid("s"), "input_tokens", "day", 10),
+            _limit("platform", _uid("pl"), "input_tokens", "day", 50),
+        ]
+
+    def test_one_scope_passes_another_fails(self):
+        # Seat usage 2 (2+3=5 <= 10: the seat passes) but platform usage
+        # 49 (49+3=52 > 50: the platform fails): denied.
+        usage = {("seat", _uid("s")): (2, 0),
+                 ("platform", _uid("pl")): (49, 0)}
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(self._rows(), "input_tokens", "day",
+                                   usage, 3)
+        self.assertEqual(cm.exception.code, errors.CODE_POLICY_DENIED)
+        self.assertEqual(errors.EXIT_CODES[errors.CODE_POLICY_DENIED], 2)
+        self.assertEqual(_error_payload(cm.exception), ERROR_DENIED)
+
+    def test_all_scopes_pass(self):
+        # No false rejection: seat 1+3=4 <= 10 and platform 20+3=23 <= 50
+        # both fit; checking the platform figure against the collapsed
+        # min (10) would deny it.
+        usage = {("seat", _uid("s")): (1, 0),
+                 ("platform", _uid("pl")): (20, 0)}
+        policy.check_admission(self._rows(), "input_tokens", "day", usage, 3)
+
+    def test_missing_scope_usage_fails_closed(self):
+        # A scope whose usage the caller cannot state is not treated as
+        # zero: INVALID_REQUEST, not a silent admission.
+        with self.assertRaises(QuotaError) as cm:
+            policy.check_admission(self._rows(), "input_tokens", "day",
+                                   {("seat", _uid("s")): (1, 0)}, 3)
+        self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_usage_pairs_are_integers(self):
+        for pair in ((True, 0), (1.0, 0), (1, -1), (1,)):
+            usage = {("seat", _uid("s")): pair,
+                     ("platform", _uid("pl")): (0, 0)}
+            with self.assertRaises(QuotaError) as cm:
+                policy.check_admission(self._rows(), "input_tokens", "day",
+                                       usage, 1)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+
+class MetricPeriodPairing(unittest.TestCase):
+    """The metric/period/window_key pairing the section-7 limits row
+    implies: input/money use turn/day/month, window_bps uses window with
+    a window_key, concurrency counts the live turn (B m1 / A MINOR 5)."""
+
+    def test_bad_pairings_rejected(self):
+        for row in (
+            _limit("team", _uid("t"), "window_bps", "day", 8000,
+                   window_key="w1"),   # window_bps uses window
+            _limit("team", _uid("t"), "window_bps", "window", 8000),   # needs a window_key
+            _limit("team", _uid("t"), "input_tokens", "window", 100,
+                   window_key="w1"),   # input/money use turn/day/month
+            _limit("team", _uid("t"), "input_tokens", "day", 100,
+                   window_key="w1"),   # ...and carry no window
+            _limit("team", _uid("t"), "money_micro_eur", "month", 100,
+                   window_key="w1"),
+            _limit("team", _uid("t"), "concurrency", "month", 3),       # live count
+            _limit("team", _uid("t"), "concurrency", "turn", 3,
+                   window_key="w1"),   # ...and carry no window
+            _limit("platform", _uid("pl"), "window_bps", "window", 20000,
+                   window_key="w1"),   # bps cannot exceed 10000
+        ):
+            with self.assertRaises(QuotaError) as cm:
+                policy.composed_limits([row])
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_good_pairings_accepted(self):
+        for row in (
+            _limit("platform", _uid("pl"), "window_bps", "window", 8000,
+                   window_key="w1"),
+            _limit("seat", _uid("s"), "concurrency", "turn", 2),
+            _limit("project", _uid("p"), "money_micro_eur", "month", 10 ** 9),
+        ):
+            caps = policy.composed_limits([row])
+            self.assertEqual(len(caps), 1)
+
+
+class ReserveAtLeastTariff(unittest.TestCase):
+    """The reserve rates bound the reservation: below the tariff (the
+    settlement) rates the sized hold under-reserves the money it covers
+    (B m3). The design's own rates are 1.2x the tariff."""
+
+    def test_reserve_below_tariff_rejected(self):
+        for override in (
+            {"reserve_input_rate": 399999},
+            {"reserve_output_rate": 2699999},
+        ):
+            bad = copy.deepcopy(MODEL)
+            bad.update(override)
+            with self.assertRaises(QuotaError) as cm:
+                policy.estimate(20000, 4, 2000, 4000, 5, bad)
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
+
+    def test_reserve_equal_to_tariff_admitted(self):
+        model = copy.deepcopy(MODEL)
+        model["reserve_input_rate"] = 400000
+        model["reserve_output_rate"] = 2700000
+        rec = policy.estimate(20000, 4, 2000, 4000, 5, model)
+        self.assertEqual(rec["hold_sized"], 56809)  # == the tariff figure
+
+
 class SweepRules(unittest.TestCase):
     def test_sweep_defer_above_80_percent(self):
         # "Defer above 80%" (section 6): strictly above 8000 bps defers; at
@@ -428,6 +668,18 @@ class SweepRules(unittest.TestCase):
         self.assertEqual(plan["tier"], "park")
         self.assertIsNone(plan["model"])
         self.assertTrue(policy.sweep_deferred(8001))
+
+    def test_park_is_reserved_for_fallback(self):
+        # 'park' is the fallback sentinel (model None): it is not a model
+        # alias, so it cannot appear as a candidate or a blocked entry
+        # (A NIT 9).
+        for call in (
+            lambda: policy.select_tier(["park"], ["park"], set()),
+            lambda: policy.select_tier(["qwen"], ["park"], {"park"}),
+        ):
+            with self.assertRaises(QuotaError) as cm:
+                call()
+            self.assertEqual(cm.exception.code, errors.CODE_INVALID_REQUEST)
 
 
 class ErrorContract(unittest.TestCase):

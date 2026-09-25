@@ -74,13 +74,15 @@ def _check_int(value, minimum=0, maximum=INT64_MAX):
 
 
 def _check_alias(value):
-    if not isinstance(value, str) or not _ALIAS_RE.match(value):
+    # fullmatch, not match: a $ anchor with re.match still accepts a
+    # trailing newline ("claude\n" is not an alias).
+    if not isinstance(value, str) or not _ALIAS_RE.fullmatch(value):
         _invalid()
     return value
 
 
 def _check_uuid(value):
-    if not isinstance(value, str) or not _UUID_RE.match(value):
+    if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
         _invalid()
     return value
 
@@ -100,9 +102,14 @@ def _validate_model(model):
     tariff_out = _check_int(model["tariff_output_rate"])
     reserve_in = _check_int(model["reserve_input_rate"])
     reserve_out = _check_int(model["reserve_output_rate"])
+    # The reserve rates bound the reservation: below the tariff (the
+    # settlement) rates the sized hold would under-reserve the money it
+    # covers. The design's own rates are 1.2x the tariff (section 3).
+    if reserve_in < tariff_in or reserve_out < tariff_out:
+        _invalid()
     if model["reservation_mode"] not in ("sized", "fixed"):
         _invalid()
-    if not isinstance(model["policy_hash"], str) or not _HASH_RE.match(
+    if not isinstance(model["policy_hash"], str) or not _HASH_RE.fullmatch(
             model["policy_hash"]):
         _invalid()
     effort = model["effort_aliases"]
@@ -223,9 +230,10 @@ def estimate(c, n, g, o, m, model, margin_bps=MARGIN_BPS_DEFAULT):
     projected_final_context   C + G*(N-1), checked against the ceiling
 
     Raises INVALID_REQUEST on contract violations (N<=M<=100, the margin
-    range, closed shapes, booleans-as-integers, the signed-64 bound) and
-    CONTEXT_PROJECTION_EXCEEDED when the projection exceeds the model input
-    ceiling.
+    range, closed shapes, booleans-as-integers, the signed-64 bound, and
+    O - the TOTAL output, section 3 - exceeding M calls at the model
+    output ceiling) and CONTEXT_PROJECTION_EXCEEDED when the projection
+    exceeds the model input ceiling.
     """
     _check_int(c)
     _check_int(n, 1, MAX_CALLS)
@@ -235,6 +243,11 @@ def estimate(c, n, g, o, m, model, margin_bps=MARGIN_BPS_DEFAULT):
     if n > m:
         _invalid()
     rates = _validate_model(model)
+    # O is the total output over the estimate: it cannot exceed M calls at
+    # the model output ceiling (section 7: the per-call cap <= model
+    # ceiling).
+    if o > m * rates[1]:
+        _invalid()
     e = expected_input_tokens(c, n, g)
     i = input_with_margin(e, margin_bps)
     check_projection(c, n, g, model)  # raises CONTEXT_PROJECTION_EXCEEDED
@@ -273,19 +286,36 @@ def _validate_limit(row):
     hard = _check_int(row["hard"])
     if soft is not None and soft > hard:
         _invalid()
+    # The section-7 pairing: input/money use turn/day/month (and carry no
+    # window), window_bps uses window with a window_key (bps: 10000 is
+    # 100%), concurrency counts the live/uncertain leases of the turn.
+    if metric in ("input_tokens", "money_micro_eur"):
+        if period not in ("turn", "day", "month") or window_key is not None:
+            _invalid()
+    elif metric == "window_bps":
+        if period != "window" or window_key is None:
+            _invalid()
+        if hard > 10000:
+            _invalid()
+    else:  # concurrency
+        if period != "turn" or window_key is not None:
+            _invalid()
     return (scope, metric, period, window_key, soft, hard)
 
 
 def composed_limits(rows, account_budget=None):
-    """The effective cap per (metric, period): the tightest hard ceiling
-    across the applicable scopes (section 4: limits compose by their
-    tightest ceiling, never by adding duplicate caps).
+    """The effective cap per (metric, period, window_key): the tightest
+    hard ceiling across the applicable scopes (section 4: limits compose
+    by their tightest ceiling, never by adding duplicate caps). Limits for
+    different windows stay separate - window_key is part of the cap
+    identity, never dropped.
 
     `rows` are limits rows (fixture dicts). `account_budget` is the
     account's one money home (accounts.budget_micro_eur, F04); it tightens
-    the (money_micro_eur, month) cap. A soft bound is carried only while it
-    sits at or below the effective hard (a warning above the cap carries no
-    information). A (metric, period) with no cap is absent: unbounded.
+    the (money_micro_eur, month, None) cap. A soft bound is carried only
+    while it sits at or below the effective hard (a warning above the cap
+    carries no information). A (metric, period, window_key) with no cap is
+    absent: unbounded.
     """
     if isinstance(rows, (str, dict)) or not isinstance(rows, (list, tuple)):
         _invalid()
@@ -293,8 +323,8 @@ def composed_limits(rows, account_budget=None):
         _check_int(account_budget, 1)
     caps = {}
     for row in rows:
-        _scope, metric, period, _window_key, soft, hard = _validate_limit(row)
-        key = (metric, period)
+        _scope, metric, period, window_key, soft, hard = _validate_limit(row)
+        key = (metric, period, window_key)
         current = caps.get(key)
         if current is None:
             caps[key] = {"hard": hard, "soft": soft}
@@ -309,7 +339,7 @@ def composed_limits(rows, account_budget=None):
         if entry["soft"] is not None and entry["soft"] > entry["hard"]:
             entry["soft"] = None
     if account_budget is not None:
-        key = ("money_micro_eur", "month")
+        key = ("money_micro_eur", "month", None)
         current = caps.get(key)
         if current is None:
             caps[key] = {"hard": account_budget, "soft": None}
@@ -320,37 +350,65 @@ def composed_limits(rows, account_budget=None):
     return caps
 
 
-def check_admission(caps, metric, period, settled, holds, new):
-    """The admission rule (section 4): settled + unresolved holds + the new
-    hold must fit the tightest applicable cap; else POLICY_DENIED.
+def check_admission(rows, metric, period, usage, new, window_key=None):
+    """The admission rule (section 4): for EVERY limit row applicable to
+    this (metric, period[, window_key]), that scope's settled charges +
+    unresolved holds + the new hold must fit the row's hard cap ("settled
+    charges + unresolved holds + new hold <= each applicable cap"); else
+    POLICY_DENIED. Caps from different scopes are never collapsed into one
+    figure: each is enforced against its own scope's usage.
 
-    `caps` is composed_limits' result; a (metric, period) without a cap is
-    unbounded.
+    `rows` are limits rows (fixture dicts, validated as in
+    composed_limits). `usage` maps (scope, scope_id) to the (settled,
+    holds) pair for that scope; every applicable scope must be present -
+    a scope whose usage is unknown fails closed as INVALID_REQUEST, not
+    zero. Entries for non-applicable scopes are ignored. `new` is the new
+    hold size for this request. For period "window" the caller must name
+    the window (window_key); for other periods window_key must be None.
+    Soft bounds are not consulted here: they annotate the grant (card 4).
+    A (metric, period, window_key) with no cap is unbounded.
     """
     if metric not in LIMIT_METRICS or period not in LIMIT_PERIODS:
         _invalid()
-    _check_int(settled)
-    _check_int(holds)
+    if (period == "window") != (window_key is not None):
+        _invalid()
+    if window_key is not None:
+        _check_alias(window_key)
     _check_int(new)
-    if not isinstance(caps, dict):
+    if isinstance(rows, (str, dict)) or not isinstance(rows, (list, tuple)):
         _invalid()
-    entry = caps.get((metric, period))
-    if entry is None:
-        return
-    if not isinstance(entry, dict) or set(entry) != {"hard", "soft"}:
+    if not isinstance(usage, dict):
         _invalid()
-    _check_int(entry["hard"])
-    if settled + holds + new > entry["hard"]:
-        raise QuotaError(errors.CODE_POLICY_DENIED, errors.MSG_POLICY_DENIED)
+    for row in rows:
+        scope, m, p, wk, _soft, hard = _validate_limit(row)
+        if (m, p, wk) != (metric, period, window_key):
+            continue  # not applicable to this check
+        key = (scope, row["scope_id"])
+        if key not in usage:
+            _invalid()  # fail closed: unknown usage is not zero
+        pair = usage[key]
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            _invalid()
+        settled = _check_int(pair[0])
+        holds = _check_int(pair[1])
+        if settled + holds + new > hard:
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
 
 
 # --- section 6: the 80% sweep and fallback tiers --------------------------------
 
 def sweep_deferred(used_bps):
-    """The 80% sweep (section 6): a cold sweep defers when the window is
-    above 80% used. "Above 80%" is strictly greater - at exactly 8000 bps
-    the sweep still runs. A deferred sweep parks; it never routes to a
-    premium tier automatically (its fallback list is [park])."""
+    """The 80% sweep (section 6): a cold sweep defers when a selected
+    window is above 80% used. Section 5: "no cold_sweep if any selected
+    window >80%" - the caller passes the MAX utilization across the
+    selected windows. "Above 80%" is strictly greater - at exactly 8000
+    bps the sweep still runs. A deferred sweep parks; it never routes to a
+    premium tier automatically (its fallback list is [park]).
+
+    A window whose utilization is UNKNOWN (never observed) is not a bps
+    value: the readings layer (not this arithmetic) decides what that
+    means; here the input must be a known 0..10000 bps."""
     _check_int(used_bps, 0, 10000)
     return used_bps > SWEEP_DEFER_BPS
 
@@ -377,6 +435,8 @@ def select_tier(candidates, fallback, blocked):
         _invalid()
     for alias in candidates:
         _check_alias(alias)
+        if alias == PARK:
+            _invalid()  # 'park' is the fallback sentinel, not a model alias
     for tier in fallback:
         if tier != PARK:
             _check_alias(tier)
@@ -384,6 +444,8 @@ def select_tier(candidates, fallback, blocked):
         if fallback[-1] != PARK or fallback.count(PARK) != 1:
             _invalid()
     for alias in blocked:
+        if alias == PARK:
+            _invalid()
         _check_alias(alias)
     for index, alias in enumerate(candidates):
         if alias not in blocked:
