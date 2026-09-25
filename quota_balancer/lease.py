@@ -47,10 +47,25 @@ above the hold - and records an observed overrun as liability: a money
 overrun becomes an adjustments row (unattributed_micro_eur,
 resolved_at NULL: it needs reconciliation, turn 3 blocks on it) plus an
 audit row; an input overrun gets an audit row. "Unknown spend is not a
-zero final receipt": a final receipt requires actual_micro_eur. Late
-receipts on an expired (uncertain) lease land in turn 3 (late_receipt:
-reconcile the original period once); this turn settles only active
-leases, and a settled lease is terminal: RECEIPT_CONFLICT.
+zero final receipt": a final receipt requires actual_micro_eur. A
+late final receipt on an expired (uncertain) lease settles it against
+the ORIGINAL grant period, exactly once (late_receipt): the holds
+keep their grant-time period_start, so the reconciliation lands in
+the original bucket even across a day/month boundary; the event_id
+makes a replay a no-op and a settled lease is terminal
+(RECEIPT_CONFLICT). A non-final receipt on an uncertain lease is
+still refused (LEASE_EXPIRED): only the gateway's closed-child final
+receipt resolves an unprovable outcome.
+
+expire: the explicit expiry path of section 4 ("Expiry -> uncertain,
+never a refund"): an active lease whose TTL has elapsed is moved to
+uncertain in one BEGIN IMMEDIATE transaction. The outcome cannot be
+proved, so the holds stay reserved - the liability is retained,
+nothing is released; the lease keeps its live slot (the lease_live
+index counts uncertain) and a late final receipt can still settle it.
+Idempotent on an already-uncertain lease (replayed=True); a
+not-yet-expired lease is INVALID_REQUEST; a settled lease is terminal
+(RECEIPT_CONFLICT); a missing lease is NOT_FOUND.
 
 The read-check-insert sequence is one transaction, so the grant_race
 property holds: under concurrent grants the sum of unresolved holds
@@ -429,6 +444,11 @@ def _grant(conn, request, now_ms):
             (request["model_id"],)).fetchone()
         if model is None:
             _not_found()
+        # privacy_4: the effort is one of the model's closed aliases -
+        # free alias-shaped text (a planted secret, path or ID) is
+        # refused, never persisted as a task class.
+        if request["effort"] not in model[11].split(","):
+            _invalid()
         account = conn.execute(
             "SELECT id, kind, budget_micro_eur FROM accounts WHERE id=?",
             (model[1],)).fetchone()
@@ -637,6 +657,56 @@ def check(path, lease_id, now_ms):
         conn.close()
 
 
+# --- expire ---------------------------------------------------------------------
+
+def expire(path, lease_id, now_ms):
+    """The explicit expiry path (section 4: "Expiry -> uncertain,
+    never a refund").
+
+    One BEGIN IMMEDIATE transaction: an active lease whose TTL has
+    elapsed (now_ms >= expires_at) is moved to uncertain. The outcome
+    cannot be proved, so the holds stay reserved - the liability is
+    retained and nothing is released; the lease keeps its live slot
+    (the lease_live index counts uncertain) and a late final receipt
+    can still settle it against the original grant period. Idempotent
+    on an already-uncertain lease (replayed=True); a not-yet-expired
+    lease is INVALID_REQUEST; a settled lease is terminal
+    (RECEIPT_CONFLICT); a missing lease is NOT_FOUND (404).
+    """
+    policy._check_int(now_ms, 1)
+    policy._check_uuid(lease_id)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = _lease_row(conn, lease_id)
+            if row is None:
+                _not_found()
+            if row["state"] == "settled":
+                raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
+                                 errors.MSG_RECEIPT_CONFLICT)
+            if row["state"] == "uncertain":
+                conn.execute("COMMIT")
+                return _lease_dict(row, replayed=True)
+            if now_ms < row["expires_at"]:
+                _invalid()  # not expired: expiry is an effect of the TTL
+            conn.execute(
+                "UPDATE leases SET state='uncertain' WHERE id=?",
+                (lease_id,))
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("coordinator", "lease_expired", lease_id, now_ms,
+                 json.dumps({"refunded": 0})))
+            conn.execute("COMMIT")
+            return _lease_dict(_lease_row(conn, lease_id))
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+
 # --- settle ------------------------------------------------------------------------
 
 _RECEIPT_FIELDS = ("lease_id", "gateway_id", "seq", "calls", "input_tokens",
@@ -707,9 +777,11 @@ def _settle(conn, receipt, now_ms):
             # recorded (reconciliation is turn 3).
             raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
                              errors.MSG_RECEIPT_CONFLICT)
-        if lease["state"] == "uncertain":
-            # Late receipts on an expired lease land in turn 3
-            # (late_receipt: reconcile the original period once).
+        if lease["state"] == "uncertain" and not receipt["final"]:
+            # Only the gateway's closed-child final receipt resolves an
+            # unprovable outcome; interim usage never settles money.
+            # (A late FINAL receipt is accepted below and settles the
+            # holds at their original, grant-time period_start.)
             raise QuotaError(errors.CODE_LEASE_EXPIRED,
                              errors.MSG_LEASE_EXPIRED)
         if receipt["final"] and receipt["actual_micro_eur"] is None:
