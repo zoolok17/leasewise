@@ -207,3 +207,25 @@ def window_freshness(observed_at, now_ms):
     if age_ms <= WALL_CAP_MS:
         return True, FRESH_FRESH
     return False, FRESH_WALL_CAP
+
+
+# Billing freshness (section 11): fresh iff age <= max_age, no idle
+# exemption. `max_age_ms` is None when no policy supplies a max_age (the
+# freshness is then "unknown", not assumed fresh or stale).
+FRESH_BILLING_FRESH = "fresh"
+FRESH_BILLING_STALE = "stale"
+FRESH_BILLING_UNKNOWN = "unknown"
+
+
+def billing_freshness(observed_at, max_age_ms, now_ms):
+    """Return (fresh, reason) for a billing total at status time.
+
+    `observed_at` is the source time (lastUpdate), not the poll receipt time;
+    it is never refreshed by an unchanged re-import. `max_age_ms` is the
+    policy's max_age_seconds * 1000, or None when there is no policy.
+    """
+    if observed_at is None or max_age_ms is None:
+        return None, FRESH_BILLING_UNKNOWN
+    if now_ms - observed_at <= max_age_ms:
+        return True, FRESH_BILLING_FRESH
+    return False, FRESH_BILLING_STALE

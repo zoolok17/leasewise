@@ -40,13 +40,13 @@ EMPTY_REPORT = (
 )
 
 EXPECTED_STATUS = (
-    '{"schema_version":2,"accounts":[{"alias":"meter","kind":"metered",'
+    '{"schema_version":3,"accounts":[{"alias":"meter","kind":"metered",'
     '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
     '"coverage_complete":false,"windows":[]}],'
     '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
     '"machine":"desktop","share_micro_eur":60000000,"report":' + EMPTY_REPORT + '},'
     '{"alias":"g2","account":"meter","machine":"worker","share_micro_eur":40000000,'
-    '"report":' + EMPTY_REPORT + '}]}'
+    '"report":' + EMPTY_REPORT + '}],"billing":[]}'
 )
 
 ERROR_INVALID_CONFIG = '{"error":{"code":"INVALID_CONFIG","message":"config document is invalid"}}'
@@ -112,9 +112,10 @@ class Card1Tests(_Base):
             }
         finally:
             conn.close()
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
         self.assertEqual(
-            tables, {"accounts", "machines", "gateways", "readings", "windows"}
+            tables, {"accounts", "machines", "gateways", "readings", "windows",
+                     "billing_policies", "billing_totals"}
         )
         self.assertEqual(journal.lower(), "wal")
 
@@ -198,14 +199,15 @@ class Card1Tests(_Base):
         # The status is exactly the documented projection: nothing beyond the
         # approved aliases and the static schema/field names may appear.
         expected = (
-            '{"schema_version":2,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
+            '{"schema_version":3,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
             '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
             '"coverage_complete":false,"windows":[]}],'
             '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
             '"account":"priv-acct-7","machine":"worker","share_micro_eur":40000000,'
             '"report":' + EMPTY_REPORT + '},'
             '{"alias":"priv-gw-9","account":"priv-acct-7","machine":"priv-mach-3",'
-            '"share_micro_eur":60000000,"report":' + EMPTY_REPORT + '}]}'
+            '"share_micro_eur":60000000,"report":' + EMPTY_REPORT + '}],'
+            '"billing":[]}'
         )
         self.assertEqual(st.stdout.strip(), expected)
         self.assertNotIn("vendor", st.stdout)
@@ -287,7 +289,7 @@ class Card1CarryOverTests(_Base):
                 f"round {round_no}: a parallel init did not exit 0 "
                 f"(sorted codes {sorted(codes)})",
             )
-        # Converged on exactly the card-1 store: version 1, WAL, three tables.
+        # Converged on the current store: version 3, WAL, all tables.
         conn = sqlite3.connect(self.db)
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -301,10 +303,11 @@ class Card1CarryOverTests(_Base):
             }
         finally:
             conn.close()
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
         self.assertEqual(journal.lower(), "wal")
         self.assertEqual(
-            tables, {"accounts", "machines", "gateways", "readings", "windows"}
+            tables, {"accounts", "machines", "gateways", "readings", "windows",
+                     "billing_policies", "billing_totals"}
         )
 
 
@@ -323,7 +326,7 @@ class Card1FixRoundTests(_Base):
         run_cli("--db", self.db, "init")
         _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
         conn = sqlite3.connect(self.db)
-        conn.execute("PRAGMA user_version=3")
+        conn.execute("PRAGMA user_version=4")
         # Downgrade to delete journal mode: the tool must not switch a
         # rejected store to WAL either (that rewrites the file header).
         conn.execute("PRAGMA journal_mode=DELETE")
@@ -441,14 +444,15 @@ class Card1FixRoundTests(_Base):
         ok = _import(self.db, self.tmp, doc)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         expected = (
-            '{"schema_version":2,"accounts":['
+            '{"schema_version":3,"accounts":['
             '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
             '"allocated_micro_eur":100000000,"coverage_complete":false,"windows":[]},'
             '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'
             '"allocated_micro_eur":0,"coverage_complete":false,"windows":[]}],'
             '"machines":["desktop"],"gateways":['
             '{"alias":"g1","account":"meter","machine":"desktop",'
-            '"share_micro_eur":100000000,"report":' + EMPTY_REPORT + '}]}'
+            '"share_micro_eur":100000000,"report":' + EMPTY_REPORT + '}]'
+            ',"billing":[]}'
         )
         self.assertEqual(_status(self.db).stdout.strip(), expected)
         # A subscription account carrying a budget is invalid.

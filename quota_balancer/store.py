@@ -33,6 +33,7 @@ from .migrate import SCHEMA_VERSION, migrate, require_supported, rollback_quietl
 from .reduce import (
     GATEWAY_STATE_OK,
     GATEWAY_STATE_RECONCILE,
+    billing_freshness,
     gateway_report_state,
     reduce_gateway_report,
     reduce_window,
@@ -84,10 +85,10 @@ def init_db(path):
     """Create or upgrade the store to the current schema version.
 
     The migration itself is transactional and ordered (see
-    migrate.migrate): a version-0 store runs steps 1 and 2, a card-1
-    (version-1) store runs step 2, a store at the current version is a
-    no-op, and a newer, unknown version is rejected before anything is
-    written or switched.
+    migrate.migrate): a version-0 store runs steps 1, 2 and 3, a card-1
+    (version-1) store runs steps 2 and 3, a card-2 (version-2) store runs
+    step 3, a store at the current version is a no-op, and a newer, unknown
+    version is rejected before anything is written or switched.
     """
     if sqlite3.sqlite_version_info < (3, 37, 0):
         # STRICT tables require SQLite >= 3.37; fail before touching the file.
@@ -524,12 +525,96 @@ def _project_windows(conn, account_id, now_ms):
     return windows
 
 
+def _project_billing(conn, now_ms):
+    """Project the card-2b-1 billing state, one entry per account that has a
+    billing policy or reduced totals, sorted by account alias.
+
+    Only local aliases and numbers appear (privacy). Freshness is evaluated
+    at read time against the policy's max_age; an account with totals but no
+    policy projects an unknown freshness (never assumed fresh).
+    """
+    machine_alias = dict(conn.execute("SELECT id, alias FROM machines"))
+    account_alias = dict(conn.execute("SELECT id, alias FROM accounts"))
+
+    policies = {}
+    for (account_id, reporter_id, scope_alias, scope_rev, dedicated,
+         allowance, cap_basis, provider_basis, ledger_basis, vat_bps,
+         poll_s, max_age_s, lag_s, abs_tol, rel_tol, mode, stale_action,
+         divergence_action) in conn.execute(
+            "SELECT account_id, reporter_machine_id, scope_alias, "
+            "scope_revision, dedicated_ai, non_ai_allowance_micro_eur, "
+            "cap_basis, provider_basis, ledger_basis, vat_bps, poll_seconds, "
+            "max_age_seconds, lag_seconds, abs_tolerance_micro_eur, "
+            "relative_tolerance_bps, mode, stale_action, divergence_action "
+            "FROM billing_policies"):
+        policies[account_id] = {
+            "reporter_machine": machine_alias.get(reporter_id),
+            "scope_alias": scope_alias,
+            "scope_revision": scope_rev,
+            "dedicated_ai": bool(dedicated),
+            "non_ai_allowance_micro_eur": allowance,
+            "cap_basis": cap_basis,
+            "provider_basis": provider_basis,
+            "ledger_basis": ledger_basis,
+            "vat_bps": vat_bps,
+            "poll_seconds": poll_s,
+            "max_age_seconds": max_age_s,
+            "lag_seconds": lag_s,
+            "abs_tolerance_micro_eur": abs_tol,
+            "relative_tolerance_bps": rel_tol,
+            "mode": mode,
+            "stale_action": stale_action,
+            "divergence_action": divergence_action,
+        }
+
+    totals_by_account = {}
+    for (account_id, scope_rev, p_start, p_end, latest, obs, _latest_ev,
+         hw, _hw_ev, conflict) in conn.execute(
+            "SELECT account_id, scope_revision, period_start, period_end, "
+            "latest_micro_eur, observed_at, latest_event_id, "
+            "high_water_micro_eur, high_water_event_id, conflict "
+            "FROM billing_totals"):
+        totals_by_account.setdefault(account_id, []).append(
+            (scope_rev, p_start, p_end, latest, obs, hw, conflict))
+
+    entries = []
+    account_ids = sorted(set(policies) | set(totals_by_account),
+                         key=lambda aid: account_alias.get(aid, ""))
+    for account_id in account_ids:
+        policy = policies.get(account_id)
+        max_age_ms = (policy["max_age_seconds"] * 1000) if policy else None
+        totals = []
+        for (scope_rev, p_start, p_end, latest, obs, hw, conflict) in sorted(
+                totals_by_account.get(account_id, []), key=lambda t: (t[0], t[1])):
+            fresh, reason = billing_freshness(obs, max_age_ms, now_ms)
+            totals.append({
+                "scope_revision": scope_rev,
+                "period_start": p_start,
+                "period_end": p_end,
+                "latest_micro_eur": latest,
+                "observed_at": obs,
+                "high_water_micro_eur": hw,
+                "conflict": bool(conflict),
+                "age_ms": (now_ms - obs) if obs is not None else None,
+                "fresh": fresh,
+                "freshness_reason": reason,
+            })
+        entries.append({
+            "account": account_alias.get(account_id),
+            "policy": policy,
+            "totals": totals,
+        })
+    return entries
+
+
 def status(path):
-    """Project the inventory plus card-2 windows/reports, sorted by alias.
+    """Project the inventory plus card-2 windows/reports and the card-2b-1
+    billing state, sorted by alias.
 
     One read transaction: the version check and all projections share a
-    single snapshot. Freshness (window age/current and the gateway report
-    state) is evaluated against the wall clock at read time.
+    single snapshot. Freshness (window age/current, the gateway report
+    state, and the billing total's age against its policy's max_age) is
+    evaluated against the wall clock at read time.
     """
     now_ms = int(time.time() * 1000)
     conn = _connect(path, must_exist=True)
@@ -590,6 +675,7 @@ def status(path):
                 "accounts": accounts,
                 "machines": machines,
                 "gateways": gateways,
+                "billing": _project_billing(conn, now_ms),
             }
             conn.execute("COMMIT")
             return result
