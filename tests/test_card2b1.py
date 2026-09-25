@@ -1030,14 +1030,30 @@ class BillingOlderHighWater(_Base):
         self.assertEqual(total["high_water_micro_eur"], 150)
         self.assertTrue(total["conflict"])
 
-        # An older LOWER total: no change at all.
-        before = _fingerprint(self.db)
+        # An older LOWER total: the projection changes nothing and no
+        # other table is touched; the new evidence is still recorded as
+        # a raw reading with its own source time (section 11). (The
+        # status projection carries wall-clock age, so the tables - not
+        # the status - are the right equality here.)
+        other_before = {t: rows for t, rows in _fingerprint(self.db)
+                        if t != "readings"}
         self.assertEqual(_readings_import(
             self.db, self.tmp,
             _doc_v3([_billing(_eid("hw-low"), "desktop", "meter", "proj-ai",
                               1, start, end, 50, False, t0)]
         )).returncode, 0)
-        self.assertEqual(_fingerprint(self.db), before)
+        other_after = {t: rows for t, rows in _fingerprint(self.db)
+                       if t != "readings"}
+        self.assertEqual(other_after, other_before)
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT observed_at, payload FROM readings "
+                "WHERE event_id = ?", (_eid("hw-low"),)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], t0)
+        self.assertEqual(json.loads(row[1])["total_micro_eur"], 50)
 
 
 class BillingTime(_Base):
@@ -1318,10 +1334,16 @@ class BillingOutputErrors(_Base):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_SCHEMA_UNSUPPORTED)
 
+        # Every rejected document above left the store untouched.
+        self.assertEqual(_fingerprint(self.db), before)
+
         # An idempotency collision: exit 2, static IDEMPOTENCY_CONFLICT.
         self.assertEqual(self._import_policy().returncode, 0)
         self.assertEqual(_readings_import(
             self.db, self.tmp, _doc_v3([good])).returncode, 0)
+        # The two accepted imports above are the only writes; the
+        # collision and the missing-DB status below may add nothing.
+        before = _fingerprint(self.db)
         collision = copy.deepcopy(good)
         collision["payload"]["total_micro_eur"] = 200
         result = _readings_import(
