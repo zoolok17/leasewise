@@ -5,15 +5,19 @@ no I/O, no store writes, no clock reads (now_ms is injected on the
 request), and it never mutates its inputs. The evaluator never mutates
 reconcile state; it reads the explicit, already-validated context.
 
-Turn 2 (this module) pins the closed input surface, the complete output
-shape, the ordered decision-table precedence and the non-AI overlay.
-The reconciliation rows (gross excess, conflict, stale, matched, lag,
-midnight, historical excess) and the advisory headroom math land in
-turns 3/4. Every part that is not yet implemented is marked and FAILS
-CLOSED: admission_basis=unavailable, headroom_micro_eur=null and
-request_fits=null, so an un-evaluated estimate never admits. Nothing
-here ever fakes a "pass" or a "matched" result.
+Turn 2 pinned the closed input surface, the complete output shape, the
+ordered decision-table precedence and the non-AI overlay. Turn 3 adds
+the reconciliation rows: the gross-excess hold (uncertified, with
+reserves/allowance/boundary/tolerance), the conflict-latest ordering
+(gross first, conflict preserved), the latest-seq ledger selection, the
+gateway usability rules, the listed-transition precedence, the boundary
+(midnight) exposure, the as-of bracket (skew/covered/excess) and the
+read-only lag timer. Turn 4 fills in the advisory headroom; until then
+headroom stays null, admission_basis=unavailable and request_fits null
+(false on a hold) - nothing is admitted on an un-evaluated estimate.
 """
+
+import math
 
 from .errors import (
     CODE_INVALID_CONFIG,
@@ -37,9 +41,12 @@ from .validate_readings import (
 
 INT64_MAX = 2 ** 63 - 1
 
-# The ledger snapshot must be within 120 s of the certified time to count
-# as the boundary exposure (section 11: "each within 120s").
-_BOUNDARY_WINDOW_MS = 120_000
+# A ledger snapshot counts for the as-of bracket only within 120 s of
+# the certified time (section 11: "require both within 120s of T"), and
+# the existing 30 s clock-skew margin lets a report cover a provider
+# receipt at observed_at >= received_at + 30000.
+_BRACKET_WINDOW_MS = 120_000
+_RECEIPT_MARGIN_MS = 30_000
 
 # Closed context / request / evidence shapes (docs/DESIGN.md, section 11,
 # "Pure input surfaces"). All fields required, no extra keys.
@@ -49,7 +56,8 @@ _CONTEXT_KEYS = frozenset({
     "boundary_event_ids",
 })
 _GATEWAY_KEYS = frozenset({"gateway", "share_micro_eur",
-                           "current_chain_event_ids"})
+                           "current_chain_event_ids",
+                           "reconciliation_required"})
 _READING_KEYS = frozenset({
     "event_id", "machine", "account", "kind", "observed_at", "payload",
     "received_at",
@@ -62,13 +70,11 @@ _COVERAGE_KEYS = frozenset({
 })
 
 # The ordered decision table (docs/DESIGN.md, section 11, the evaluation
-# decision table). First matching base row wins. Only the rows this turn
-# can decide honestly are implemented; the rest are turn-3/4 stubs that
-# never match (so the evaluation falls through to the catch-all and
-# headroom stays unavailable - fail closed, never a faked pass).
+# decision table). First matching base row wins.
 _BASE_ROW_ORDER = (
     "basis_scope",                 # 1: unknown / basis_unknown,scope_mismatch,gateway_unusable / alert / unknown
-    "no_sample",                   # 2: unknown / billing_unknown (no provider sample) / alert / provisional
+    "no_sample",                   # 2: unknown / billing_unknown (no sample) / alert / provisional
+    "stale_sample",                #    unknown / billing_stale / alert / provisional
     "gross_excess",                # 3: unexplained_excess / provider_excess / hold / comparable
     "latched_conflict",            # 4: conflict / source_conflict / alert / provisional
     "midnight",                    # 5: temporally_unresolved / snapshot_skew / none / provisional
@@ -147,10 +153,13 @@ def _validate_context(context):
         chain = gw["current_chain_event_ids"]
         if not isinstance(chain, list) or not all(_is_uuid(e) for e in chain):
             _invalid()
+        if not _is_bool(gw["reconciliation_required"]):
+            _invalid()
         gateways.append({
             "gateway": gw["gateway"],
             "share_micro_eur": gw["share_micro_eur"],
             "current_chain_event_ids": list(chain),
+            "reconciliation_required": gw["reconciliation_required"],
         })
 
     # policy: the full billing-policy-import record (closed shape), and it
@@ -194,13 +203,17 @@ def _validate_context(context):
             if ref not in reading_ids:
                 _invalid()
 
-    # current-period provider events and per-gateway ledger snapshots.
+    # current-period provider events and per-gateway ledger chains
+    # (seq, observed_at, money fields); the chain order is by seq.
     provider_events = [r for r in readings if r["kind"] == KIND_PROVIDER_BILLING
                        and r["payload"]["period_start"] == period_start]
-    snapshots_by_gateway = {}
+    chains_by_gateway = {}
     for gw in gateways:
-        snaps = [
-            (r["observed_at"], r["payload"]["settled_micro_eur"])
+        chain = [
+            (r["payload"]["seq"], r["observed_at"],
+             r["payload"]["settled_micro_eur"],
+             r["payload"]["reserved_micro_eur"],
+             r["payload"]["uncertain_micro_eur"], r["event_id"])
             for r in readings
             if r["kind"] == KIND_GATEWAY_SNAPSHOT
             and r["payload"]["gateway"] == gw["gateway"]
@@ -208,7 +221,8 @@ def _validate_context(context):
             and r["payload"]["period_start"] == period_start
             and r["payload"]["settled_micro_eur"] is not None
         ]
-        snapshots_by_gateway[gw["gateway"]] = snaps
+        chain.sort(key=lambda row: row[0])
+        chains_by_gateway[gw["gateway"]] = chain
 
     return {
         "account": account,
@@ -222,7 +236,7 @@ def _validate_context(context):
         "boundary_exposure_micro_eur": boundary_exposure,
         "boundary_event_ids": list(boundary_ids),
         "provider_events": provider_events,
-        "snapshots_by_gateway": snapshots_by_gateway,
+        "chains_by_gateway": chains_by_gateway,
     }
 
 
@@ -340,44 +354,177 @@ def _validate_request(request, ctx):
 # Current-period state (pure extractions, no reconciliation math)
 # ---------------------------------------------------------------------------
 
-def _latest_provider_total(provider_events):
-    """P_e: the latest provider total for the current period (by source
-    time, then receipt). None when there is no provider sample."""
+def _latest_provider(provider_events):
+    """The latest provider event of the current period by (source time,
+    receipt). None when there is no provider sample. The gross check uses
+    this value, never the retained high-water."""
     if not provider_events:
         return None
-    latest = max(provider_events, key=lambda e: (e["observed_at"],
-                                                  e["received_at"]))
-    return latest["payload"]["total_micro_eur"]
+    return max(provider_events, key=lambda e: (e["observed_at"],
+                                               e["received_at"]))
 
 
-def _latest_ledger_settled(snapshots_by_gateway):
-    """L_now: the sum of the latest current-period settled snapshot per
-    gateway (0 where a gateway has no usable snapshot)."""
-    total = 0
-    for snaps in snapshots_by_gateway.values():
-        if snaps:
-            total += max(snaps, key=lambda s: s[0])[1]
-    return total
+def _provider_total(provider_events):
+    latest = _latest_provider(provider_events)
+    return latest["payload"]["total_micro_eur"] if latest else None
 
 
-def _boundary_e(snapshots_by_gateway, complete_at):
-    """B_e: the sum of the last ledger snapshot at/before complete_at
-    (each within 120 s) across the configured gateways. None (unusable)
-    when complete_at is unknown or any gateway lacks a qualifying
-    snapshot - a proved empty boundary is the only path to B_e=0."""
-    if complete_at is None:
-        return None
-    total = 0
-    for snaps in snapshots_by_gateway.values():
-        best = None
-        for obs, settled in snaps:
-            if obs <= complete_at and (complete_at - obs) <= _BOUNDARY_WINDOW_MS:
-                if best is None or obs > best[0]:
-                    best = (obs, settled)
-        if best is None:
+def _chain_latest(chain):
+    """The highest-seq row of a store-selected chain (seq ordering, never
+    observed_at); None when the chain has no usable report."""
+    return chain[-1] if chain else None
+
+
+def _chain_is_decreasing(chain):
+    """A decreased in-chain total (seq order) breaks the nondecreasing
+    ledger invariant; the chain is unusable then."""
+    return any(chain[i + 1][2] < chain[i][2] for i in range(len(chain) - 1))
+
+
+def _gateway_usable(ctx):
+    """(usable, unusable_reason) for the current ledger: every configured
+    gateway must have a usable current chain - a nondecreasing chain and
+    no reconciliation requirement (an empty chain is an identity with no
+    current amount and contributes 0 to L_now). A transition listed in
+    unresolved_event_ids (copied from the store's reconcile state) keeps
+    its gateway unusable; a repeated ok report cannot clear it, and a
+    transition no longer listed does not re-latch."""
+    for gw in ctx["gateways"]:
+        chain = ctx["chains_by_gateway"][gw["gateway"]]
+        if gw["reconciliation_required"]:
+            return False, "gateway_unusable"
+        if _chain_is_decreasing(chain):
+            return False, "gateway_unusable"
+        listed = set(ctx["unresolved_event_ids"])
+        if listed & {row[5] for row in chain}:
+            return False, "gateway_unusable"
+    return True, None
+
+
+def _ledger_now(ctx):
+    """L_now / R_now: per gateway, the latest (highest-seq) snapshot's
+    settled, and reserved + uncertain. R_now never adds unattributed
+    again (it is a subset of settled). None when the ledger is unusable
+    (missing/ambiguous chains, a decreased total, a listed transition or
+    a reconciliation-required gateway)."""
+    if not _gateway_usable(ctx)[0]:
+        return None, None
+    l_now = 0
+    r_now = 0
+    for gw in ctx["gateways"]:
+        chain = ctx["chains_by_gateway"][gw["gateway"]]
+        if not chain:
+            # A configured identity with no current amount: L_now is
+            # unknown (null), never zero-filled.
+            return None, None
+        latest = _chain_latest(chain)
+        l_now += latest[2]
+        r_now += latest[3] + latest[4]
+    return l_now, r_now
+
+
+def _boundary_known(ctx):
+    """The midnight boundary exposure B: known only with store boundary
+    evidence (a boundary event id) or an explicit 0 with none - a null
+    exposure is UNKNOWN, never zero. Returns (B, known)."""
+    exposure = ctx["boundary_exposure_micro_eur"]
+    if exposure is None:
+        return None, False
+    return exposure, True
+
+
+def _provider_fresh(latest, policy, now_ms):
+    """The sample is fresh when now - observed_at <= max_age_seconds
+    (source age, the billing freshness rule)."""
+    return (now_ms - latest["observed_at"]
+            <= policy["max_age_seconds"] * 1000)
+
+
+def _conflict_latched(provider_events):
+    """Replay the store's source-time reduce over the current-period
+    provider totals: a newer total below the retained high-water (or an
+    equal-time unequal total) latches the sticky conflict. The evaluator
+    preserves it, never clears it."""
+    rows = sorted(provider_events, key=lambda e: e["observed_at"])
+    conflict = False
+    high_water = None
+    latest_obs = None
+    latest_total = None
+    for e in rows:
+        total = e["payload"]["total_micro_eur"]
+        if high_water is None:
+            high_water = total
+        if e["observed_at"] > (latest_obs or -1):
+            if total < high_water:
+                conflict = True
+            if total > high_water:
+                high_water = total
+            latest_obs = e["observed_at"]
+            latest_total = total
+        elif e["observed_at"] == latest_obs and total != latest_total:
+            conflict = True
+        elif total > high_water:
+            high_water = total
+    return conflict
+
+
+def _last_financial_change(ctx):
+    """Read-only idle timer base: the latest stored ledger amount/epoch
+    change - the max observed_at across the selected gateway chains. The
+    provider sample is the EXTERNAL observation, not local activity, so it
+    does not reset the local idle timer (a fresh provider reading against
+    an idle ledger is exactly what the diagnostic catches). None when
+    there is no ledger history: missing history cannot establish elapsed
+    idle time, and reserve activity (a newer gateway report) resets it."""
+    changes = []
+    for chain in ctx["chains_by_gateway"].values():
+        changes.extend(row[1] for row in chain)
+    return max(changes) if changes else None
+
+
+def _bracket(chains, complete_at):
+    """As-of bracket at the certified time T=complete_at: per gateway,
+    the last chain snapshot at/before T (its settled is the L_asof base)
+    and the first at/after T (its reserved + uncertain are the still-open
+    amounts). Both must be within 120 s of T; otherwise the bracket is
+    unusable (None). L_asof = sum of settled at/before T. U_asof =
+    L_asof + sum of the at/after-T reserved + uncertain (the upper bound
+    of in-scope money at T)."""
+    l_asof = 0
+    open_after = 0
+    for chain in chains:
+        lower = None
+        upper = None
+        for _seq, obs, settled, reserved, uncertain, _ev in chain:
+            if obs <= complete_at:
+                if lower is None or obs > lower[0]:
+                    lower = (obs, settled)
+            else:
+                if upper is None or obs < upper[0]:
+                    upper = (obs, reserved, uncertain)
+        if lower is None or complete_at - lower[0] > _BRACKET_WINDOW_MS:
             return None
-        total += best[1]
-    return total
+        if upper is None or upper[0] - complete_at > _BRACKET_WINDOW_MS:
+            return None
+        l_asof += lower[1]
+        open_after += upper[1] + upper[2]
+    return l_asof, l_asof + open_after
+
+
+def _bracket_usable(chains, complete_at, now_ms):
+    """The bracket side is usable only when every configured gateway
+    contributes (a gateway with no chain cannot be bracketed)."""
+    return len(chains) > 0 and all(c for c in chains) and _bracket(
+        chains, complete_at) is not None
+
+
+def _tolerance(l, policy):
+    """tau(L) = max(abs_tolerance, ceil(L * relative_bps / 10000)). The
+    absolute floor dominates at low totals; tolerance is a comparison
+    width, never a budget credit."""
+    rel = math.ceil(l * policy["relative_tolerance_bps"] / 10_000) \
+        if policy["relative_tolerance_bps"] else 0
+    return max(policy["abs_tolerance_micro_eur"], rel)
 
 
 def _resolve_overlap(entry, P, L_now, B_e):
@@ -391,7 +538,8 @@ def _resolve_overlap(entry, P, L_now, B_e):
     complete = entry["complete_at"] is not None
     proof = entry["matched_provenance"] is True
     if floor is not None:
-        if not (complete and proof and B_e is not None and P is not None):
+        if not (complete and proof and B_e is not None and P is not None
+                and L_now is not None):
             _invalid()
         if not (0 <= floor <= min(P, L_now, B_e)):
             _invalid()
@@ -407,20 +555,13 @@ def _estimate(provider_events, overlap_by_event, L_now):
     overlap is unproved; it never admits (headroom fails closed)."""
     if not provider_events:
         return None
-    best = L_now
+    best = L_now if L_now is not None else 0
     for e in provider_events:
         O_e = overlap_by_event.get(e["event_id"], 0)
-        cand = e["payload"]["total_micro_eur"] + L_now - O_e
+        cand = e["payload"]["total_micro_eur"] + (L_now or 0) - O_e
         if cand > best:
             best = cand
     return best
-
-
-def _known_floor(P, L_now):
-    """known_floor = max of the known operands (P, L_now); null if neither
-    is known. Unknown operands are omitted, never zero-filled."""
-    known = [v for v in (P, L_now) if v is not None]
-    return max(known) if known else None
 
 
 def _any_non_ai_current(provider_events):
@@ -430,83 +571,175 @@ def _any_non_ai_current(provider_events):
 
 
 # ---------------------------------------------------------------------------
-# The ordered decision table (turn 2: no_sample + the catch-all are live;
-# the rest are turn-3/4 stubs that never match, so the evaluation falls
-# through to the catch-all and headroom stays unavailable - fail closed).
+# The ordered decision table (first matching base row wins).
 # ---------------------------------------------------------------------------
 
-def _base_row(ctx, P):
+def _gross_excess_holds(latest, l_now, r_now, b_known, b, allowance, policy,
+                        chains, now_ms):
+    """Row 3: a FRESH latest P_e beyond L_now + R_now + B + allowance +
+    tau(L_now) is unexplained_excess / hold / comparable, without any
+    certificate. The time/ledger guards: every gateway's latest report
+    must cover the provider receipt (observed_at >= received_at + 30 s)
+    and be <= 120 s old; an unknown boundary disables the check (never
+    B=0); a nonmonotonic or incomplete ledger (unusable) invalidates the
+    sufficient test."""
+    if l_now is None or not b_known:
+        return False
+    if not _provider_fresh(latest, policy, now_ms):
+        return False
+    receipt = latest["received_at"]
+    for chain in chains:
+        latest_report = _chain_latest(chain)
+        if latest_report is None:
+            return False
+        if latest_report[1] < receipt + _RECEIPT_MARGIN_MS:
+            return False  # does not cover the provider receipt
+        if latest_report[1] - receipt > _BRACKET_WINDOW_MS:
+            return False  # older than 120 s after the provider receipt
+        if now_ms - latest_report[1] > _BRACKET_WINDOW_MS:
+            return False  # stale report
+    tau = _tolerance(l_now, policy)
+    return latest["payload"]["total_micro_eur"] > \
+        l_now + r_now + b + allowance + tau
+
+
+def _base_row(ctx, req, P, l_now):
     """Walk the ordered decision table; return the first matching row as
-    (state, reason, action, quality). Rows whose reconciliation logic
-    lands in turns 3/4 are marked and return None (no match)."""
-    for row in _BASE_ROW_ORDER:
-        # 1: basis/scope/unusable-ledger -> alert/unknown.
-        #   TODO(turn 3): the unusable-ledger and scope checks.
-        # 3: fresh gross excess -> hold.
-        #   TODO(turn 3): the gross-excess predicate with time/ledger guards.
-        # 4: latched conflict -> alert.
-        #   TODO(turn 3): the conflict latch from the reduce.
-        # 5: unknown midnight boundary exposure -> none/snapshot_skew.
-        #   TODO(turn 3): the boundary-exposure timer.
-        # 6: certified historical excess -> hold.
-        #   TODO(turn 3): the certified historical bracket.
-        # 7: certified P below old settled -> alert/missing_old_spend.
-        #   TODO(turn 3): the certified historical negative gap.
-        # 8: idle material negative gap -> alert/lag_investigate.
-        #   TODO(turn 3): the read-only lag timer.
-        # 9: no certificate, gross time guards absent -> none/snapshot_skew.
-        #   TODO(turn 3): the as-of bracket guards.
-        # 11: certified difference covered -> reserve_or_scope_covered.
-        #   TODO(turn 3): the reserve/allowance bracket.
-        # 12: matched within tolerance, complete evidence -> matched/Q.
-        #   TODO(turn 3): the matched classification.
-        if row == "no_sample" and P is None:
-            return ("unknown", "billing_unknown", "alert", "provisional")
-        if row == "unresolved_bounds":
-            # Catch-all: an incomplete certificate/bracket is a provisional
-            # observation with no action. This is the only base row that
-            # matches in turn 2, so no turn-2 evaluation ever reaches a
-            # "matched" or hold result.
-            return ("temporally_unresolved", "coverage_unknown",
-                    "none", "provisional")
-    # Unreachable: "unresolved_bounds" always matches.
-    _invalid()
+    (state, reason, action, quality). The headroom math stays fail-closed
+    until turn 4; no row here admits."""
+    now_ms = req["now_ms"]
+    policy = ctx["policy"]
+    provider_events = ctx["provider_events"]
+    allowance = policy["non_ai_allowance_micro_eur"]
+    chains = list(ctx["chains_by_gateway"].values())
+    usable, unusable_reason = _gateway_usable(ctx)
+    latest = _latest_provider(provider_events)
+    b, b_known = _boundary_known(ctx)
+
+    # Row 1: unusable ledger -> unknown / gateway_unusable / alert /
+    # unknown (basis/scope variants are turn-4 basis work).
+    if not usable:
+        return ("unknown", unusable_reason, "alert", "unknown")
+
+    # Row 2: no provider sample -> alert (never a new hold).
+    if latest is None:
+        return ("unknown", "billing_unknown", "alert", "provisional")
+
+    # Row 2b: a stale sample alerts; a stale P never gross-holds.
+    if not _provider_fresh(latest, policy, now_ms):
+        return ("unknown", "billing_stale", "alert", "provisional")
+
+    # Row 3: the fresh latest-value gross check runs BEFORE the conflict
+    # row, with the latest receipt's own guards, without clearing the
+    # conflict.
+    if _gross_excess_holds(latest, l_now, _ledger_now(ctx)[1], b_known, b,
+                           allowance, policy, chains, now_ms):
+        return ("unexplained_excess", "provider_excess",
+                "hold", "comparable")
+
+    # Row 4: the remaining latched conflict alerts (preserved, never
+    # cleared by the evaluator).
+    if _conflict_latched(provider_events):
+        return ("conflict", "source_conflict", "alert", "provisional")
+
+    # Row 5: unknown midnight boundary exposure - the excess checks are
+    # disabled as snapshot_skew, not B=0.
+    if not b_known:
+        return ("temporally_unresolved", "snapshot_skew",
+                "none", "provisional")
+
+    # Rows 6/7/11: the certified as-of brackets (per event, complete
+    # coverage required); the chain must be continuous (nondecreasing,
+    # usable) for the historical amounts to count.
+    for entry in req["coverage"]:
+        complete_at = entry["complete_at"]
+        if complete_at is None:
+            continue
+        if not usable or _bracket(chains, complete_at) is None:
+            continue  # unusable/ambiguous chain: no historical amounts
+        l_asof, u_asof = _bracket(chains, complete_at)
+        P_e = next(e["payload"]["total_micro_eur"]
+                   for e in provider_events
+                   if e["event_id"] == entry["event_id"])
+        tau_asof = _tolerance(l_asof, policy)
+        if P_e > u_asof + b + allowance + tau_asof:
+            # Row 6: certified excess beyond the upper + B + allowance.
+            return ("unexplained_excess", "provider_excess",
+                    "hold", "comparable")
+        if P_e > l_asof + tau_asof:
+            # Row 11: the difference is covered by the upper's
+            # reserved/uncertain plus allowance.
+            return ("reserve_or_scope_covered",
+                    "reserve_or_scope_covered", "none", "comparable")
+
+    # Row 8: the read-only idle diagnostic. A material negative gap
+    # (P below L_now - tau) alerts once now - last stored amount/epoch
+    # change reaches lag_seconds; equality never starts the timer, and
+    # missing history cannot establish elapsed idle time.
+    last_change = _last_financial_change(ctx)
+    if last_change is not None:
+        tau_now = _tolerance(l_now, policy)
+        idle_ms = now_ms - last_change
+        if (idle_ms >= policy["lag_seconds"] * 1000
+                and P < l_now - tau_now):
+            return ("provider_behind", "lag_investigate",
+                    "alert", "provisional")
+
+    # Row 9: a fresh sample with no usable certificate brackets but no
+    # time/ledger guards either -> provisional snapshot_skew. (The
+    # no-bracket case: the bracket side cannot be proved.)
+    if latest is not None and not any(
+            e["complete_at"] is not None for e in req["coverage"]):
+        return ("temporally_unresolved", "snapshot_skew",
+                "none", "provisional")
+
+    # Row 10: catch-all - an incomplete certificate/bracket is a
+    # provisional observation with no action.
+    return ("temporally_unresolved", "coverage_unknown",
+            "none", "provisional")
 
 
 def evaluate_billing(context, request):
     """Evaluate one metered account's billing evidence (pure).
 
     Returns the closed Evaluation output (all fields required, nullable
-    arithmetic when unknown). Turn 2 fails closed on admission:
-    admission_basis=unavailable, headroom_micro_eur=null and
-    request_fits=null (except the hold rule), so nothing is admitted on an
+    arithmetic when unknown). Turn 4 fills in the advisory headroom;
+    until then headroom_micro_eur=null, admission_basis=unavailable and
+    request_fits=null (false on a hold) - nothing is admitted on an
     un-evaluated estimate. proposal is always null for the evaluator (the
     opening planner is a separate, later function).
     """
     ctx = _validate_context(context)
     req = _validate_request(request, ctx)
 
-    P = _latest_provider_total(ctx["provider_events"])
-    L_now = _latest_ledger_settled(ctx["snapshots_by_gateway"])
+    P = _provider_total(ctx["provider_events"])
+    l_now, _r_now = _ledger_now(ctx)
 
     # Resolve each certificate's overlap (raises INVALID_CONFIG on an
     # out-of-range explicit floor), then the spend estimate.
     overlap_by_event = {}
     for entry in req["coverage"]:
-        B_e = _boundary_e(ctx["snapshots_by_gateway"], entry["complete_at"])
+        B_e = None
+        if entry["complete_at"] is not None:
+            B_e = _boundary_e(ctx, entry["complete_at"])
         overlap_by_event[entry["event_id"]] = _resolve_overlap(
-            entry, P, L_now, B_e)
-    estimate = _estimate(ctx["provider_events"], overlap_by_event, L_now)
-    known_floor = _known_floor(P, L_now)
+            entry, P, l_now, B_e)
+    estimate = _estimate(ctx["provider_events"], overlap_by_event, l_now)
+    # The floor diagnostic is the ledger's current settled total (L_now);
+    # unattributed is a subset of settled and never added again, and an
+    # unusable ledger has no known floor (null, never zero-filled).
+    known_floor = l_now
 
-    state, reason, action, quality = _base_row(ctx, P)
+    state, reason, action, quality = _base_row(
+        ctx, req, P, l_now)
     action, reason = apply_non_ai_overlay(
         action, reason, _any_non_ai_current(ctx["provider_events"]))
 
-    # Turn 2: headroom is not yet implemented - fail closed.
+    # Turn 4: headroom is not yet implemented - fail closed.
     headroom = None
     admission_basis = "unavailable"
     request_fits = False if action == "hold" else None
+    conflict = _conflict_latched(ctx["provider_events"])
 
     return {
         "state": state,
@@ -519,4 +752,23 @@ def evaluate_billing(context, request):
         "headroom_micro_eur": headroom,
         "request_fits": request_fits,
         "proposal": None,
+        "conflict_latched": conflict,
     }
+
+
+def _boundary_e(ctx, complete_at):
+    """B_e: the sum of the last ledger snapshot at/before complete_at
+    (each within 120 s) across the configured gateways. None (unusable)
+    when complete_at is unknown or any gateway lacks a qualifying
+    snapshot - a proved empty boundary is the only path to B_e=0."""
+    total = 0
+    for chain in ctx["chains_by_gateway"].values():
+        best = None
+        for _seq, obs, settled, _r, _u, _ev in chain:
+            if obs <= complete_at and (complete_at - obs) <= _BRACKET_WINDOW_MS:
+                if best is None or obs > best[0]:
+                    best = (obs, settled)
+        if best is None:
+            return None
+        total += best[1]
+    return total
