@@ -1410,5 +1410,288 @@ class BillingFallbackAllowance(unittest.TestCase):
         self.assertIs(out["request_fits"], False)
 
 
+_OUTPUT_KEYS = frozenset({
+    "state", "action", "reason", "quality", "admission_basis",
+    "known_floor_micro_eur", "estimate_micro_eur", "headroom_micro_eur",
+    "request_fits", "proposal", "conflict_latched",
+})
+_STATES = frozenset({
+    "unknown", "unexplained_excess", "conflict", "temporally_unresolved",
+    "provider_behind", "reserve_or_scope_covered", "matched",
+})
+_REASONS = frozenset({
+    "gateway_unusable", "basis_unknown", "scope_mismatch", "billing_unknown",
+    "billing_stale", "provider_excess", "source_conflict", "snapshot_skew",
+    "lag_investigate", "coverage_unknown", "reserve_or_scope_covered",
+    "matched", "non_ai_present",
+})
+_ACTIONS = frozenset({"hold", "alert", "none"})
+_QUALITIES = frozenset({"comparable", "provisional", "unknown"})
+_BASES = frozenset({"billing_estimate", "ledger_fallback", "unavailable"})
+
+
+class BillingOutputErrors(unittest.TestCase):
+    """billing_output_errors: every result and error branch serializes to
+    the closed output shape - exact keys, closed enums, bounded
+    non-negative ints (or null), proposal always null, request_fits
+    bool-or-null - and repeated calls on the same inputs are identical
+    with the inputs untouched (zero financial side effects). Error
+    branches are static: INVALID_CONFIG, the static message, no
+    retry_at, and the closed exit mapping (exit 2, not a store fault)."""
+
+    def _branches(self):
+        """(name, ctx, req) covering every result branch: the fallback
+        (card row), the comparable certified, the hold (uncertified
+        excess), the alert branches (unusable ledger, no sample,
+        latched conflict, non-AI overlay) and the provisional none."""
+        prov_obs = SEP + 2 * 86_400_000
+        evA, evB = _eid("asof"), _eid("latest")
+        base = dict(
+            readings=[
+                _provider(45_000_000, False, prov_obs, _eid("prov")),
+                _snapshot(20_000_000, prov_obs - 30_000, evA),
+                _snapshot(50_000_000, prov_obs + 40_000, evB),
+            ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [evA, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
+        req = _request(now_ms=prov_obs + 50_000)
+        return [
+            ("fallback", _context(**base), req),
+            ("comparable", _context(**base), _request(
+                now_ms=prov_obs + 50_000,
+                coverage=[{"event_id": _eid("prov"),
+                           "upper_at": prov_obs + 40_000,
+                           "complete_at": prov_obs - 30_000,
+                           "overlap_floor_micro_eur": None,
+                           "matched_provenance": True}])),
+            ("hold", _context(
+                readings=[
+                    _provider(80_000_000, False, prov_obs, _eid("prov")),
+                    _snapshot(20_000_000, prov_obs - 30_000, _eid("ha")),
+                    _snapshot(50_000_000, prov_obs + 40_000, _eid("hl")),
+                ],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [_eid("ha"),
+                                                       _eid("hl")],
+                           "reconciliation_required": False}],
+                boundary_exposure_micro_eur=0,
+                boundary_event_ids=[_eid("ha")]),
+             _request(now_ms=prov_obs + 50_000)),
+            ("unusable_ledger", _context(
+                readings=[_provider(50_000_000, False, prov_obs,
+                                    _eid("prov"))],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [],
+                           "reconciliation_required": False}]),
+             _request(now_ms=prov_obs + 50_000)),
+            ("no_sample", _context(
+                readings=[
+                    _snapshot(20_000_000, prov_obs - 30_000, _eid("na")),
+                    _snapshot(50_000_000, prov_obs + 40_000, _eid("nl")),
+                ],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [_eid("na"),
+                                                       _eid("nl")],
+                           "reconciliation_required": False}]),
+             _request(now_ms=prov_obs + 50_000)),
+            ("conflict", _context(
+                readings=[
+                    _provider(50_000_000, False, SEP + 86_400_000,
+                              _eid("p1")),
+                    _provider(45_000_000, False, prov_obs, _eid("p2")),
+                    _snapshot(45_000_000, prov_obs + 40_000, _eid("cl")),
+                ],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [_eid("cl")],
+                           "reconciliation_required": False}],
+                boundary_exposure_micro_eur=0,
+                boundary_event_ids=[_eid("cl")]),
+             _request(now_ms=prov_obs + 50_000)),
+            ("non_ai", _context(
+                readings=[
+                    _provider(45_000_000, True, prov_obs, _eid("prov")),
+                    _snapshot(20_000_000, prov_obs - 30_000, _eid("aa")),
+                    _snapshot(50_000_000, prov_obs + 40_000, _eid("al")),
+                ],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [_eid("aa"),
+                                                       _eid("al")],
+                           "reconciliation_required": False}],
+                boundary_exposure_micro_eur=0,
+                boundary_event_ids=[_eid("aa")]),
+             _request(now_ms=prov_obs + 50_000)),
+            ("provisional", _context(
+                readings=[
+                    _provider(45_000_000, False, prov_obs, _eid("prov")),
+                    _snapshot(20_000_000, prov_obs - 30_000, _eid("pa")),
+                    _snapshot(50_000_000, prov_obs + 40_000, _eid("pl")),
+                ],
+                gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                           "current_chain_event_ids": [_eid("pa"),
+                                                       _eid("pl")],
+                           "reconciliation_required": False}]),
+             _request(now_ms=prov_obs + 50_000)),
+        ]
+
+    def test_closed_shape_every_branch(self):
+        for name, ctx, req in self._branches():
+            out = _eval(ctx, req)
+            self.assertEqual(frozenset(out), _OUTPUT_KEYS, name)
+            self.assertIn(out["state"], _STATES, name)
+            self.assertIn(out["action"], _ACTIONS, name)
+            self.assertIn(out["reason"], _REASONS, name)
+            self.assertIn(out["quality"], _QUALITIES, name)
+            self.assertIn(out["admission_basis"], _BASES, name)
+            for key in ("known_floor_micro_eur", "estimate_micro_eur",
+                        "headroom_micro_eur"):
+                v = out[key]
+                self.assertTrue(
+                    v is None or (type(v) is int and 0 <= v <= 2 ** 63 - 1),
+                    (name, key, v))
+            self.assertIsNone(out["proposal"], name)
+            self.assertTrue(out["request_fits"] is None
+                            or type(out["request_fits"]) is bool, name)
+            self.assertIsInstance(out["conflict_latched"], bool, name)
+            json.dumps(out)  # closed and serializable
+
+    def test_deterministic_and_side_effect_free(self):
+        # Before/after snapshots: repeated calls are identical and the
+        # inputs are never mutated - zero financial side effects.
+        for name, ctx, req in self._branches():
+            before = (copy.deepcopy(ctx), copy.deepcopy(req))
+            first = _eval(ctx, req)
+            second = _eval(ctx, req)
+            self.assertEqual(first, second, name)
+            self.assertEqual((ctx, req), before, name)
+
+    def _valid(self):
+        prov_obs = SEP + 2 * 86_400_000
+        evA, evB = _eid("asof"), _eid("latest")
+        ctx = _context(
+            readings=[
+                _provider(45_000_000, False, prov_obs, _eid("prov")),
+                _snapshot(20_000_000, prov_obs - 30_000, evA),
+                _snapshot(50_000_000, prov_obs + 40_000, evB),
+            ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [evA, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
+        return ctx, _request(now_ms=prov_obs + 50_000)
+
+    def test_error_branches_are_static_and_closed(self):
+        from quota_balancer.errors import (
+            CODE_INVALID_CONFIG, EXIT_CODES, MSG_INVALID_CONFIG)
+        ctx, req = self._valid()
+        prov_obs = SEP + 2 * 86_400_000
+        cert = {"event_id": _eid("prov"), "upper_at": prov_obs + 40_000,
+                "complete_at": prov_obs - 30_000,
+                "overlap_floor_micro_eur": None,
+                "matched_provenance": True}
+        cases = [
+            # Bad context shapes.
+            ({k: v for k, v in ctx.items() if k != "cap_micro_eur"}, req),
+            (dict(ctx, extra=1), req),
+            (dict(ctx, cap_micro_eur=-1), req),
+            (dict(ctx, cap_micro_eur="100"), req),
+            # Bad request shapes.
+            (ctx, dict(req, extra=1)),
+            (ctx, dict(req, version=2)),
+            (ctx, dict(req, requested_micro_eur=-1)),
+            (ctx, dict(req, requested_micro_eur="5")),
+            (ctx, dict(req, account="other")),
+            # Bad references.
+            (dict(ctx, gateways=[dict(
+                ctx["gateways"][0], current_chain_event_ids=[_eid("ghost")])
+                ]), req),
+            (dict(ctx, boundary_event_ids=[_eid("ghost")]), req),
+            # Certificate violations.
+            (ctx, dict(req, coverage=[dict(cert, upper_at=None)])),
+            # complete_at after upper_at.
+            (ctx, dict(req, coverage=[dict(cert,
+                                           upper_at=prov_obs - 40_000)])),
+            (ctx, dict(req, coverage=[dict(cert,
+                                           overlap_floor_micro_eur=
+                                           20_000_001)])),  # > min(P,L,B_e)
+            (ctx, dict(req, coverage=[dict(cert), dict(cert)])),
+        ]
+        for bad_ctx, bad_req in cases:
+            with self.assertRaises(QuotaError) as ctx_err:
+                _eval(bad_ctx, bad_req)
+            err = ctx_err.exception
+            self.assertEqual(err.code, CODE_INVALID_CONFIG)
+            # A static message: never the raw input, never an OS detail.
+            self.assertEqual(err.message, MSG_INVALID_CONFIG)
+            self.assertIsNone(err.retry_at)
+            self.assertEqual(EXIT_CODES[err.code], 2)
+
+
+class BillingPrivacy(unittest.TestCase):
+    """privacy_2b: no keys, IDs, paths, signed headers, URLs or raw
+    input in any output. The inputs carry a distinctive machine alias
+    and distinctive event ids; no output value is a container (so no
+    nested ids/paths/headers/URLs can ride along), and the serialized
+    output and every error message are marker-free."""
+
+    _MACHINE = "leak-machine"
+    _P1 = "deadbeef-0000-4000-8000-000000000001"
+    _P2 = "deadbeef-0000-4000-8000-000000000002"
+
+    def _marked(self, **over):
+        prov_obs = SEP + 2 * 86_400_000
+        evB = _eid("latest")
+        ctx = _context(
+            readings=[
+                dict(_provider(45_000_000, False, prov_obs, _eid("prov")),
+                     event_id=self._P2, machine=self._MACHINE),
+                dict(_snapshot(20_000_000, prov_obs - 30_000, _eid("a")),
+                     event_id=self._P1, machine=self._MACHINE),
+                dict(_snapshot(50_000_000, prov_obs + 40_000, evB),
+                     machine=self._MACHINE),
+            ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [self._P1, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=0, boundary_event_ids=[self._P1])
+        ctx.update(over)
+        return ctx
+
+    def _assert_marker_free(self, *texts):
+        for text in texts:
+            self.assertNotIn(self._MACHINE, text)
+            self.assertNotIn("deadbeef", text)
+
+    def test_result_branches_carry_no_input(self):
+        prov_obs = SEP + 2 * 86_400_000
+        cert = {"event_id": self._P2, "upper_at": prov_obs + 40_000,
+                "complete_at": prov_obs - 30_000,
+                "overlap_floor_micro_eur": None,
+                "matched_provenance": True}
+        for req in (_request(now_ms=prov_obs + 50_000),
+                    _request(now_ms=prov_obs + 50_000,
+                             requested_micro_eur=50_000_000,
+                             coverage=[cert])):
+            out = _eval(self._marked(), req)
+            s = json.dumps(out)
+            # Only approved scalars: no nested containers to hide a key,
+            # id, path, signed header or URL.
+            for v in out.values():
+                self.assertTrue(
+                    v is None or type(v) in (str, int, bool), (s, v))
+            self._assert_marker_free(s)
+
+    def test_error_messages_carry_no_input(self):
+        from quota_balancer.errors import MSG_INVALID_CONFIG
+        prov_obs = SEP + 2 * 86_400_000
+        with self.assertRaises(QuotaError) as ctx_err:
+            _eval(self._marked(cap_micro_eur=-1),
+                  _request(now_ms=prov_obs + 50_000))
+        err = ctx_err.exception
+        self.assertEqual(err.message, MSG_INVALID_CONFIG)
+        self._assert_marker_free(err.message, str(err))
+
+
 if __name__ == "__main__":
     unittest.main()
