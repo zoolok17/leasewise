@@ -304,23 +304,11 @@ def _validate_reading(reading, account):
 # Request validation
 # ---------------------------------------------------------------------------
 
-def _validate_request(request, ctx):
-    """Validate the closed evaluation request; return a normalized copy."""
-    if not isinstance(request, dict) or frozenset(request) != _REQUEST_KEYS:
-        _invalid()
-    if type(request["version"]) is not int or request["version"] != 1:
-        _invalid()
-    if not _is_alias(request["account"]) or request["account"] != ctx["account"]:
-        _invalid()
-    now_ms = request["now_ms"]
-    if not _is_nonneg_int(now_ms):
-        _invalid()
-    if not _is_nonneg_int(request["requested_micro_eur"]):
-        _invalid()
-
+def _validate_coverage(coverage, ctx, now_ms):
+    """Validate the closed per-event coverage array; return a normalized
+    copy. Shared by the evaluation and the opening request."""
     provider_ids = {e["event_id"] for e in ctx["provider_events"]}
     seen = set()
-    coverage = request["coverage"]
     if not isinstance(coverage, list):
         _invalid()
     normalized = []
@@ -357,6 +345,24 @@ def _validate_request(request, ctx):
             "overlap_floor_micro_eur": floor,
             "matched_provenance": item["matched_provenance"],
         })
+    return normalized
+
+
+def _validate_request(request, ctx):
+    """Validate the closed evaluation request; return a normalized copy."""
+    if not isinstance(request, dict) or frozenset(request) != _REQUEST_KEYS:
+        _invalid()
+    if type(request["version"]) is not int or request["version"] != 1:
+        _invalid()
+    if not _is_alias(request["account"]) or request["account"] != ctx["account"]:
+        _invalid()
+    now_ms = request["now_ms"]
+    if not _is_nonneg_int(now_ms):
+        _invalid()
+    if not _is_nonneg_int(request["requested_micro_eur"]):
+        _invalid()
+
+    normalized = _validate_coverage(request["coverage"], ctx, now_ms)
     return {
         "version": 1,
         "account": request["account"],
