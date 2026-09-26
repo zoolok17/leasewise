@@ -103,6 +103,7 @@ def _validate_baselines(items, ctx):
         if row is None or row[0] != max(r[0] for r in chain) or row[2] != amount:
             _invalid()
         baselines[gateway] = {"snapshot_event_id": ref, "baseline": amount,
+                              "observed_at": by_id[ref]["observed_at"],
                               "payload": by_id[ref]["payload"]}
     if set(baselines) != set(ctx["chains_by_gateway"]):
         _invalid()
@@ -171,6 +172,12 @@ def _validate_open_request(request, ctx):
         entry["proof_sum"] = _sum(proofs[i]["amount"] for i in entry["ids"])
     _sum([a["external"] for a in allocations.values()] + [non_ai["amount"]])
     _sum(b["baseline"] for b in baselines.values())
+    # Fix tk-dba39941b750 finding 3: the per-gateway opening sum is checked
+    # here, unconditionally, so an overflowing baseline+external is
+    # INVALID_CONFIG even when another safety predicate would already make
+    # the plan unsafe (it must never reach the ready branch unmarked).
+    for gateway in ctx["chains_by_gateway"]:
+        _checked(baselines[gateway]["baseline"] + allocations[gateway]["external"])
 
     return {
         "now_ms": now_ms, "drain_completed_at": drain,
@@ -228,6 +235,18 @@ def _ledger_quiet(ctx, req):
                for b in req["baselines"].values())
 
 
+def _baselines_cover_drain(req):
+    """Each selected baseline snapshot must be observed at or after drain
+    completion (fix tk-dba39941b750 finding 1): a report from before the
+    drain describes the pre-drain ledger and cannot attest its post-drain,
+    quiet state, however fresh it still is relative to `now`. The design
+    (section 11) requires "fresh matching reports" without stating this
+    inequality; this is this build's fail-closed reading of it (recorded
+    as a decision in docs/STEP-CARD-2B-2B.md, for the design owner)."""
+    drain = req["drain_completed_at"]
+    return all(b["observed_at"] >= drain for b in req["baselines"].values())
+
+
 def _allocations_exact(ctx, req, provider_total):
     """The independently proven, disjoint, owned external charges cover
     exactly max(0, P-L); non-AI stays in the allowance bucket."""
@@ -274,13 +293,21 @@ def _opening_safe(ctx, req):
         # basis is not silently converted (design is silent), it is unsafe.
         single = len({policy["cap_basis"], policy["provider_basis"],
                       policy["ledger_basis"]}) == 1
-        usable = scope_ok and single and _gateway_usable(ctx, now_ms)
+        # Continuity (a well-formed chain) is checked without the freshness
+        # bracket, so an explicit overlap floor with no usable B_e is still
+        # INVALID_CONFIG even when the ledger report is stale (fix
+        # tk-dba39941b750 finding 2); freshness alone gates readiness,
+        # via `usable` below.
+        continuous = scope_ok and single and _gateway_usable(
+            ctx, now_ms, require_fresh=False)
+        usable = continuous and _gateway_usable(ctx, now_ms)
         checks += [scope_ok, single, usable]
-        if usable:
+        if continuous:
             chains = list(ctx["chains_by_gateway"].values())
             ledger = _sum(chain[-1][2] for chain in chains)
             _overlaps(events, req["coverage"], chains, ledger)   # invalid explicit floor
     checks += [
+        _baselines_cover_drain(req),
         _ledger_quiet(ctx, req),
         _latest_provider(events)["event_id"] == provider["event_id"],
         not ctx["provider_conflict"],
