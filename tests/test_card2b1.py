@@ -924,58 +924,53 @@ class BillingConfigInvariant(_Base):
             return _billing(_eid(label), "desktop", "meter", "proj-ai", 1,
                             start, end, 100, False, now - 1000)
 
-        # B01 is enforced at BILLING-READING INGEST, not at config-import:
-        # config-import is the operator's full replacement, and a policy
-        # row cannot be checked against a config that may still move.
+        # B01 and the metered kind are enforced at CONFIG-IMPORT as well
+        # as at billing-reading ingest: an account that has a billing
+        # policy must stay ingest-able, so an import that would break the
+        # allocation, or flip the kind, is refused (exit 2, nothing
+        # written) instead of stranding the account's billing readings.
         # Raising g1 to 50M keeps the shares card-1-legal (50 + 40 = 90
         # <= 100) but shares + allowance (90 + 20 = 110) exceeds the cap
-        # - the config imports, and the next reading is refused (exit 2).
+        # - the config-import itself is refused (exit 2).
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 50_000_000
-        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
-                         0)
-        result = _readings_import(
-            self.db, self.tmp, _doc_v3([reading("cfg-b01-a")]))
+        result = _config_import(self.db, self.tmp, doc)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
+        # The store is unchanged: the allocation still holds, so a
+        # billing reading ingests.
+        self.assertEqual(_readings_import(
+            self.db, self.tmp, _doc_v3([reading("cfg-b01-a")])).returncode,
+            0)
         # Restoring a valid allocation (20 + 40 = 60; 60 + 20 <= 100)
-        # lets the next reading through again.
+        # imports cleanly.
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 20_000_000
         self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
                          0)
-        self.assertEqual(_readings_import(
-            self.db, self.tmp, _doc_v3([reading("cfg-b01-b")])).returncode,
-            0)
         # Lowering the cap below shares + allowance (60 + 20 = 80 > 75,
         # while the shares 60 <= 75 stay card-1-legal) is the same shape:
-        # the config imports, the reading is refused.
+        # the config-import is refused (exit 2).
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 20_000_000
         doc["accounts"][0]["budget_micro_eur"] = 75_000_000
-        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
-                         0)
-        result = _readings_import(
-            self.db, self.tmp, _doc_v3([reading("cfg-b01-c")]))
+        result = _config_import(self.db, self.tmp, doc)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
         doc = copy.deepcopy(VALID_DOC)
         doc["gateways"][0]["share_micro_eur"] = 20_000_000
         self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
                          0)
-        # The metered kind is enforced at ingest the same way: card 1
-        # admits no gateway on a subscription account, so the flip
-        # document drops the gateways as well. The config imports (the
-        # config is the operator's), and the next reading is refused -
-        # a non-metered account has no spend to attribute.
+        # The metered kind is enforced at config-import the same way:
+        # card 1 admits no gateway on a subscription account, so the
+        # flip document drops the gateways as well. The config-import is
+        # refused (exit 2) - a non-metered account has no spend to
+        # attribute, so flipping it would strand its billing readings.
         doc = copy.deepcopy(VALID_DOC)
         doc["accounts"][0]["kind"] = "subscription"
         doc["accounts"][0]["budget_micro_eur"] = None
         doc["gateways"] = []
-        self.assertEqual(_config_import(self.db, self.tmp, doc).returncode,
-                         0)
-        result = _readings_import(
-            self.db, self.tmp, _doc_v3([reading("cfg-kind")]))
+        result = _config_import(self.db, self.tmp, doc)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_INVALID_CONFIG)
         doc = copy.deepcopy(VALID_DOC)
