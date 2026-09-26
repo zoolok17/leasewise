@@ -1064,5 +1064,144 @@ class Privacy2b(Base):
         self.assertFalse(hasattr(billing_open, "sqlite3"))
 
 
+# ---------------------------------------------------------------------------
+# Fix round tk-dba39941b750 (blind read: 1 MAJOR, 2 MINOR)
+# ---------------------------------------------------------------------------
+
+class FixRoundTkDba39941b750(Base):
+    """Reproductions and positive controls for the three findings. Each was
+    RED against f8d8843 before its fix in billing_open.py (see the "Fix
+    round" section of docs/STEP-CARD-2B-2B.md for finding -> fix -> commit).
+    """
+
+    def test_finding1_baseline_before_drain_is_unsafe(self):
+        # MAJOR: a snapshot observed before the drain describes the
+        # pre-drain ledger; it cannot attest the post-drain, quiet state,
+        # even though it is within the 120s freshness bracket of `now`.
+        # lag_seconds=1 makes the bug observable in a 2s window instead of
+        # relying on the default 4h lag to exceed the freshness bracket.
+        policy = dict(_POLICY, lag_seconds=1)
+        drain = D0
+        now = drain + 2000
+        prov_id = _eid("fix1-provider")
+        provider = _provider(19 * E, False, drain + 1000, event=prov_id)
+        provider["received_at"] = drain + 1100
+        snap_event = _eid("fix1-snap")
+        proof_event = _eid("fix1-proof")
+
+        def build(snap_observed):
+            snap = _snapshot(18_430_000, snap_observed, snap_event)
+            snap["received_at"] = snap_observed + 1000
+            ctx = _context(
+                readings=[provider, snap], policy=policy,
+                boundary_exposure_micro_eur=0,
+                gateways=[dict(gateway="g1", share_micro_eur=40 * E,
+                               current_chain_event_ids=[snap_event])])
+            req = dict(
+                version=1, account="meter", now_ms=now, drain_completed_at=drain,
+                drain_verified=True, billing_event_id=prov_id,
+                coverage=[dict(event_id=prov_id, upper_at=drain, complete_at=drain,
+                               overlap_floor_micro_eur=None, matched_provenance=True)],
+                baselines=[dict(gateway="g1", snapshot_event_id=snap_event,
+                                baseline_micro_eur=18_430_000)],
+                allocations=[dict(gateway="g1", external_micro_eur=570_000,
+                                  evidence_ids=[proof_event])],
+                non_ai_allocation=dict(amount_micro_eur=0, evidence_ids=[]),
+                proven_external=[dict(evidence_id=proof_event, gateway="g1",
+                                      amount_micro_eur=570_000,
+                                      disjoint_from_managed=True)])
+            return ctx, req
+
+        # Reproduction: the referenced snapshot is 60s BEFORE the drain
+        # (still within the 120s freshness bracket of `now`, 2s later).
+        self.unsafe(*build(drain - 60_000))
+        # Positive control: the same report, refreshed 1.5s after the
+        # drain -> ready, opening = 19.00.
+        out = self.ready(*build(drain + 1_500))
+        self.assertEqual(out["allocations"], [dict(
+            gateway="g1", baseline_micro_eur=18_430_000,
+            external_micro_eur=570_000, opening_micro_eur=19 * E)])
+
+    def test_finding2_explicit_floor_needs_a_bound_even_when_stale(self):
+        # MINOR: an explicit overlap floor with no usable B_e must be
+        # INVALID_CONFIG regardless of whether the ledger report is
+        # currently fresh; staleness must not hide a missing bound.
+        def build(snap_age_ms):
+            ctx, req = world()
+            snap = reading(ctx, snap_id("g1"))
+            snap["observed_at"] = NOW - snap_age_ms
+            snap["received_at"] = snap["observed_at"] + 1000
+            bad = copy.deepcopy(req)
+            bad["coverage"][0].update(upper_at=D0, complete_at=D0,
+                                      overlap_floor_micro_eur=1)
+            return ctx, bad
+
+        # Reproduction control: fresh (30s old) snapshot, no bound at D0
+        # (it postdates D0 by hours) -> already INVALID_CONFIG.
+        self.invalid(*build(30_000))
+        # Reproduction: only the snapshot's age relative to `now` changes
+        # (120,001ms, past the freshness bracket) -> was unsafe; must stay
+        # INVALID_CONFIG (same missing bound, still no usable B_e).
+        self.invalid(*build(120_001))
+
+    def test_finding2_valid_stale_floor_stays_unsafe_not_invalid(self):
+        # Positive control: a genuinely provable floor (bound exists, value
+        # within it) must NOT be rejected merely because the ledger report
+        # is stale relative to `now` - staleness makes the plan unsafe, not
+        # invalid.
+        old = D0 - 500_000
+        ctx, req = world()
+        snap = reading(ctx, snap_id("g1"))
+        snap["observed_at"] = old
+        snap["received_at"] = old + 1000
+        req = dict(req, now_ms=old + 200_000,          # stale relative to now
+                   drain_completed_at=old - 100_000)
+        req["coverage"][0].update(event_id=PROV, upper_at=old, complete_at=old,
+                                  overlap_floor_micro_eur=0, matched_provenance=True)
+        ctx["readings"][0]["observed_at"] = old            # provider matches
+        ctx["readings"][0]["received_at"] = old + 100
+        self.unsafe(ctx, req)                          # not raised
+
+    def test_finding3_per_gateway_opening_overflow_is_invalid_before_verdict(self):
+        # MINOR: every individual input and the separately checked sums
+        # fit int64, but baseline+external for one gateway overflows; this
+        # must be INVALID_CONFIG even though the ordinary share/sum check
+        # would otherwise call the plan merely unsafe.
+        ctx, req = world(ledgers={"g1": INT64}, total=INT64, external={"g1": [1]},
+                         shares={"g1": INT64})
+        ctx["cap_micro_eur"] = INT64
+        self.invalid(ctx, req)
+
+    def test_finding3_isolated_from_the_declared_external_field(self):
+        # Same arithmetic-overflow contract as above, isolated from the
+        # finding-3 per-gateway opening check: here the DECLARED
+        # external_micro_eur is small (0) and legal, but the two proofs it
+        # (nominally, if summed) would consume overflow int64 on their own.
+        # A wrong declared amount is normally just a mismatch (unsafe); an
+        # overflowing SUM OF PROOFS must still be INVALID_CONFIG.
+        half = INT64 // 2 + 1                    # two of these overflow int64
+        ctx, req = world(external={"g1": []})
+        p0 = proof("half-0", "g1", half)
+        p1 = proof("half-1", "g1", half)
+        req["proven_external"] = [p0, p1]
+        req["allocations"][0]["evidence_ids"] = [p0["evidence_id"], p1["evidence_id"]]
+        self.invalid(ctx, req)
+
+    def test_finding2_known_overlap_bound_enforced_without_a_usable_gateway(self):
+        # Supplemental regression (surfaced by mutation verification of the
+        # finding-2 fix): with no gateway at all, continuity fails outright
+        # (not merely staleness), so the planner's own _overlaps call never
+        # runs; _validate_known_overlap_bounds is what still refuses an
+        # explicit floor greater than the provider total P in that case.
+        ctx, req = world()
+        ctx["gateways"] = []
+        req["baselines"] = []
+        req["allocations"] = []
+        req["proven_external"] = []
+        req["non_ai_allocation"] = dict(amount_micro_eur=0, evidence_ids=[])
+        req["coverage"][0]["overlap_floor_micro_eur"] = 19 * E + 1   # > P
+        self.invalid(ctx, req)
+
+
 if __name__ == "__main__":
     unittest.main()
