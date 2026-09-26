@@ -1,11 +1,11 @@
 """Card 2b-2 acceptance tests: the evaluate_billing input/output contract
-(turn 2 of 4 - input surface, output shape, errors and precedence).
+(input surface, output shape, errors, precedence and headroom).
 
 Run from the repository root:
     python -m unittest discover -s tests -v
 
 evaluate_billing(context, request) is a PURE function: no I/O, no store
-writes, no clock reads (time is injected). This turn pins:
+writes, no clock reads (time is injected). These tests pin:
 
   billing_eval_input           closed context/request validation: bad
                                types, unknown fields, unsupported version,
@@ -27,16 +27,15 @@ writes, no clock reads (time is injected). This turn pins:
                                row precedes the unresolved-bounds catch-all)
                                and first-match-wins.
 
-Turn 3 adds the reconciliation rows: gross excess (uncertified) with
+The reconciliation rows cover gross excess (uncertified) with
 reserves/allowance/boundary/tolerance, conflict-latest ordering (gross
 first, conflict preserved), latest-seq ledger selection, gateway
 usability, listed-transition precedence, the midnight boundary
 exposure, the as-of bracket (skew/covered/excess), the read-only lag
-timer and the tolerance. The advisory headroom is turn 4; until then
-headroom stays null, admission_basis=unavailable and request_fits null
-(false on a hold) so nothing is ever admitted on an un-evaluated
-estimate. The floor diagnostic (known_floor) is the ledger's current
-settled total, null when the ledger is unusable.
+timer and the tolerance. Both advisory headrooms need fresh usable
+ledger evidence; request_fits is null when headroom is unknown, and
+false on a hold. known_floor is the maximum of known provider and
+usable ledger amounts; unknown operands are omitted.
 """
 
 import copy
@@ -788,7 +787,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
     def test_unattributed_counted_once(self):
         # A valid report with reserved/uncertain: R_now = reserved +
         # uncertain; unattributed (a subset of settled) is never added
-        # again. The floor diagnostic uses settled only.
+        # again. The floor takes the maximum known provider/ledger amount.
         ev = _eid("snap")
         prov_obs = SEP + 2 * 86_400_000
         ctx = _context(
@@ -841,7 +840,7 @@ class BillingReconcileStatePrecedence(unittest.TestCase):
         prov_obs = SEP + 2 * 86_400_000
         ctx = self._ctx([])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
-        # The ledger is usable; the turn-3 rows decide the rest.
+        # The ledger is usable after the store clears its transition.
         self.assertEqual(out["known_floor_micro_eur"], 50_000_000)
         self.assertEqual(out["headroom_micro_eur"], 60_000_000)
 
@@ -956,13 +955,14 @@ class BillingReconcileSnapshotSkew(unittest.TestCase):
 
 class BillingReconcileUncertainOverlap(unittest.TestCase):
     """billing_reconcile_uncertain_overlap; billing_coverage: an
-    uncertified (no complete_at) lastUpdate is unresolved - covered or
-    unresolved, never an excess HOLD; a verified P above
+    lastUpdate alone supplies no economic certificate. Missing bracket
+    evidence remains unresolved; a verified P above
     U_asof + allowance + tau yields the (advisory) HOLD."""
 
     def test_uncertified_lastupdate_is_unresolved(self):
-        # No complete_at: the bracket is unprovable -> unresolved, no
-        # excess hold (a missing certificate alone is not anomalous).
+        # No lower snapshot brackets upper_at, and boundary is unknown:
+        # unresolved, no excess hold. Missing completeness alone would
+        # not disable a valid upper_at historical excess check.
         ev = _eid("snap")
         prov_obs = SEP + 2 * 86_400_000
         ctx = _context(

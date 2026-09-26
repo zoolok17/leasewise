@@ -1,5 +1,8 @@
 # Step record — Card 2b-2: billing evaluation
 
+The original turn records below are historical. The **Fix round** section
+at the end supersedes their conflicting judgment calls and test claims.
+
 Work order: tk-bc9cd374d5cd (short turn 4 of 4; turns 1-3 on the same
 branch). Seat: qwen-quota-dev-1. Branch: `card-2b-2` (built on
 `main` via ec9b1ab, the card-4 merge @ schema v5). Date: 2026-09-26.
@@ -199,3 +202,99 @@ Turn 4 (this turn):
 - **The wall clock.** Freshness, lag and receipt margins are all
   injected (now_ms, observed_at/received_at); the real clock is not
   exercised, by the pure-function contract.
+
+## Fix round — combined independent reads (2026-09-26)
+
+Base: `e03d325`; request `tk-f05c1e2c770c`. Both independent reads were
+reproduced through the public evaluator before production changes.
+No source repository changes, provider traffic, push or enforcement.
+
+Regression commit `72f27e4` adds 32 tests: the initial targeted run had
+36 failing assertions/subtests and two errors. Contract fix `0469940`
+passed its seven targeted validation cases. Monetary/decision fix
+`4510ad6` passed all 32 regressions. Fixture correction `0a6b9c0` passed
+all 72 existing evaluator acceptance tests and both demo outcomes.
+Follow-up regression commit `d76b396` adds six cases; three exposed
+remaining edge failures. Fix `c49734c` passes all 38 regression cases.
+Final inspection reproduced raw provider conflicts disappearing under
+basis rounding: regression `ccc60bc` was RED, then `0afc1aa` passed all
+39 regressions and the 72 acceptance tests.
+
+Finding IDs C1-C14 refer to the numbered Codex read; S1-S7 refer to the
+numbered Sonnet findings. M2/M4 are its previously surviving mutants.
+Test names below are methods in `tests/test_billing_eval_fix.py` unless
+explicitly stated otherwise; each has the `test_` prefix.
+
+| Finding | Fix | Regression tests | Fix commit |
+|---|---|---|---|
+| C1 / S3: basis and scope | Convert provider/ledger/share/boundary amounts to cap basis before comparison; unknown basis and mismatched owner/scope defer with unavailable headroom. | c1_convert_ledger_before_fallback; s3_convert_provider_before_gross; c1_basis_unknown_precedes_scope_and_gateway; missing_vat_defers_comparison; c1_scope_owner_revision_gates | 4510ad6 |
+| C2 / S2: stale gateway admits | Latest selected report age gates both headroom formulas, inclusive 120000ms boundary. | c2_freshness_gates_both_headrooms | 4510ad6 |
+| C3 / S6: ambiguous chain | Validate raw same-seq amounts and epoch/hash/machine identity; unresolved store transitions remain authoritative; identical replays count once. | c3_contradictory_same_seq_unusable_both_orders; c3_epoch_hash_machine_continuity; raw_same_seq_conflict_cannot_round_away; identical_replays_count_once; selected_legacy_report_does_not_disappear | 4510ad6, c49734c |
+| S6: duplicate gateways | Reject duplicate gateway records and invalid chain references before aggregation. | s6_duplicate_gateway_rejected; chain_reference_wrong_gateway_or_kind; duplicate_event_collision_rejected | 0469940 |
+| C4 / S5: wrong historical bracket | Use upper_at, inclusive upper/lower bounds; BOTH settled and open exposure come from UPPER. Complete_at remains the lower-overlap proof boundary. | c4_upper_bracket_not_lower_or_complete; c4_exact_at_upper_time_counts; s5_upper_only_certificate_holds | 4510ad6 |
+| C5: event-order precedence | Test each higher-priority predicate against every event before any covered result. | c5_precedence_all_events_both_orders | 4510ad6 |
+| C6: invented receipt-gap limit | Keep only receipt+30s lower bound and report age<=120s; no maximum distance after receipt. | c6_no_maximum_receipt_gap | 4510ad6 |
+| C7 / S4: heartbeat resets idle | Derive change time from amount changes, including reserves/uncertainty; unchanged heartbeats do not reset it. | c7_unchanged_heartbeats_do_not_reset_idle; reserve_change_resets_idle_but_repeated_reserve_does_not | 4510ad6 |
+| C8 / S1: missing table rows | Implement matched, lag_expected and missing_old_spend plus first-row basis/scope reasons; stale uses state=stale. Old settled lower bounds need no nearby upper-cutoff snapshot. | c8_matched_and_lag_expected; c8_missing_old_spend_during_activity; missing_old_spend_needs_no_nearby_cutoff_snapshot; C1 tests | 4510ad6, c49734c |
+| C9: overlap bounds and priority | Validate each explicit floor against its own P_e; a valid explicit proof wins even when B_e>P_e. Reject explicit evidence lacking completeness/provenance even with an unusable ledger. | c9_each_overlap_uses_its_own_provider_amount; c9_explicit_proof_beats_derived_overlap; explicit_overlap_without_proof_rejected_on_unusable_ledger | 4510ad6, c49734c |
+| C10: provider tie order | Latest selection uses source time then UUID; conflict folding reuses the store reducer on raw values before rounding, not receipt order. | c10_uuid_tie_not_receipt_order; raw_provider_conflict_cannot_round_away | 4510ad6, 0afc1aa |
+| C11 / S7: overflow and floats | Checked int64 money results/sums; integer rational ceil only; no binary floats. | c11_estimate_overflow_rejected; c11_component_sum_overflow_rejected; c11_tolerance_large_integer_exact | 4510ad6 |
+| C12 / S7: closed API drift | Exact three-key gateway input and ten-key Evaluation output; store's unresolved references supply reconcile state. | c12_exact_spec_input_output | 0469940 |
+| C13: lost provider floor | Diagnostic floor is max of known operands, including retained provider high-water when ledger is unavailable. | c13_known_provider_floor_survives_unusable_ledger; existing BillingConflictedLatestGross tests | 4510ad6 |
+| C14: validation holes | Exact integer version; typed payload rejection; known unresolved references. | c14_boolean_version; c14_null_payload_typed_error; c14_unknown_unresolved_reference | 0469940 |
+| M2: receipt margin mutant | Pin 29999ms versus 30000ms after receipt. | mutant_receipt_margin_exact_boundary | 4510ad6 |
+| M4: tolerance-floor mutant | Pin fractional tolerance equality/+1 boundaries. | mutant_tolerance_rounds_up | 4510ad6 |
+
+### Reversed judgments and clarified limits
+
+- Stale gateway reports disable **both** headrooms. Stale provider
+  billing alone still permits the fresh-ledger fallback with an ALERT.
+- Valid explicit overlap evidence can establish comparable admission;
+  it is not excluded merely because it is explicit or B_e exceeds P_e.
+- known_floor includes known provider evidence, preserving the retained
+  high-water; it is not only L_now and is never enforced in fallback.
+- Remove the unspecced maximum receipt gap, heartbeat-based idle timer,
+  lower-snapshot historical threshold and per-event short-circuit order.
+- The extra gateway reconciliation flag and output conflict flag are
+  removed. The closed contract wins over the author's test definitions.
+- Existing fixtures are corrected, not relaxed: distinct reports have
+  distinct seq; tests of provider staleness keep local reports fresh;
+  idle tests include fresh unchanged heartbeats. Freshness, same-seq
+  conflict and receipt-gap assertions that contradicted the spec were
+  reversed. Missing rows now have behavioral tests, not just a name list.
+- Sonnet S5's sample P=13 and UPPER settled=14 cannot prove excess under
+  the written formula. Its mechanism finding is accepted; the positive
+  HOLD fixture uses UPPER settled=10, with later spend raising L_now to
+  14. The companion P=13/UPPER=13 fixture explicitly forbids a false HOLD.
+- Ambiguity: a same-seq report with different observation times is treated
+  as ambiguous/unusable, even with equal amounts. Identical replays count
+  once. Store-selected chain IDs remain a trusted store assertion, not a
+  telemetry-selected identity. Raw differences cannot disappear through
+  monetary rounding. No monetary timestamp is silently made current.
+- Boundary exposure is treated as ledger-basis money; explicit overlap
+  evidence is cap-basis money. Cap and allowance already use cap basis.
+  Rational operations use Python's exact wide intermediate numerator and
+  check the final int64 amount, matching shared convert_basis; aggregates
+  and estimates are checked before any output or admission comparison.
+- A sparse continuous settled lower bound remains valid for the old-spend
+  ALERT without a nearby bracket. Its tolerance uses that lower bound;
+  this diagnostic cannot produce a HOLD or refund. Upper-exposure and
+  overlap calculations retain their separate 120s bracket requirements.
+- This remains an advisory pure function. It does not establish provider
+  completeness, authenticate the context builder, clear stored holds or
+  enforce ceilings against unmediated spend.
+
+### Fix-round verification
+
+- Targeted: 39 new regressions and 72 existing evaluator tests pass.
+- Both demo outcomes pass: gross excess HOLD; P=45/L=50 fallback=50.
+- Mutation checks executed in memory, source unchanged: receipt margin
+  30000->0 and tolerance ceil->floor each fail their targeted test.
+- Initial full run: 289 tests passed in 93.119s. It was already running
+  when the final inspection found the provider-rounding conflict; a
+  final full run is therefore necessary to cover the delivered fix.
+- Final full run: `python -m unittest discover -s tests` passed **290
+  tests in 83.546s**, foreground, after the last production change.
+  Test temporary files stayed under task scratch. `git diff --check`
+  passed. The isolated clone and red/green/mutation logs are retained
+  for the lead to fetch and review; no push was performed.
