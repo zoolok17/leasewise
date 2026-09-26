@@ -363,6 +363,8 @@ def _validate_request(request, ctx):
             _invalid()
         if not _is_bool(item["matched_provenance"]):
             _invalid()
+        if floor is not None and (complete_at is None or not item["matched_provenance"]):
+            _invalid()
         normalized.append({
             "event_id": event_id,
             "upper_at": upper_at,
@@ -452,6 +454,7 @@ def _gateway_usable(ctx, now_ms):
             return False
         identity = None
         seen = {}
+        previous_settled = None
         for row in chain:
             event = by_id[row[5]]
             payload = event["payload"]
@@ -459,11 +462,16 @@ def _gateway_usable(ctx, now_ms):
             if identity is not None and key != identity:
                 return False
             identity = key
-            if row[0] in seen and seen[row[0]] != row[1:5]:
+            money = tuple(payload[key] for key in (
+                "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur",
+                "unattributed_micro_eur"))
+            report = (event["observed_at"], money)
+            if row[0] in seen and seen[row[0]] != report:
                 return False
-            seen[row[0]] = row[1:5]
-        if any(b[2] < a[2] for a, b in zip(chain, chain[1:])):
-            return False
+            seen[row[0]] = report
+            if previous_settled is not None and money[0] < previous_settled:
+                return False
+            previous_settled = money[0]
         if not 0 <= now_ms - chain[-1][1] <= _BRACKET_WINDOW_MS:
             return False
     return True
@@ -492,11 +500,12 @@ def _tolerance(ledger, policy):
     return _checked(max(policy["abs_tolerance_micro_eur"], relative))
 
 
-def _boundary_e(chains, at):
-    """Lower settled bound, with a nearby snapshot on every chain."""
+def _boundary_e(chains, at, max_age_ms=_BRACKET_WINDOW_MS):
+    """Lower settled bound; old-spend diagnostics need no proximity limit."""
     if at is None or not chains:
         return None
-    rows = [max((r for r in chain if 0 <= at-r[1] <= _BRACKET_WINDOW_MS),
+    rows = [max((r for r in chain if r[1] <= at
+                 and (max_age_ms is None or at-r[1] <= max_age_ms)),
                 key=lambda r: (r[1], r[0]), default=None) for chain in chains]
     return _sum(r[2] for r in rows) if all(r is not None for r in rows) else None
 
@@ -585,8 +594,12 @@ def _decision(ctx, req, ledger, reserves, comparable):
            for _, p, l, u in certified):
         return "unexplained_excess", "provider_excess", "hold", "comparable"
     quality = "comparable" if comparable else "provisional"
-    for entry, amount, _, _ in certified:
-        old = _boundary_e(chains, entry["upper_at"] - policy["lag_seconds"] * 1000)
+    for entry in req["coverage"]:
+        if entry["upper_at"] is None:
+            continue
+        amount = by_id[entry["event_id"]]["payload"]["total_micro_eur"]
+        old = _boundary_e(chains, entry["upper_at"] - policy["lag_seconds"] * 1000,
+                          max_age_ms=None)
         if old is not None and amount < old - _tolerance(old, policy):
             return "provider_behind", "missing_old_spend", "alert", quality
     last_change = _last_financial_change(chains)
