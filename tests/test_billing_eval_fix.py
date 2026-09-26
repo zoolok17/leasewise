@@ -257,6 +257,49 @@ class BillingReviewRegressions(unittest.TestCase):
             ctx, req = case(rows, [_provider(80*E, False, T)])
             self.assertEqual(evaluate_billing(ctx, req)['known_floor_micro_eur'], 80*E)
 
+    def test_missing_old_spend_needs_no_nearby_cutoff_snapshot(self):
+        # A continuous older settled lower bound remains valid; the 120s
+        # bracket constraint is for upper exposure, not this lower bound.
+        p = _provider(45*E, False, T)
+        rows = [snap(50*E, T-14_400_000-600_000, 1), snap(60*E, T+40_000, 2)]
+        ctx, req = case(rows, [p], coverage=[cert(p, complete=None)])
+        self.assertEqual(evaluate_billing(ctx, req)['reason'], 'missing_old_spend')
+
+    def test_raw_same_seq_conflict_cannot_round_away(self):
+        rows = [snap(101, T+40_000), snap(102, T+40_000)]
+        rows[1]['event_id'] = _eid('round-away')
+        ctx, req = case(rows)
+        ctx['policy'].update(ledger_basis='invoice_total', vat_bps=2000)
+        self.assertEqual(evaluate_billing(ctx, req)['reason'], 'gateway_unusable')
+
+    def test_explicit_overlap_without_proof_rejected_on_unusable_ledger(self):
+        p = _provider(50*E, False, T)
+        ctx, req = case([], [p], coverage=[cert(p, floor=1, proof=False)])
+        self.reject(ctx, req)
+
+    def test_selected_legacy_report_does_not_disappear(self):
+        rows = [snap(at=T), snap(at=T+40_000, seq=2)]
+        for key in ('settled_micro_eur', 'reserved_micro_eur', 'uncertain_micro_eur', 'unattributed_micro_eur'):
+            del rows[1]['payload'][key]
+        ctx, req = case(rows)
+        self.assertEqual(evaluate_billing(ctx, req)['admission_basis'], 'unavailable')
+
+    def test_identical_replays_count_once(self):
+        first = snap()
+        replay = copy.deepcopy(first); replay['event_id'] = _eid('same-seq-replay')
+        ctx, req = case([first, replay])
+        self.assertEqual(evaluate_billing(ctx, req)['headroom_micro_eur'], 50*E)
+        ctx['readings'].append(copy.deepcopy(first))
+        self.assertEqual(evaluate_billing(ctx, req)['headroom_micro_eur'], 50*E)
+
+    def test_reserve_change_resets_idle_but_repeated_reserve_does_not(self):
+        now = T+14_400_000
+        p = _provider(45*E, False, now-60_000)
+        for changed, action in ((False, 'alert'), (True, 'none')):
+            rows = [snap(at=T, reserved=1), snap(at=now-1000, seq=2, reserved=2 if changed else 1)]
+            ctx, req = case(rows, [p], now=now)
+            self.assertEqual(evaluate_billing(ctx, req)['action'], action)
+
 
 if __name__ == '__main__':
     unittest.main()
