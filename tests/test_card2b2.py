@@ -729,6 +729,8 @@ class BillingGatewayUncertainty(unittest.TestCase):
     def _assert_unusable(self, out):
         self.assertEqual(out["admission_basis"], "unavailable")
         self.assertIsNone(out["headroom_micro_eur"])
+        # No known headroom: request_fits is unknown (None) - a missing
+        # basis never admits, and only a hold is known-false.
         self.assertIsNone(out["request_fits"])
 
     def test_absent_snapshot_is_unusable(self):
@@ -743,7 +745,11 @@ class BillingGatewayUncertainty(unittest.TestCase):
             boundary_event_ids=[be])
         self._assert_unusable(out)
 
-    def test_stale_snapshot_is_unusable(self):
+    def test_stale_snapshot_is_unusable_for_brackets(self):
+        # A >120 s report is unusable for the bracket and the gross
+        # receipt guard, but L_now (the latest-seq settled) is still
+        # usable: the evaluation alerts (billing_stale) and the
+        # fallback headroom holds (100 - 0 - 40 - 0 = 60).
         ev = _eid("snap")
         prov_obs = SEP + 2 * 86_400_000
         ctx = _context(
@@ -755,7 +761,12 @@ class BillingGatewayUncertainty(unittest.TestCase):
                        "current_chain_event_ids": [ev],
                        "reconciliation_required": False}],
         )
-        self._assert_unusable(_eval(ctx, _request()))
+        out = _eval(ctx, _request())
+        self.assertEqual(out["action"], "alert")
+        self.assertEqual(out["reason"], "billing_stale")
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 60_000_000)
+        self.assertIs(out["request_fits"], True)  # H=0 fits
 
     def test_decreased_in_chain_total_is_unusable(self):
         # A decreased in-chain total (nondecreasing is a chain invariant)
@@ -830,11 +841,13 @@ class BillingReconcileStatePrecedence(unittest.TestCase):
         )
 
     def test_listed_transition_keeps_gateway_unusable(self):
-        # While the transition id is listed, the gateway is unusable even
-        # with an ordinary ok snapshot (no evaluator writes to clear it).
-        out = _eval(self._ctx([_eid("transition")]), _request())
+        # While the transition id is listed (a chain row is unresolved),
+        # the gateway is unusable even with an ordinary ok snapshot (no
+        # evaluator writes to clear it).
+        out = _eval(self._ctx([_eid("snap")]), _request())
         self.assertEqual(out["admission_basis"], "unavailable")
         self.assertIsNone(out["headroom_micro_eur"])
+        self.assertIsNone(out["request_fits"])  # unknown, never admitted
 
     def test_cleared_transition_does_not_re_latch(self):
         # After the store reconciliation drops the id, the gateway is
@@ -1139,6 +1152,262 @@ class BillingTolerance(unittest.TestCase):
         out = _eval(self._ctx(20_200_001, 20_000_000),
                     _request(requested_micro_eur=10, now_ms=SEP + 2 * 86_400_000 + 50_000))
         self.assertEqual(out["action"], "hold")
+
+
+class BillingHeadroom(unittest.TestCase):
+    """billing_headroom: the advisory headroom and its admission basis.
+    Comparable (admission_basis=billing_estimate) only with complete
+    overlap proof for every retained provider event, a fresh latest
+    sample and no latched conflict: headroom = cap - E - R_now.
+    Otherwise, with usable local ledger inputs: headroom =
+    cap - allowance - L_now - R_now (admission_basis=ledger_fallback):
+    the managed-work headroom keeps the separate non-AI allowance out
+    of H, and the diagnostic E is not enforced in fallback. A hold
+    recommendation denies H regardless of headroom; a missing P means
+    estimate=null (never P=0); a missing/unusable ledger means
+    headroom=null with admission_basis=unavailable."""
+
+    def _certified(self, p, o, l, cap=100_000_000, allowance=0, r=0, b=0):
+        """One provider event, fully certified by its coverage entry
+        (complete + matched provenance, usable B_e = o <= P)."""
+        prov_obs = SEP + 2 * 86_400_000
+        evA, evB = _eid("asof"), _eid("latest")
+        return _context(
+            cap_micro_eur=cap,
+            readings=[
+                _provider(p, False, prov_obs, _eid("prov")),
+                _snapshot(o, prov_obs - 30_000, evA),
+                _snapshot(l, prov_obs + 40_000, evB, reserved=r),
+            ],
+            policy=dict(_POLICY, non_ai_allowance_micro_eur=allowance),
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [evA, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=b,
+            boundary_event_ids=[evA] if b is not None else [])
+
+    def _certified_req(self, prov_obs, requested=0):
+        return _request(
+            now_ms=prov_obs + 50_000, requested_micro_eur=requested,
+            coverage=[{"event_id": _eid("prov"),
+                       "upper_at": prov_obs + 40_000,
+                       "complete_at": prov_obs - 30_000,
+                       "overlap_floor_micro_eur": None,
+                       "matched_provenance": True}])
+
+    def test_certified_81_07(self):
+        # The proof-bearing fixture: P=14.30, O=14.30, L=18.43,
+        # R=0.50, cap=100 -> E = max(18.43, 14.30+18.43-14.30) = 18.43,
+        # headroom = 100 - 18.43 - 0.50 = 81.07, billing_estimate.
+        prov_obs = SEP + 2 * 86_400_000
+        out = _eval(self._certified(14_300_000, 14_300_000, 18_430_000,
+                                    r=500_000),
+                    self._certified_req(prov_obs))
+        self.assertEqual(out["admission_basis"], "billing_estimate")
+        self.assertEqual(out["estimate_micro_eur"], 18_430_000)
+        self.assertEqual(out["headroom_micro_eur"], 81_070_000)
+        self.assertEqual(out["known_floor_micro_eur"], 18_430_000)
+        self.assertEqual(out["action"], "none")
+
+    def test_certified_minus_fallback_differs_by_allowance(self):
+        # Complete overlap (O=P=B_e=50): E = max(60, 50+60-50) = 60,
+        # certified headroom = 100 - 60 - 0 = 40 - while the fallback
+        # would keep the 10 of allowance out (30).
+        prov_obs = SEP + 2 * 86_400_000
+        ctx = self._certified(50_000_000, 50_000_000, 60_000_000,
+                              allowance=10_000_000)
+        out = _eval(ctx, self._certified_req(prov_obs, 40_000_000))
+        self.assertEqual(out["admission_basis"], "billing_estimate")
+        self.assertEqual(out["estimate_micro_eur"], 60_000_000)
+        self.assertEqual(out["headroom_micro_eur"], 40_000_000)
+        self.assertIs(out["request_fits"], True)
+        out = _eval(ctx, self._certified_req(prov_obs, 40_000_001))
+        self.assertIs(out["request_fits"], False)
+
+    def test_r_subtracted_once_in_both_bases(self):
+        # R=10 appears exactly once per formula: certified
+        # 100 - 60 - 10 = 30 and fallback 100 - 0 - 60 - 10 = 30.
+        prov_obs = SEP + 2 * 86_400_000
+        ctx = self._certified(50_000_000, 50_000_000, 60_000_000,
+                              r=10_000_000)
+        out = _eval(ctx, self._certified_req(prov_obs))
+        self.assertEqual(out["admission_basis"], "billing_estimate")
+        self.assertEqual(out["headroom_micro_eur"], 30_000_000)
+        # The same context without the certificate: the fallback also
+        # subtracts R exactly once.
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 30_000_000)
+
+    def test_fallback_normal_p45_l50(self):
+        # The card row: no proof, P=45 below L=50 -> the provisional
+        # fallback: headroom = 100 - 0 - 50 - 0 = 50, and the
+        # diagnostic E = max(50, 45+50-0) = 95 is NOT enforced.
+        prov_obs = SEP + 2 * 86_400_000
+        evA, evB = _eid("asof"), _eid("latest")
+        ctx = _context(
+            readings=[
+                _provider(45_000_000, False, prov_obs, _eid("prov")),
+                _snapshot(20_000_000, prov_obs - 30_000, evA),
+                _snapshot(50_000_000, prov_obs + 40_000, evB),
+            ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [evA, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["estimate_micro_eur"], 95_000_000)
+        self.assertEqual(out["headroom_micro_eur"], 50_000_000)
+        self.assertEqual(out["action"], "none")
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
+                                  requested_micro_eur=50_000_000))
+        self.assertIs(out["request_fits"], True)
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
+                                  requested_micro_eur=50_000_001))
+        self.assertIs(out["request_fits"], False)
+
+
+class BillingHeadroomBoundaries(unittest.TestCase):
+    """billing_headroom_boundaries: hold always false-fit, missing P
+    keeps the fallback (estimate=null, never P=0), a latched conflict
+    blocks comparable (fallback), a cap-exceeding estimate is rejected
+    (fail closed), a stale sample keeps the usable-ledger fallback."""
+
+    def _plain(self, readings, b=0):
+        return _context(
+            readings=readings,
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [r["event_id"]
+                                                   for r in readings
+                                                   if r["kind"] == "gateway_snapshot"],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=b,
+            boundary_event_ids=[readings[1]["event_id"]] if b is not None
+            else [])
+
+    def test_hold_always_false_fit(self):
+        # An uncertified 30 EUR excess (P=80 vs L=50) is a HOLD; the
+        # fallback headroom (50) still cannot admit on a hold.
+        prov_obs = SEP + 2 * 86_400_000
+        ctx = self._plain([
+            _provider(80_000_000, False, prov_obs, _eid("prov")),
+            _snapshot(20_000_000, prov_obs - 30_000, _eid("asof")),
+            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest")),
+        ])
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
+                                  requested_micro_eur=10_000_000))
+        self.assertEqual(out["action"], "hold")
+        self.assertEqual(out["quality"], "comparable")
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 50_000_000)
+        self.assertIs(out["request_fits"], False)
+
+    def test_missing_p_keeps_the_fallback(self):
+        # No provider sample: estimate=null (never P=0) - but the
+        # usable ledger still yields the fallback headroom 100-0-50-0.
+        prov_obs = SEP + 2 * 86_400_000
+        ctx = self._plain([
+            _snapshot(20_000_000, prov_obs - 30_000, _eid("asof")),
+            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest")),
+        ])
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
+        self.assertEqual(out["action"], "alert")
+        self.assertEqual(out["reason"], "billing_unknown")
+        self.assertIsNone(out["estimate_micro_eur"])
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 50_000_000)
+        self.assertIs(out["request_fits"], True)  # H=0 fits
+
+    def test_conflict_blocks_comparable(self):
+        # A newer total below the high-water latches the conflict; with
+        # a usable ledger the result is the fallback (100-0-45-0=55),
+        # never the comparable basis.
+        t1, t2 = SEP + 86_400_000, SEP + 2 * 86_400_000
+        ctx = self._plain([
+            _provider(50_000_000, False, t1, _eid("prov-1")),
+            _provider(45_000_000, False, t2, _eid("prov-2")),
+            _snapshot(45_000_000, t2 + 40_000, _eid("latest")),
+        ])
+        out = _eval(ctx, _request(now_ms=t2 + 50_000))
+        self.assertEqual(out["action"], "alert")
+        self.assertEqual(out["reason"], "source_conflict")
+        self.assertTrue(out["conflict_latched"])
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 55_000_000)
+
+    def test_rejected_headroom_fails_closed(self):
+        # A fully certified estimate above the cap (E=110 > 100): the
+        # negative headroom is rejected, not reported - fail closed.
+        prov_obs = SEP + 2 * 86_400_000
+        ctx = self._plain([
+            _provider(110_000_000, False, prov_obs, _eid("prov")),
+            _snapshot(110_000_000, prov_obs - 30_000, _eid("asof")),
+            _snapshot(110_000_000, prov_obs + 40_000, _eid("latest")),
+        ])
+        out = _eval(ctx, self._certified_req_of(prov_obs, 10_000_000))
+        self.assertEqual(out["estimate_micro_eur"], 110_000_000)
+        self.assertEqual(out["admission_basis"], "unavailable")
+        self.assertIsNone(out["headroom_micro_eur"])
+        # No known headroom: the fit is unknown (None) - fail closed.
+        self.assertIsNone(out["request_fits"])
+
+    def test_stale_sample_keeps_the_fallback(self):
+        # One second past max_age (7200 s): the sample alerts
+        # (billing_stale) - the usable ledger still yields the fallback
+        # headroom 100-0-50-0.
+        now = SEP + 3 * 86_400_000
+        stale_obs = now - 7_201_000
+        ctx = self._plain([
+            _provider(45_000_000, False, stale_obs, _eid("prov")),
+            _snapshot(20_000_000, stale_obs - 30_000, _eid("asof")),
+            _snapshot(50_000_000, stale_obs + 40_000, _eid("latest")),
+        ])
+        out = _eval(ctx, _request(now_ms=now))
+        self.assertEqual(out["action"], "alert")
+        self.assertEqual(out["reason"], "billing_stale")
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 50_000_000)
+
+    def _certified_req_of(self, prov_obs, requested):
+        return _request(
+            now_ms=prov_obs + 50_000, requested_micro_eur=requested,
+            coverage=[{"event_id": _eid("prov"),
+                       "upper_at": prov_obs + 40_000,
+                       "complete_at": prov_obs - 30_000,
+                       "overlap_floor_micro_eur": None,
+                       "matched_provenance": True}])
+
+
+class BillingFallbackAllowance(unittest.TestCase):
+    """billing_fallback_allowance (C1, accepted): the managed fallback
+    subtracts the non-AI allowance from headroom/request_fits - cap=100,
+    L=50, R=0, allowance=10 and provisional billing: headroom=40; a
+    request of exactly 40 fits, 40.000001 does not; the allowance stays
+    separate from managed work."""
+
+    def test_allowance_subtracted_from_the_fallback(self):
+        prov_obs = SEP + 2 * 86_400_000
+        evA, evB = _eid("asof"), _eid("latest")
+        ctx = _context(
+            readings=[
+                _provider(45_000_000, False, prov_obs, _eid("prov")),
+                _snapshot(20_000_000, prov_obs - 30_000, evA),
+                _snapshot(50_000_000, prov_obs + 40_000, evB),
+            ],
+            policy=dict(_POLICY, non_ai_allowance_micro_eur=10_000_000),
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [evA, evB],
+                       "reconciliation_required": False}],
+            boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
+                                  requested_micro_eur=40_000_000))
+        self.assertEqual(out["admission_basis"], "ledger_fallback")
+        self.assertEqual(out["headroom_micro_eur"], 40_000_000)
+        self.assertIs(out["request_fits"], True)
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
+                                  requested_micro_eur=40_000_001))
+        self.assertIs(out["request_fits"], False)
 
 
 if __name__ == "__main__":

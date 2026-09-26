@@ -12,9 +12,19 @@ reserves/allowance/boundary/tolerance), the conflict-latest ordering
 (gross first, conflict preserved), the latest-seq ledger selection, the
 gateway usability rules, the listed-transition precedence, the boundary
 (midnight) exposure, the as-of bracket (skew/covered/excess) and the
-read-only lag timer. Turn 4 fills in the advisory headroom; until then
-headroom stays null, admission_basis=unavailable and request_fits null
-(false on a hold) - nothing is admitted on an un-evaluated estimate.
+read-only lag timer. Turn 4 fills in the advisory headroom and its
+admission basis, and the closed output/privacy contract: comparable
+headroom = cap - E - R_now (admission_basis=billing_estimate) only
+with complete overlap proof for every retained provider event, a
+fresh sample and no latched conflict; otherwise headroom =
+cap - allowance - L_now - R_now (admission_basis=ledger_fallback)
+with usable local ledger inputs - the separate non-AI allowance stays
+out of the requested H, and the diagnostic E is not enforced in
+fallback. A hold recommendation denies H regardless of headroom; a
+missing P keeps the fallback (estimate null, never P=0); a rejected
+(cap-exceeding) estimate or a missing/unusable ledger fails closed
+(headroom null, admission_basis unavailable) - nothing is ever
+admitted on a rejected estimate.
 """
 
 import math
@@ -713,7 +723,7 @@ def evaluate_billing(context, request):
     req = _validate_request(request, ctx)
 
     P = _provider_total(ctx["provider_events"])
-    l_now, _r_now = _ledger_now(ctx)
+    l_now, r_now = _ledger_now(ctx)
 
     # Resolve each certificate's overlap (raises INVALID_CONFIG on an
     # out-of-range explicit floor), then the spend estimate.
@@ -721,7 +731,8 @@ def evaluate_billing(context, request):
     for entry in req["coverage"]:
         B_e = None
         if entry["complete_at"] is not None:
-            B_e = _boundary_e(ctx, entry["complete_at"])
+            B_e = _boundary_e(ctx["chains_by_gateway"].values(),
+                              entry["complete_at"])
         overlap_by_event[entry["event_id"]] = _resolve_overlap(
             entry, P, l_now, B_e)
     estimate = _estimate(ctx["provider_events"], overlap_by_event, l_now)
@@ -735,11 +746,20 @@ def evaluate_billing(context, request):
     action, reason = apply_non_ai_overlay(
         action, reason, _any_non_ai_current(ctx["provider_events"]))
 
-    # Turn 4: headroom is not yet implemented - fail closed.
-    headroom = None
-    admission_basis = "unavailable"
-    request_fits = False if action == "hold" else None
     conflict = _conflict_latched(ctx["provider_events"])
+    headroom, admission_basis = _advisory_headroom(
+        ctx, req, l_now, r_now, estimate, conflict, P)
+    # A hold recommendation denies the requested H regardless of
+    # headroom (always false-fit). Otherwise H fits when the headroom
+    # is available and the requested amount does not exceed it; with no
+    # known headroom the fit is UNKNOWN (None) - never a false-fit, and
+    # never an admission either.
+    if action == "hold":
+        request_fits = False
+    elif headroom is None:
+        request_fits = None
+    else:
+        request_fits = req["requested_micro_eur"] <= headroom
 
     return {
         "state": state,
@@ -756,13 +776,73 @@ def evaluate_billing(context, request):
     }
 
 
-def _boundary_e(ctx, complete_at):
+def _advisory_headroom(ctx, req, l_now, r_now, estimate, conflict, P):
+    """(headroom, admission_basis) for the advisory managed-work
+    headroom (section 11, "Advisory headroom and opening plan").
+    Comparable (admission_basis=billing_estimate) only when EVERY
+    retained provider event is fully proven (a coverage entry with a
+    certified time, matched provenance, a usable B_e and the derived
+    O_e=B_e under B_e<=P_e - never an explicit floor), the latest
+    sample is fresh and no conflict is latched: headroom = cap - E -
+    R_now. Otherwise, with usable local ledger inputs (R_now known),
+    the fallback: headroom = cap - allowance - L_now - R_now
+    (admission_basis=ledger_fallback) - the separate non-AI allowance
+    stays out of the requested H, and the diagnostic E is kept for
+    diagnostics, not enforced in fallback. A cap-exceeding headroom
+    is rejected: the estimate fails closed (null, unavailable), never
+    reported negative, and nothing is admitted on it. A
+    missing/unusable ledger leaves both fields null/unavailable."""
+    if r_now is None:
+        return None, "unavailable"
+    cap = ctx["cap_micro_eur"]
+    if P is not None and estimate is not None:
+        comparable = (not conflict
+                      and _provider_fresh(
+                          _latest_provider(ctx["provider_events"]),
+                          ctx["policy"], req["now_ms"])
+                      and _fully_proven(ctx["provider_events"],
+                                        req["coverage"],
+                                        ctx["chains_by_gateway"].values()))
+        if comparable:
+            headroom = cap - estimate - r_now
+            if 0 <= headroom <= INT64_MAX:
+                return headroom, "billing_estimate"
+            # Rejected (the estimate exceeds the cap): fail closed.
+            return None, "unavailable"
+    # The fallback keeps the separate non-AI allowance out of H.
+    headroom = (cap - ctx["policy"]["non_ai_allowance_micro_eur"]
+                - l_now - r_now)
+    if 0 <= headroom <= INT64_MAX:
+        return headroom, "ledger_fallback"
+    return None, "unavailable"
+
+
+def _fully_proven(provider_events, coverage, chains):
+    """Whether every retained provider event carries the proofs for a
+    comparable estimate: a coverage entry with a certified (complete)
+    time, matched provenance, a usable B_e (the last ledger snapshot
+    at/before the certified time, within 120 s, on every gateway) and
+    B_e<=P_e (the derived O_e=B_e) - a hand-set explicit floor never
+    counts as proof."""
+    by_event = {e["event_id"]: e for e in coverage}
+    for e in provider_events:
+        entry = by_event.get(e["event_id"])
+        if (entry is None or entry["complete_at"] is None
+                or entry["matched_provenance"] is not True):
+            return False
+        b_e = _boundary_e(chains, entry["complete_at"])
+        if b_e is None or b_e > e["payload"]["total_micro_eur"]:
+            return False
+    return True
+
+
+def _boundary_e(chains, complete_at):
     """B_e: the sum of the last ledger snapshot at/before complete_at
     (each within 120 s) across the configured gateways. None (unusable)
     when complete_at is unknown or any gateway lacks a qualifying
     snapshot - a proved empty boundary is the only path to B_e=0."""
     total = 0
-    for chain in ctx["chains_by_gateway"].values():
+    for chain in chains:
         best = None
         for _seq, obs, settled, _r, _u, _ev in chain:
             if obs <= complete_at and (complete_at - obs) <= _BRACKET_WINDOW_MS:
