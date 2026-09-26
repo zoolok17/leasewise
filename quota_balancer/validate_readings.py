@@ -217,26 +217,15 @@ def _next_utc_month_start(ms):
         return None
 
 
-def _is_utc_month_period(start, end):
-    """True when [start, end) is bounded by UTC month bounds, end > start.
-
-    The gateway v3 snapshot period is 'utc_month', pinned to month
-    boundaries - a sub-month or mid-month bound is not a UTC-month
-    period. (The provider billing period is stricter: exactly one month,
-    _is_one_utc_month_period.)
-    """
-    return (_is_utc_month_start(start) and _is_utc_month_start(end)
-            and end > start)
-
-
 def _is_one_utc_month_period(start, end):
     """True when [start, end) is exactly one UTC month: start is the
     first instant of a UTC month and end the first instant of the month
     that follows it.
 
-    A provider billing period is one UTC month - a multi-month span is
-    not a period: it would fold distinct months into one row and leave
-    the row's period_end stale once later months arrive.
+    The provider billing period and the gateway v3 snapshot period are
+    both one UTC month - a multi-month span is not a period: it would
+    fold distinct months into one row and leave the row's period_end
+    stale once later months arrive.
     """
     return (_is_utc_month_start(start)
             and _next_utc_month_start(start) == end)
@@ -263,12 +252,13 @@ def _validate_gateway_snapshot(payload, billing):
         _invalid()
     normalized = None
     if billing:
-        # Version 3: the periods are REQUIRED UTC-month bounds, and the
-        # four money fields are present: non-negative int64 micro-EUR, the
-        # first three disjoint categories, unattributed a subset of
-        # settled. A legacy (v2) snapshot carries no money fields: its
-        # money evidence stays unknown, never zero.
-        if not _is_utc_month_period(period_start, period_end):
+        # Version 3: the periods are REQUIRED and exactly one UTC month
+        # (the provider rule), and the four money fields are present:
+        # non-negative int64 micro-EUR, the first three disjoint
+        # categories, unattributed a subset of settled. A legacy (v2)
+        # snapshot carries no money fields: its money evidence stays
+        # unknown, never zero.
+        if not _is_one_utc_month_period(period_start, period_end):
             _invalid()
         settled = payload["settled_micro_eur"]
         reserved = payload["reserved_micro_eur"]
