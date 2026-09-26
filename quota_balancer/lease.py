@@ -1057,3 +1057,115 @@ def _settle(conn, receipt, now_ms):
     except BaseException:
         rollback_quietly(conn)
         raise
+
+
+# --- limit-events (card 5 fix round: POST /v1/limit-events, section 7) -----------
+
+_LIMIT_EVENT_KEYS = frozenset((
+    "event_id", "account_id", "model_id", "turn_id", "observed_at",
+    "evidence_kind", "resets_at", "exhausted_windows"))
+_EVIDENCE_KINDS = frozenset((
+    "codex_exhausted", "claude_exhausted", "provider_usage_429"))
+
+
+def _validate_limit_event(event):
+    if not isinstance(event, dict) or frozenset(event) != _LIMIT_EVENT_KEYS:
+        _invalid()
+    policy._check_uuid(event["event_id"])
+    policy._check_uuid(event["account_id"])
+    if event["model_id"] is not None:
+        policy._check_uuid(event["model_id"])
+    policy._check_uuid(event["turn_id"])
+    policy._check_int(event["observed_at"], 1)
+    if event["evidence_kind"] not in _EVIDENCE_KINDS:
+        _invalid()
+    if event["resets_at"] is not None:
+        policy._check_int(event["resets_at"], 1)
+    windows = event["exhausted_windows"]
+    if not isinstance(windows, list) or not all(isinstance(w, str) for w in windows):
+        _invalid()
+
+
+def record_limit_event(path, event, now_ms):
+    """Publish a reporter-observed limit exhaustion as a parked block on
+    the account (section 7: "POST /limit-events... 202
+    {block_id,retry_at,state}").
+
+    A block is account-wide (model_id NULL) or model-scoped, matching the
+    blocks_live partial index (one live block per (account,
+    model-or-null)). Idempotent by event_id: an identical replay returns
+    the SAME block; a reused event_id naming a different account/model is
+    IDEMPOTENCY_CONFLICT. A DIFFERENT event_id for an account that already
+    has a live block joins that existing block rather than raising a
+    uniqueness conflict - this is exactly the card's own demo ("two
+    machines share one block"): a second reporter's exhaustion evidence
+    for the same account does not fork a second block, it confirms the
+    one already parking that account.
+
+    The store has no separate limit-events table (none is named in
+    section 7's table list); turn_id/exhausted_windows are validated for
+    shape but only the fields the blocks/audit tables actually carry
+    (evidence_kind as reason, resets_at as retry_at, event_id as
+    source_event_id) are persisted - a scope decision recorded in
+    docs/STEP-CARD-5.md, not a silent drop.
+    """
+    policy._check_int(now_ms, 1)
+    _validate_limit_event(event)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT id, account_id, model_id, retry_at, state FROM "
+                "blocks WHERE source_event_id=?",
+                (event["event_id"],)).fetchone()
+            if existing is not None:
+                if (existing[1] != event["account_id"]
+                        or existing[2] != event["model_id"]):
+                    raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                     errors.MSG_IDEMPOTENCY_CONFLICT)
+                conn.execute("COMMIT")
+                return {"block_id": existing[0], "retry_at": existing[3],
+                        "state": existing[4]}
+            account = conn.execute("SELECT id FROM accounts WHERE id=?",
+                                   (event["account_id"],)).fetchone()
+            if account is None:
+                _not_found()
+            if event["model_id"] is not None:
+                model = conn.execute(
+                    "SELECT id FROM models WHERE id=? AND account_id=?",
+                    (event["model_id"], event["account_id"])).fetchone()
+                if model is None:
+                    _not_found()
+            block_id = str(_uuid.uuid4())
+            conn.execute(
+                "INSERT OR IGNORE INTO blocks(id, account_id, model_id, "
+                "reason, retry_at, state, source_event_id, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (block_id, event["account_id"], event["model_id"],
+                 event["evidence_kind"], event["resets_at"], "parked",
+                 event["event_id"], now_ms))
+            live = conn.execute(
+                "SELECT id, retry_at, state FROM blocks WHERE account_id=? "
+                "AND model_id IS ? AND state IN ('parked','probing')",
+                (event["account_id"], event["model_id"])).fetchone()
+            if live is None:
+                # The partial index only restricts live states; a missed
+                # insert here would mean the account/model pair already
+                # had a live row under a stricter identity than queried -
+                # fail closed rather than report success silently.
+                raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("coordinator", "limit_event_recorded", live[0], now_ms,
+                 json.dumps({"evidence_kind": event["evidence_kind"]})))
+            conn.execute("COMMIT")
+            return {"block_id": live[0], "retry_at": live[1], "state": live[2]}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
