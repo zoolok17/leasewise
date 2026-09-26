@@ -272,6 +272,17 @@ class BillingReviewRegressions(unittest.TestCase):
         ctx['policy'].update(ledger_basis='invoice_total', vat_bps=2000)
         self.assertEqual(evaluate_billing(ctx, req)['reason'], 'gateway_unusable')
 
+    def test_raw_provider_conflict_cannot_round_away(self):
+        older = _provider(102, False, T-1000, _eid('raw-older'))
+        newer = _provider(101, False, T, _eid('raw-newer'))
+        for providers in ([older, newer], [newer, older]):
+            ctx, req = case([snap(85)], providers)
+            ctx['policy'].update(provider_basis='invoice_total', vat_bps=2000)
+            before = copy.deepcopy(ctx)
+            out = evaluate_billing(ctx, req)
+            self.assertEqual((out['reason'], out['action']), ('source_conflict', 'alert'))
+            self.assertEqual(ctx, before)
+
     def test_explicit_overlap_without_proof_rejected_on_unusable_ledger(self):
         p = _provider(50*E, False, T)
         ctx, req = case([], [p], coverage=[cert(p, floor=1, proof=False)])
