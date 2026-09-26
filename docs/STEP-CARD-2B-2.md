@@ -298,3 +298,36 @@ explicitly stated otherwise; each has the `test_` prefix.
   Test temporary files stayed under task scratch. `git diff --check`
   passed. The isolated clone and red/green/mutation logs are retained
   for the lead to fetch and review; no push was performed.
+
+## Fix round 2
+
+Contributor/reviewer reference for the delta after `aa17e21`. The four
+follow-up counterexamples are fixed in the pure advisory evaluator; no
+lease enforcement, provider I/O or stored reconciliation state changes.
+All test names below are in `tests/test_billing_eval_fix_round2.py` and
+have the `test_` prefix.
+
+| Finding | Fix | Regression evidence |
+|---|---|---|
+| N1 (major): inverted historical bracket | At an equal observation time the upper uses the highest sequence. Both sides must exist within the window and upper seq must be at least lower seq; inversion supplies no historical certificate. Current-chain latest selection remains highest-seq. | n1_timestamp_ties_use_later_sequence; n1_clock_rollback_never_inverts_historical_bracket (both input orders, exact T and between rolled-back times). |
+| N2 (C7 remainder): raw activity rounded away | Derive last financial change before basis conversion. Raw reserves 5 to 6 break idle even though both convert to 5; unchanged raw reserves retain the timer. | n2_raw_reserve_change_breaks_idle_despite_rounding; also asserts converted headroom and input immutability. |
+| N3 (C8 remainder): matched without overlap proof | Matched requires proved, fresh, conflict-free overlap in addition to complete certificates and tolerance. P=49.9/L=50 with an unproved derived overlap stays temporally_unresolved; a valid explicit floor can establish matched. | n3_matched_requires_proved_overlap. |
+| N4 (C9 remainder): stale input skips numeric validation | Reject explicit floors exceeding converted provider money before usability short-circuits. Continuous chains also supply known current/historical bounds even when stale; missing/ambiguous chains do not invent bounds. | n4_stale_ledger_cannot_hide_invalid_explicit_floor; n4_known_provider_and_historical_bounds_always_validate; n4_stale_ledger_valid_floor_stays_unavailable. |
+
+The initial six-test run on unchanged production code failed with eight
+subtest failures covering every finding. After the fixes, those six tests
+passed. One further boundary test covers absent ledger evidence and a
+historical bound below the current ledger. The combined first/second fix
+regression selection passes 46 tests. Valid stale evidence still returns
+unavailable headroom; early validation cannot authorize stale money.
+
+The historical-bracket clarification rejects inversion rather than sorting
+the current ledger by wall clock. A tie is resolved using sequence; a
+rollback that leaves the upper older than the lower remains unresolved.
+The earlier closure of C7/C8/C9 applied to their initial examples; the
+narrower combinations reported in the second read are covered here.
+
+Final verification: `python -m unittest discover -s tests` ran once after
+all production/test edits: **297 tests passed in 78.261s**, foreground.
+`git diff --check` passed. The clone and red/green/full-suite logs remain
+in task scratch for the lead's fetch and evidence review; no push.

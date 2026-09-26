@@ -419,7 +419,7 @@ def _scope_matches(ctx):
                for e in ctx["provider_events"])
 
 
-def _gateway_usable(ctx, now_ms):
+def _gateway_usable(ctx, now_ms, *, require_fresh=True):
     """Validate the store-selected chain before selecting highest seq.
 
     Reconcile state is authoritative; history validates continuity but does
@@ -457,7 +457,7 @@ def _gateway_usable(ctx, now_ms):
             if previous_settled is not None and money[0] < previous_settled:
                 return False
             previous_settled = money[0]
-        if not 0 <= now_ms - chain[-1][1] <= _BRACKET_WINDOW_MS:
+        if require_fresh and not 0 <= now_ms - chain[-1][1] <= _BRACKET_WINDOW_MS:
             return False
     return True
 
@@ -497,13 +497,44 @@ def _boundary_e(chains, at, max_age_ms=_BRACKET_WINDOW_MS):
 
 def _bracket(chains, at):
     """Inclusive brackets around upper_at; settled AND open come from UPPER."""
-    if at is None or _boundary_e(chains, at) is None:
+    if at is None or not chains:
         return None
-    upper = [min((r for r in chain if 0 <= r[1]-at <= _BRACKET_WINDOW_MS),
-                 key=lambda r: (r[1], r[0]), default=None) for chain in chains]
-    if any(r is None for r in upper):
-        return None
+    upper = []
+    for chain in chains:
+        lower = max((r for r in chain if 0 <= at-r[1] <= _BRACKET_WINDOW_MS),
+                    key=lambda r: (r[1], r[0]), default=None)
+        # At equal observation times, the later sequence carries the
+        # conservative upper exposure. Clock rollback must not invert
+        # the bracket, even when current-chain ordering remains valid.
+        following = min((r for r in chain if 0 <= r[1]-at <= _BRACKET_WINDOW_MS),
+                        key=lambda r: (r[1], -r[0]), default=None)
+        if lower is None or following is None or following[0] < lower[0]:
+            return None
+        upper.append(following)
     return _sum(r[2] for r in upper), _sum(v for r in upper for v in r[2:5])
+
+
+def _validate_known_overlap_bounds(ctx, req):
+    """Staleness cannot excuse evidence disproved by known numeric bounds."""
+    explicit_entries = [e for e in req["coverage"]
+                        if e["overlap_floor_micro_eur"] is not None]
+    if not explicit_entries:
+        return
+    amounts = {e["event_id"]: e["payload"]["total_micro_eur"]
+               for e in ctx["provider_events"]}
+    continuous = _gateway_usable(ctx, req["now_ms"], require_fresh=False)
+    chains = list(ctx["chains_by_gateway"].values())
+    ledger = _sum(chain[-1][2] for chain in chains) if continuous else None
+    for entry in explicit_entries:
+        explicit = entry["overlap_floor_micro_eur"]
+        bounds = [amounts[entry["event_id"]]]
+        if continuous:
+            bounds.append(ledger)
+            bound = _boundary_e(chains, entry["complete_at"])
+            if bound is not None:
+                bounds.append(bound)
+        if explicit > min(bounds):
+            _invalid()
 
 
 def _overlaps(events, coverage, chains, ledger):
@@ -587,7 +618,7 @@ def _decision(ctx, req, ledger, reserves, comparable):
                           max_age_ms=None)
         if old is not None and amount < old - _tolerance(old, policy):
             return "provider_behind", "missing_old_spend", "alert", quality
-    last_change = _last_financial_change(chains)
+    last_change = ctx["last_financial_change"]
     if (last_change is not None and now-last_change >= policy["lag_seconds"] * 1000
             and latest["payload"]["total_micro_eur"] < ledger - _tolerance(ledger, policy)):
         return "provider_behind", "lag_investigate", "alert", "provisional"
@@ -596,7 +627,7 @@ def _decision(ctx, req, ledger, reserves, comparable):
         return "temporally_unresolved", reason, "none", "provisional"
     if any(p > l + _tolerance(l, policy) for _, p, l, _ in certified):
         return "reserve_or_scope_covered", "reserve_or_scope_covered", "none", quality
-    if all(entry["complete_at"] is not None and entry["matched_provenance"]
+    if comparable and all(entry["complete_at"] is not None and entry["matched_provenance"]
            and l == u and abs(p-l) <= _tolerance(l, policy)
            for entry, p, l, u in certified) and len(certified) == len(events):
         return "matched", "matched", "none", quality
@@ -612,7 +643,13 @@ def evaluate_billing(context, request):
     # The store latches conflicts on source amounts. Basis conversion may
     # round distinct amounts alike, but it must never clear that latch.
     ctx["provider_conflict"] = _conflict_latched(ctx["provider_events"])
+    # Preserve raw activity before conversion can round distinct amounts
+    # alike. Epoch changes are already gated by current-chain continuity.
+    ctx["last_financial_change"] = _last_financial_change(
+        ctx["chains_by_gateway"].values())
     basis_ok = _normalize_money(ctx)
+    if basis_ok:
+        _validate_known_overlap_bounds(ctx, req)
     scope_ok = basis_ok and _scope_matches(ctx)
     usable = scope_ok and _gateway_usable(ctx, req["now_ms"])
     ledger = reserves = estimate = headroom = None
