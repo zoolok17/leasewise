@@ -72,8 +72,7 @@ def _context(readings):
         "gateways": [{"gateway": "g1", "share_micro_eur": 60_000_000,
                       "current_chain_event_ids": [
                           r["event_id"] for r in readings
-                          if r["kind"] == "gateway_snapshot"],
-                      "reconciliation_required": False}],
+                          if r["kind"] == "gateway_snapshot"]}],
         "policy": dict(_POLICY),
         "readings": readings,
         "unresolved_event_ids": [],

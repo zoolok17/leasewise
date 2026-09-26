@@ -66,8 +66,7 @@ _CONTEXT_KEYS = frozenset({
     "boundary_event_ids",
 })
 _GATEWAY_KEYS = frozenset({"gateway", "share_micro_eur",
-                           "current_chain_event_ids",
-                           "reconciliation_required"})
+                           "current_chain_event_ids"})
 _READING_KEYS = frozenset({
     "event_id", "machine", "account", "kind", "observed_at", "payload",
     "received_at",
@@ -153,23 +152,26 @@ def _validate_context(context):
     if not isinstance(context["gateways"], list):
         _invalid()
     gateways = []
+    gateway_names = set()
     for gw in context["gateways"]:
         if not isinstance(gw, dict) or frozenset(gw) != _GATEWAY_KEYS:
             _invalid()
         if not _is_alias(gw["gateway"]):
             _invalid()
+        if gw["gateway"] in gateway_names:
+            _invalid()
+        gateway_names.add(gw["gateway"])
         if not _is_nonneg_int(gw["share_micro_eur"]):
             _invalid()
         chain = gw["current_chain_event_ids"]
         if not isinstance(chain, list) or not all(_is_uuid(e) for e in chain):
             _invalid()
-        if not _is_bool(gw["reconciliation_required"]):
+        if len(chain) != len(set(chain)):
             _invalid()
         gateways.append({
             "gateway": gw["gateway"],
             "share_micro_eur": gw["share_micro_eur"],
             "current_chain_event_ids": list(chain),
-            "reconciliation_required": gw["reconciliation_required"],
         })
 
     # policy: the full billing-policy-import record (closed shape), and it
@@ -187,10 +189,19 @@ def _validate_context(context):
     if not isinstance(context["readings"], list):
         _invalid()
     readings = [_validate_reading(r, account) for r in context["readings"]]
+    by_id = {}
+    for reading in readings:
+        event_id = reading["event_id"]
+        if event_id in by_id and by_id[event_id] != reading:
+            _invalid()
+        by_id[event_id] = reading
+    readings = list(by_id.values())
 
     # unresolved_event_ids: local UUID references (closed type).
     unresolved = context["unresolved_event_ids"]
     if not isinstance(unresolved, list) or not all(_is_uuid(e) for e in unresolved):
+        _invalid()
+    if len(unresolved) != len(set(unresolved)) or any(e not in by_id for e in unresolved):
         _invalid()
 
     boundary_exposure = context["boundary_exposure_micro_eur"]
@@ -202,6 +213,8 @@ def _validate_context(context):
     boundary_ids = context["boundary_event_ids"]
     if not isinstance(boundary_ids, list) or not all(_is_uuid(e) for e in boundary_ids):
         _invalid()
+    if len(boundary_ids) != len(set(boundary_ids)):
+        _invalid()
     reading_ids = {r["event_id"] for r in readings}
     for ref in boundary_ids:
         if ref not in reading_ids:
@@ -211,6 +224,10 @@ def _validate_context(context):
     for gw in gateways:
         for ref in gw["current_chain_event_ids"]:
             if ref not in reading_ids:
+                _invalid()
+            row = by_id[ref]
+            if (row["kind"] != KIND_GATEWAY_SNAPSHOT
+                    or row["payload"]["gateway"] != gw["gateway"]):
                 _invalid()
 
     # current-period provider events and per-gateway ledger chains
@@ -271,6 +288,8 @@ def _validate_reading(reading, account):
     if not _is_nonneg_int(observed_at) or not _is_nonneg_int(received_at):
         _invalid()
     payload = reading["payload"]
+    if not isinstance(payload, dict):
+        _invalid()
     if kind == KIND_PROVIDER_BILLING:
         norm = _validate_provider_billing(payload, observed_at)
     elif kind == KIND_GATEWAY_SNAPSHOT:
@@ -304,7 +323,7 @@ def _validate_request(request, ctx):
     """Validate the closed evaluation request; return a normalized copy."""
     if not isinstance(request, dict) or frozenset(request) != _REQUEST_KEYS:
         _invalid()
-    if request["version"] != 1:
+    if type(request["version"]) is not int or request["version"] != 1:
         _invalid()
     if not _is_alias(request["account"]) or request["account"] != ctx["account"]:
         _invalid()
@@ -401,8 +420,6 @@ def _gateway_usable(ctx):
     transition no longer listed does not re-latch."""
     for gw in ctx["gateways"]:
         chain = ctx["chains_by_gateway"][gw["gateway"]]
-        if gw["reconciliation_required"]:
-            return False, "gateway_unusable"
         if _chain_is_decreasing(chain):
             return False, "gateway_unusable"
         listed = set(ctx["unresolved_event_ids"])
@@ -772,7 +789,6 @@ def evaluate_billing(context, request):
         "headroom_micro_eur": headroom,
         "request_fits": request_fits,
         "proposal": None,
-        "conflict_latched": conflict,
     }
 
 

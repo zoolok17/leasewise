@@ -116,7 +116,7 @@ def _context(**over):
         "cap_micro_eur": 100_000_000,
         "gateways": [
             {"gateway": "g1", "share_micro_eur": 60_000_000,
-             "current_chain_event_ids": [], "reconciliation_required": False},
+             "current_chain_event_ids": []},
         ],
         "policy": copy.deepcopy(_POLICY),
         "readings": [],
@@ -208,7 +208,7 @@ class BillingEvalInput(unittest.TestCase):
         # a current_chain_event_id that references no reading
         ctx2 = _context(readings=[_provider(80_000_000, False, SEP + 1)],
                         gateways=[{"gateway": "g1", "share_micro_eur": 60,
-                                   "current_chain_event_ids": [_eid("ghost")], "reconciliation_required": False}])
+                                   "current_chain_event_ids": [_eid("ghost")]}])
         self._reject(ctx2, req)
 
     def test_boundary_ids_are_known(self):
@@ -279,7 +279,7 @@ class BillingEvalInput(unittest.TestCase):
                 _snapshot(0, SEP + 86_400_000, b),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB], "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[b],
         )
@@ -312,7 +312,7 @@ class BillingOverlapPrecedence(unittest.TestCase):
                 _snapshot(60_000_000, SEP + 2 * 86_400_000, evB),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB], "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
         )
 
     def test_explicit_valid_floor_wins(self):
@@ -445,8 +445,7 @@ class BillingGrossExcessUncertified(unittest.TestCase):
                 _snapshot(l, snap_obs, ev, reserved=r),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -474,8 +473,7 @@ class BillingGrossExcessUncertified(unittest.TestCase):
                 _snapshot(80_000_000, prov_obs + 125_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -494,8 +492,7 @@ class BillingGrossExcessUncertified(unittest.TestCase):
                 _snapshot(80_000_000, prov_obs + 121_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request())
         self.assertNotEqual(out["action"], "hold")
@@ -512,8 +509,7 @@ class BillingGrossExcessUncertified(unittest.TestCase):
                 _snapshot(80_000_000, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         # now far after max_age has passed: the sample is stale.
         out = _eval(ctx, _request(now_ms=prov_obs + 7200_000 + 1000))
@@ -548,8 +544,7 @@ class BillingGrossAllowance(unittest.TestCase):
             readings=readings,
             policy=dict(_POLICY, non_ai_allowance_micro_eur=allowance),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=b,
             boundary_event_ids=list(b_refs),
         )
@@ -621,8 +616,7 @@ class BillingConflictedLatestGross(unittest.TestCase):
             ],
             policy=dict(_POLICY, non_ai_allowance_micro_eur=allowance),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -645,7 +639,7 @@ class BillingConflictedLatestGross(unittest.TestCase):
         self.assertEqual(out["reason"], "provider_excess")
         self.assertEqual(out["quality"], "comparable")
         # The latched conflict is still reported, not cleared.
-        self.assertEqual(out["conflict_latched"], True)
+        self.assertEqual(out["known_floor_micro_eur"], 100_000_000)
 
 
 class BillingLatestChainSeq(unittest.TestCase):
@@ -659,8 +653,7 @@ class BillingLatestChainSeq(unittest.TestCase):
         return _context(
             readings=list(chain_events) + list(extra),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": list(chain),
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": list(chain)}],
         )
 
     def test_highest_seq_in_current_chain_wins(self):
@@ -720,8 +713,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
                 _snapshot(40_000_000, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         ctx.update(ctx_over)
         return _eval(ctx, _request())
@@ -739,8 +731,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
             readings=[_provider(50_000_000, False, SEP + 1),
                       _snapshot(0, SEP + 1, be)],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": []}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be])
         self._assert_unusable(out)
@@ -758,8 +749,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
                 _snapshot(40_000_000, prov_obs + 121_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request())
         self.assertEqual(out["action"], "alert")
@@ -780,8 +770,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
                 _snapshot(40_000_000, t2, _eid("s3"), seq=3),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [_eid("s2"), _eid("s3")],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [_eid("s2"), _eid("s3")]}],
         )
         self._assert_unusable(_eval(ctx, _request()))
 
@@ -794,9 +783,9 @@ class BillingGatewayUncertainty(unittest.TestCase):
                 _snapshot(40_000_000, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": True}],
+                       "current_chain_event_ids": [ev]}],
         )
+        ctx["unresolved_event_ids"] = [ev]
         self._assert_unusable(_eval(ctx, _request()))
 
     def test_unattributed_counted_once(self):
@@ -812,8 +801,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
                           uncertain=1_000_000, unattributed=2_000_000),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request())
         # settled is 40M; the 2M unattributed inside it is not added.
@@ -835,8 +823,7 @@ class BillingReconcileStatePrecedence(unittest.TestCase):
                 _snapshot(40_000_000, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             unresolved_event_ids=unresolved,
         )
 
@@ -883,8 +870,7 @@ class BillingMidnightExposure(unittest.TestCase):
         return _context(
             readings=readings,
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=b,
             boundary_event_ids=list(b_refs),
         ), _request(now_ms=now)
@@ -931,8 +917,7 @@ class BillingReconcileSnapshotSkew(unittest.TestCase):
                 _snapshot(10_000_000, prov_obs - 130_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         self.assertEqual(out["state"], "temporally_unresolved")
@@ -955,8 +940,7 @@ class BillingReconcileSnapshotSkew(unittest.TestCase):
                 _snapshot(10_000_000, t_lower, ev_l, seq=1),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev_u, ev_l],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev_u, ev_l]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -987,8 +971,7 @@ class BillingReconcileUncertainOverlap(unittest.TestCase):
                 _snapshot(18_430_000, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request(now_ms=prov_obs + 60_000,
                                   coverage=[{
@@ -1017,8 +1000,7 @@ class BillingReconcileUncertainOverlap(unittest.TestCase):
                 _snapshot(17_900_000, t_lower, ev_l, seq=1),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev_u, ev_l],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev_u, ev_l]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -1054,8 +1036,7 @@ class BillingReconcileLagTimer(unittest.TestCase):
                 _snapshot(l, last_change, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         ), _request(now_ms=now)
@@ -1128,8 +1109,7 @@ class BillingTolerance(unittest.TestCase):
                 _snapshot(l, prov_obs + 40_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [ev]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -1181,8 +1161,7 @@ class BillingHeadroom(unittest.TestCase):
             ],
             policy=dict(_POLICY, non_ai_allowance_micro_eur=allowance),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=b,
             boundary_event_ids=[evA] if b is not None else [])
 
@@ -1252,8 +1231,7 @@ class BillingHeadroom(unittest.TestCase):
                 _snapshot(50_000_000, prov_obs + 40_000, evB),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         self.assertEqual(out["admission_basis"], "ledger_fallback")
@@ -1280,8 +1258,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [r["event_id"]
                                                    for r in readings
-                                                   if r["kind"] == "gateway_snapshot"],
-                       "reconciliation_required": False}],
+                                                   if r["kind"] == "gateway_snapshot"]}],
             boundary_exposure_micro_eur=b,
             boundary_event_ids=[readings[1]["event_id"]] if b is not None
             else [])
@@ -1332,7 +1309,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         out = _eval(ctx, _request(now_ms=t2 + 50_000))
         self.assertEqual(out["action"], "alert")
         self.assertEqual(out["reason"], "source_conflict")
-        self.assertTrue(out["conflict_latched"])
+        self.assertEqual(out["reason"], "source_conflict")
         self.assertEqual(out["admission_basis"], "ledger_fallback")
         self.assertEqual(out["headroom_micro_eur"], 55_000_000)
 
@@ -1397,8 +1374,7 @@ class BillingFallbackAllowance(unittest.TestCase):
             ],
             policy=dict(_POLICY, non_ai_allowance_micro_eur=10_000_000),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
                                   requested_micro_eur=40_000_000))
@@ -1413,7 +1389,7 @@ class BillingFallbackAllowance(unittest.TestCase):
 _OUTPUT_KEYS = frozenset({
     "state", "action", "reason", "quality", "admission_basis",
     "known_floor_micro_eur", "estimate_micro_eur", "headroom_micro_eur",
-    "request_fits", "proposal", "conflict_latched",
+    "request_fits", "proposal",
 })
 _STATES = frozenset({
     "unknown", "unexplained_excess", "conflict", "temporally_unresolved",
@@ -1453,8 +1429,7 @@ class BillingOutputErrors(unittest.TestCase):
                 _snapshot(50_000_000, prov_obs + 40_000, evB),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
         req = _request(now_ms=prov_obs + 50_000)
         return [
@@ -1474,8 +1449,7 @@ class BillingOutputErrors(unittest.TestCase):
                 ],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                            "current_chain_event_ids": [_eid("ha"),
-                                                       _eid("hl")],
-                           "reconciliation_required": False}],
+                                                       _eid("hl")]}],
                 boundary_exposure_micro_eur=0,
                 boundary_event_ids=[_eid("ha")]),
              _request(now_ms=prov_obs + 50_000)),
@@ -1483,8 +1457,7 @@ class BillingOutputErrors(unittest.TestCase):
                 readings=[_provider(50_000_000, False, prov_obs,
                                     _eid("prov"))],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                           "current_chain_event_ids": [],
-                           "reconciliation_required": False}]),
+                           "current_chain_event_ids": []}]),
              _request(now_ms=prov_obs + 50_000)),
             ("no_sample", _context(
                 readings=[
@@ -1493,8 +1466,7 @@ class BillingOutputErrors(unittest.TestCase):
                 ],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                            "current_chain_event_ids": [_eid("na"),
-                                                       _eid("nl")],
-                           "reconciliation_required": False}]),
+                                                       _eid("nl")]}]),
              _request(now_ms=prov_obs + 50_000)),
             ("conflict", _context(
                 readings=[
@@ -1504,8 +1476,7 @@ class BillingOutputErrors(unittest.TestCase):
                     _snapshot(45_000_000, prov_obs + 40_000, _eid("cl")),
                 ],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                           "current_chain_event_ids": [_eid("cl")],
-                           "reconciliation_required": False}],
+                           "current_chain_event_ids": [_eid("cl")]}],
                 boundary_exposure_micro_eur=0,
                 boundary_event_ids=[_eid("cl")]),
              _request(now_ms=prov_obs + 50_000)),
@@ -1517,8 +1488,7 @@ class BillingOutputErrors(unittest.TestCase):
                 ],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                            "current_chain_event_ids": [_eid("aa"),
-                                                       _eid("al")],
-                           "reconciliation_required": False}],
+                                                       _eid("al")]}],
                 boundary_exposure_micro_eur=0,
                 boundary_event_ids=[_eid("aa")]),
              _request(now_ms=prov_obs + 50_000)),
@@ -1530,8 +1500,7 @@ class BillingOutputErrors(unittest.TestCase):
                 ],
                 gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                            "current_chain_event_ids": [_eid("pa"),
-                                                       _eid("pl")],
-                           "reconciliation_required": False}]),
+                                                       _eid("pl")]}]),
              _request(now_ms=prov_obs + 50_000)),
         ]
 
@@ -1553,7 +1522,6 @@ class BillingOutputErrors(unittest.TestCase):
             self.assertIsNone(out["proposal"], name)
             self.assertTrue(out["request_fits"] is None
                             or type(out["request_fits"]) is bool, name)
-            self.assertIsInstance(out["conflict_latched"], bool, name)
             json.dumps(out)  # closed and serializable
 
     def test_deterministic_and_side_effect_free(self):
@@ -1576,8 +1544,7 @@ class BillingOutputErrors(unittest.TestCase):
                 _snapshot(50_000_000, prov_obs + 40_000, evB),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [evA, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [evA, evB]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[evA])
         return ctx, _request(now_ms=prov_obs + 50_000)
 
@@ -1652,8 +1619,7 @@ class BillingPrivacy(unittest.TestCase):
                      machine=self._MACHINE),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [self._P1, evB],
-                       "reconciliation_required": False}],
+                       "current_chain_event_ids": [self._P1, evB]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[self._P1])
         ctx.update(over)
         return ctx

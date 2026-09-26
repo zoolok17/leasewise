@@ -29,8 +29,7 @@ def case(samples=None, providers=None, now=T+60_000, coverage=None):
     providers = [] if providers is None else providers
     ctx = _context(readings=samples + providers, boundary_exposure_micro_eur=0,
                    gateways=[dict(gateway='g1', share_micro_eur=60*E,
-                                  current_chain_event_ids=[s['event_id'] for s in samples],
-                                  reconciliation_required=False)])
+                                  current_chain_event_ids=[s['event_id'] for s in samples])])
     return ctx, _request(now_ms=now, coverage=coverage or [])
 
 
