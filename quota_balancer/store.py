@@ -157,7 +157,10 @@ def _upsert(conn, accounts, machines, gateways):
 
     Retained aliases are updated in place (config-owned columns only, so the
     card-2 state columns survive); new aliases are inserted; removed aliases
-    are deleted only when unreferenced (children before parents).
+    are deleted only when unreferenced (children before parents). Before any
+    of that, an account with a billing policy must stay ingest-able under
+    the document (metered kind, B01 allocation) - otherwise the import is
+    refused and nothing is written.
     """
     # Read the old maps under the write lock: a concurrent import cannot
     # commit new UUIDs between this read and the updates/deletes below.
@@ -173,6 +176,38 @@ def _upsert(conn, accounts, machines, gateways):
         account_ids[alias] = old_accounts.get(alias) or str(uuid.uuid4())
     for alias in machines:
         machine_ids[alias] = old_machines.get(alias) or str(uuid.uuid4())
+
+    # Billing-policy guard: an account that carries a policy must stay
+    # ingest-able, because every billing reading for it re-checks the
+    # metered kind and the B01 allocation (shares + non-AI allowance
+    # <= cap, on the cap's tax basis) against the CURRENT config. An
+    # import that dropped the alias (the removal guards below refuse it
+    # the same way) or that flipped its kind, or that broke the
+    # allocation, is refused - static error, nothing written - instead
+    # of stranding the account: every later billing reading would be
+    # refused, and a mixed batch would lose its gateway snapshot too.
+    # The check mirrors the ingest re-check: same kind rule, same
+    # allocation, against the DOCUMENT's new kind, cap and shares - the
+    # config a later reading would re-check if the import were allowed.
+    # The shares come from the document (the DB still holds the old
+    # gateways at this point), not the store.
+    new_accounts = {alias: (kind, budget)
+                    for alias, _vendor, kind, budget in accounts}
+    new_shares = {}
+    for _galias, account, _machine, share, _period in gateways:
+        new_shares[account] = new_shares.get(account, 0) + share
+    for (alias, kind, allowance, cap_basis, ledger_basis,
+         vat_bps) in conn.execute(
+            "SELECT a.alias, a.kind, "
+            "p.non_ai_allowance_micro_eur, p.cap_basis, p.ledger_basis, "
+            "p.vat_bps FROM billing_policies p "
+            "JOIN accounts a ON a.id = p.account_id"):
+        new = new_accounts.get(alias)
+        if new is None or new[0] != kind:
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        allocation_within_cap(
+            new[1], new_shares.get(alias, 0), allowance, cap_basis,
+            ledger_basis, vat_bps)
 
     # Accounts: update config-owned columns for retained aliases (the card-2
     # state columns - window_keys, activity_seq, coverage_complete,
