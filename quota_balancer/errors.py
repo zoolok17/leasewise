@@ -36,6 +36,13 @@ CODE_WINDOW_LIMIT = "WINDOW_LIMIT"
 CODE_ACCOUNT_PARKED = "ACCOUNT_PARKED"
 CODE_CONCURRENCY_LIMIT = "CONCURRENCY_LIMIT"
 
+# Card 5 private-HTTP transport errors (docs/DESIGN.md sections 6-7).
+# These never occur off the HTTP transport (there is no CLI request to
+# authenticate), so they are not in EXIT_CODES; the HTTP layer maps them
+# to 401/403 directly (docs/STEP-CARD-5.md).
+CODE_UNAUTHENTICATED = "UNAUTHENTICATED"
+CODE_FORBIDDEN = "FORBIDDEN"
+
 EXIT_CODES = {
     CODE_INVALID_CONFIG: 2,
     CODE_SCHEMA_UNSUPPORTED: 2,
@@ -91,6 +98,8 @@ MSG_MONEY_LIMIT = "the money limit is reached"
 MSG_WINDOW_LIMIT = "the window limit is reached"
 MSG_ACCOUNT_PARKED = "the account is parked"
 MSG_CONCURRENCY_LIMIT = "the concurrency limit is reached"
+MSG_UNAUTHENTICATED = "client identity is missing or unrecognized"
+MSG_FORBIDDEN = "the identified machine is not authorized for this request"
 
 
 class QuotaError(Exception):

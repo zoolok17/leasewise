@@ -776,6 +776,45 @@ def set_coverage(path, account, complete):
         conn.close()
 
 
+def set_machine_identity(path, machine, identity_ref, enabled):
+    """Enroll or update a machine's HTTP identity allowlist entry
+    (operator-only; card 5's identity allowlist, docs/DESIGN.md section
+    6: "optional private authenticated TLS tailnet ingress with machine
+    allowlist"). There is no remote/HTTP path to this: enrollment is a
+    local, operator-driven action, same as set_coverage/reconcile.
+
+    `identity_ref` is the opaque value the host ingress presents per
+    request (unique among enrolled machines; None un-enrolls). `enabled`
+    is a boolean; a disabled machine is refused like an unenrolled one.
+    """
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            row = conn.execute(
+                "SELECT id FROM machines WHERE alias = ?", (machine,)
+            ).fetchone()
+            if row is None:
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            if identity_ref is not None and conn.execute(
+                    "SELECT 1 FROM machines WHERE identity_ref = ? "
+                    "AND id != ?", (identity_ref, row[0])).fetchone():
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            conn.execute(
+                "UPDATE machines SET identity_ref=?, enabled=? WHERE id=?",
+                (identity_ref, 1 if enabled else 0, row[0]),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
 def reconcile(path, gateway):
     """Clear a gateway's reconciliation_required state (operator-only).
 

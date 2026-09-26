@@ -9,6 +9,7 @@ import sys
 
 from . import errors
 from .errors import QuotaError
+from .http_api import DEFAULT_HOST, BindRefused, make_server
 from .store import (
     billing_policy_import,
     import_config,
@@ -16,6 +17,7 @@ from .store import (
     reading_import,
     reconcile,
     set_coverage,
+    set_machine_identity,
     status,
 )
 
@@ -71,6 +73,21 @@ def _build_parser():
         help="clear a gateway's reconciliation_required state (operator-only)",
     )
     recon.add_argument("--gateway", required=True, help="gateway alias")
+    identity = sub.add_parser(
+        "identity-set",
+        help="enroll/update a machine's HTTP identity allowlist entry (operator-only)",
+    )
+    identity.add_argument("--machine", required=True, help="machine alias")
+    identity.add_argument("--identity-ref", required=True,
+                          help="the opaque identity value the ingress presents")
+    identity.add_argument("--enabled", required=True, type=_bool,
+                          help="'true' or 'false'")
+    serve = sub.add_parser(
+        "serve", help="run the card-5 private /v1 HTTP server (blocking)"
+    )
+    serve.add_argument("--host", default=DEFAULT_HOST,
+                       help="bind address; must be a literal loopback IP")
+    serve.add_argument("--port", type=int, default=8443)
     return parser
 
 
@@ -89,6 +106,15 @@ def main(argv=None):
             set_coverage(args.db, args.account, args.complete)
         elif args.verb == "reconcile":
             reconcile(args.db, args.gateway)
+        elif args.verb == "identity-set":
+            set_machine_identity(args.db, args.machine, args.identity_ref,
+                                 args.enabled)
+        elif args.verb == "serve":
+            try:
+                make_server(args.db, host=args.host, port=args.port).serve_forever()
+            except BindRefused:
+                _emit_error(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+                return errors.EXIT_CODES[errors.CODE_INVALID_REQUEST]
         else:
             print(json.dumps(status(args.db), separators=(",", ":")))
         return 0

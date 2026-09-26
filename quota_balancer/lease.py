@@ -515,7 +515,7 @@ def _grant(conn, request, now_ms):
         if account is None:
             _not_found()
         machine_id = seat[1]
-        account_id, _kind, budget = account
+        account_id, account_kind, budget = account
         # Project authorization (section 7: children share project
         # authorization; the server derives membership): the model's
         # account must be one the seat's project has been given.
@@ -591,6 +591,29 @@ def _grant(conn, request, now_ms):
         # machine: a foreign one cannot bind (much less upgrade the
         # enforcement of) the lease.
         enforcement = seat[3]
+        # CARRY-OVER m4 (STEP-CARD-4, closed in card 5): a seat's stored
+        # enforcement is an operator setting, not a request the client can
+        # shape - but subscription_admission/subscription_warn are
+        # declarations that THIS seat is billed by a subscription, not by
+        # this account's money admission at all. On a METERED account
+        # (one WITH a real budget) that declaration is simply wrong, and
+        # silently honoring it would skip money admission entirely (a
+        # seat setting acting as a money bypass). shadow is NOT included:
+        # it is a generic observe-only mode with no billing-model claim
+        # of its own (section 6: "Old wrappers keep working in
+        # observe-only deployments and appear unmanaged/unmetered"), and
+        # is exercised deliberately on a metered account by
+        # test_card4_turn_c_fix.test_shadow_consumes_no_concurrency_slot.
+        # The design gives no explicit ruling for this combination
+        # (docs/DESIGN.md only states "only metered_advisory is permitted
+        # on a metered account" for the pre-6b sized-enforcement path
+        # itself); the fail-closed reading, recorded here and in
+        # docs/STEP-CARD-5.md, is to REJECT the grant outright rather
+        # than silently reinterpret the seat's setting as metered_advisory.
+        if account_kind == "metered" and enforcement in (
+                "subscription_admission", "subscription_warn"):
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
         sized_ready = None
         if request["gateway_id"] is not None:
             gw = conn.execute(

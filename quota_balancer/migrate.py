@@ -41,7 +41,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -387,8 +387,27 @@ _DDL_V5 = (
 # The canonical version-5 migration script, kept for byte-for-byte comparison.
 MIGRATION_V5 = "\n".join(_DDL_V5) + "\nPRAGMA user_version=5;\n"
 
+# Card 5 (migration version 6): the private-HTTP identity allowlist
+# (section 6: "Default loopback; optional private authenticated TLS
+# tailnet ingress with machine allowlist"). machines add identity_ref
+# (unique among non-null values - a machine need not be enrolled),
+# enabled and last_seen_at (section 7's promised "later" columns). No
+# CHECK on `enabled` (STRICT already enforces INTEGER; the HTTP layer
+# treats anything but 1 as disabled, fail closed).
+_DDL_V6 = (
+    "ALTER TABLE machines ADD COLUMN identity_ref TEXT;",
+    "ALTER TABLE machines ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE machines ADD COLUMN last_seen_at INTEGER;",
+    "CREATE UNIQUE INDEX machines_identity_ref ON machines(identity_ref) "
+    "WHERE identity_ref IS NOT NULL;",
+)
+
+# The canonical version-6 migration script, kept for byte-for-byte comparison.
+MIGRATION_V6 = "\n".join(_DDL_V6) + "\nPRAGMA user_version=6;\n"
+
 # Step N upgrades a store from version N-1 to version N.
-_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5}
+_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
+          6: _DDL_V6}
 
 
 def schema_version(conn):
