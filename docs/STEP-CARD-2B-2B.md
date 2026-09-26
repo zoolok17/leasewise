@@ -151,7 +151,17 @@ state included, `now_ms` excluded).
     no usable `B_e` => INVALID_CONFIG, checked even when the ledger is
     stale); the planner reuses `_validate_known_overlap_bounds` and
     `_overlaps`. The planner itself does not use `O_e`: P-L is compared
-    directly, as the design specifies.
+    directly, as the design specifies. **Correction (fix round
+    tk-dba39941b750, finding 2):** at first build, "checked even when
+    stale" was aspirational, not actual - `_overlaps` ran only when the
+    gateway chain was fresh (`usable`), so a stale chain hid a missing or
+    exceeded `B_e`. Fixed: continuity (chain well-formedness) is now
+    checked independently of freshness (`continuous`, `require_fresh=False`)
+    and gates `_overlaps`; freshness alone still gates readiness
+    (`usable = continuous and` the fresh check). `_validate_known_overlap_bounds`
+    is still reused unconditionally as before, and remains the only guard
+    left when there is no gateway at all (continuity itself fails, not
+    merely staleness).
 11. **OPENING_UNSAFE as an error.** `plan_opening` returns the unsafe
     Proposal as a value. The `OPENING_UNSAFE` error code (exit 2) is for the
     later wrapper that makes an explicit usable-plan request; it is not
@@ -159,6 +169,71 @@ state included, `now_ms` excluded).
 12. **`source_events`** for a ready plan: the billing event, every baseline
     snapshot and every coverage event, sorted. Evidence ids are operator
     assertions, not events, and are not listed.
+13. **Baseline must cover the drain (fix round tk-dba39941b750, finding 1).**
+    The design says "fresh matching reports" without stating an inequality
+    against `drain_completed_at`. Fail-closed reading, for the design
+    owner: each selected baseline snapshot's `observed_at` must be
+    `>= drain_completed_at`. A report from before the drain describes the
+    pre-drain ledger and cannot attest the ledger's post-drain, quiet
+    state, however fresh it still is relative to `now` (a report can sit
+    within the 120s freshness bracket of `now` and still predate the
+    drain by any amount, when `lag_seconds` is small). This is distinct
+    from, and in addition to, the existing `lastUpdate >= drain +
+    lag_seconds` provider-side catch-up test.
+
+## Fix round tk-dba39941b750 (blind read: 1 MAJOR, 2 MINOR)
+
+Branch `card-2b-2b`, still on top of the tests/feat/docs commits above.
+Each finding got a failing-first regression test (built from the
+reproduction quoted in the work order) in a new
+`FixRoundTkDba39941b750` class in `tests/test_card2b2b.py`, plus the
+positive control the finding named; two more isolating tests were added
+after re-running the mutation tool (below) exposed that two existing
+checks had become unreachable by any test once the fixes landed.
+
+| Finding | Fix | Test(s) | Commit |
+|---|---|---|---|
+| 1 MAJOR - readiness didn't require the baseline report to cover the drain | new `_baselines_cover_drain`: every baseline snapshot's `observed_at >= drain_completed_at`, added to the safety checks in `_opening_safe` (decision 13) | `test_finding1_baseline_before_drain_is_unsafe` (repro: unsafe) + its positive control (snapshot 1.5s after drain: ready, opening 19.00) | (this fix round) |
+| 2 MINOR - staleness hid a missing/exceeded explicit-overlap bound | split the old freshness-gated `usable` into `continuous` (chain well-formed, `require_fresh=False`) and `usable` (`continuous` plus freshness); `_overlaps` is now gated by `continuous`, so it still runs on a stale-but-continuous chain (decision 10 correction) | `test_finding2_explicit_floor_needs_a_bound_even_when_stale` (repro at both snapshot ages) + `test_finding2_valid_stale_floor_stays_unsafe_not_invalid` (positive control: a provable stale floor stays unsafe, not invalid) + `test_finding2_known_overlap_bound_enforced_without_a_usable_gateway` (isolates `_validate_known_overlap_bounds`, added after mutation re-run) | (this fix round) |
+| 3 MINOR - per-gateway opening arithmetic (`baseline+external`) was unchecked before a verdict | added an unconditional `_checked(baseline+external)` loop over every configured gateway in `_validate_open_request`, right after the existing checked sums | `test_finding3_per_gateway_opening_overflow_is_invalid_before_verdict` (repro) + `test_finding3_isolated_from_the_declared_external_field` (isolates the checked proof-sum from the new per-gateway check, added after mutation re-run) | (this fix round) |
+
+**Evidence.**
+- Red: all three reproduction tests failed against f8d8843 (finding 1:
+  wrong verdict `ready`/`verified` instead of `unsafe`; finding 2: no
+  `QuotaError` raised instead of `INVALID_CONFIG`; finding 3: no
+  `QuotaError` raised instead of `INVALID_CONFIG`) - kept as
+  `red-fix-round.txt`. The finding-2 positive control already passed
+  pre-fix (it was never broken).
+- Green: all 4 new tests plus the full `test_card2b2b.py` module (96
+  tests) pass after the fix.
+- Regression: `test_card2b2*.py` + `test_billing_eval*.py` = 171 tests
+  green.
+- Mutation re-run on `billing_open.py`: 49 mutations applicable (3 of the
+  original 52 patterns no longer match after the `continuous`/`usable`
+  refactor - not a coverage loss, the code they targeted moved), all 49
+  killed, 0 survivors, plus 4 new mutations targeting the three fixes
+  (all killed). The first re-run surfaced 2 survivors -
+  `_validate_known_overlap_bounds` and the checked proof-sum - both now
+  redundant-*looking* once findings 1-3 landed but each still the ONLY
+  guard in a distinct scenario (no gateway at all; a small declared
+  external hiding an overflowing proof sum): isolated with the two extra
+  tests above rather than deleted. Kept as `mutation-run.txt`.
+- Full suite, once, foreground (PYTHONPATH=clone, TEMP/TMP under
+  scratch): `Ran 393 tests in 85.0s ... OK` (387 before this fix round +
+  6 new: 4 reproductions/controls + 2 mutation-driven isolating tests).
+  `git diff --check` clean. `python demo_card2b2b.py` still prints `demo
+  ok` (the demo fixture already had a fresh, post-drain snapshot, so it
+  was never affected by finding 1).
+
+**Record corrections.** The "Evidence" section above already listed
+"51 killed, 0 survived" for the *first* build's mutation sweep, which was
+accurate for that sweep; it is not reopened here. What the fix round
+corrects is decision 10 (marked inline above) and the module docstring's
+claim in `billing_open.py` ("every validation and arithmetic check that
+can raise runs BEFORE any safety verdict") - true only after this fix
+round's finding-2 and finding-3 fixes; before it, `_overlaps` could be
+skipped by staleness (finding 2) and the per-gateway opening sum was
+checked only inside the ready branch (finding 3).
 
 ## Residual risk
 
@@ -169,7 +244,7 @@ state included, `now_ms` excluded).
   design: operator/fixture assertions, not provider telemetry).
 - Overlap floors are validated but not used to reduce `D`; if a later card
   wants the planner to use `O_e`, that is a design change.
-- Decisions 3, 4 and 6 tighten the design's wording; a cold reader may
+- Decisions 3, 4, 6 and 13 tighten the design's wording; a cold reader may
   prefer INVALID_CONFIG over unsafe for the stale-chain reference (3).
 - No integration with a store, HTTP mapping or application of proposals
   exists or is tested (out of scope).
