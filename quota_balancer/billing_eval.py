@@ -1,30 +1,13 @@
-"""Pure billing evaluation (card 2b-2).
+"""Pure advisory billing evaluation (card 2b-2).
 
-evaluate_billing(context, request) -> Evaluation is a PURE function:
-no I/O, no store writes, no clock reads (now_ms is injected on the
-request), and it never mutates its inputs. The evaluator never mutates
-reconcile state; it reads the explicit, already-validated context.
+Validate the closed context, convert to the cap's monetary basis, then
+evaluate the ordered predicates globally across the retained evidence.
+Both headroom formulas require fresh, continuous gateway chains. Only
+proved, fresh, conflict-free billing uses the provider spend estimate;
+otherwise the ledger fallback retains the separate non-AI allowance.
 
-Turn 2 pinned the closed input surface, the complete output shape, the
-ordered decision-table precedence and the non-AI overlay. Turn 3 adds
-the reconciliation rows: the gross-excess hold (uncertified, with
-reserves/allowance/boundary/tolerance), the conflict-latest ordering
-(gross first, conflict preserved), the latest-seq ledger selection, the
-gateway usability rules, the listed-transition precedence, the boundary
-(midnight) exposure, the as-of bracket (skew/covered/excess) and the
-read-only lag timer. Turn 4 fills in the advisory headroom and its
-admission basis, and the closed output/privacy contract: comparable
-headroom = cap - E - R_now (admission_basis=billing_estimate) only
-with complete overlap proof for every retained provider event, a
-fresh sample and no latched conflict; otherwise headroom =
-cap - allowance - L_now - R_now (admission_basis=ledger_fallback)
-with usable local ledger inputs - the separate non-AI allowance stays
-out of the requested H, and the diagnostic E is not enforced in
-fallback. A hold recommendation denies H regardless of headroom; a
-missing P keeps the fallback (estimate null, never P=0); a rejected
-(cap-exceeding) estimate or a missing/unusable ledger fails closed
-(headroom null, admission_basis unavailable) - nothing is ever
-admitted on a rejected estimate.
+No I/O, clock reads, input mutation, receipts or reconcile-state writes.
+A HOLD is a recommendation and always makes request_fits false.
 """
 
 from .reduce import convert_basis, reduce_billing_total
@@ -83,7 +66,7 @@ _COVERAGE_KEYS = frozenset({
 _BASE_ROW_ORDER = (
     "basis_scope",                 # 1: unknown / basis_unknown,scope_mismatch,gateway_unusable / alert / unknown
     "no_sample",                   # 2: unknown / billing_unknown (no sample) / alert / provisional
-    "stale_sample",                #    unknown / billing_stale / alert / provisional
+    "stale_sample",                #    stale / billing_stale / alert / provisional
     "gross_excess",                # 3: unexplained_excess / provider_excess / hold / comparable
     "latched_conflict",            # 4: conflict / source_conflict / alert / provisional
     "midnight",                    # 5: temporally_unresolved / snapshot_skew / none / provisional
@@ -94,6 +77,8 @@ _BASE_ROW_ORDER = (
     "unresolved_bounds",           # 10: temporally_unresolved / coverage_unknown / none / provisional
     "reserve_covered",             # 11: reserve_or_scope_covered / reserve_or_scope_covered / none / Q
     "matched",                     # 12: matched / matched / none / Q
+    "lag_expected",                # 13: provider_behind / lag_expected / none / Q
+    "incomplete",                  # 14: temporally_unresolved / coverage_unknown / none / provisional
 )
 
 
@@ -570,7 +555,7 @@ def _decision(ctx, req, ledger, reserves, comparable):
         return "unknown", "billing_unknown", "alert", "provisional"
     if not _fresh(latest, policy, now):
         return "stale", "billing_stale", "alert", "provisional"
-    conflict = _conflict_latched(events)
+    conflict = ctx["provider_conflict"]
     chains = list(ctx["chains_by_gateway"].values())
     boundary = ctx["boundary_exposure_micro_eur"]
     allowance = policy["non_ai_allowance_micro_eur"]
@@ -624,6 +609,9 @@ def evaluate_billing(context, request):
     """Pure advisory evaluation; no receipt, reconcile state or ledger writes."""
     ctx = _validate_context(context)
     req = _validate_request(request, ctx)
+    # The store latches conflicts on source amounts. Basis conversion may
+    # round distinct amounts alike, but it must never clear that latch.
+    ctx["provider_conflict"] = _conflict_latched(ctx["provider_events"])
     basis_ok = _normalize_money(ctx)
     scope_ok = basis_ok and _scope_matches(ctx)
     usable = scope_ok and _gateway_usable(ctx, req["now_ms"])
@@ -641,7 +629,7 @@ def evaluate_billing(context, request):
         if ctx["provider_events"]:
             estimate = max([ledger] + [_checked(e["payload"]["total_micro_eur"] + ledger
                            - overlaps[e["event_id"]]) for e in ctx["provider_events"]])
-        comparable = (proved and not _conflict_latched(ctx["provider_events"])
+        comparable = (proved and not ctx["provider_conflict"]
                       and all(_fresh(e, ctx["policy"], req["now_ms"]) for e in ctx["provider_events"]))
         state, reason, action, quality = _decision(ctx, req, ledger, reserves, comparable)
         if comparable:
