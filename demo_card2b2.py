@@ -37,12 +37,12 @@ def _provider(total, observed):
     }
 
 
-def _snapshot(settled, observed, event):
+def _snapshot(settled, observed, event, seq=1):
     return {
         "event_id": event, "machine": "desktop", "account": "meter",
         "kind": "gateway_snapshot", "observed_at": observed,
         "received_at": observed + 1000,
-        "payload": {"gateway": "g1", "ledger_epoch": 1, "seq": 1,
+        "payload": {"gateway": "g1", "ledger_epoch": 1, "seq": seq,
                     "period_start": SEP, "period_end": OCT,
                     "policy_hashes": None, "sized_ready": False,
                     "reconciliation_required": False,
@@ -105,7 +105,7 @@ def main():
         _context([
             _provider(80_000_000, obs),
             _snapshot(20_000_000, obs - 30_000, _eid("a")),
-            _snapshot(50_000_000, obs + 40_000, _eid("l")),
+            _snapshot(50_000_000, obs + 40_000, _eid("l"), seq=2),
         ]),
         _request(obs + 50_000, requested=10_000_000))
     _print("1) uncertified 30 EUR excess (P=80, L=50) => HOLD:", out)
@@ -120,7 +120,7 @@ def main():
         _context([
             _provider(45_000_000, obs),
             _snapshot(20_000_000, obs - 30_000, _eid("a2")),
-            _snapshot(50_000_000, obs + 40_000, _eid("l2")),
+            _snapshot(50_000_000, obs + 40_000, _eid("l2"), seq=2),
         ]),
         _request(obs + 50_000))
     _print("2) normal P=45 / L=50 => fallback headroom 50:", out)

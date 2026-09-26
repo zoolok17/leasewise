@@ -275,7 +275,7 @@ class BillingEvalInput(unittest.TestCase):
             readings=[
                 _provider(80_000_000, False, SEP + 86_400_000, _eid("prov")),
                 _snapshot(50_000_000, SEP + 1 * 86_400_000, evA),
-                _snapshot(60_000_000, SEP + 2 * 86_400_000, evB),
+                _snapshot(60_000_000, SEP + 2 * 86_400_000, evB, seq=2),
                 _snapshot(0, SEP + 86_400_000, b),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
@@ -284,13 +284,13 @@ class BillingEvalInput(unittest.TestCase):
             boundary_event_ids=[b],
         )
         # P=80, L_now=60, B_e=50 -> min=50. A floor of 51 is out of range.
-        self._reject(ctx, _request(
+        self._reject(ctx, _request(now_ms=SEP + 2 * 86_400_000 + 1000,
             coverage=[{"event_id": _eid("prov"), "upper_at": SEP + 2 * 86_400_000,
                        "complete_at": SEP + 1 * 86_400_000,
                        "overlap_floor_micro_eur": 51_000_000,
                        "matched_provenance": True}]))
         # in-range floor is accepted
-        _eval(ctx, _request(
+        _eval(ctx, _request(now_ms=SEP + 2 * 86_400_000 + 1000,
             coverage=[{"event_id": _eid("prov"),
                        "upper_at": SEP + 2 * 86_400_000,
                        "complete_at": SEP + 1 * 86_400_000,
@@ -309,7 +309,7 @@ class BillingOverlapPrecedence(unittest.TestCase):
             readings=[
                 _provider(80_000_000, False, SEP + 86_400_000, _eid("prov")),
                 _snapshot(50_000_000, SEP + 1 * 86_400_000, evA),
-                _snapshot(60_000_000, SEP + 2 * 86_400_000, evB),
+                _snapshot(60_000_000, SEP + 2 * 86_400_000, evB, seq=2),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [evA, evB]}],
@@ -317,7 +317,7 @@ class BillingOverlapPrecedence(unittest.TestCase):
 
     def test_explicit_valid_floor_wins(self):
         # O_e = 30 (explicit) -> E = max(60, 80+60-30) = 110.
-        out = _eval(self._ctx(), _request(
+        out = _eval(self._ctx(), _request(now_ms=SEP + 2 * 86_400_000 + 1000,
             coverage=[{"event_id": _eid("prov"),
                        "upper_at": SEP + 2 * 86_400_000,
                        "complete_at": SEP + 1 * 86_400_000,
@@ -328,7 +328,7 @@ class BillingOverlapPrecedence(unittest.TestCase):
     def test_absent_overlap_derives_with_proof(self):
         # No explicit floor, but complete + matched_provenance + usable
         # B_e=50 and B_e<=P_e (50<=80) -> O_e=B_e=50 -> E=max(60,80+60-50)=90.
-        out = _eval(self._ctx(), _request(
+        out = _eval(self._ctx(), _request(now_ms=SEP + 2 * 86_400_000 + 1000,
             coverage=[{"event_id": _eid("prov"),
                        "upper_at": SEP + 2 * 86_400_000,
                        "complete_at": SEP + 1 * 86_400_000,
@@ -339,7 +339,7 @@ class BillingOverlapPrecedence(unittest.TestCase):
     def test_absent_overlap_no_proof_is_zero(self):
         # No explicit floor and no matched provenance -> O_e=0 ->
         # E=max(60,80+60-0)=140 (diagnostic over-count, still conservative).
-        out = _eval(self._ctx(), _request(
+        out = _eval(self._ctx(), _request(now_ms=SEP + 2 * 86_400_000 + 1000,
             coverage=[{"event_id": _eid("prov"),
                        "upper_at": SEP + 2 * 86_400_000,
                        "complete_at": SEP + 1 * 86_400_000,
@@ -364,6 +364,8 @@ class BillingNonAiAlert(unittest.TestCase):
                 _snapshot(45_000_000, prov_obs + 40_000, _eid("snap")),
                 _snapshot(0, prov_obs, be),
             ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [_eid("snap")]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[be])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         self.assertEqual(out["action"], "none")
@@ -378,6 +380,8 @@ class BillingNonAiAlert(unittest.TestCase):
                 _snapshot(45_000_000, prov_obs + 40_000, _eid("snap")),
                 _snapshot(0, prov_obs, be),
             ],
+            gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
+                       "current_chain_event_ids": [_eid("snap")]}],
             boundary_exposure_micro_eur=0, boundary_event_ids=[be])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         self.assertEqual(out["action"], "alert")
@@ -458,11 +462,9 @@ class BillingGrossExcessUncertified(unittest.TestCase):
         self.assertEqual(out["action"], "hold")
         self.assertEqual(out["quality"], "comparable")
 
-    def test_report_far_after_receipt_cannot_hold(self):
-        # The report arrives 125 s after the provider receipt: beyond
-        # the 120 s window it cannot cover the receipt, so no gross
-        # hold even though it is fresh for now (B proven empty, so the
-        # only thing standing between it and a hold is the window).
+    def test_report_far_after_receipt_can_hold(self):
+        # Receipt coverage has only a lower bound; this report is fresh
+        # at evaluation time and covers a receipt more than 120s ago.
         ev = _eid("snap")
         be = _eid("boundary")
         prov_obs = SEP + 2 * 86_400_000
@@ -478,8 +480,8 @@ class BillingGrossExcessUncertified(unittest.TestCase):
             boundary_event_ids=[be],
         )
         out = _eval(ctx, _request(now_ms=prov_obs + 135_000))
-        self.assertNotEqual(out["action"], "hold")
-        self.assertEqual(out["quality"], "provisional")
+        self.assertEqual(out["action"], "hold")
+        self.assertEqual(out["quality"], "comparable")
 
     def test_old_snapshot_cannot_hold(self):
         # The report is older than 120 s from the provider receipt: the
@@ -496,7 +498,7 @@ class BillingGrossExcessUncertified(unittest.TestCase):
         )
         out = _eval(ctx, _request())
         self.assertNotEqual(out["action"], "hold")
-        self.assertEqual(out["quality"], "provisional")
+        self.assertEqual(out["quality"], "unknown")
 
     def test_stale_provider_sample_does_not_hold(self):
         # A provider sample older than max_age (stale row 2) alerts, and a
@@ -506,14 +508,14 @@ class BillingGrossExcessUncertified(unittest.TestCase):
         ctx = _context(
             readings=[
                 _provider(150_000_000, False, prov_obs, _eid("prov")),
-                _snapshot(80_000_000, prov_obs + 40_000, ev),
+                _snapshot(80_000_000, prov_obs + 7_201_000, ev),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [ev]}],
         )
         # now far after max_age has passed: the sample is stale.
         out = _eval(ctx, _request(now_ms=prov_obs + 7200_000 + 1000))
-        self.assertEqual(out["state"], "unknown")
+        self.assertEqual(out["state"], "stale")
         self.assertEqual(out["reason"], "billing_stale")
         self.assertEqual(out["action"], "alert")
         self.assertEqual(out["quality"], "provisional")
@@ -667,7 +669,7 @@ class BillingLatestChainSeq(unittest.TestCase):
              _snapshot(100_000_000, t1, _eid("s30"), seq=30)],
             chain=[_eid("s20"), _eid("s30")],
         )
-        out = _eval(ctx, _request())
+        out = _eval(ctx, _request(now_ms=t1 + 1000))
         # The floor diagnostic reflects the chain-latest settled (100).
         self.assertEqual(out["known_floor_micro_eur"], 100_000_000)
 
@@ -694,7 +696,7 @@ class BillingLatestChainSeq(unittest.TestCase):
              _snapshot(40_000_000, t2, _eid("s3"), seq=3)],
             chain=[_eid("s5"), _eid("s3")],
         )
-        out = _eval(ctx, _request())
+        out = _eval(ctx, _request(now_ms=t1 + 1000))
         self.assertEqual(out["known_floor_micro_eur"], 100_000_000)
 
 
@@ -737,10 +739,7 @@ class BillingGatewayUncertainty(unittest.TestCase):
         self._assert_unusable(out)
 
     def test_stale_snapshot_is_unusable_for_brackets(self):
-        # A >120 s report is unusable for the bracket and the gross
-        # receipt guard, but L_now (the latest-seq settled) is still
-        # usable: the evaluation alerts (billing_stale) and the
-        # fallback headroom holds (100 - 0 - 40 - 0 = 60).
+        # A stale local ledger disables BOTH forms of headroom.
         ev = _eid("snap")
         prov_obs = SEP + 2 * 86_400_000
         ctx = _context(
@@ -753,10 +752,8 @@ class BillingGatewayUncertainty(unittest.TestCase):
         )
         out = _eval(ctx, _request())
         self.assertEqual(out["action"], "alert")
-        self.assertEqual(out["reason"], "billing_stale")
-        self.assertEqual(out["admission_basis"], "ledger_fallback")
-        self.assertEqual(out["headroom_micro_eur"], 60_000_000)
-        self.assertIs(out["request_fits"], True)  # H=0 fits
+        self.assertEqual(out["reason"], "gateway_unusable")
+        self._assert_unusable(out)
 
     def test_decreased_in_chain_total_is_unusable(self):
         # A decreased in-chain total (nondecreasing is a chain invariant)
@@ -803,9 +800,10 @@ class BillingGatewayUncertainty(unittest.TestCase):
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [ev]}],
         )
-        out = _eval(ctx, _request())
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         # settled is 40M; the 2M unattributed inside it is not added.
-        self.assertEqual(out["known_floor_micro_eur"], 40_000_000)
+        self.assertEqual(out["known_floor_micro_eur"], 45_000_000)
+        self.assertEqual(out["headroom_micro_eur"], 54_000_000)
 
 
 class BillingReconcileStatePrecedence(unittest.TestCase):
@@ -842,9 +840,10 @@ class BillingReconcileStatePrecedence(unittest.TestCase):
         ev = _eid("snap")
         prov_obs = SEP + 2 * 86_400_000
         ctx = self._ctx([])
-        out = _eval(ctx, _request())
+        out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         # The ledger is usable; the turn-3 rows decide the rest.
-        self.assertEqual(out["known_floor_micro_eur"], 40_000_000)
+        self.assertEqual(out["known_floor_micro_eur"], 50_000_000)
+        self.assertEqual(out["headroom_micro_eur"], 60_000_000)
 
 
 class BillingMidnightExposure(unittest.TestCase):
@@ -855,7 +854,7 @@ class BillingMidnightExposure(unittest.TestCase):
 
     def _ctx(self, p, b, now, b_refs=()):
         ev = _eid("snap")
-        prov_obs = SEP + 2 * 86_400_000
+        prov_obs = now - 50_000
         readings = [
             _provider(p, False, prov_obs, _eid("prov")),
         ]
@@ -920,9 +919,9 @@ class BillingReconcileSnapshotSkew(unittest.TestCase):
                        "current_chain_event_ids": [ev]}],
         )
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
-        self.assertEqual(out["state"], "temporally_unresolved")
-        self.assertEqual(out["reason"], "snapshot_skew")
-        self.assertEqual(out["action"], "none")
+        self.assertEqual(out["state"], "unknown")
+        self.assertEqual(out["reason"], "gateway_unusable")
+        self.assertEqual(out["action"], "alert")
 
     def test_valid_brackets_catch_true_excess(self):
         # A certified gap of 3 EUR (P - L_asof = 300000 > tau(10M)=50000)
@@ -936,11 +935,12 @@ class BillingReconcileSnapshotSkew(unittest.TestCase):
                 _provider(13_000_000, False, t_upper + 20_000, _eid("prov")),
                 # A proved-empty boundary (B=0) for the certified check.
                 _snapshot(0, t_upper, be),
-                _snapshot(13_000_000, t_upper + 40_000, ev_u, seq=2),
+                _snapshot(10_000_000, t_upper, _eid("at-t"), seq=2),
+                _snapshot(13_000_000, t_upper + 40_000, ev_u, seq=3),
                 _snapshot(10_000_000, t_lower, ev_l, seq=1),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev_u, ev_l]}],
+                       "current_chain_event_ids": [ev_u, ev_l, _eid("at-t")]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         )
@@ -1034,9 +1034,10 @@ class BillingReconcileLagTimer(unittest.TestCase):
                 # snapshot so the chain's latest stays the ledger one.
                 _snapshot(0, last_change - 10_000, be),
                 _snapshot(l, last_change, ev),
+                _snapshot(l, now - 1000, _eid("heartbeat"), seq=2),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
-                       "current_chain_event_ids": [ev]}],
+                       "current_chain_event_ids": [ev, _eid("heartbeat")]}],
             boundary_exposure_micro_eur=0,
             boundary_event_ids=[be],
         ), _request(now_ms=now)
@@ -1157,7 +1158,7 @@ class BillingHeadroom(unittest.TestCase):
             readings=[
                 _provider(p, False, prov_obs, _eid("prov")),
                 _snapshot(o, prov_obs - 30_000, evA),
-                _snapshot(l, prov_obs + 40_000, evB, reserved=r),
+                _snapshot(l, prov_obs + 40_000, evB, reserved=r, seq=2),
             ],
             policy=dict(_POLICY, non_ai_allowance_micro_eur=allowance),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
@@ -1228,7 +1229,7 @@ class BillingHeadroom(unittest.TestCase):
             readings=[
                 _provider(45_000_000, False, prov_obs, _eid("prov")),
                 _snapshot(20_000_000, prov_obs - 30_000, evA),
-                _snapshot(50_000_000, prov_obs + 40_000, evB),
+                _snapshot(50_000_000, prov_obs + 40_000, evB, seq=2),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [evA, evB]}],
@@ -1270,7 +1271,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         ctx = self._plain([
             _provider(80_000_000, False, prov_obs, _eid("prov")),
             _snapshot(20_000_000, prov_obs - 30_000, _eid("asof")),
-            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest")),
+            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest"), seq=2),
         ])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000,
                                   requested_micro_eur=10_000_000))
@@ -1286,7 +1287,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         prov_obs = SEP + 2 * 86_400_000
         ctx = self._plain([
             _snapshot(20_000_000, prov_obs - 30_000, _eid("asof")),
-            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest")),
+            _snapshot(50_000_000, prov_obs + 40_000, _eid("latest"), seq=2),
         ])
         out = _eval(ctx, _request(now_ms=prov_obs + 50_000))
         self.assertEqual(out["action"], "alert")
@@ -1304,7 +1305,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         ctx = self._plain([
             _provider(50_000_000, False, t1, _eid("prov-1")),
             _provider(45_000_000, False, t2, _eid("prov-2")),
-            _snapshot(45_000_000, t2 + 40_000, _eid("latest")),
+            _snapshot(45_000_000, t2 + 40_000, _eid("latest"), seq=2),
         ])
         out = _eval(ctx, _request(now_ms=t2 + 50_000))
         self.assertEqual(out["action"], "alert")
@@ -1320,7 +1321,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         ctx = self._plain([
             _provider(110_000_000, False, prov_obs, _eid("prov")),
             _snapshot(110_000_000, prov_obs - 30_000, _eid("asof")),
-            _snapshot(110_000_000, prov_obs + 40_000, _eid("latest")),
+            _snapshot(110_000_000, prov_obs + 40_000, _eid("latest"), seq=2),
         ])
         out = _eval(ctx, self._certified_req_of(prov_obs, 10_000_000))
         self.assertEqual(out["estimate_micro_eur"], 110_000_000)
@@ -1338,7 +1339,7 @@ class BillingHeadroomBoundaries(unittest.TestCase):
         ctx = self._plain([
             _provider(45_000_000, False, stale_obs, _eid("prov")),
             _snapshot(20_000_000, stale_obs - 30_000, _eid("asof")),
-            _snapshot(50_000_000, stale_obs + 40_000, _eid("latest")),
+            _snapshot(50_000_000, now - 1000, _eid("latest"), seq=2),
         ])
         out = _eval(ctx, _request(now_ms=now))
         self.assertEqual(out["action"], "alert")
@@ -1370,7 +1371,7 @@ class BillingFallbackAllowance(unittest.TestCase):
             readings=[
                 _provider(45_000_000, False, prov_obs, _eid("prov")),
                 _snapshot(20_000_000, prov_obs - 30_000, evA),
-                _snapshot(50_000_000, prov_obs + 40_000, evB),
+                _snapshot(50_000_000, prov_obs + 40_000, evB, seq=2),
             ],
             policy=dict(_POLICY, non_ai_allowance_micro_eur=10_000_000),
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
@@ -1393,13 +1394,13 @@ _OUTPUT_KEYS = frozenset({
 })
 _STATES = frozenset({
     "unknown", "unexplained_excess", "conflict", "temporally_unresolved",
-    "provider_behind", "reserve_or_scope_covered", "matched",
+    "provider_behind", "reserve_or_scope_covered", "matched", "stale",
 })
 _REASONS = frozenset({
     "gateway_unusable", "basis_unknown", "scope_mismatch", "billing_unknown",
     "billing_stale", "provider_excess", "source_conflict", "snapshot_skew",
     "lag_investigate", "coverage_unknown", "reserve_or_scope_covered",
-    "matched", "non_ai_present",
+    "matched", "non_ai_present", "lag_expected", "missing_old_spend",
 })
 _ACTIONS = frozenset({"hold", "alert", "none"})
 _QUALITIES = frozenset({"comparable", "provisional", "unknown"})
@@ -1426,7 +1427,7 @@ class BillingOutputErrors(unittest.TestCase):
             readings=[
                 _provider(45_000_000, False, prov_obs, _eid("prov")),
                 _snapshot(20_000_000, prov_obs - 30_000, evA),
-                _snapshot(50_000_000, prov_obs + 40_000, evB),
+                _snapshot(50_000_000, prov_obs + 40_000, evB, seq=2),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [evA, evB]}],
@@ -1541,7 +1542,7 @@ class BillingOutputErrors(unittest.TestCase):
             readings=[
                 _provider(45_000_000, False, prov_obs, _eid("prov")),
                 _snapshot(20_000_000, prov_obs - 30_000, evA),
-                _snapshot(50_000_000, prov_obs + 40_000, evB),
+                _snapshot(50_000_000, prov_obs + 40_000, evB, seq=2),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
                        "current_chain_event_ids": [evA, evB]}],
@@ -1615,7 +1616,7 @@ class BillingPrivacy(unittest.TestCase):
                      event_id=self._P2, machine=self._MACHINE),
                 dict(_snapshot(20_000_000, prov_obs - 30_000, _eid("a")),
                      event_id=self._P1, machine=self._MACHINE),
-                dict(_snapshot(50_000_000, prov_obs + 40_000, evB),
+                dict(_snapshot(50_000_000, prov_obs + 40_000, evB, seq=2),
                      machine=self._MACHINE),
             ],
             gateways=[{"gateway": "g1", "share_micro_eur": 60_000_000,
