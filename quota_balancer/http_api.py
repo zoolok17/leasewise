@@ -713,7 +713,15 @@ def handle_readings(db_path, identity, doc, now_ms, idempotency_key):
 def handle_limit_event(db_path, identity, body, now_ms, idempotency_key):
     """POST /v1/limit-events. "Reporter authorized for account" (section
     7): the same project_accounts authorization readings' cli_window kind
-    now uses (fix round tk-7d7fd9023f8c findings 2 and 5)."""
+    now uses (fix round tk-7d7fd9023f8c findings 2 and 5).
+
+    Fix round 4 (tk-1b3649a06f0e) finding R2: this check alone authorizes
+    only the SUBMITTED account_id; a legacy replay (fix round 3 finding
+    F2) can name a DIFFERENT account than the one its event_id actually
+    belongs to, and record_limit_event's own content comparison is
+    skipped entirely for legacy rows. The callback below is re-checked
+    INSIDE record_limit_event's own transaction against the block's real,
+    STORED account for that case specifically - see its docstring."""
     machine_id, _alias = identity
     event = _wire_to_limit_event(body)
     _check_idempotency_key(idempotency_key, event.get("event_id")
@@ -727,7 +735,10 @@ def handle_limit_event(db_path, identity, body, now_ms, idempotency_key):
         conn.close()
     if not authorized:
         raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
-    result = lease.record_limit_event(db_path, event, now_ms)
+    result = lease.record_limit_event(
+        db_path, event, now_ms,
+        authorized_for_account=lambda conn, acct: _authorized_reporter_for_account(
+            conn, machine_id, acct))
     return 202, dict(result)
 
 

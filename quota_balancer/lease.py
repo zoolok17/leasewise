@@ -1174,7 +1174,7 @@ def _merge_retry_at(old, new):
     return max(old, new)
 
 
-def record_limit_event(path, event, now_ms):
+def record_limit_event(path, event, now_ms, authorized_for_account=None):
     """Publish a reporter-observed limit exhaustion as a parked block on
     the account (section 7: "POST /limit-events... 202
     {block_id,retry_at,state}").
@@ -1199,12 +1199,24 @@ def record_limit_event(path, event, now_ms):
     blocks.source_event_id - a creator identity from before limit_events
     existed at all, with no real turn_id/observed_at/exhausted_windows to
     compare (synthesized placeholders, not evidence) and no record of any
-    OTHER event that may have joined its block. Its content is never
+    OTHER event that may have joined its block. Its CONTENT is never
     compared and never merged: a replay of a legacy event_id always
     returns the block's CURRENT state unchanged, exactly like a
     content-matching replay, so a delayed pre-upgrade retry can neither
     conflict nor re-park (nor otherwise disturb) an account the operator
-    has since recovered.
+    has since recovered. Its account_id is NOT one of the unknown fields
+    though (fix round 4, tk-1b3649a06f0e finding R2) - copied faithfully
+    from the pre-v7 block, it is real and known, and ignoring content
+    must never also disable authorization on it: `authorized_for_account`
+    (an optional `(conn, account_id) -> bool` callback; None for every
+    non-HTTP/CLI caller) is re-checked against the block's STORED account
+    for a legacy row specifically, before any of its state is returned -
+    not merely the submitted account_id the caller's own request named,
+    which the original bug trusted blindly. A submitted account_id that
+    disagrees with the stored one, from a caller who IS authorized for
+    the real account, is still a genuine content mismatch
+    (IDEMPOTENCY_CONFLICT) - the two checks are independent, not
+    alternatives.
     """
     policy._check_int(now_ms, 1)
     _validate_limit_event(event)
@@ -1218,7 +1230,17 @@ def record_limit_event(path, event, now_ms):
                 "legacy FROM limit_events WHERE event_id=?",
                 (event["event_id"],)).fetchone()
             if existing is not None:
-                if not existing[8]:
+                stored_account_id = existing[0]
+                if existing[8]:
+                    if authorized_for_account is not None \
+                            and not authorized_for_account(
+                                conn, stored_account_id):
+                        raise QuotaError(errors.CODE_FORBIDDEN,
+                                         errors.MSG_FORBIDDEN)
+                    if event["account_id"] != stored_account_id:
+                        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                         errors.MSG_IDEMPOTENCY_CONFLICT)
+                else:
                     stored = dict(zip(
                         ("account_id", "model_id", "turn_id", "observed_at",
                          "evidence_kind", "resets_at", "exhausted_windows"),

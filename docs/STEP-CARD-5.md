@@ -149,6 +149,7 @@ protocol-error path (finding 6).
 | Fix round tk-7d7fd9023f8c | `FixRoundNonEnforcingLeases`, `FixRoundReadingAccountAuthorization`, `FixRoundWireAdapter`, `FixRoundIdempotencyKey`, `FixRoundPlanAndLimitEvents`, `FixRoundCheckRequestIdUuid`, `FixRoundIPv6Bind` (`tests/test_card5.py`) - one class per finding; see the Fix round section below for the finding -> fix -> test -> commit table |
 | Fix round 2 tk-dae9aab24ef8 | `FixRound2SettleReplayIdentity`, `FixRound2WireIdentity`, `FixRound2LimitEventContentIdentity`, `FixRound2LimitEventEvidenceMerge`, `FixRound2LimitEventEvidenceKindType`, `FixRound2WireOptionalKeysAndGatewaySnapshot`, `FixRound2PlanOptionalTaskClass`, `FixRound2PlanAuthorization` (`tests/test_card5.py`) - one class per finding (N1-N7 + the escalated authorization observation); see the Fix round 2 section below for the finding -> fix -> test -> commit table |
 | Fix round 3 tk-f9018a7e573e | `FixRound3AtomicWireIdentity`, `FixRound3LegacyLimitEventMigration`, `FixRound3PlanAuthorizationReporters`, `FixRound3PlanUnknownResetPoisonsRetryAt`, `FixRound3GatewaySnapshotMixedKeyRefused` (`tests/test_card5.py`) - one class per finding (F1-F5); see the Fix round 3 section below for the finding -> fix -> test -> commit table |
+| Fix round 4 tk-1b3649a06f0e | `FixRound4PopulatedV7Upgrade`, `FixRound4LegacyReplayAccountBinding` (`tests/test_card5.py`) - one class per finding (R1-R2); see the Fix round 4 section below for the finding -> fix -> test -> commit table |
 
 ## Evidence
 
@@ -665,6 +666,68 @@ above; design silent or ambiguous, fail-closed reading):
 - Full suite, once, foreground (`PYTHONPATH=<clone>`, `TEMP`/`TMP` under
   scratch): `Ran 516 tests in 183.5s ... OK` (504 at the `d93c64c` head +
   12 net new, all in `test_card5.py`). `git diff --check` clean.
+
+## Fix round 4 tk-1b3649a06f0e (R1-R2)
+
+Branch `card-5`, still on top of the commits above. A third delta read of
+fix round 3 (card-5 `d93c64c..1f3e68f`), by the same reviewer as round 3.
+F1, F3, F4 and F5 were closed outright, including every concurrency and
+interrupted-commit probe, and the direct v6-to-v8 upgrade replay was
+confirmed repaired. Two new MAJORs remained in the migration/legacy path
+itself.
+
+| # | Sev | Finding | Fix | Test(s) | Commit |
+|---|---|---|---|---|---|
+| R1 | MAJOR | The v8 backfill's `INSERT ... SELECT` was unconditional: an ORDINARY v7 store (one made by the immediately preceding revision, not merely a hand-built or corrupt one) already has a full-content `limit_events` row for every creator event, so the backfill collided with it on `limit_events.event_id`'s own primary key - the migration rolled back cleanly (no half-schema corruption) but left the store stuck at v7, unable to use the new engine at all | `migrate.py`: `_DDL_V8`'s backfill `INSERT` gained `AND source_event_id NOT IN (SELECT event_id FROM limit_events)` - it now backfills ONLY a legacy row genuinely missing from limit_events (a true pre-v7 store), never replacing an existing real (full-content) row with a synthesized one | `FixRound4PopulatedV7Upgrade` (a v7 store with BOTH a creator's and a joiner's real, full-content `limit_events` rows already present - exactly what any store made by fix round 3 itself already has - upgrades to v8 cleanly through the real `store.init_db`; both rows replay afterward as ordinary non-legacy replays, and a changed-content replay of either is still a genuine `IDEMPOTENCY_CONFLICT`, proving neither was silently downgraded to `legacy=1`) | (this fix round) |
+| R2 | MAJOR, security | A legacy row's account binding was not enforced: authorization checked the SUBMITTED `account_id` only, and the legacy replay branch (finding F2) skips ALL content comparison, including account_id - a caller authorized for account B, submitting account B alongside another account's (A's) real legacy `event_id`, got A's block/retry_at/state back, 202, as if it were B's own event | `lease.py`: `record_limit_event` gains an optional `authorized_for_account(conn, account_id) -> bool` callback, re-checked against the block's STORED account (never the submitted one) for a legacy row specifically, before any of its state is returned - FORBIDDEN if the caller cannot reach the real account at all, IDEMPOTENCY_CONFLICT if it can but the submitted account_id still disagrees with the real one. `http_api.py`'s `handle_limit_event` passes a closure over its own `_authorized_reporter_for_account` | `FixRound4LegacyReplayAccountBinding` (the reviewer's own repro: a caller whose ONLY project_accounts grant was moved from the event's real account to another gets 403, not the real block; a caller authorized for BOTH accounts, submitting the wrong one, gets 409, not a silent cross-account replay; the allowed same-account changed-content replay - kept - still works) | (this fix round) |
+
+**Doc follow-up (requested this round, no code change):**
+
+29. **A pre-existing grant/reading id with no stored `http_request_
+    identity` row falls back entirely to the store's own content-hash
+    comparison, exactly as it did before fix round 2 introduced the HTTP
+    wire-identity ledger.** `_check_http_identity` treats "no row found"
+    as "nothing to conflict with," never as a synthesized pass - it does
+    not (and structurally cannot) reconstruct the ORIGINAL wire-only
+    fields (`task_class`, `seat_id`) a request made before that ledger
+    existed. The first such request that IS accepted after fix round 2
+    (its content matching what the store itself already had on file)
+    records its own wire hash at that moment via `_record_http_identity`,
+    inside the same transaction as its own replay - not before. Every
+    LATER replay of that same key is then checked against THAT recorded
+    hash, closing the full-wire-body gap from that point forward, the
+    same way finding N2 originally intended, just one request later than
+    a store that had the ledger from its very first request. This is the
+    identical, deliberate trade-off finding R1/decision 27 documents for
+    a legacy limit-event's content: a field genuinely unrecoverable from
+    history is not fabricated, and the system starts trusting it again
+    from the first moment it is actually observed.
+
+**Evidence.**
+- Red: with `http_api.py`/`lease.py`/`migrate.py` stashed back to
+  `1f3e68f` (this round's own pre-fix head) and `tests/test_card5.py`
+  kept at its fix-round-4 state, all 3 of the new behavioral tests failed
+  or errored for the exact reason each finding describes (R1's populated-
+  upgrade test errored with the reviewer's own `sqlite3.IntegrityError:
+  UNIQUE constraint failed: limit_events.event_id`, surfaced as
+  `QuotaError(STORE_ERROR)`; both R2 tests returned `202` with the real
+  account's block instead of `403`/`409`). The fourth
+  (`test_legacy_replay_with_the_matching_account_is_still_a_pure_replay`)
+  passed unchanged, as it should - the same-account case was never
+  broken. Kept: `card-5/evidence4/red-fixround4.txt`.
+- Green: `test_card5.py` in full: 122 tests OK (118 before this round, +4
+  net new, all in the two new `FixRound4*` classes).
+- Mutation re-run (`card-5/mutate5.py`, expanded with this round's own 4
+  new mutations: R1's populated-v7 exclusion clause (1, `migrate.py` -
+  a mutation target for the first time this round); R2's authorization-
+  against-stored-account check, its account-content-mismatch check, and
+  `http_api.py`'s own callback wiring (3)). All 4 fit in one foreground
+  chunk, well under the ~9-minute ceiling; `git diff 1f3e68f --
+  quota_balancer` confirmed empty (content-identical to the fixed
+  backup) after the chunk. First and only pass: 4 killed, 0 survivors.
+- Full suite, once, foreground (`PYTHONPATH=<clone>`, `TEMP`/`TMP` under
+  scratch): `Ran 520 tests in 187.0s ... OK` (516 at the `1f3e68f` head +
+  4 net new). `git diff --check` clean.
 
 ## Residual risk
 

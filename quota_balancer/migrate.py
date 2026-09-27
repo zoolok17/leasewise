@@ -478,7 +478,8 @@ _DDL_V8 = (
     "'00000000-0000-4000-8000-000000000000', updated_at, reason, "
     "retry_at, '[]', id, updated_at, 1 FROM blocks WHERE "
     "source_event_id IS NOT NULL AND reason IN "
-    "('codex_exhausted','claude_exhausted','provider_usage_429');",
+    "('codex_exhausted','claude_exhausted','provider_usage_429') "
+    "AND source_event_id NOT IN (SELECT event_id FROM limit_events);",
 )
 
 # The canonical version-8 migration script, kept for byte-for-byte comparison.

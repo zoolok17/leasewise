@@ -136,17 +136,25 @@ def _limit_event(event_id=None, account_id=ACCOUNT, model_id=None,
 def _build_store(tmp, name="lease.db", budget=10 * HOLD, gateway_sized=1,
                  enabled_a=1, enabled_b=1, account_kind="metered",
                  enforcement_a="metered", enforcement_b="metered",
-                 profile=True):
+                 profile=True, stop_at_v7=False):
     """A schema-v6 store: one account (two seats on two machines sharing
     it - the card's demo), one sized gateway on MACHINE_A, one unrelated
     account with no project grant (finding-2 fixtures), and (by default)
-    one profiles row for GET /v1/plan (finding-5 fixtures)."""
+    one profiles row for GET /v1/plan (finding-5 fixtures).
+
+    `stop_at_v7` (fix round 4 finding R1) builds a REAL, fully-fixtured
+    v7 store - not a hand-built pretend schema - for the populated-v7
+    upgrade regression: the exact same fixture every other test here
+    uses, just one migration short."""
     db = os.path.join(tmp, name)
     conn = sqlite3.connect(db)
     try:
-        for script in (migrate.MIGRATION_V1, migrate.MIGRATION_V2,
-                       migrate.MIGRATION_V3, migrate.MIGRATION_V4,
-                       migrate.MIGRATION_V5, migrate.MIGRATION_V6, migrate.MIGRATION_V7, migrate.MIGRATION_V8):
+        scripts = [migrate.MIGRATION_V1, migrate.MIGRATION_V2,
+                  migrate.MIGRATION_V3, migrate.MIGRATION_V4,
+                  migrate.MIGRATION_V5, migrate.MIGRATION_V6, migrate.MIGRATION_V7]
+        if not stop_at_v7:
+            scripts.append(migrate.MIGRATION_V8)
+        for script in scripts:
             conn.executescript(script)
         budget_col = budget if account_kind == "metered" else None
         conn.execute(
@@ -2251,6 +2259,225 @@ class FixRound3GatewaySnapshotMixedKeyRefused(_ServerCase):
                                    payload=payload)
         self.assertEqual(status, 400, body)
         self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4 (tk-1b3649a06f0e): R1 (populated-v7 upgrade) and R2 (legacy
+# replay account binding), from the third delta review of fix round 3
+# (card-5 d93c64c..1f3e68f).
+# ---------------------------------------------------------------------------
+
+class FixRound4PopulatedV7Upgrade(_ServerCase):
+    """Finding R1 (MAJOR): a v7 store that already has full-content
+    limit_events rows (the ordinary case for any store made by the
+    immediately preceding revision) must upgrade to v8 cleanly - the
+    backfill must never try to insert a legacy row over an existing real
+    one, and both a creator's and a joiner's real identity must survive
+    the upgrade unchanged."""
+
+    def test_populated_v7_store_upgrades_and_retains_creator_and_joiner_identity(self):
+        # The current lease.record_limit_event itself already depends on
+        # limit_events.legacy (added by THIS round's own v8 migration),
+        # so it cannot be used to populate a v7-only store directly - the
+        # fixture instead writes exactly the rows the immediately
+        # preceding revision's own record_limit_event would have written
+        # for a creator, then a joiner, of the SAME live block (matching
+        # this file's own established direct-SQL fixture style, e.g.
+        # _park): a v7 store already has full-content limit_events rows
+        # for BOTH before any v8 upgrade ever runs.
+        db = _build_store(self.tmp, stop_at_v7=True)
+        creator_event_id = str(uuid.uuid4())
+        joiner_event_id = str(uuid.uuid4())
+        block_id = str(uuid.uuid4())
+        creator_turn_id, joiner_turn_id = str(uuid.uuid4()), str(uuid.uuid4())
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "INSERT INTO blocks(id, account_id, model_id, reason, "
+                "retry_at, state, source_event_id, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (block_id, ACCOUNT, None, "provider_usage_429", None,
+                 "parked", creator_event_id, NOW))
+            for event_id, turn_id in ((creator_event_id, creator_turn_id),
+                                      (joiner_event_id, joiner_turn_id)):
+                conn.execute(
+                    "INSERT INTO limit_events(event_id, account_id, "
+                    "model_id, turn_id, observed_at, evidence_kind, "
+                    "resets_at, exhausted_windows, block_id, received_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (event_id, ACCOUNT, None, turn_id, NOW,
+                     "provider_usage_429", None, "[]", block_id, NOW))
+            conn.commit()
+        finally:
+            conn.close()
+        # The real upgrade path, v7 -> v8 (this round's own migrate.py
+        # fix), on a store that ALREADY has full-content limit_events
+        # rows for both the creator and the joiner - the exact case the
+        # reviewer's own unconditional-INSERT repro breaks.
+        store.init_db(db)
+        self.start_with_db(db)
+        # Both replay as ordinary (non-legacy) content-matching replays,
+        # unchanged by the upgrade.
+        status, replay_creator = _call(
+            self.base, "POST", "/v1/limit-events",
+            body=_limit_event(event_id=creator_event_id, account_id=ACCOUNT,
+                              model_id=None, turn_id=creator_turn_id,
+                              observed_at=NOW, resets_at=None),
+            identity=IDENTITY_A, idempotency_key=creator_event_id)
+        self.assertEqual(status, 202, replay_creator)
+        self.assertEqual(replay_creator["block_id"], block_id)
+        status, replay_joiner = _call(
+            self.base, "POST", "/v1/limit-events",
+            body=_limit_event(event_id=joiner_event_id, account_id=ACCOUNT,
+                              model_id=None, turn_id=joiner_turn_id,
+                              observed_at=NOW, resets_at=None),
+            identity=IDENTITY_A, idempotency_key=joiner_event_id)
+        self.assertEqual(status, 202, replay_joiner)
+        self.assertEqual(replay_joiner["block_id"], block_id)
+        # A changed-content replay of either is STILL a genuine conflict,
+        # proving both rows are real (post-upgrade, non-legacy) v7
+        # identities, not silently downgraded to legacy by the upgrade.
+        status, conflict = _call(
+            self.base, "POST", "/v1/limit-events",
+            body=_limit_event(event_id=creator_event_id, account_id=ACCOUNT,
+                              model_id=None, turn_id=creator_turn_id,
+                              observed_at=NOW, resets_at=NOW + 3_600_000),
+            identity=IDENTITY_A, idempotency_key=creator_event_id)
+        self.assertEqual(status, 409, conflict)
+        self.assertEqual(conflict["error"]["code"], "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(
+            _rows(self.db, "SELECT legacy FROM limit_events WHERE "
+                 "event_id=?", (creator_event_id,))[0][0], 0)
+        self.assertEqual(
+            _rows(self.db, "SELECT legacy FROM limit_events WHERE "
+                 "event_id=?", (joiner_event_id,))[0][0], 0)
+
+
+class FixRound4LegacyReplayAccountBinding(_ServerCase):
+    """Finding R2 (MAJOR, security): a legacy row's account_id is REAL
+    and known (unlike its other, genuinely unrecoverable content) - it
+    must still be enforced, both as authorization (against the STORED
+    account, not merely the submitted one) and as content identity."""
+
+    ACCOUNT_B = "11111111-1111-4111-8111-111111111113"
+
+    def _build_upgraded_legacy_store(self, event_id):
+        base = os.environ.get("AGENTTALK_SCRATCH")
+        if base:
+            os.makedirs(base, exist_ok=True)
+        tmp = tempfile.mkdtemp(dir=base, prefix="quota-card5-v6r2-")
+        db = os.path.join(tmp, "v6.db")
+        conn = sqlite3.connect(db)
+        try:
+            for script in (migrate.MIGRATION_V1, migrate.MIGRATION_V2,
+                          migrate.MIGRATION_V3, migrate.MIGRATION_V4,
+                          migrate.MIGRATION_V5, migrate.MIGRATION_V6):
+                conn.executescript(script)
+            conn.execute(
+                "INSERT INTO accounts(id, alias, vendor, kind, "
+                "budget_micro_eur) VALUES(?,?,?,?,?)",
+                (ACCOUNT, "meter", "ovh", "metered", 10 * HOLD))
+            conn.execute(
+                "INSERT INTO accounts(id, alias, vendor, kind, "
+                "budget_micro_eur) VALUES(?,?,?,?,?)",
+                (self.ACCOUNT_B, "meterb", "ovh", "metered", 10 * HOLD))
+            conn.execute(
+                "INSERT INTO machines(id, alias, identity_ref, enabled) "
+                "VALUES(?,?,?,?)", (MACHINE_A, "desktop", IDENTITY_A, 1))
+            conn.execute("INSERT INTO projects(id, alias) VALUES(?,?)",
+                        (PROJECT, "org"))
+            conn.execute(
+                "INSERT INTO project_accounts(project_id, account_id) "
+                "VALUES(?,?)", (PROJECT, ACCOUNT))
+            conn.execute("INSERT INTO teams(id, project_id, alias) "
+                        "VALUES(?,?,?)", (TEAM, PROJECT, "dev"))
+            conn.execute(
+                "INSERT INTO seats(id, team_id, machine_id, alias, role, "
+                "enforcement) VALUES(?,?,?,?,?,?)",
+                (SEAT_A, TEAM, MACHINE_A, "s1", "main", "metered"))
+            block_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO blocks(id, account_id, model_id, reason, "
+                "retry_at, state, source_event_id, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (block_id, ACCOUNT, None, "provider_usage_429", None,
+                 "cleared", event_id, NOW))
+            conn.commit()
+        finally:
+            conn.close()
+        return db, block_id
+
+    def test_legacy_replay_unauthorized_for_the_stored_account_is_forbidden(self):
+        # The reviewer's own repro: the caller's project_accounts grant
+        # is changed from A (the event's real account) to B, leaving it
+        # authorized only for B; submitting the legacy event_id with
+        # account_id=B (the ONLY account it can legitimately claim) must
+        # not disclose or touch A's block.
+        event_id = str(uuid.uuid4())
+        db, block_id = self._build_upgraded_legacy_store(event_id)
+        store.init_db(db)
+        self.start_with_db(db)
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "UPDATE project_accounts SET account_id=? WHERE "
+                "project_id=? AND account_id=?",
+                (self.ACCOUNT_B, PROJECT, ACCOUNT))
+            conn.commit()
+        finally:
+            conn.close()
+        replay = _limit_event(event_id=event_id, account_id=self.ACCOUNT_B,
+                              model_id=None, resets_at=None)
+        status, body = _call(
+            self.base, "POST", "/v1/limit-events", body=replay,
+            identity=IDENTITY_A, idempotency_key=event_id)
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"]["code"], "FORBIDDEN")
+        self.assertEqual(
+            _rows(self.db, "SELECT state FROM blocks WHERE id=?",
+                 (block_id,))[0][0], "cleared")
+
+    def test_legacy_replay_with_a_mismatched_but_authorized_account_is_conflict(self):
+        # The caller is authorized for BOTH accounts (the real one, A,
+        # and the one it submitted, B) - not an authorization gap, but a
+        # genuine content mismatch: the event really does belong to A.
+        event_id = str(uuid.uuid4())
+        db, block_id = self._build_upgraded_legacy_store(event_id)
+        store.init_db(db)
+        self.start_with_db(db)
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO project_accounts(project_id, account_id) "
+                "VALUES(?,?)", (PROJECT, self.ACCOUNT_B))
+            conn.commit()
+        finally:
+            conn.close()
+        replay = _limit_event(event_id=event_id, account_id=self.ACCOUNT_B,
+                              model_id=None, resets_at=None)
+        status, body = _call(
+            self.base, "POST", "/v1/limit-events", body=replay,
+            identity=IDENTITY_A, idempotency_key=event_id)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"]["code"], "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(
+            _rows(self.db, "SELECT state FROM blocks WHERE id=?",
+                 (block_id,))[0][0], "cleared")
+
+    def test_legacy_replay_with_the_matching_account_is_still_a_pure_replay(self):
+        # Keep the allowed same-account changed-content replay working.
+        event_id = str(uuid.uuid4())
+        db, block_id = self._build_upgraded_legacy_store(event_id)
+        store.init_db(db)
+        self.start_with_db(db)
+        replay = _limit_event(event_id=event_id, account_id=ACCOUNT,
+                              model_id=MODEL, resets_at=NOW + 3_600_000)
+        status, body = _call(
+            self.base, "POST", "/v1/limit-events", body=replay,
+            identity=IDENTITY_A, idempotency_key=event_id)
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body["block_id"], block_id)
+        self.assertEqual(body["state"], "cleared")
 
 
 if __name__ == "__main__":
