@@ -317,11 +317,14 @@ class Card4Turn3Test(unittest.TestCase):
         event_id = _rows(db, "SELECT event_id FROM receipts")[0][0]
         self.assertEqual(_rows(db, "SELECT COUNT(*) FROM receipts"),
                          [(1,)])
+        # A replay reports the same released/retained the first settle did
+        # (fix round 2, tk-dae9aab24ef8 finding N1: "the first receipt's
+        # own response unchanged" - not a flat zero).
         again = lease.settle(db, _receipt(event_id, lease_id, actual,
                                           at=NOW_LATE), NOW_LATE)
         self.assertTrue(again["replayed"])
-        self.assertEqual(again["released_micro_eur"], 0)
-        self.assertEqual(again["retained_micro_eur"], 0)
+        self.assertEqual(again["released_micro_eur"], HOLD - actual)
+        self.assertEqual(again["retained_micro_eur"], actual)
         self.assertEqual(_rows(db, "SELECT COUNT(*) FROM receipts"),
                          [(1,)])
         # October admission: the original period is fully reconciled, so

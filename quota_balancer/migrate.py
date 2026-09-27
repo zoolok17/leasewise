@@ -11,10 +11,17 @@ project_accounts, limits) of section 7; version 4 (card 2b-1, section
 the billing policy/totals tables; version 5 (card 4, section 7) adds
 the lease-store tables (blocks, leases, holds, receipts, adjustments,
 audit, daily_totals) and the exact partial indexes (blocks_live,
-receipt_final, lease_live). Versions 1-3 are kept byte for byte: a card
-adds only its own DDL. A store at the current version is a no-op; a store at
-a newer, unknown version is rejected before anything is written or
-switched (left byte-for-byte unchanged).
+receipt_final, lease_live); version 6 (card 5, section 6) adds the
+identity allowlist columns to machines; version 7 (card 5 fix round 2)
+adds limit_events (full-content idempotency for POST /limit-events) and
+http_request_identity (the HTTP transport's own Idempotency-Key ledger
+for wire-only fields the store never receives); version 8 (card 5 fix
+round 3) adds limit_events.legacy and backfills it from pre-v7 stores'
+own blocks.source_event_id rows (creator identities only - a joiner's
+identity was never recorded before v7 at all). Versions 1-3 are kept
+byte for byte: a card adds only its own DDL. A store at the current
+version is a no-op; a store at a newer, unknown version is rejected
+before anything is written or switched (left byte-for-byte unchanged).
 
 Migration protocol (fix round): the preliminary version read takes no lock.
 A store below the current version is switched to WAL first (WAL is a
@@ -41,7 +48,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -387,8 +394,100 @@ _DDL_V5 = (
 # The canonical version-5 migration script, kept for byte-for-byte comparison.
 MIGRATION_V5 = "\n".join(_DDL_V5) + "\nPRAGMA user_version=5;\n"
 
+# Card 5 (migration version 6): the private-HTTP identity allowlist
+# (section 6: "Default loopback; optional private authenticated TLS
+# tailnet ingress with machine allowlist"). machines add identity_ref
+# (unique among non-null values - a machine need not be enrolled),
+# enabled and last_seen_at (section 7's promised "later" columns). No
+# CHECK on `enabled` (STRICT already enforces INTEGER; the HTTP layer
+# treats anything but 1 as disabled, fail closed).
+_DDL_V6 = (
+    "ALTER TABLE machines ADD COLUMN identity_ref TEXT;",
+    "ALTER TABLE machines ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE machines ADD COLUMN last_seen_at INTEGER;",
+    "CREATE UNIQUE INDEX machines_identity_ref ON machines(identity_ref) "
+    "WHERE identity_ref IS NOT NULL;",
+)
+
+# The canonical version-6 migration script, kept for byte-for-byte comparison.
+MIGRATION_V6 = "\n".join(_DDL_V6) + "\nPRAGMA user_version=6;\n"
+
+# Card 5 fix round 2 (migration version 7): two card-5-owned tables no
+# earlier card added.
+#
+# limit_events retains every ACCEPTED POST /limit-events report by its own
+# event_id - not only the one that first created a block (fix round 2,
+# tk-dae9aab24ef8 findings N3/N4): full-content idempotency (a replay
+# compares every field; a changed field is IDEMPOTENCY_CONFLICT) and
+# tracking which block an event joined, so a later report can still be
+# recognized as a pure replay after the block itself is cleared or
+# updated by other events.
+#
+# http_request_identity is the HTTP transport's own Idempotency-Key
+# ledger for the two routes (grant, readings) whose wire body carries
+# fields (task_class, seat_id) the store never receives at all -
+# "idempotency identity covers the FULL canonical wire body, including
+# fields the store does not keep" (finding N2). Scoped by route: an
+# Idempotency-Key is a client-chosen UUID, unique in practice (it must
+# equal the body's own request_id/event_id) but the route is included
+# for defense in depth, not because a real collision is expected.
+_DDL_V7 = (
+    "CREATE TABLE limit_events(\n"
+    " event_id TEXT PRIMARY KEY,\n"
+    " account_id TEXT NOT NULL REFERENCES accounts(id),\n"
+    " model_id TEXT REFERENCES models(id),\n"
+    " turn_id TEXT NOT NULL,\n"
+    " observed_at INTEGER NOT NULL,\n"
+    " evidence_kind TEXT NOT NULL,\n"
+    " resets_at INTEGER,\n"
+    " exhausted_windows TEXT NOT NULL,\n"
+    " block_id TEXT NOT NULL REFERENCES blocks(id),\n"
+    " received_at INTEGER NOT NULL) STRICT;",
+    "CREATE TABLE http_request_identity(\n"
+    " route TEXT NOT NULL,\n"
+    " idempotency_key TEXT NOT NULL,\n"
+    " wire_hash TEXT NOT NULL,\n"
+    " created_at INTEGER NOT NULL,\n"
+    " PRIMARY KEY(route, idempotency_key)) STRICT;",
+)
+
+# The canonical version-7 migration script, kept for byte-for-byte comparison.
+MIGRATION_V7 = "\n".join(_DDL_V7) + "\nPRAGMA user_version=7;\n"
+
+# Card 5 fix round 3 (migration version 8, finding F2): v7 created
+# limit_events EMPTY, forgetting every limit-event identity a pre-v7
+# store already had. blocks.source_event_id is the only surviving trace
+# of those pre-v7 CREATOR events (a joiner's own event_id was never
+# recorded anywhere before v7 at all - that identity is unrecoverable,
+# a documented residual limitation, not something this migration can
+# fix). `legacy` flags a backfilled row's content as SYNTHESIZED, not
+# real evidence: turn_id/exhausted_windows have no v6 equivalent at all
+# (a fixed sentinel/empty placeholder), and observed_at/received_at fall
+# back to the block's own updated_at (a real timestamp, just not the
+# original report instant). record_limit_event never compares OR merges
+# a legacy row's content - see its own docstring. The WHERE clause
+# excludes receipt/settle-conflict blocks (reason IN
+# ('receipt_conflict','overrun')): those also set source_event_id, but
+# to a SETTLE event_id, never a limit-event one.
+_DDL_V8 = (
+    "ALTER TABLE limit_events ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0;",
+    "INSERT INTO limit_events(event_id, account_id, model_id, turn_id, "
+    "observed_at, evidence_kind, resets_at, exhausted_windows, block_id, "
+    "received_at, legacy) "
+    "SELECT source_event_id, account_id, model_id, "
+    "'00000000-0000-4000-8000-000000000000', updated_at, reason, "
+    "retry_at, '[]', id, updated_at, 1 FROM blocks WHERE "
+    "source_event_id IS NOT NULL AND reason IN "
+    "('codex_exhausted','claude_exhausted','provider_usage_429') "
+    "AND source_event_id NOT IN (SELECT event_id FROM limit_events);",
+)
+
+# The canonical version-8 migration script, kept for byte-for-byte comparison.
+MIGRATION_V8 = "\n".join(_DDL_V8) + "\nPRAGMA user_version=8;\n"
+
 # Step N upgrades a store from version N-1 to version N.
-_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5}
+_STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
+          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8}
 
 
 def schema_version(conn):

@@ -531,7 +531,7 @@ class BillingMigrationRollback(_Base):
         self.assertEqual(good.returncode, 0, good.stderr)
         conn = sqlite3.connect(db)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 8)
             readings_sql = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE name='readings'"
             ).fetchone()[0]

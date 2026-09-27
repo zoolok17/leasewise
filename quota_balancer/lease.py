@@ -327,7 +327,43 @@ def _parked_block_error(conn, account_id, model_id):
 
 # --- grant ----------------------------------------------------------------------
 
-def grant(path, request, now_ms):
+def _check_http_identity(conn, wire_identity):
+    """Fix round 3 finding F1: the HTTP wire-identity check/record must
+    run INSIDE the same write transaction as the durable business effect
+    it accompanies - two separate transactions (fix round 2's own
+    design) left a crash/concurrency window where a competing request
+    with different content could commit between them. `wire_identity` is
+    `(route, key, wire_hash)` or None (a caller with no HTTP identity to
+    guard, e.g. every non-HTTP/CLI caller). Called right after BEGIN
+    IMMEDIATE: under the write lock, a genuinely concurrent competitor
+    blocks here until the first transaction commits or rolls back, then
+    sees its committed identity row (or its absence, if it rolled back)."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    row = conn.execute(
+        "SELECT wire_hash FROM http_request_identity WHERE route=? "
+        "AND idempotency_key=?", (route, key)).fetchone()
+    if row is not None and row[0] != wire_hash:
+        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                         errors.MSG_IDEMPOTENCY_CONFLICT)
+
+
+def _record_http_identity(conn, wire_identity, now_ms):
+    """The write half of _check_http_identity - called right before
+    COMMIT, in the SAME transaction as the mutation, so an injected
+    failure here rolls back the whole mutation, not merely this row (a
+    monkeypatch point for the interrupted-commit regressions)."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    conn.execute(
+        "INSERT OR IGNORE INTO http_request_identity(route, "
+        "idempotency_key, wire_hash, created_at) VALUES(?,?,?,?)",
+        (route, key, wire_hash, now_ms))
+
+
+def grant(path, request, now_ms, wire_identity=None):
     """Admit and record one lease, or refuse it with a section-7 code.
 
     One BEGIN IMMEDIATE transaction: read the chain, the account and
@@ -342,12 +378,18 @@ def grant(path, request, now_ms):
     enforcement, money_hold, caps, granted_at, expires_at, replayed};
     a replay re-returns the stored lease with replayed=True and adds no
     hold.
+
+    `wire_identity` (fix round 3 finding F1) is the HTTP layer's own
+    `(route, key, wire_hash)` full-wire-body identity, checked and
+    recorded atomically with this same transaction - see
+    _check_http_identity/_record_http_identity. None for every
+    non-HTTP/CLI caller (no HTTP identity to guard).
     """
     policy._check_int(now_ms, 1)
     _validate_grant_request(request)
     conn = _connect(path, must_exist=True)
     try:
-        return _grant(conn, request, now_ms)
+        return _grant(conn, request, now_ms, wire_identity)
     except QuotaError:
         raise
     except sqlite3.Error as exc:
@@ -480,9 +522,10 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         raise QuotaError(code, msg)
 
 
-def _grant(conn, request, now_ms):
+def _grant(conn, request, now_ms, wire_identity=None):
     conn.execute("BEGIN IMMEDIATE")
     try:
+        _check_http_identity(conn, wire_identity)
         seat = conn.execute(
             "SELECT id, machine_id, team_id, enforcement FROM seats "
             "WHERE id=?", (request["seat_id"],)).fetchone()
@@ -515,7 +558,7 @@ def _grant(conn, request, now_ms):
         if account is None:
             _not_found()
         machine_id = seat[1]
-        account_id, _kind, budget = account
+        account_id, account_kind, budget = account
         # Project authorization (section 7: children share project
         # authorization; the server derives membership): the model's
         # account must be one the seat's project has been given.
@@ -548,6 +591,7 @@ def _grant(conn, request, now_ms):
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
+            _record_http_identity(conn, wire_identity, now_ms)
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
 
@@ -591,6 +635,29 @@ def _grant(conn, request, now_ms):
         # machine: a foreign one cannot bind (much less upgrade the
         # enforcement of) the lease.
         enforcement = seat[3]
+        # CARRY-OVER m4 (STEP-CARD-4, closed in card 5): a seat's stored
+        # enforcement is an operator setting, not a request the client can
+        # shape - but subscription_admission/subscription_warn are
+        # declarations that THIS seat is billed by a subscription, not by
+        # this account's money admission at all. On a METERED account
+        # (one WITH a real budget) that declaration is simply wrong, and
+        # silently honoring it would skip money admission entirely (a
+        # seat setting acting as a money bypass). shadow is NOT included:
+        # it is a generic observe-only mode with no billing-model claim
+        # of its own (section 6: "Old wrappers keep working in
+        # observe-only deployments and appear unmanaged/unmetered"), and
+        # is exercised deliberately on a metered account by
+        # test_card4_turn_c_fix.test_shadow_consumes_no_concurrency_slot.
+        # The design gives no explicit ruling for this combination
+        # (docs/DESIGN.md only states "only metered_advisory is permitted
+        # on a metered account" for the pre-6b sized-enforcement path
+        # itself); the fail-closed reading, recorded here and in
+        # docs/STEP-CARD-5.md, is to REJECT the grant outright rather
+        # than silently reinterpret the seat's setting as metered_advisory.
+        if account_kind == "metered" and enforcement in (
+                "subscription_admission", "subscription_warn"):
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
         sized_ready = None
         if request["gateway_id"] is not None:
             gw = conn.execute(
@@ -719,6 +786,7 @@ def _grant(conn, request, now_ms):
             "redacted_details) VALUES(?,?,?,?,?)",
             ("coordinator", "lease_granted", lease_id, now_ms,
              json.dumps({"final": 0})))
+        _record_http_identity(conn, wire_identity, now_ms)
         conn.execute("COMMIT")
         return _lease_dict(_lease_row(conn, lease_id))
     except BaseException:
@@ -815,6 +883,11 @@ def expire(path, lease_id, now_ms):
 _RECEIPT_FIELDS = ("lease_id", "gateway_id", "seq", "calls", "input_tokens",
                    "cached_input_tokens", "output_tokens", "actual_micro_eur",
                    "outcome", "final", "observed_at", "received_at")
+# The replay-identity subset (fix round 2 finding N1): every field EXCEPT
+# the two server-derived receipt timestamps, which an HTTP retry
+# regenerates on every call and so can never agree with a stored row.
+_RECEIPT_IDENTITY_FIELDS = tuple(
+    f for f in _RECEIPT_FIELDS if f not in ("observed_at", "received_at"))
 
 
 def _hold_metric(conn, limit_id):
@@ -903,14 +976,31 @@ def _settle(conn, receipt, now_ms):
             (receipt["event_id"],)).fetchone()
         if stored is not None:
             # A duplicate event_id: identical content is a no-op replay,
-            # different content is an idempotency conflict.
-            if any(receipt[a] != b for a, b in
-                   zip(_RECEIPT_FIELDS, stored[1:])):
+            # different content is an idempotency conflict. Identity
+            # excludes observed_at/received_at (fix round 2,
+            # tk-dae9aab24ef8 finding N1): the HTTP adapter derives both
+            # from the receipt instant on EVERY call, so an identical
+            # retry a moment later would otherwise always look like a
+            # conflicting report and could never be recovered.
+            stored_map = dict(zip(_RECEIPT_FIELDS, stored[1:]))
+            if any(receipt[f] != stored_map[f]
+                   for f in _RECEIPT_IDENTITY_FIELDS):
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
+            # Replay the first receipt's own response unchanged (finding
+            # N1): recomputed from the lease's fixed money_hold and the
+            # stored (identity-checked) actual/final, the same formula
+            # the original settle below uses - never the first call's
+            # transient state, never a flat zero.
+            released = retained = 0
+            if stored_map["final"] and lease["money_hold"] is not None:
+                retained = min(stored_map["actual_micro_eur"],
+                               lease["money_hold"])
+                released = lease["money_hold"] - retained
             conn.execute("COMMIT")
             return {"state": lease["state"], "replayed": True,
-                    "released_micro_eur": 0, "retained_micro_eur": 0}
+                    "released_micro_eur": released,
+                    "retained_micro_eur": retained}
         if lease["state"] == "settled":
             # Terminal rows cannot be reopened: a conflicting FINAL
             # receipt blocks further work on the account (section 4,
@@ -1034,3 +1124,189 @@ def _settle(conn, receipt, now_ms):
     except BaseException:
         rollback_quietly(conn)
         raise
+
+
+# --- limit-events (card 5 fix round: POST /v1/limit-events, section 7) -----------
+
+_LIMIT_EVENT_KEYS = frozenset((
+    "event_id", "account_id", "model_id", "turn_id", "observed_at",
+    "evidence_kind", "resets_at", "exhausted_windows"))
+_EVIDENCE_KINDS = frozenset((
+    "codex_exhausted", "claude_exhausted", "provider_usage_429"))
+
+
+def _validate_limit_event(event):
+    if not isinstance(event, dict) or frozenset(event) != _LIMIT_EVENT_KEYS:
+        _invalid()
+    policy._check_uuid(event["event_id"])
+    policy._check_uuid(event["account_id"])
+    if event["model_id"] is not None:
+        policy._check_uuid(event["model_id"])
+    policy._check_uuid(event["turn_id"])
+    policy._check_int(event["observed_at"], 1)
+    # Type-checked BEFORE membership (fix round 2, tk-dae9aab24ef8
+    # finding N6): `x in a_frozenset` hashes x first, so an unhashable
+    # client value (a list, a dict) raised a raw TypeError - surfacing as
+    # an internal fault (503) instead of the client's actual mistake (400).
+    if not isinstance(event["evidence_kind"], str) \
+            or event["evidence_kind"] not in _EVIDENCE_KINDS:
+        _invalid()
+    if event["resets_at"] is not None:
+        policy._check_int(event["resets_at"], 1)
+    windows = event["exhausted_windows"]
+    if not isinstance(windows, list) or not all(isinstance(w, str) for w in windows):
+        _invalid()
+
+
+_LIMIT_EVENT_IDENTITY_FIELDS = (
+    "account_id", "model_id", "turn_id", "observed_at", "evidence_kind",
+    "resets_at", "exhausted_windows")
+
+
+def _merge_retry_at(old, new):
+    """Conservative evidence merge (fix round 2 finding N4): the latest
+    KNOWN reset wins (never schedule an earlier retry than any report
+    says), but an unknown (null) reset from EITHER side makes the merged
+    reset unknown too - recovery then waits for positive evidence from
+    every report, not just the first one."""
+    if old is None or new is None:
+        return None
+    return max(old, new)
+
+
+def record_limit_event(path, event, now_ms, authorized_for_account=None):
+    """Publish a reporter-observed limit exhaustion as a parked block on
+    the account (section 7: "POST /limit-events... 202
+    {block_id,retry_at,state}").
+
+    A block is account-wide (model_id NULL) or model-scoped, matching the
+    blocks_live partial index (one live block per (account,
+    model-or-null)). Idempotent by event_id - EVERY accepted event is
+    retained in limit_events (fix round 2, tk-dae9aab24ef8 findings
+    N3/N4; migration version 7), not only the one that first created its
+    block: a replay compares the FULL content (not just account/model)
+    and, if unchanged, returns the block's CURRENT state as a pure read -
+    no write, no audit row, so a delayed replay can never re-park an
+    account an operator has since cleared, nor drift from what the block
+    actually now says. A DIFFERENT event_id for an account/model that
+    already has a live block JOINS it (the card's own demo: "two machines
+    share one block") rather than raising a uniqueness conflict, and
+    MERGES its exhaustion evidence into the block's retry_at
+    conservatively (_merge_retry_at) rather than discarding it.
+
+    A LEGACY row (fix round 3, tk-f9018a7e573e finding F2; migration
+    version 8) is one migration v8 backfilled from a pre-v7 store's own
+    blocks.source_event_id - a creator identity from before limit_events
+    existed at all, with no real turn_id/observed_at/exhausted_windows to
+    compare (synthesized placeholders, not evidence) and no record of any
+    OTHER event that may have joined its block. Its CONTENT is never
+    compared and never merged: a replay of a legacy event_id always
+    returns the block's CURRENT state unchanged, exactly like a
+    content-matching replay, so a delayed pre-upgrade retry can neither
+    conflict nor re-park (nor otherwise disturb) an account the operator
+    has since recovered. Its account_id is NOT one of the unknown fields
+    though (fix round 4, tk-1b3649a06f0e finding R2) - copied faithfully
+    from the pre-v7 block, it is real and known, and ignoring content
+    must never also disable authorization on it: `authorized_for_account`
+    (an optional `(conn, account_id) -> bool` callback; None for every
+    non-HTTP/CLI caller) is re-checked against the block's STORED account
+    for a legacy row specifically, before any of its state is returned -
+    not merely the submitted account_id the caller's own request named,
+    which the original bug trusted blindly. A submitted account_id that
+    disagrees with the stored one, from a caller who IS authorized for
+    the real account, is still a genuine content mismatch
+    (IDEMPOTENCY_CONFLICT) - the two checks are independent, not
+    alternatives.
+    """
+    policy._check_int(now_ms, 1)
+    _validate_limit_event(event)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT account_id, model_id, turn_id, observed_at, "
+                "evidence_kind, resets_at, exhausted_windows, block_id, "
+                "legacy FROM limit_events WHERE event_id=?",
+                (event["event_id"],)).fetchone()
+            if existing is not None:
+                stored_account_id = existing[0]
+                if existing[8]:
+                    if authorized_for_account is not None \
+                            and not authorized_for_account(
+                                conn, stored_account_id):
+                        raise QuotaError(errors.CODE_FORBIDDEN,
+                                         errors.MSG_FORBIDDEN)
+                    if event["account_id"] != stored_account_id:
+                        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                         errors.MSG_IDEMPOTENCY_CONFLICT)
+                else:
+                    stored = dict(zip(
+                        ("account_id", "model_id", "turn_id", "observed_at",
+                         "evidence_kind", "resets_at", "exhausted_windows"),
+                        existing[:7]))
+                    stored["exhausted_windows"] = json.loads(stored["exhausted_windows"])
+                    if any(stored[f] != event[f]
+                           for f in _LIMIT_EVENT_IDENTITY_FIELDS):
+                        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                         errors.MSG_IDEMPOTENCY_CONFLICT)
+                block_id = existing[7]
+                block = conn.execute(
+                    "SELECT retry_at, state FROM blocks WHERE id=?",
+                    (block_id,)).fetchone()
+                conn.execute("COMMIT")
+                return {"block_id": block_id, "retry_at": block[0],
+                        "state": block[1]}
+            account = conn.execute("SELECT id FROM accounts WHERE id=?",
+                                   (event["account_id"],)).fetchone()
+            if account is None:
+                _not_found()
+            if event["model_id"] is not None:
+                model = conn.execute(
+                    "SELECT id FROM models WHERE id=? AND account_id=?",
+                    (event["model_id"], event["account_id"])).fetchone()
+                if model is None:
+                    _not_found()
+            live = conn.execute(
+                "SELECT id, retry_at, state FROM blocks WHERE account_id=? "
+                "AND model_id IS ? AND state IN ('parked','probing')",
+                (event["account_id"], event["model_id"])).fetchone()
+            if live is None:
+                block_id = str(_uuid.uuid4())
+                retry_at, state = event["resets_at"], "parked"
+                conn.execute(
+                    "INSERT INTO blocks(id, account_id, model_id, "
+                    "reason, retry_at, state, source_event_id, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (block_id, event["account_id"], event["model_id"],
+                     event["evidence_kind"], retry_at, state,
+                     event["event_id"], now_ms))
+            else:
+                block_id, old_retry_at, state = live
+                retry_at = _merge_retry_at(old_retry_at, event["resets_at"])
+                conn.execute(
+                    "UPDATE blocks SET retry_at=?, updated_at=? WHERE id=?",
+                    (retry_at, now_ms, block_id))
+            conn.execute(
+                "INSERT INTO limit_events(event_id, account_id, model_id, "
+                "turn_id, observed_at, evidence_kind, resets_at, "
+                "exhausted_windows, block_id, received_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (event["event_id"], event["account_id"], event["model_id"],
+                 event["turn_id"], event["observed_at"],
+                 event["evidence_kind"], event["resets_at"],
+                 json.dumps(event["exhausted_windows"]), block_id, now_ms))
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("coordinator", "limit_event_recorded", block_id, now_ms,
+                 json.dumps({"evidence_kind": event["evidence_kind"]})))
+            conn.execute("COMMIT")
+            return {"block_id": block_id, "retry_at": retry_at, "state": state}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()

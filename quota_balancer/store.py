@@ -453,7 +453,33 @@ def _apply_billing_policies(conn, policies):
         )
 
 
-def reading_import(path, file):
+def _check_http_identity(conn, wire_identity):
+    """Fix round 3 finding F1: see lease._check_http_identity - the same
+    HTTP wire-identity check, duplicated rather than imported (store.py
+    and lease.py deliberately do not import each other)."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    row = conn.execute(
+        "SELECT wire_hash FROM http_request_identity WHERE route=? "
+        "AND idempotency_key=?", (route, key)).fetchone()
+    if row is not None and row[0] != wire_hash:
+        raise QuotaError(CODE_IDEMPOTENCY_CONFLICT, MSG_IDEMPOTENCY_CONFLICT)
+
+
+def _record_http_identity(conn, wire_identity, now_ms):
+    """See lease._record_http_identity - a monkeypatch point for the
+    interrupted-commit regressions."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    conn.execute(
+        "INSERT OR IGNORE INTO http_request_identity(route, "
+        "idempotency_key, wire_hash, created_at) VALUES(?,?,?,?)",
+        (route, key, wire_hash, now_ms))
+
+
+def reading_import(path, file, wire_identity=None):
     """Validate a card-2 reading document and apply it atomically.
 
     Validation (shape/types, no future observations) happens before any
@@ -463,6 +489,12 @@ def reading_import(path, file):
     batch with IDEMPOTENCY_CONFLICT), references are resolved, and the
     reading is recorded and reduced into windows / the gateway report. All
     of it commits as one transaction, so a partial import never commits.
+
+    `wire_identity` (fix round 3 finding F1) is the HTTP layer's own
+    `(route, key, wire_hash)` full-wire-body identity for the single-
+    reading HTTP path, checked and recorded atomically with this same
+    transaction. None for the CLI batch-import path (no HTTP identity to
+    guard).
     """
     now_ms = int(time.time() * 1000)
     try:
@@ -479,6 +511,7 @@ def reading_import(path, file):
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            _check_http_identity(conn, wire_identity)
             require_supported(conn)
             machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
             account_ids = dict(conn.execute("SELECT alias, id FROM accounts"))
@@ -486,6 +519,7 @@ def reading_import(path, file):
             for reading in readings:
                 _apply_reading(conn, reading, machine_ids, account_ids,
                                gateway_ids, now_ms)
+            _record_http_identity(conn, wire_identity, now_ms)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -765,6 +799,45 @@ def set_coverage(path, account, complete):
             conn.execute(
                 "UPDATE accounts SET coverage_complete=? WHERE id=?",
                 (1 if complete else 0, row[0]),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def set_machine_identity(path, machine, identity_ref, enabled):
+    """Enroll or update a machine's HTTP identity allowlist entry
+    (operator-only; card 5's identity allowlist, docs/DESIGN.md section
+    6: "optional private authenticated TLS tailnet ingress with machine
+    allowlist"). There is no remote/HTTP path to this: enrollment is a
+    local, operator-driven action, same as set_coverage/reconcile.
+
+    `identity_ref` is the opaque value the host ingress presents per
+    request (unique among enrolled machines; None un-enrolls). `enabled`
+    is a boolean; a disabled machine is refused like an unenrolled one.
+    """
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            row = conn.execute(
+                "SELECT id FROM machines WHERE alias = ?", (machine,)
+            ).fetchone()
+            if row is None:
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            if identity_ref is not None and conn.execute(
+                    "SELECT 1 FROM machines WHERE identity_ref = ? "
+                    "AND id != ?", (identity_ref, row[0])).fetchone():
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            conn.execute(
+                "UPDATE machines SET identity_ref=?, enabled=? WHERE id=?",
+                (identity_ref, 1 if enabled else 0, row[0]),
             )
             conn.execute("COMMIT")
         except BaseException:
