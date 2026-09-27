@@ -146,7 +146,7 @@ def _build_store(tmp, name="lease.db", budget=10 * HOLD, gateway_sized=1,
     try:
         for script in (migrate.MIGRATION_V1, migrate.MIGRATION_V2,
                        migrate.MIGRATION_V3, migrate.MIGRATION_V4,
-                       migrate.MIGRATION_V5, migrate.MIGRATION_V6):
+                       migrate.MIGRATION_V5, migrate.MIGRATION_V6, migrate.MIGRATION_V7):
             conn.executescript(script)
         budget_col = budget if account_kind == "metered" else None
         conn.execute(
@@ -1477,6 +1477,389 @@ class IdentityEnrollment(unittest.TestCase):
         result = run_cli("--db", db, "serve", "--host", "0.0.0.0", "--port", "0")
         self.assertEqual(result.returncode, 2)
         self.assertIn("INVALID_REQUEST", result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (tk-dae9aab24ef8): N1-N7 + plan authorization. Every class
+# below is grouped by finding; the reviewer's own real-socket reproductions
+# are pinned as closely as their exact numbers allow.
+# ---------------------------------------------------------------------------
+
+# 2026-09-01T00:00:00Z / 2026-10-01T00:00:00Z: exact UTC month bounds for
+# NOW (2026-09-, one hour into the month) - gateway_snapshot's billing
+# payload requires an exact one-UTC-month period.
+MONTH_START = 1788220800000
+NEXT_MONTH_START = 1790812800000
+
+
+class FixRound2SettleReplayIdentity(_ServerCase):
+    """Finding N1 (MAJOR): a settle replay must not conflict with its own
+    first receipt merely because the adapter re-derives observed_at/
+    received_at on every request."""
+
+    def test_identical_final_settlement_retry_does_not_conflict_with_itself(self):
+        self.start()
+        _status, granted = self.grant()
+        lease_id = granted["lease_id"]
+        receipt = _receipt(final=True, actual=1)
+        key = receipt["event_id"]
+        status1, body1 = _call(
+            self.base, "POST", "/v1/leases/%s/settle" % lease_id, body=receipt,
+            identity=IDENTITY_A, idempotency_key=key)
+        self.assertEqual(status1, 200, body1)
+        time.sleep(0.025)
+        status2, body2 = _call(
+            self.base, "POST", "/v1/leases/%s/settle" % lease_id, body=receipt,
+            identity=IDENTITY_A, idempotency_key=key)
+        self.assertEqual(status2, 200, body2)
+        self.assertEqual(body2["state"], body1["state"])
+        self.assertEqual(body2["released_micro_eur"], body1["released_micro_eur"])
+        self.assertEqual(body2["retained_micro_eur"], body1["retained_micro_eur"])
+        self.assertEqual(_rows(self.db, "SELECT COUNT(*) FROM receipts")[0][0], 1)
+
+
+class FixRound2WireIdentity(_ServerCase):
+    """Finding N2 (MAJOR): idempotency identity must cover the full
+    canonical wire body, including fields the store itself never keeps
+    (grant's task_class, readings' seat_id)."""
+
+    def test_grant_replay_with_changed_task_class_is_conflict(self):
+        self.start()
+        request = _grant_request(task_class=TASK_CLASS)
+        status1, body1 = _call(
+            self.base, "POST", "/v1/leases", body=request, identity=IDENTITY_A,
+            idempotency_key=request["request_id"])
+        self.assertEqual(status1, 201, body1)
+        changed = dict(request, task_class="nonexistent_profile")
+        status2, body2 = _call(
+            self.base, "POST", "/v1/leases", body=changed, identity=IDENTITY_A,
+            idempotency_key=request["request_id"])
+        self.assertEqual(status2, 409, body2)
+        self.assertEqual(body2["error"]["code"], "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(_rows(self.db, "SELECT COUNT(*) FROM leases")[0][0], 1)
+
+    def test_reading_replay_with_changed_seat_id_is_conflict(self):
+        self.start()
+        reading = _reading(seat_id=None)
+        key = reading["event_id"]
+        status1, body1 = _call(
+            self.base, "POST", "/v1/readings", body=reading, identity=IDENTITY_A,
+            idempotency_key=key)
+        self.assertEqual(status1, 202, body1)
+        changed = dict(reading, seat_id=SEAT_B)
+        status2, body2 = _call(
+            self.base, "POST", "/v1/readings", body=changed, identity=IDENTITY_A,
+            idempotency_key=key)
+        self.assertEqual(status2, 409, body2)
+        self.assertEqual(body2["error"]["code"], "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(
+            _rows(self.db, "SELECT seat_id FROM readings WHERE event_id=?",
+                 (reading["event_id"],))[0][0], None)
+
+
+class FixRound2LimitEventContentIdentity(_ServerCase):
+    """Finding N3 (MAJOR): limit-event dedup must compare full content and
+    must remember every accepted event id, including one that only joined
+    a block - a pure replay is a read, never a second write."""
+
+    def test_replay_with_changed_resets_at_is_conflict(self):
+        self.start()
+        event_id = str(uuid.uuid4())
+        status1, body1 = self.limit_event(event_id=event_id, resets_at=None)
+        self.assertEqual(status1, 202, body1)
+        status2, body2 = self.limit_event(
+            event_id=event_id, resets_at=NOW + 3_600_000)
+        self.assertEqual(status2, 409, body2)
+        self.assertEqual(body2["error"]["code"], "IDEMPOTENCY_CONFLICT")
+
+    def test_replay_of_a_joining_event_adds_no_new_block_or_audit_row(self):
+        # The reviewer's own repro (b/c): a SECOND event joining an
+        # already-live block is not the one that created it - dedup keyed
+        # only on "which event created this block" misses it entirely, so
+        # replaying the JOINER, not the creator, is the case that exposes
+        # the bug (a solo creator-only replay was already fine before this
+        # round; see FixRoundPlanAndLimitEvents.test_limit_event_replay_is_
+        # idempotent).
+        self.start()
+        _status, creator = self.limit_event(model_id=None)
+        joiner = _limit_event(model_id=None)
+        status, joined = _call(
+            self.base, "POST", "/v1/limit-events", body=joiner,
+            identity=IDENTITY_A, idempotency_key=joiner["event_id"])
+        self.assertEqual(status, 202, joined)
+        self.assertEqual(joined["block_id"], creator["block_id"])
+        blocks_before = _rows(self.db, "SELECT COUNT(*) FROM blocks")[0][0]
+        audit_before = _rows(self.db, "SELECT COUNT(*) FROM audit")[0][0]
+        status, replayed = _call(
+            self.base, "POST", "/v1/limit-events", body=joiner,
+            identity=IDENTITY_A, idempotency_key=joiner["event_id"])
+        self.assertEqual(status, 202, replayed)
+        self.assertEqual(_rows(self.db, "SELECT COUNT(*) FROM blocks")[0][0],
+                         blocks_before)
+        self.assertEqual(_rows(self.db, "SELECT COUNT(*) FROM audit")[0][0],
+                         audit_before)
+
+    def test_replay_of_a_joining_event_after_its_block_is_cleared_does_not_reopen_it(self):
+        # The reviewer's own repro: clear the block a joining event's
+        # report once joined, then replay that SAME (unchanged) joiner
+        # event while the account is recovered - a delayed outbox retry
+        # must not re-park it.
+        self.start()
+        _status, creator = self.limit_event(model_id=None)
+        joiner = _limit_event(model_id=None)
+        _call(self.base, "POST", "/v1/limit-events", body=joiner,
+             identity=IDENTITY_A, idempotency_key=joiner["event_id"])
+        block_id = creator["block_id"]
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE blocks SET state='cleared' WHERE id=?",
+                        (block_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        blocks_before = _rows(self.db, "SELECT COUNT(*) FROM blocks")[0][0]
+        status, replayed = _call(
+            self.base, "POST", "/v1/limit-events", body=joiner,
+            identity=IDENTITY_A, idempotency_key=joiner["event_id"])
+        self.assertEqual(status, 202, replayed)
+        self.assertEqual(replayed["block_id"], block_id)
+        self.assertEqual(replayed["state"], "cleared")
+        self.assertEqual(_rows(self.db, "SELECT COUNT(*) FROM blocks")[0][0],
+                         blocks_before)
+
+
+class FixRound2LimitEventEvidenceMerge(_ServerCase):
+    """Finding N4 (MAJOR): joining a live block must merge evidence
+    conservatively - the latest KNOWN reset wins, but an unknown reset from
+    either side poisons the merged result to unknown."""
+
+    def test_later_known_reset_wins_over_an_earlier_one(self):
+        self.start()
+        status, a = self.limit_event(resets_at=NOW + 60_000)
+        self.assertEqual(status, 202, a)
+        status, b = self.limit_event(resets_at=NOW + 3_600_000)
+        self.assertEqual(status, 202, b)
+        self.assertEqual(b["block_id"], a["block_id"])
+        self.assertEqual(b["retry_at"], NOW + 3_600_000)
+        self.assertEqual(
+            _rows(self.db, "SELECT retry_at FROM blocks WHERE id=?",
+                 (a["block_id"],)), [(NOW + 3_600_000,)])
+
+    def test_a_smaller_reset_from_a_later_joining_event_does_not_regress_the_retry_at(self):
+        # The reviewer's own wording: "never schedule an earlier retry
+        # than any report says." A joining event reporting a SMALLER
+        # (earlier) reset than the block already has must not move the
+        # retry_at backwards - only max(old, new), never new alone.
+        self.start()
+        status, a = self.limit_event(resets_at=NOW + 3_600_000)
+        self.assertEqual(status, 202, a)
+        status, b = self.limit_event(resets_at=NOW + 60_000)
+        self.assertEqual(status, 202, b)
+        self.assertEqual(b["block_id"], a["block_id"])
+        self.assertEqual(b["retry_at"], NOW + 3_600_000)
+        self.assertEqual(
+            _rows(self.db, "SELECT retry_at FROM blocks WHERE id=?",
+                 (a["block_id"],)), [(NOW + 3_600_000,)])
+
+    def test_unknown_reset_from_a_joining_event_poisons_the_merged_retry_at(self):
+        self.start()
+        status, a = self.limit_event(resets_at=NOW + 60_000)
+        self.assertEqual(status, 202, a)
+        status, b = self.limit_event(resets_at=None)
+        self.assertEqual(status, 202, b)
+        self.assertEqual(b["block_id"], a["block_id"])
+        self.assertIsNone(b["retry_at"])
+        self.assertEqual(
+            _rows(self.db, "SELECT retry_at FROM blocks WHERE id=?",
+                 (a["block_id"],)), [(None,)])
+
+
+class FixRound2LimitEventEvidenceKindType(_ServerCase):
+    """Finding N6 (MINOR): an invalid evidence_kind TYPE (not merely an
+    unrecognized string) must be 400 INVALID_REQUEST, never 503."""
+
+    def test_list_evidence_kind_is_400_not_503(self):
+        self.start()
+        event = _limit_event()
+        event["evidence_kind"] = []
+        status, body = _call(
+            self.base, "POST", "/v1/limit-events", body=event,
+            identity=IDENTITY_A, idempotency_key=event["event_id"])
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+
+
+class FixRound2WireOptionalKeysAndGatewaySnapshot(_ServerCase):
+    """Finding N5 (MAJOR): the adapter must accept the section-7 wire
+    shape (gateway_id UUID, genuinely optional keys) rather than requiring
+    internal aliases or treating optional keys as mandatory-but-nullable."""
+
+    def test_gateway_snapshot_with_wire_gateway_id_uuid_is_accepted(self):
+        self.start()
+        payload = {
+            "gateway_id": GATEWAY, "ledger_epoch": 1, "seq": 1,
+            "period_start": MONTH_START, "period_end": NEXT_MONTH_START,
+            "settled_micro_eur": 0, "reserved_micro_eur": 0,
+            "uncertain_micro_eur": 0, "unattributed_micro_eur": 0,
+            "reconciliation_required": False, "sized_ready": False,
+            "policy_hashes": None,
+        }
+        status, body = self.report(account_id=ACCOUNT, kind="gateway_snapshot",
+                                   payload=payload)
+        self.assertEqual(status, 202, body)
+
+    def test_gateway_snapshot_with_the_internal_alias_key_is_refused(self):
+        # The wire never names the internal alias directly; only the
+        # adapter itself may resolve gateway_id -> gateway.
+        self.start()
+        payload = {
+            "gateway": "g1", "ledger_epoch": 1, "seq": 1,
+            "period_start": MONTH_START, "period_end": NEXT_MONTH_START,
+            "settled_micro_eur": 0, "reserved_micro_eur": 0,
+            "uncertain_micro_eur": 0, "unattributed_micro_eur": 0,
+            "reconciliation_required": False, "sized_ready": False,
+            "policy_hashes": None,
+        }
+        status, body = self.report(account_id=ACCOUNT, kind="gateway_snapshot",
+                                   payload=payload)
+        self.assertEqual(status, 400, body)
+
+    def test_gateway_snapshot_with_a_non_uuid_gateway_id_is_refused(self):
+        self.start()
+        payload = {
+            "gateway_id": "not-a-uuid", "ledger_epoch": 1, "seq": 1,
+            "period_start": MONTH_START, "period_end": NEXT_MONTH_START,
+            "settled_micro_eur": 0, "reserved_micro_eur": 0,
+            "uncertain_micro_eur": 0, "unattributed_micro_eur": 0,
+            "reconciliation_required": False, "sized_ready": False,
+            "policy_hashes": None,
+        }
+        status, body = self.report(account_id=ACCOUNT, kind="gateway_snapshot",
+                                   payload=payload)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+
+    def test_gateway_snapshot_with_a_non_string_gateway_id_is_400_not_503(self):
+        # A JSON array/object gateway_id is not merely UUID-malformed - it
+        # is not even a bindable sqlite parameter type, so without the
+        # UUID-SHAPE check first, this would surface as a raw
+        # sqlite3.InterfaceError (caught by the generic store-fault guard
+        # as 503), not the client's actual mistake (400).
+        self.start()
+        payload = {
+            "gateway_id": ["not", "a", "string"], "ledger_epoch": 1, "seq": 1,
+            "period_start": MONTH_START, "period_end": NEXT_MONTH_START,
+            "settled_micro_eur": 0, "reserved_micro_eur": 0,
+            "uncertain_micro_eur": 0, "unattributed_micro_eur": 0,
+            "reconciliation_required": False, "sized_ready": False,
+            "policy_hashes": None,
+        }
+        status, body = self.report(account_id=ACCOUNT, kind="gateway_snapshot",
+                                   payload=payload)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["code"], "INVALID_REQUEST")
+
+    def test_reading_optional_seat_id_may_be_absent_entirely(self):
+        self.start()
+        reading = _reading()
+        del reading["seat_id"]
+        status, body = _call(
+            self.base, "POST", "/v1/readings", body=reading, identity=IDENTITY_A,
+            idempotency_key=reading["event_id"])
+        self.assertEqual(status, 202, body)
+
+    def test_limit_event_optional_model_id_may_be_absent_entirely(self):
+        self.start()
+        event = _limit_event()
+        del event["model_id"]
+        status, body = _call(
+            self.base, "POST", "/v1/limit-events", body=event, identity=IDENTITY_A,
+            idempotency_key=event["event_id"])
+        self.assertEqual(status, 202, body)
+
+
+class FixRound2PlanOptionalTaskClass(_ServerCase):
+    """Finding N7 (MINOR): task_class is an OPTIONAL /v1/plan filter, not
+    a required parameter - decision 15 misread section 7's placeholder
+    URL as license to change the endpoint's contract."""
+
+    def test_plan_without_task_class_returns_a_list(self):
+        self.start()
+        status, body = _call(
+            self.base, "GET", "/v1/plan?project_id=%s" % PROJECT,
+            identity=IDENTITY_A)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(set(body) - {"server_at", "policy_revision"}, {"plans"})
+        self.assertEqual(len(body["plans"]), 1)
+        plan = body["plans"][0]
+        self.assertEqual(plan["task_class"], TASK_CLASS)
+        self.assertEqual(plan["candidates"], [{"model": "opus", "blocked": False}])
+
+    def test_plan_without_task_class_omits_profiles_the_project_does_not_offer(self):
+        self.start()
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO profiles(id, task_class, candidates, "
+                "context_rules, calibration, expected_calls, growth_tokens, "
+                "margin_bps, max_calls, output_cap, per_call_output_cap, "
+                "ttl_ms, policy_revision) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), "unrelated_class",
+                 json.dumps(["nonexistent-model"]), "{}", "{}", 1, 0, 12500, 2,
+                 1000, 500, TTL_MS, 1))
+            conn.commit()
+        finally:
+            conn.close()
+        status, body = _call(
+            self.base, "GET", "/v1/plan?project_id=%s" % PROJECT,
+            identity=IDENTITY_A)
+        self.assertEqual(status, 200, body)
+        task_classes = {p["task_class"] for p in body["plans"]}
+        self.assertEqual(task_classes, {TASK_CLASS})
+
+    def test_plan_with_task_class_response_shape_is_unchanged(self):
+        self.start()
+        status, body = _call(
+            self.base, "GET",
+            "/v1/plan?project_id=%s&task_class=%s" % (PROJECT, TASK_CLASS),
+            identity=IDENTITY_A)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(set(body) - {"server_at", "policy_revision"},
+                         {"candidates", "reasons", "context", "caps", "retry_at"})
+
+
+class FixRound2PlanAuthorization(_ServerCase):
+    """Escalated observation: only a machine with a seat in the project, or
+    a reporter relationship to one of its accounts, may read the plan -
+    fail closed rather than authenticate-only."""
+
+    def test_plan_read_by_an_unrelated_machine_is_403(self):
+        self.start()
+        outsider_identity = "identity-outsider"
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO machines(id, alias, identity_ref, enabled) "
+                "VALUES(?,?,?,?)",
+                (str(uuid.uuid4()), "outsider", outsider_identity, 1))
+            conn.commit()
+        finally:
+            conn.close()
+        status, body = _call(
+            self.base, "GET",
+            "/v1/plan?project_id=%s&task_class=%s" % (PROJECT, TASK_CLASS),
+            identity=outsider_identity)
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"]["code"], "FORBIDDEN")
+
+    def test_plan_read_by_a_project_seat_machine_still_works(self):
+        self.start()
+        status, body = _call(
+            self.base, "GET",
+            "/v1/plan?project_id=%s&task_class=%s" % (PROJECT, TASK_CLASS),
+            identity=IDENTITY_A)
+        self.assertEqual(status, 200, body)
 
 
 if __name__ == "__main__":

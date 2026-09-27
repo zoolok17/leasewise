@@ -147,6 +147,7 @@ protocol-error path (finding 6).
 | (supplemental) enrollment | `IdentityEnrollment`: `store.set_machine_identity` enrolls/updates/disables; rejects a duplicate `identity_ref`; rejects an unknown machine; a machine may reclaim its own value; the CLI `identity-set` and `serve` verbs, end to end (`serve --host 0.0.0.0` still refuses over a real, timeout-bounded subprocess) |
 | m4 carry-over | `tests/test_card4_seat_kind_fix.py`: `subscription_admission`/`subscription_warn` on a metered account -> `POLICY_DENIED`; the same on a subscription account still grants; `metered`/`metered_advisory`/`shadow` on a metered account still grant (the negative control for the narrowed fix, see decision 1) |
 | Fix round tk-7d7fd9023f8c | `FixRoundNonEnforcingLeases`, `FixRoundReadingAccountAuthorization`, `FixRoundWireAdapter`, `FixRoundIdempotencyKey`, `FixRoundPlanAndLimitEvents`, `FixRoundCheckRequestIdUuid`, `FixRoundIPv6Bind` (`tests/test_card5.py`) - one class per finding; see the Fix round section below for the finding -> fix -> test -> commit table |
+| Fix round 2 tk-dae9aab24ef8 | `FixRound2SettleReplayIdentity`, `FixRound2WireIdentity`, `FixRound2LimitEventContentIdentity`, `FixRound2LimitEventEvidenceMerge`, `FixRound2LimitEventEvidenceKindType`, `FixRound2WireOptionalKeysAndGatewaySnapshot`, `FixRound2PlanOptionalTaskClass`, `FixRound2PlanAuthorization` (`tests/test_card5.py`) - one class per finding (N1-N7 + the escalated authorization observation); see the Fix round 2 section below for the finding -> fix -> test -> commit table |
 
 ## Evidence
 
@@ -322,12 +323,18 @@ reading):
     use..."); `/v1/readings` and `/v1/limit-events` are mutations with
     their own natural id (`event_id`) and got no exemption named
     anywhere.
-15. **`/v1/plan` requires a `task_class` query parameter card 5 adds.**
-    Section 7's own shown URL (`GET /plan?project_id=...`) is captioned
-    "a placeholder, not a runnable command"; a `profiles` row is keyed by
-    `task_class` with no other way to select one. Missing either query
-    parameter is `INVALID_REQUEST` (400); an unknown project or
-    `task_class` is `NOT_FOUND` (404).
+15. **~~`/v1/plan` requires a `task_class` query parameter card 5
+    adds.~~ SUPERSEDED by fix round 2 (finding N7).** This decision
+    misread section 7's own "placeholder, not a runnable command"
+    caption as license to change the endpoint's contract by adding a
+    required parameter neither the URL nor the response shape names.
+    `task_class` is now an OPTIONAL filter: given, the single-object
+    response documented above is unchanged; absent, the response is
+    `{"plans": [...]}`, one entry per task_class the project's own
+    accounts offer at least one candidate model for. A missing
+    `project_id` is still `INVALID_REQUEST` (400); an unknown project,
+    or (with `task_class` given) an unknown `task_class`, is still
+    `NOT_FOUND` (404).
 16. **`/v1/plan`'s `context` is always `null`; `fallback` tiers are
     always `[]`.** No card built computes a project-scoped, request-time
     context outside of an actual `POST /leases` call (this endpoint
@@ -418,6 +425,142 @@ silently rewritten: the "Ownership", "Lease tokens", "`public_bind`" and
 and 8 (superseded/corrected above). The first build's Evidence section
 (51/0/1 mutation counts, 447-test full suite) is historically accurate
 for that build and is left as originally written.
+
+## Fix round 2 tk-dae9aab24ef8 (N1-N7 + plan authorization)
+
+Branch `card-5`, still on top of the commits above. A second, independent
+real-socket review (a different reviewer) closed every finding from the
+first fix round and found seven new ones (N1-N7) plus an authorization
+gap the reviewer explicitly declined to call a proven defect but the lead
+escalated to a required fix anyway. Each got a failing-first reproduction,
+over real sockets, built from the reviewer's own repro, in
+`tests/test_card5.py` under one `FixRound2*` class per finding.
+
+| # | Sev | Finding | Fix | Test(s) | Commit |
+|---|---|---|---|---|---|
+| N1 | MAJOR | An identical settlement retry conflicted with its own first receipt: the adapter re-derives `observed_at`/`received_at` on every call, and `_RECEIPT_FIELDS` included both in the duplicate-content comparison | `lease.py`: `_RECEIPT_IDENTITY_FIELDS` (every `_RECEIPT_FIELDS` entry except the two server-derived timestamps) is what a replay is compared against; `_settle`'s replay branch also now recomputes `released_micro_eur`/`retained_micro_eur` from the lease's fixed `money_hold` and the stored `actual_micro_eur`/`final` (the same formula the original settle path uses) instead of hardcoding both to zero | `FixRound2SettleReplayIdentity` (an ordinary final receipt, resent unchanged 25ms later over the real socket, settles 200 both times with an identical released/retained, and exactly one `receipts` row) | (this fix round) |
+| N2 | MAJOR | Idempotency identity did not cover wire-only fields the store never keeps: grant's `task_class` and readings' `seat_id` could change under a replayed key without triggering `IDEMPOTENCY_CONFLICT` | `http_api.py`: a new `http_request_identity` table plus `_check_wire_identity`/`_remember_wire_identity` - a sha256 of the FULL canonical wire body, checked before the store call and remembered only AFTER it succeeds (a failed first attempt must not lock the key to a body that never took effect), scoped per route (`leases`, `readings`) | `FixRound2WireIdentity` (2 tests: a grant replay with only `task_class` changed, and a reading replay with only `seat_id` changed to another machine's existing seat, are both `IDEMPOTENCY_CONFLICT`, not a silent second-value replay) | (this fix round) |
+| N3 | MAJOR | Limit-event dedup neither compared full content nor remembered events that only joined a block: a changed `resets_at`/`model_id` under a reused `event_id` was accepted again, and replaying a JOINING (non-creating) event added a spurious audit row every time and, once its block was cleared, silently re-parked the account | `migrate.py`: new `limit_events` table (migration v7), keyed by `event_id`, recording EVERY accepted event's full content and which block it joined; `lease.py`: `record_limit_event` rewritten - a replay compares the full `_LIMIT_EVENT_IDENTITY_FIELDS` set and, if unchanged, returns the block's CURRENT state as a pure read (no write, no audit row); a genuinely new event (joiner or creator) always gets its own `limit_events` row | `FixRound2LimitEventContentIdentity` (3 tests: a changed `resets_at` under a reused `event_id` is `IDEMPOTENCY_CONFLICT`; replaying an unchanged JOINING event adds no new block or audit row; replaying that same joining event after its block is cleared returns the cleared state, not a new parked block) | (this fix round) |
+| N4 | MAJOR | Joining a live block discarded the new exhaustion/reset evidence (`INSERT OR IGNORE` alone): a later, more pessimistic `resets_at` was dropped, and an `resets_at=null` (unknown) report was also dropped rather than poisoning the known value | `lease.py`: `_merge_retry_at(old, new)` - the latest KNOWN reset wins (never schedule an earlier retry than any report says), but an unknown reset from EITHER side makes the merged reset unknown too; called on every join (an `UPDATE blocks SET retry_at=...`, not a second `INSERT OR IGNORE`) | `FixRound2LimitEventEvidenceMerge` (3 tests: a later, further-out known reset overwrites an earlier one on join; a SMALLER reset from a later-joining event does NOT regress the block's retry_at - added after the mutation re-run, which caught "take the newest report" as observably identical to "take the max" until this case existed; a null reset from a joining event poisons the merged retry_at to null; all three verified directly against the stored `blocks.retry_at`) | (this fix round) |
+| N5 | MAJOR | The adapter still exposed the internal reading schema: `gateway_snapshot` required the internal `gateway` alias key on the wire instead of translating the documented `gateway_id` UUID, and `readings.seat_id`/`limit-events.model_id` were treated as mandatory-but-nullable instead of genuinely optional | `http_api.py`: `_translate_gateway_snapshot_payload` (resolves wire `gateway_id` UUID -> internal `gateway` alias via the `gateways` table, called inside `_wire_to_reading` before version detection); `_closed_shape(body, required, optional)` - an optional key may be ABSENT entirely (defaults to `None`), not merely nullable; `seat_id`/`model_id` moved to each adapter's optional set | `FixRound2WireOptionalKeysAndGatewaySnapshot` (6 tests: a `gateway_snapshot` with the wire's own `gateway_id` UUID is accepted; the SAME payload keyed by the internal `gateway` alias instead is now refused; a malformed-string and a non-string (JSON array) `gateway_id` are each `INVALID_REQUEST` (400) - the non-string case added after the mutation re-run, since a malformed-but-still-string id already failed identically with or without the explicit UUID-shape check (the same "gateway not found"), while a non-string id reaching sqlite's own parameter binding unguarded raised `STORE_ERROR` (503) instead; a reading/limit-event with `seat_id`/`model_id` omitted entirely, not merely `null`, is accepted) | (this fix round) |
+| N6 | MINOR | `evidence_kind=[]` raised a raw `TypeError` during frozenset membership (`x in frozenset` hashes `x` first), surfacing as `STORE_ERROR` (503) instead of the client's actual mistake | `lease.py`: `_validate_limit_event` type-checks `evidence_kind` (`isinstance(..., str)`) BEFORE the membership test, not after | `FixRound2LimitEventEvidenceKindType` (`evidence_kind=[]` is `INVALID_REQUEST`, 400, not 503) | (this fix round) |
+| N7 | MINOR | `GET /v1/plan` required a `task_class` query parameter added by decision 15, misreading section 7's own placeholder URL as license to change the endpoint's contract | `http_api.py`: `task_class` is now optional at the router and in `handle_plan`; a new `_plan_for_task_class` helper computes one task_class's plan (extracted from the prior single-task_class body, unchanged); given `task_class`, the response is the same single-object shape as before; absent, the response is `{"plans": [...]}`, filtered (via an internal `_offered` flag, popped before the response leaves the function) to task classes the project's own accounts offer at least one candidate model for | `FixRound2PlanOptionalTaskClass` (3 tests: without `task_class`, a list of exactly the project's own offered task classes; a profile with a candidate model none of the project's accounts offer is NOT listed; with `task_class` given, the response shape is unchanged) | (this fix round) |
+| (escalated observation) | - | Any enabled machine could read any project's plan; the reviewer declined to call this a proven defect (section 7 does not specify project-scoped reads), but the lead's decision fails closed anyway | `http_api.py`: `_authorized_for_project(conn, machine_id, project_id)` - a seat in the project, OR a reporter relationship (`project_accounts`) to one of its accounts; called in `handle_plan` right after confirming the project exists, `FORBIDDEN` (403) otherwise | `FixRound2PlanAuthorization` (2 tests: an enrolled machine with no seat/project relationship at all gets 403; the project's own seat machine is unaffected, 200) | (this fix round) |
+
+**New decisions from this round** (numbered continuing from the list
+above; design silent or ambiguous, fail-closed reading):
+
+19. **A settle replay's identity excludes `observed_at`/`received_at`
+    ONLY - not `lease_id`, `gateway_id`, or any other `_RECEIPT_FIELDS`
+    entry.** These two are the sole fields the adapter itself derives
+    fresh on every call (finding N1); every other field is genuinely
+    client-supplied and a change in any of them is still a real content
+    difference, still `IDEMPOTENCY_CONFLICT`.
+20. **The HTTP-layer wire-identity cache (`http_request_identity`) is
+    scoped to `leases` and `readings` only - not `settle` or
+    `limit-events`.** Settle's own store-level identity already covers
+    its full wire body after excluding the two server-derived timestamps
+    (decision 19); limit-events' full-content identity now lives entirely
+    in the new `limit_events` table (finding N3). A second, redundant
+    HTTP-layer cache for either would duplicate the same guarantee the
+    store already gives, not add one.
+21. **`limit_events` retains every ACCEPTED event, not only the one that
+    created its block.** The `blocks` table alone cannot answer "was
+    THIS event_id already accepted, and with what content" once a second
+    event has joined an existing block or the block has since been
+    cleared or updated by yet other events - exactly the gap findings
+    N3/N4 exploit. A dedicated ledger, keyed by `event_id`, is the
+    natural fix, matching `http_request_identity`'s own shape.
+22. **Evidence merge on join is conservative in ONE direction only: an
+    unknown reset, once introduced, is not automatically cleared by a
+    LATER known one from a different report.** `_merge_retry_at(old,
+    new)` returns `None` whenever either side is `None` - once a block's
+    `retry_at` is unknown, a subsequent report with a real value does not
+    by itself resolve it (that report becomes the new `old` on its OWN
+    next merge, but the CURRENT merge still poisons to unknown). This
+    matches the reviewer's own wording ("recovery waits for evidence")
+    read literally; a design that wants "any known value resolves an
+    unknown block" would need a different, asymmetric merge rule no
+    finding actually asked for.
+23. **`gateway_snapshot`'s `gateway_id` must resolve to a REAL row in
+    `gateways`, not merely be UUID-shaped.** `_translate_gateway_snapshot_
+    payload` looks the id up (`SELECT alias FROM gateways WHERE id=?`)
+    and refuses (`INVALID_REQUEST`, 400) when it does not exist - the
+    same "fail closed on an unresolvable reference" reading `_wire_to_
+    reading` already applies to `account_id`/`seat_id`.
+24. **`/v1/plan`'s project-authorization check runs AFTER confirming the
+    project exists, not before.** An unknown `project_id` is still
+    `NOT_FOUND` (404) regardless of the caller's own authorization -
+    consistent with every other route in this file (existence is checked
+    before ownership/authorization throughout), not a new information-
+    disclosure decision specific to this endpoint.
+
+**Evidence.**
+- Red: with `http_api.py`/`lease.py` stashed back to this round's own
+  pre-fix head (`quota_balancer/migrate.py` and every test file kept at
+  their fix-round-2 state, since the new schema and test additions are
+  not themselves behavioral fixes), 16 of the 18 first-drafted
+  `FixRound2*` tests failed, each for the exact reason its finding
+  describes (e.g. N1's settlement retry got `409 IDEMPOTENCY_CONFLICT` on
+  the second call; N7 without `task_class` got `400 INVALID_REQUEST`; the
+  outsider-machine plan read got `200`, not `403`). The remaining 2 are
+  deliberate regression/positive controls (a solo creator-event replay,
+  and the with-`task_class` response shape) that were already correct
+  before this round and are kept alongside their round-2 siblings for
+  contrast, not additional red evidence. Kept:
+  `card-5/evidence2/red-fixround2.txt`.
+- Green: `test_card5.py` in full: 106 tests OK (85 before this round, +21
+  net new - the original 18 `FixRound2*` tests plus 3 more added after the
+  mutation re-run below found real gaps in what they isolated).
+- Targeted regression: `test_card1.py`, `test_card2b1.py`, `test_card4.py`,
+  `test_card4_seat_kind_fix.py` together: 50 tests OK (two `test_card1.py`
+  assertions of the store's full table set needed the two new migration-7
+  tables, `limit_events`/`http_request_identity`, added to their expected
+  sets - a mechanical update, not a design change). This surfaced a real,
+  separate regression, not a docs mismatch: two PRE-EXISTING settle-replay
+  tests (`test_card4_ops.test_settle_final_releases_and_retains`,
+  `test_card4_expiry.test_late_receipt_reconciles_original_period`)
+  asserted the OLD hardcoded-zero replay response N1 deliberately
+  replaces; both were updated to expect the recomputed released/retained
+  values (identical to the first settle's own response), the correct
+  reading per the lead's own N1 decision, not a weakening of either test.
+- Mutation re-run (`card-5/mutate5.py`, expanded with this round's own 16
+  new mutations - not 19; the earlier estimate before writing them was
+  wrong - targeting: N1's identity-field exclusion and replay response
+  recomputation (2); N2's wire-identity mismatch/remember logic (2); N3's
+  replay-content-check and limit_events persistence (2); N4's merge
+  poisoning/max-taking (2); N5's gateway_id translation, UUID-shape check,
+  and optional-key closing (3); N6's type-check ordering (1); N7's
+  authorization check, router requirement, and list-filter (4)). Run in
+  two chunks of 8, each its own foreground command well under the ~9-
+  minute-per-command ceiling (the direct cause of two earlier lost turns -
+  a single-shot sweep across 59 total mutations does not fit one
+  command's foreground budget, and a killed mid-mutation process leaves
+  its target file mutated on disk, since `mutate5.py`'s own restore-on-
+  exit only runs on a clean exit). `mutate5.py` now also restores every
+  target from a held-in-memory original at the START of its own loop, not
+  only in `finally`, and each round-2 mutation runs against a narrow,
+  per-finding dotted test-class list (`TARGETED_TESTS`) instead of the
+  whole ~64s module, per the lead's own instruction; `git diff 2177407 --
+  quota_balancer` was confirmed empty after every chunk. First pass: 14
+  killed, 2 survived (`N4 merge_retry_at takes the newest report instead
+  of the max`, `N5 gateway_id UUID-shape check dropped`) - both real gaps,
+  not harness bugs. N4's survivor: the existing evidence-merge test only
+  ever sent a LATER, LARGER `resets_at`, so "return new" and "return
+  max(old, new)" produced the identical answer; added a test sending a
+  smaller `resets_at` from a later-joining event, proving the retry_at
+  must never regress. N5's survivor: a malformed-but-still-a-string
+  `gateway_id` already fails identically with or without the explicit
+  `_is_uuid` check (the same "gateway not found" 400 either way); a
+  non-string `gateway_id` (a JSON array) does NOT - without the check it
+  reaches sqlite's own parameter binding, which raises `sqlite3.
+  InterfaceError` (caught as `STORE_ERROR`, 503) instead of the client's
+  actual mistake (`INVALID_REQUEST`, 400); added that case. Clean re-run,
+  both chunks: 16 killed, 0 survivors.
+- Full suite, once, foreground (`PYTHONPATH=<clone>`, `TEMP`/`TMP` under
+  scratch): `Ran 504 tests in 179.9s ... OK` (501 at the `2177407` WIP
+  commit + 3 net new from the mutation-survivor fixes above). `git diff
+  --check` clean.
 
 ## Residual risk
 

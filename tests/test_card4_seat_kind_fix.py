@@ -70,7 +70,7 @@ def _build_store(tmp, account_kind, enforcement, budget=10 * HOLD):
     try:
         for script in (migrate.MIGRATION_V1, migrate.MIGRATION_V2,
                        migrate.MIGRATION_V3, migrate.MIGRATION_V4,
-                       migrate.MIGRATION_V5, migrate.MIGRATION_V6):
+                       migrate.MIGRATION_V5, migrate.MIGRATION_V6, migrate.MIGRATION_V7):
             conn.executescript(script)
         conn.execute(
             "INSERT INTO accounts(id, alias, vendor, kind, budget_micro_eur)"

@@ -230,6 +230,120 @@ def _envelope(now_ms, body):
     return out
 
 
+def _wire_identity_hash(body):
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _check_wire_identity(db_path, route, key, body):
+    """Fix round 2 (tk-dae9aab24ef8) finding N2: grant/readings drop a
+    wire-only field (task_class, seat_id) before the store ever sees the
+    request, so the store's OWN content check cannot detect a changed
+    value there. This is the ADDITIONAL, HTTP-layer identity check over
+    the FULL, undropped wire body - it never replaces the store's own
+    replay/rotation logic (a genuine replay still goes on to call
+    lease.grant/store.reading_import normally; grant still mints a fresh
+    token). A mismatch is refused BEFORE that call ever happens. Returns
+    the computed hash, to be persisted only after the call succeeds
+    (_remember_wire_identity) - a failed first attempt must not lock the
+    key to a body that never actually took effect."""
+    wire_hash = _wire_identity_hash(body)
+    conn = store._connect(db_path, must_exist=True)
+    try:
+        row = conn.execute(
+            "SELECT wire_hash FROM http_request_identity WHERE route=? "
+            "AND idempotency_key=?", (route, key)).fetchone()
+    except sqlite3.Error as exc:
+        _store_fault(exc)
+    finally:
+        conn.close()
+    if row is not None and row[0] != wire_hash:
+        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                         errors.MSG_IDEMPOTENCY_CONFLICT)
+    return wire_hash
+
+
+def _remember_wire_identity(db_path, route, key, wire_hash, now_ms):
+    conn = store._connect(db_path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO http_request_identity(route, "
+                "idempotency_key, wire_hash, created_at) VALUES(?,?,?,?)",
+                (route, key, wire_hash, now_ms))
+            conn.execute("COMMIT")
+        except BaseException:
+            migrate.rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_fault(exc)
+    finally:
+        conn.close()
+
+
+def _closed_shape(body, required_keys, optional_keys=frozenset()):
+    """A closed shape where some keys may be ABSENT entirely (section 7's
+    own "?" suffix, e.g. "seat_id?", "model_id?") rather than merely
+    nullable: an absent optional key defaults to None, identically to an
+    explicit null (fix round 2 finding N5: "optional keys optional", not
+    mandatory-but-nullable). Every other key stays mandatory; any key
+    outside required|optional is still refused."""
+    if not isinstance(body, dict):
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    keys = frozenset(body)
+    if not required_keys <= keys or keys - required_keys - optional_keys:
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    result = dict(body)
+    for key in optional_keys:
+        result.setdefault(key, None)
+    return result
+
+
+def _authorized_for_project(conn, machine_id, project_id):
+    """Fix round 2: the delta review observed that any enabled machine
+    could read any project's plan (no project-scoped read restriction at
+    all). Fail closed: only a machine with a seat IN the project, or a
+    reporter relationship (project_accounts) to one of its accounts, may
+    read the plan."""
+    if conn.execute(
+            "SELECT 1 FROM seats s JOIN teams t ON t.id=s.team_id "
+            "WHERE s.machine_id=? AND t.project_id=? LIMIT 1",
+            (machine_id, project_id)).fetchone() is not None:
+        return True
+    account_ids = [r[0] for r in conn.execute(
+        "SELECT account_id FROM project_accounts WHERE project_id=?",
+        (project_id,)).fetchall()]
+    return any(_authorized_reporter_for_account(conn, machine_id, a)
+              for a in account_ids)
+
+
+def _translate_gateway_snapshot_payload(payload, conn):
+    """Section 7's own gateway_snapshot payload names `gateway_id` (a
+    store UUID); the tested internal payload shape names `gateway` (the
+    gateway's own alias, resolved later against machine/account by
+    store._apply_reading). Fix round 2 finding N5: this was the adapter's
+    one missing payload-level translation - every other gateway_snapshot
+    field already matches the internal shape 1:1."""
+    if not isinstance(payload, dict) or "gateway_id" not in payload:
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    gateway_id = payload["gateway_id"]
+    if not _is_uuid(gateway_id):
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    try:
+        row = conn.execute("SELECT alias FROM gateways WHERE id=?",
+                           (gateway_id,)).fetchone()
+    except sqlite3.Error as exc:
+        _store_fault(exc)
+    if row is None:
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    translated = dict(payload)
+    del translated["gateway_id"]
+    translated["gateway"] = row[0]
+    return translated
+
+
 def _check_idempotency_key(key, expected_id):
     """Section 7: "Mutations use Idempotency-Key=request_id/event_id;
     same ID/content replays, different content =>409." Fix round
@@ -264,11 +378,18 @@ _WIRE_GRANT_KEYS = frozenset({
 _WIRE_SETTLE_KEYS = frozenset({
     "event_id", "outcome", "calls", "input_tokens", "cached_input_tokens",
     "output_tokens", "actual_micro_eur", "gateway_id", "seq", "final"})
-_WIRE_READING_KEYS = frozenset({
-    "event_id", "account_id", "seat_id", "observed_at", "kind", "payload"})
-_WIRE_LIMIT_EVENT_KEYS = frozenset({
-    "event_id", "account_id", "model_id", "turn_id", "observed_at",
+# seat_id/model_id are OPTIONAL keys (fix round 2 finding N5: may be
+# absent from the wire body entirely, per section 7's "seat_id?"/
+# "model_id?" notation - not merely nullable-but-mandatory).
+_WIRE_READING_REQUIRED = frozenset({
+    "event_id", "account_id", "observed_at", "kind", "payload"})
+_WIRE_READING_OPTIONAL = frozenset({"seat_id"})
+_WIRE_READING_KEYS = _WIRE_READING_REQUIRED | _WIRE_READING_OPTIONAL
+_WIRE_LIMIT_EVENT_REQUIRED = frozenset({
+    "event_id", "account_id", "turn_id", "observed_at",
     "evidence_kind", "resets_at", "exhausted_windows"})
+_WIRE_LIMIT_EVENT_OPTIONAL = frozenset({"model_id"})
+_WIRE_LIMIT_EVENT_KEYS = _WIRE_LIMIT_EVENT_REQUIRED | _WIRE_LIMIT_EVENT_OPTIONAL
 
 
 def _wire_to_grant(body):
@@ -311,7 +432,7 @@ def _wire_to_settle(lease_id, body, now_ms):
     return receipt
 
 
-def _wire_to_reading(body, alias, conn):
+def _wire_to_reading(body, identity, conn):
     """POST /v1/readings: the documented body is one flat reading
     ({event_id,account_id,seat_id?,observed_at,kind,payload}); the only
     tested, store-backed path is the card-2/2b-1 BATCH document
@@ -322,15 +443,28 @@ def _wire_to_reading(body, alias, conn):
     a client-suppliable field, which is exactly the "owner reporter" rule
     (section 7) enforced by construction rather than by a separate check.
 
-    seat_id is validated (null, or an existing seat) but NOT persisted:
-    store._apply_reading hardcodes readings.seat_id to NULL - no card
-    built so far threads a seat_id through the reduction pipeline. This
-    is the exact missing dependency reported (not silently omitted) in
-    docs/STEP-CARD-5.md; forking validate_readings/store's tested reading
-    pipeline to add it is out of this fix round's scope.
+    seat_id (an OPTIONAL key, fix round 2 finding N5) is validated for
+    OWNERSHIP as well as existence (finding N2: "if seat attribution is
+    supported, validate ownership as well as existence") - it must be one
+    of the CALLER's own seats, not merely a seat that exists somewhere.
+    It is still not persisted: store._apply_reading hardcodes
+    readings.seat_id to NULL - no card built so far threads a seat_id
+    through the reduction pipeline. This is the exact missing dependency
+    reported (not silently omitted) in docs/STEP-CARD-5.md; forking
+    validate_readings/store's tested reading pipeline to add it is out of
+    this fix round's scope.
+
+    gateway_snapshot's payload is translated from the wire's `gateway_id`
+    (a store UUID) to the internal `gateway` (an alias) - fix round 2
+    finding N5; every other reading kind's payload already matches the
+    internal shape unchanged. `usage` is a documented section-7 kind no
+    card built has ever validated (no KIND_USAGE, no reduction rule
+    anywhere in validate_readings.py/store.py): still refused here, an
+    explicit, reported scope gap - implementing it is a new card-sized
+    dependency, not a wire-adapter fix.
     """
-    if not isinstance(body, dict) or frozenset(body) != _WIRE_READING_KEYS:
-        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    machine_id, alias = identity
+    body = _closed_shape(body, _WIRE_READING_REQUIRED, _WIRE_READING_OPTIONAL)
     kind = body["kind"]
     if kind not in (KIND_CLI_WINDOW, KIND_GATEWAY_SNAPSHOT, KIND_PROVIDER_BILLING):
         raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
@@ -354,14 +488,18 @@ def _wire_to_reading(body, alias, conn):
         account_alias = row[0]
     if seat_id is not None:
         try:
-            row = conn.execute("SELECT 1 FROM seats WHERE id=?",
+            row = conn.execute("SELECT machine_id FROM seats WHERE id=?",
                                (seat_id,)).fetchone()
         except sqlite3.Error as exc:
             _store_fault(exc)
         if row is None:
             raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
-    version = DOC_VERSION
+        if row[0] != machine_id:
+            raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
     payload = body["payload"]
+    if kind == KIND_GATEWAY_SNAPSHOT:
+        payload = _translate_gateway_snapshot_payload(payload, conn)
+    version = DOC_VERSION
     if kind == KIND_PROVIDER_BILLING or (
             kind == KIND_GATEWAY_SNAPSHOT and isinstance(payload, dict)
             and "settled_micro_eur" in payload):
@@ -373,9 +511,8 @@ def _wire_to_reading(body, alias, conn):
 
 
 def _wire_to_limit_event(body):
-    if not isinstance(body, dict) or frozenset(body) != _WIRE_LIMIT_EVENT_KEYS:
-        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
-    return dict(body)
+    return _closed_shape(body, _WIRE_LIMIT_EVENT_REQUIRED,
+                         _WIRE_LIMIT_EVENT_OPTIONAL)
 
 
 # ---------------------------------------------------------------------------
@@ -395,10 +532,20 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
     (metered_advisory/shadow), returns no token (section 7: "Terminal
     replay returns terminal state without a token"; "[metered_advisory/
     shadow]... has null token/money_hold and cannot pass /check" - fix
-    round tk-7d7fd9023f8c finding 1)."""
+    round tk-7d7fd9023f8c finding 1).
+
+    Fix round 2 (tk-dae9aab24ef8) finding N2: task_class is dropped
+    before the store ever sees the request, so its own content_hash
+    cannot detect a changed value there; _check_wire_identity compares
+    the FULL wire body (not just the internal fields) against whatever
+    was stored for this Idempotency-Key, raising IDEMPOTENCY_CONFLICT on
+    a mismatch BEFORE lease.grant() is ever called. The identity is only
+    remembered after a successful call, so a failed first attempt never
+    locks the key to a body that never took effect."""
     machine_id, _alias = identity
     internal = _wire_to_grant(body)
     _check_idempotency_key(idempotency_key, internal["request_id"])
+    wire_hash = _check_wire_identity(db_path, "leases", idempotency_key, body)
     seat_id = internal.get("seat_id")
     if isinstance(seat_id, str):
         conn = store._connect(db_path, must_exist=True)
@@ -412,6 +559,7 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
         if row is not None and row[0] != machine_id:
             raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
     result = lease.grant(db_path, internal, now_ms)
+    _remember_wire_identity(db_path, "leases", idempotency_key, wire_hash, now_ms)
     lease_token = None
     if result["state"] != "settled" and result["enforcement"] not in _NON_ENFORCING:
         lease_token = _new_token()
@@ -515,12 +663,21 @@ def handle_readings(db_path, identity, doc, now_ms, idempotency_key):
     project_accounts chain grant() uses (fix round tk-7d7fd9023f8c
     finding 2): gateway_snapshot already binds to its gateway's own
     machine+account and provider_billing to the account's configured
-    reporter_machine, so only cli_window is unprotected."""
+    reporter_machine, so only cli_window is unprotected.
+
+    Fix round 2 (tk-dae9aab24ef8) finding N2: seat_id is dropped before
+    the store ever sees the reading (store._apply_reading hardcodes it
+    NULL), so the store's own event_id-based dedup cannot detect a
+    changed seat_id under a replayed event_id either; the same
+    _check_wire_identity guard as grant's covers it."""
     machine_id, alias = identity
+    event_id = doc.get("event_id") if isinstance(doc, dict) else None
+    _check_idempotency_key(idempotency_key,
+                          event_id if isinstance(event_id, str) else None)
+    wire_hash = _check_wire_identity(db_path, "readings", idempotency_key, doc)
     conn = store._connect(db_path, must_exist=True)
     try:
-        account_id, translated = _wire_to_reading(doc, alias, conn)
-        _check_idempotency_key(idempotency_key, translated["readings"][0]["event_id"])
+        account_id, translated = _wire_to_reading(doc, identity, conn)
         if (translated["readings"][0]["kind"] == KIND_CLI_WINDOW
                 and account_id is not None
                 and not _authorized_reporter_for_account(conn, machine_id, account_id)):
@@ -537,6 +694,7 @@ def handle_readings(db_path, identity, doc, now_ms, idempotency_key):
             os.remove(tmp_path)
         except OSError:
             pass
+    _remember_wire_identity(db_path, "readings", idempotency_key, wire_hash, now_ms)
     return 202, {"event_id": translated["readings"][0]["event_id"], "accepted": True}
 
 
@@ -561,83 +719,125 @@ def handle_limit_event(db_path, identity, body, now_ms, idempotency_key):
     return 202, dict(result)
 
 
-def handle_plan(db_path, project_id, task_class, now_ms):
-    """GET /v1/plan?project_id=...: "ordered candidates/reasons/context/
-    caps/retry_at, no hold" (section 7). No card built provides a
-    project-scoped request-time context (POST /leases takes context from
-    the CLIENT, per request); `context` is honestly reported null here
-    rather than fabricated (fix round tk-7d7fd9023f8c finding 5 - "report
-    the exact missing dependency"). `task_class` is a required query
-    parameter this build adds: section 7's own shown URL is a
-    "placeholder, not a runnable command", and a profiles row is keyed
-    by task_class with no other way to select one. `fallback` tiers have
-    no backing column anywhere in the profiles table (card 3 never added
+def _plan_for_task_class(conn, task_class, account_ids):
+    """Compute one task_class's plan dict for handle_plan, or None if no
+    profile is keyed by that task_class. `_offered` is an internal-only
+    flag (popped by every caller before the dict reaches a client):
+    whether the project's own accounts offer at least one candidate model
+    for this task_class at all - the filter fix round 2 uses to keep the
+    task_class-less list response from listing profiles the project has
+    no relationship to whatsoever."""
+    profile = conn.execute(
+        "SELECT candidates, max_calls, output_cap, per_call_output_cap "
+        "FROM profiles WHERE task_class=?", (task_class,)).fetchone()
+    if profile is None:
+        return None
+    candidates_json, max_calls, output_cap, per_call_output_cap = profile
+    try:
+        candidates = json.loads(candidates_json)
+    except ValueError as exc:
+        _store_fault(exc)
+    if not isinstance(candidates, list) or not candidates or not all(
+            isinstance(a, str) for a in candidates):
+        raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+    offered = {}
+    blocked_account_wide, blocked_model_ids, retry_ats = set(), set(), []
+    if account_ids:
+        placeholders = ",".join("?" * len(account_ids))
+        for alias, model_id, account_id in conn.execute(
+                "SELECT alias, id, account_id FROM models "
+                "WHERE account_id IN (%s)" % placeholders, account_ids):
+            offered.setdefault(alias, []).append((account_id, model_id))
+        for account_id, model_id, retry_at in conn.execute(
+                "SELECT account_id, model_id, retry_at FROM blocks "
+                "WHERE account_id IN (%s) AND state IN "
+                "('parked','probing')" % placeholders, account_ids):
+            if model_id is None:
+                blocked_account_wide.add(account_id)
+            else:
+                blocked_model_ids.add(model_id)
+            retry_ats.append(retry_at)
+    blocked = set()
+    for alias in candidates:
+        entries = offered.get(alias)
+        if not entries or all(
+                a in blocked_account_wide or m in blocked_model_ids
+                for a, m in entries):
+            blocked.add(alias)
+    decision = policy.select_tier(candidates, [], blocked)
+    retry_at = None
+    if decision["tier"] == "park":
+        known = [r for r in retry_ats if r is not None]
+        retry_at = max(known) if known else None
+    return {
+        "task_class": task_class,
+        "candidates": [{"model": alias, "blocked": alias in blocked}
+                      for alias in candidates],
+        "reasons": {alias: ("blocked" if alias in blocked else "available")
+                   for alias in candidates},
+        "context": None,
+        "caps": {"max_calls": max_calls, "output_cap": output_cap,
+                "per_call_output_cap": per_call_output_cap},
+        "retry_at": retry_at,
+        "_offered": any(alias in offered for alias in candidates),
+    }
+
+
+def handle_plan(db_path, identity, project_id, task_class, now_ms):
+    """GET /v1/plan?project_id=...[&task_class=...]: "ordered candidates/
+    reasons/context/caps/retry_at, no hold" (section 7). No card built
+    provides a project-scoped request-time context (POST /leases takes
+    context from the CLIENT, per request); `context` is honestly reported
+    null here rather than fabricated (fix round tk-7d7fd9023f8c finding 5
+    - "report the exact missing dependency"). `fallback` tiers have no
+    backing column anywhere in the profiles table (card 3 never added
     one); policy.select_tier is called with fallback=[] - a second
     reported gap, not a silent one.
+
+    Fix round 2 (tk-dae9aab24ef8) finding N7: `task_class` is now an
+    OPTIONAL filter, not a required parameter added by decision 15 - that
+    decision misread section 7's own placeholder URL as license to change
+    the endpoint's contract. Given, the response is the single-object
+    shape prior rounds already documented, unchanged. Omitted, the
+    response is `{"plans": [...]}`: one entry per task_class the
+    project's own accounts offer at least one candidate model for (a
+    task_class with zero relationship to this project is not listed).
+
+    Authorization (delta review, escalated by the lead to a required
+    fix): section 7 does not specify project-scoped reads and the review
+    explicitly declined to call the previous global-machine-read behavior
+    a proven defect, but the lead's decision fails closed anyway - only a
+    machine with a seat in the project, or a reporter relationship to one
+    of its accounts, may read the plan (_authorized_for_project).
     """
-    if not _is_uuid(project_id) or not isinstance(task_class, str) \
-            or not _is_alias(task_class):
+    machine_id, _alias = identity
+    if not _is_uuid(project_id) or (task_class is not None and (
+            not isinstance(task_class, str) or not _is_alias(task_class))):
         raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
     conn = store._connect(db_path, must_exist=True)
     try:
         if conn.execute("SELECT 1 FROM projects WHERE id=?",
                         (project_id,)).fetchone() is None:
             raise QuotaError(errors.CODE_NOT_FOUND, errors.MSG_NOT_FOUND)
-        profile = conn.execute(
-            "SELECT candidates, max_calls, output_cap, per_call_output_cap "
-            "FROM profiles WHERE task_class=?", (task_class,)).fetchone()
-        if profile is None:
-            raise QuotaError(errors.CODE_NOT_FOUND, errors.MSG_NOT_FOUND)
-        candidates_json, max_calls, output_cap, per_call_output_cap = profile
-        try:
-            candidates = json.loads(candidates_json)
-        except ValueError as exc:
-            _store_fault(exc)
-        if not isinstance(candidates, list) or not candidates or not all(
-                isinstance(a, str) for a in candidates):
-            raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+        if not _authorized_for_project(conn, machine_id, project_id):
+            raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
         account_ids = [r[0] for r in conn.execute(
             "SELECT account_id FROM project_accounts WHERE project_id=?",
             (project_id,)).fetchall()]
-        offered = {}
-        blocked_account_wide, blocked_model_ids, retry_ats = set(), set(), []
-        if account_ids:
-            placeholders = ",".join("?" * len(account_ids))
-            for alias, model_id, account_id in conn.execute(
-                    "SELECT alias, id, account_id FROM models "
-                    "WHERE account_id IN (%s)" % placeholders, account_ids):
-                offered.setdefault(alias, []).append((account_id, model_id))
-            for account_id, model_id, retry_at in conn.execute(
-                    "SELECT account_id, model_id, retry_at FROM blocks "
-                    "WHERE account_id IN (%s) AND state IN "
-                    "('parked','probing')" % placeholders, account_ids):
-                if model_id is None:
-                    blocked_account_wide.add(account_id)
-                else:
-                    blocked_model_ids.add(model_id)
-                retry_ats.append(retry_at)
-        blocked = set()
-        for alias in candidates:
-            entries = offered.get(alias)
-            if not entries or all(
-                    a in blocked_account_wide or m in blocked_model_ids
-                    for a, m in entries):
-                blocked.add(alias)
-        decision = policy.select_tier(candidates, [], blocked)
-        retry_at = None
-        if decision["tier"] == "park":
-            known = [r for r in retry_ats if r is not None]
-            retry_at = max(known) if known else None
-        return 200, {
-            "candidates": [{"model": alias, "blocked": alias in blocked}
-                          for alias in candidates],
-            "reasons": {alias: ("blocked" if alias in blocked else "available")
-                       for alias in candidates},
-            "context": None,
-            "caps": {"max_calls": max_calls, "output_cap": output_cap,
-                    "per_call_output_cap": per_call_output_cap},
-            "retry_at": retry_at,
-        }
+        if task_class is not None:
+            plan = _plan_for_task_class(conn, task_class, account_ids)
+            if plan is None:
+                raise QuotaError(errors.CODE_NOT_FOUND, errors.MSG_NOT_FOUND)
+            plan.pop("_offered")
+            plan.pop("task_class")
+            return 200, plan
+        plans = []
+        for (tc,) in conn.execute(
+                "SELECT DISTINCT task_class FROM profiles").fetchall():
+            plan = _plan_for_task_class(conn, tc, account_ids)
+            if plan is not None and plan.pop("_offered"):
+                plans.append(plan)
+        return 200, {"plans": plans}
     finally:
         conn.close()
 
@@ -734,11 +934,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(split.query)
                 project_id = (query.get("project_id") or [None])[0]
                 task_class = (query.get("task_class") or [None])[0]
-                if project_id is None or task_class is None:
+                if project_id is None:
                     raise QuotaError(errors.CODE_INVALID_REQUEST,
                                      errors.MSG_INVALID_REQUEST)
-                status_code, wire = handle_plan(db_path, project_id, task_class,
-                                                now_ms)
+                status_code, wire = handle_plan(db_path, identity, project_id,
+                                                task_class, now_ms)
             elif method == "POST" and path == "/v1/leases":
                 body = _parse_object(_read_body(self))
                 status_code, wire = handle_grant(db_path, identity, body, now_ms,

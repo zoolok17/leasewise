@@ -403,12 +403,16 @@ class Card4Turn2Test(unittest.TestCase):
                          [("settled", "completed")])
         self.assertEqual(
             _rows(db, "SELECT settled_actual FROM holds"), [(actual,)])
-        # Identical duplicate: a no-op replay, nothing moves again.
+        # Identical duplicate: a no-op replay, nothing moves again in the
+        # STORE, but the response reports the same released/retained the
+        # first settle did (fix round 2, tk-dae9aab24ef8 finding N1: "the
+        # first receipt's own response unchanged" - not a flat zero, which
+        # would make a lost settlement response unrecoverable by retry).
         again = lease.settle(db, _receipt(event_id, lease_id, actual),
                              NOW)
         self.assertTrue(again["replayed"])
-        self.assertEqual(again["released_micro_eur"], 0)
-        self.assertEqual(again["retained_micro_eur"], 0)
+        self.assertEqual(again["released_micro_eur"], HOLD - actual)
+        self.assertEqual(again["retained_micro_eur"], actual)
         # A different receipt on a settled lease: it blocks, the
         # recorded liability is preserved.
         _assert_quota_error(
