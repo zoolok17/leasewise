@@ -327,7 +327,43 @@ def _parked_block_error(conn, account_id, model_id):
 
 # --- grant ----------------------------------------------------------------------
 
-def grant(path, request, now_ms):
+def _check_http_identity(conn, wire_identity):
+    """Fix round 3 finding F1: the HTTP wire-identity check/record must
+    run INSIDE the same write transaction as the durable business effect
+    it accompanies - two separate transactions (fix round 2's own
+    design) left a crash/concurrency window where a competing request
+    with different content could commit between them. `wire_identity` is
+    `(route, key, wire_hash)` or None (a caller with no HTTP identity to
+    guard, e.g. every non-HTTP/CLI caller). Called right after BEGIN
+    IMMEDIATE: under the write lock, a genuinely concurrent competitor
+    blocks here until the first transaction commits or rolls back, then
+    sees its committed identity row (or its absence, if it rolled back)."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    row = conn.execute(
+        "SELECT wire_hash FROM http_request_identity WHERE route=? "
+        "AND idempotency_key=?", (route, key)).fetchone()
+    if row is not None and row[0] != wire_hash:
+        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                         errors.MSG_IDEMPOTENCY_CONFLICT)
+
+
+def _record_http_identity(conn, wire_identity, now_ms):
+    """The write half of _check_http_identity - called right before
+    COMMIT, in the SAME transaction as the mutation, so an injected
+    failure here rolls back the whole mutation, not merely this row (a
+    monkeypatch point for the interrupted-commit regressions)."""
+    if wire_identity is None:
+        return
+    route, key, wire_hash = wire_identity
+    conn.execute(
+        "INSERT OR IGNORE INTO http_request_identity(route, "
+        "idempotency_key, wire_hash, created_at) VALUES(?,?,?,?)",
+        (route, key, wire_hash, now_ms))
+
+
+def grant(path, request, now_ms, wire_identity=None):
     """Admit and record one lease, or refuse it with a section-7 code.
 
     One BEGIN IMMEDIATE transaction: read the chain, the account and
@@ -342,12 +378,18 @@ def grant(path, request, now_ms):
     enforcement, money_hold, caps, granted_at, expires_at, replayed};
     a replay re-returns the stored lease with replayed=True and adds no
     hold.
+
+    `wire_identity` (fix round 3 finding F1) is the HTTP layer's own
+    `(route, key, wire_hash)` full-wire-body identity, checked and
+    recorded atomically with this same transaction - see
+    _check_http_identity/_record_http_identity. None for every
+    non-HTTP/CLI caller (no HTTP identity to guard).
     """
     policy._check_int(now_ms, 1)
     _validate_grant_request(request)
     conn = _connect(path, must_exist=True)
     try:
-        return _grant(conn, request, now_ms)
+        return _grant(conn, request, now_ms, wire_identity)
     except QuotaError:
         raise
     except sqlite3.Error as exc:
@@ -480,9 +522,10 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         raise QuotaError(code, msg)
 
 
-def _grant(conn, request, now_ms):
+def _grant(conn, request, now_ms, wire_identity=None):
     conn.execute("BEGIN IMMEDIATE")
     try:
+        _check_http_identity(conn, wire_identity)
         seat = conn.execute(
             "SELECT id, machine_id, team_id, enforcement FROM seats "
             "WHERE id=?", (request["seat_id"],)).fetchone()
@@ -548,6 +591,7 @@ def _grant(conn, request, now_ms):
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
+            _record_http_identity(conn, wire_identity, now_ms)
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
 
@@ -742,6 +786,7 @@ def _grant(conn, request, now_ms):
             "redacted_details) VALUES(?,?,?,?,?)",
             ("coordinator", "lease_granted", lease_id, now_ms,
              json.dumps({"final": 0})))
+        _record_http_identity(conn, wire_identity, now_ms)
         conn.execute("COMMIT")
         return _lease_dict(_lease_row(conn, lease_id))
     except BaseException:
@@ -1148,6 +1193,18 @@ def record_limit_event(path, event, now_ms):
     share one block") rather than raising a uniqueness conflict, and
     MERGES its exhaustion evidence into the block's retry_at
     conservatively (_merge_retry_at) rather than discarding it.
+
+    A LEGACY row (fix round 3, tk-f9018a7e573e finding F2; migration
+    version 8) is one migration v8 backfilled from a pre-v7 store's own
+    blocks.source_event_id - a creator identity from before limit_events
+    existed at all, with no real turn_id/observed_at/exhausted_windows to
+    compare (synthesized placeholders, not evidence) and no record of any
+    OTHER event that may have joined its block. Its content is never
+    compared and never merged: a replay of a legacy event_id always
+    returns the block's CURRENT state unchanged, exactly like a
+    content-matching replay, so a delayed pre-upgrade retry can neither
+    conflict nor re-park (nor otherwise disturb) an account the operator
+    has since recovered.
     """
     policy._check_int(now_ms, 1)
     _validate_limit_event(event)
@@ -1157,19 +1214,20 @@ def record_limit_event(path, event, now_ms):
         try:
             existing = conn.execute(
                 "SELECT account_id, model_id, turn_id, observed_at, "
-                "evidence_kind, resets_at, exhausted_windows, block_id "
-                "FROM limit_events WHERE event_id=?",
+                "evidence_kind, resets_at, exhausted_windows, block_id, "
+                "legacy FROM limit_events WHERE event_id=?",
                 (event["event_id"],)).fetchone()
             if existing is not None:
-                stored = dict(zip(
-                    ("account_id", "model_id", "turn_id", "observed_at",
-                     "evidence_kind", "resets_at", "exhausted_windows"),
-                    existing[:7]))
-                stored["exhausted_windows"] = json.loads(stored["exhausted_windows"])
-                if any(stored[f] != event[f]
-                       for f in _LIMIT_EVENT_IDENTITY_FIELDS):
-                    raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
-                                     errors.MSG_IDEMPOTENCY_CONFLICT)
+                if not existing[8]:
+                    stored = dict(zip(
+                        ("account_id", "model_id", "turn_id", "observed_at",
+                         "evidence_kind", "resets_at", "exhausted_windows"),
+                        existing[:7]))
+                    stored["exhausted_windows"] = json.loads(stored["exhausted_windows"])
+                    if any(stored[f] != event[f]
+                           for f in _LIMIT_EVENT_IDENTITY_FIELDS):
+                        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                         errors.MSG_IDEMPOTENCY_CONFLICT)
                 block_id = existing[7]
                 block = conn.execute(
                     "SELECT retry_at, state FROM blocks WHERE id=?",

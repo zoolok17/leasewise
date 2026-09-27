@@ -236,51 +236,20 @@ def _wire_identity_hash(body):
     ).hexdigest()
 
 
-def _check_wire_identity(db_path, route, key, body):
-    """Fix round 2 (tk-dae9aab24ef8) finding N2: grant/readings drop a
-    wire-only field (task_class, seat_id) before the store ever sees the
-    request, so the store's OWN content check cannot detect a changed
-    value there. This is the ADDITIONAL, HTTP-layer identity check over
-    the FULL, undropped wire body - it never replaces the store's own
-    replay/rotation logic (a genuine replay still goes on to call
-    lease.grant/store.reading_import normally; grant still mints a fresh
-    token). A mismatch is refused BEFORE that call ever happens. Returns
-    the computed hash, to be persisted only after the call succeeds
-    (_remember_wire_identity) - a failed first attempt must not lock the
-    key to a body that never actually took effect."""
-    wire_hash = _wire_identity_hash(body)
-    conn = store._connect(db_path, must_exist=True)
-    try:
-        row = conn.execute(
-            "SELECT wire_hash FROM http_request_identity WHERE route=? "
-            "AND idempotency_key=?", (route, key)).fetchone()
-    except sqlite3.Error as exc:
-        _store_fault(exc)
-    finally:
-        conn.close()
-    if row is not None and row[0] != wire_hash:
-        raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
-                         errors.MSG_IDEMPOTENCY_CONFLICT)
-    return wire_hash
-
-
-def _remember_wire_identity(db_path, route, key, wire_hash, now_ms):
-    conn = store._connect(db_path, must_exist=True)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO http_request_identity(route, "
-                "idempotency_key, wire_hash, created_at) VALUES(?,?,?,?)",
-                (route, key, wire_hash, now_ms))
-            conn.execute("COMMIT")
-        except BaseException:
-            migrate.rollback_quietly(conn)
-            raise
-    except sqlite3.Error as exc:
-        _store_fault(exc)
-    finally:
-        conn.close()
+# Fix round 2 (tk-dae9aab24ef8) finding N2 identified that grant/readings
+# drop a wire-only field (task_class, seat_id) before the store ever sees
+# the request, so the store's OWN content check cannot detect a changed
+# value there - the FULL, undropped wire body needs its own identity
+# check. Fix round 3 (tk-f9018a7e573e) finding F1: that check must run in
+# the SAME transaction as the durable business effect it accompanies, not
+# a separate one before/after - two independent transactions left a
+# window where a competing request, or a crash between them, let a
+# CHANGED body claim an already-used key. `_wire_identity_hash` (pure,
+# no DB) is still computed here; the check-and-record itself is now
+# `lease._check_http_identity`/`_record_http_identity` and
+# `store._check_http_identity`/`_record_http_identity`, called from
+# INSIDE `lease.grant`/`store.reading_import`'s own single transaction -
+# see each function's own docstring.
 
 
 def _closed_shape(body, required_keys, optional_keys=frozenset()):
@@ -301,12 +270,41 @@ def _closed_shape(body, required_keys, optional_keys=frozenset()):
     return result
 
 
+def _authorized_project_reporter(conn, machine_id, account_id):
+    """Fix round 3 finding F3: a machine may be authoritative for one of
+    a project's accounts through ANY of three relationships, not only
+    the project_accounts/seat chain _authorized_reporter_for_account
+    checks - a gateway on this account bound to this machine
+    (gateways.machine_id, the same relationship
+    _reduce_gateway_snapshot's own owner check already trusts), or this
+    account's configured billing reporter (billing_policies.
+    reporter_machine_id, the same relationship _reduce_provider_billing's
+    own policy check already trusts). The delta review's own repro: a
+    machine with no seat at all, but a real gateway on a project account,
+    could already report a valid gateway_snapshot (202) yet was refused
+    the project's plan (403) - the same relationship should authorize
+    both."""
+    if _authorized_reporter_for_account(conn, machine_id, account_id):
+        return True
+    try:
+        if conn.execute(
+                "SELECT 1 FROM gateways WHERE account_id=? AND machine_id=? "
+                "LIMIT 1", (account_id, machine_id)).fetchone() is not None:
+            return True
+        return conn.execute(
+            "SELECT 1 FROM billing_policies WHERE account_id=? AND "
+            "reporter_machine_id=? LIMIT 1",
+            (account_id, machine_id)).fetchone() is not None
+    except sqlite3.Error as exc:
+        _store_fault(exc)
+
+
 def _authorized_for_project(conn, machine_id, project_id):
     """Fix round 2: the delta review observed that any enabled machine
     could read any project's plan (no project-scoped read restriction at
-    all). Fail closed: only a machine with a seat IN the project, or a
-    reporter relationship (project_accounts) to one of its accounts, may
-    read the plan."""
+    all). Fail closed: only a machine with a seat IN the project, or an
+    authoritative reporter relationship (_authorized_project_reporter) to
+    one of its accounts, may read the plan."""
     if conn.execute(
             "SELECT 1 FROM seats s JOIN teams t ON t.id=s.team_id "
             "WHERE s.machine_id=? AND t.project_id=? LIMIT 1",
@@ -315,7 +313,7 @@ def _authorized_for_project(conn, machine_id, project_id):
     account_ids = [r[0] for r in conn.execute(
         "SELECT account_id FROM project_accounts WHERE project_id=?",
         (project_id,)).fetchall()]
-    return any(_authorized_reporter_for_account(conn, machine_id, a)
+    return any(_authorized_project_reporter(conn, machine_id, a)
               for a in account_ids)
 
 
@@ -327,6 +325,11 @@ def _translate_gateway_snapshot_payload(payload, conn):
     one missing payload-level translation - every other gateway_snapshot
     field already matches the internal shape 1:1."""
     if not isinstance(payload, dict) or "gateway_id" not in payload:
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    if "gateway" in payload:
+        # Fix round 3 finding F5: the internal alias key is never a wire
+        # field - refuse a mixed payload before translation would
+        # otherwise silently overwrite the client's own "gateway" value.
         raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
     gateway_id = payload["gateway_id"]
     if not _is_uuid(gateway_id):
@@ -462,6 +465,12 @@ def _wire_to_reading(body, identity, conn):
     anywhere in validate_readings.py/store.py): still refused here, an
     explicit, reported scope gap - implementing it is a new card-sized
     dependency, not a wire-adapter fix.
+
+    Fix round 3 (tk-f9018a7e573e) finding F5: a payload naming BOTH the
+    wire's own `gateway_id` and the internal-only `gateway` key is
+    refused before any translation happens - the internal key is never
+    a client-suppliable field, and silently letting translation overwrite
+    it hid a client value that should have been rejected outright.
     """
     machine_id, alias = identity
     body = _closed_shape(body, _WIRE_READING_REQUIRED, _WIRE_READING_OPTIONAL)
@@ -536,16 +545,16 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
 
     Fix round 2 (tk-dae9aab24ef8) finding N2: task_class is dropped
     before the store ever sees the request, so its own content_hash
-    cannot detect a changed value there; _check_wire_identity compares
-    the FULL wire body (not just the internal fields) against whatever
-    was stored for this Idempotency-Key, raising IDEMPOTENCY_CONFLICT on
-    a mismatch BEFORE lease.grant() is ever called. The identity is only
-    remembered after a successful call, so a failed first attempt never
-    locks the key to a body that never took effect."""
+    cannot detect a changed value there - the FULL wire body's own
+    identity is checked (and, fix round 3 finding F1, recorded)
+    atomically INSIDE lease.grant's own transaction, raising
+    IDEMPOTENCY_CONFLICT on a mismatch before any business write
+    happens, and never persisting the identity of a call that did not
+    itself commit."""
     machine_id, _alias = identity
     internal = _wire_to_grant(body)
     _check_idempotency_key(idempotency_key, internal["request_id"])
-    wire_hash = _check_wire_identity(db_path, "leases", idempotency_key, body)
+    wire_hash = _wire_identity_hash(body)
     seat_id = internal.get("seat_id")
     if isinstance(seat_id, str):
         conn = store._connect(db_path, must_exist=True)
@@ -558,8 +567,8 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
             conn.close()
         if row is not None and row[0] != machine_id:
             raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
-    result = lease.grant(db_path, internal, now_ms)
-    _remember_wire_identity(db_path, "leases", idempotency_key, wire_hash, now_ms)
+    result = lease.grant(db_path, internal, now_ms,
+                         wire_identity=("leases", idempotency_key, wire_hash))
     lease_token = None
     if result["state"] != "settled" and result["enforcement"] not in _NON_ENFORCING:
         lease_token = _new_token()
@@ -668,13 +677,15 @@ def handle_readings(db_path, identity, doc, now_ms, idempotency_key):
     Fix round 2 (tk-dae9aab24ef8) finding N2: seat_id is dropped before
     the store ever sees the reading (store._apply_reading hardcodes it
     NULL), so the store's own event_id-based dedup cannot detect a
-    changed seat_id under a replayed event_id either; the same
-    _check_wire_identity guard as grant's covers it."""
+    changed seat_id under a replayed event_id either - the same
+    full-wire-body identity as grant's, checked and (fix round 3 finding
+    F1) recorded atomically INSIDE store.reading_import's own
+    transaction."""
     machine_id, alias = identity
     event_id = doc.get("event_id") if isinstance(doc, dict) else None
     _check_idempotency_key(idempotency_key,
                           event_id if isinstance(event_id, str) else None)
-    wire_hash = _check_wire_identity(db_path, "readings", idempotency_key, doc)
+    wire_hash = _wire_identity_hash(doc)
     conn = store._connect(db_path, must_exist=True)
     try:
         account_id, translated = _wire_to_reading(doc, identity, conn)
@@ -688,13 +699,14 @@ def handle_readings(db_path, identity, doc, now_ms, idempotency_key):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(translated, handle)
-        store.reading_import(db_path, tmp_path)
+        store.reading_import(
+            db_path, tmp_path,
+            wire_identity=("readings", idempotency_key, wire_hash))
     finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
-    _remember_wire_identity(db_path, "readings", idempotency_key, wire_hash, now_ms)
     return 202, {"event_id": translated["readings"][0]["event_id"], "accepted": True}
 
 
@@ -741,7 +753,13 @@ def _plan_for_task_class(conn, task_class, account_ids):
             isinstance(a, str) for a in candidates):
         raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
     offered = {}
-    blocked_account_wide, blocked_model_ids, retry_ats = set(), set(), []
+    blocked_account_wide, blocked_model_ids = set(), set()
+    # Fix round 3 finding F4: keyed by the exact block that would need to
+    # clear for THIS (account, model-or-account-wide) entry to recover,
+    # not a flat list of every retry_at across the project's accounts -
+    # retry_at below only ever draws from blocks that actually keep some
+    # blocked candidate blocked.
+    block_retry = {}
     if account_ids:
         placeholders = ",".join("?" * len(account_ids))
         for alias, model_id, account_id in conn.execute(
@@ -756,19 +774,30 @@ def _plan_for_task_class(conn, task_class, account_ids):
                 blocked_account_wide.add(account_id)
             else:
                 blocked_model_ids.add(model_id)
-            retry_ats.append(retry_at)
+            block_retry[(account_id, model_id)] = retry_at
     blocked = set()
+    relevant_retry_ats = []
     for alias in candidates:
         entries = offered.get(alias)
         if not entries or all(
                 a in blocked_account_wide or m in blocked_model_ids
                 for a, m in entries):
             blocked.add(alias)
+            for a, m in entries or ():
+                if a in blocked_account_wide:
+                    relevant_retry_ats.append(block_retry[(a, None)])
+                if m in blocked_model_ids:
+                    relevant_retry_ats.append(block_retry[(a, m)])
     decision = policy.select_tier(candidates, [], blocked)
     retry_at = None
-    if decision["tier"] == "park":
-        known = [r for r in retry_ats if r is not None]
-        retry_at = max(known) if known else None
+    if decision["tier"] == "park" and relevant_retry_ats:
+        # Conservative, matching _merge_retry_at's own rule (finding F4):
+        # an unknown reset among the blocks actually keeping a candidate
+        # blocked poisons retry_at to unknown - a known timestamp must
+        # never be advertised on the strength of ANOTHER block alone
+        # while a still-relevant block's own reset is unknown.
+        retry_at = (None if any(r is None for r in relevant_retry_ats)
+                   else max(relevant_retry_ats))
     return {
         "task_class": task_class,
         "candidates": [{"model": alias, "blocked": alias in blocked}

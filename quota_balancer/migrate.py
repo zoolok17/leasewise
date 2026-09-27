@@ -15,7 +15,10 @@ receipt_final, lease_live); version 6 (card 5, section 6) adds the
 identity allowlist columns to machines; version 7 (card 5 fix round 2)
 adds limit_events (full-content idempotency for POST /limit-events) and
 http_request_identity (the HTTP transport's own Idempotency-Key ledger
-for wire-only fields the store never receives). Versions 1-3 are kept
+for wire-only fields the store never receives); version 8 (card 5 fix
+round 3) adds limit_events.legacy and backfills it from pre-v7 stores'
+own blocks.source_event_id rows (creator identities only - a joiner's
+identity was never recorded before v7 at all). Versions 1-3 are kept
 byte for byte: a card adds only its own DDL. A store at the current
 version is a no-op; a store at a newer, unknown version is rejected
 before anything is written or switched (left byte-for-byte unchanged).
@@ -45,7 +48,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -451,9 +454,39 @@ _DDL_V7 = (
 # The canonical version-7 migration script, kept for byte-for-byte comparison.
 MIGRATION_V7 = "\n".join(_DDL_V7) + "\nPRAGMA user_version=7;\n"
 
+# Card 5 fix round 3 (migration version 8, finding F2): v7 created
+# limit_events EMPTY, forgetting every limit-event identity a pre-v7
+# store already had. blocks.source_event_id is the only surviving trace
+# of those pre-v7 CREATOR events (a joiner's own event_id was never
+# recorded anywhere before v7 at all - that identity is unrecoverable,
+# a documented residual limitation, not something this migration can
+# fix). `legacy` flags a backfilled row's content as SYNTHESIZED, not
+# real evidence: turn_id/exhausted_windows have no v6 equivalent at all
+# (a fixed sentinel/empty placeholder), and observed_at/received_at fall
+# back to the block's own updated_at (a real timestamp, just not the
+# original report instant). record_limit_event never compares OR merges
+# a legacy row's content - see its own docstring. The WHERE clause
+# excludes receipt/settle-conflict blocks (reason IN
+# ('receipt_conflict','overrun')): those also set source_event_id, but
+# to a SETTLE event_id, never a limit-event one.
+_DDL_V8 = (
+    "ALTER TABLE limit_events ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0;",
+    "INSERT INTO limit_events(event_id, account_id, model_id, turn_id, "
+    "observed_at, evidence_kind, resets_at, exhausted_windows, block_id, "
+    "received_at, legacy) "
+    "SELECT source_event_id, account_id, model_id, "
+    "'00000000-0000-4000-8000-000000000000', updated_at, reason, "
+    "retry_at, '[]', id, updated_at, 1 FROM blocks WHERE "
+    "source_event_id IS NOT NULL AND reason IN "
+    "('codex_exhausted','claude_exhausted','provider_usage_429');",
+)
+
+# The canonical version-8 migration script, kept for byte-for-byte comparison.
+MIGRATION_V8 = "\n".join(_DDL_V8) + "\nPRAGMA user_version=8;\n"
+
 # Step N upgrades a store from version N-1 to version N.
 _STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
-          6: _DDL_V6, 7: _DDL_V7}
+          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8}
 
 
 def schema_version(conn):

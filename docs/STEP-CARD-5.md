@@ -148,6 +148,7 @@ protocol-error path (finding 6).
 | m4 carry-over | `tests/test_card4_seat_kind_fix.py`: `subscription_admission`/`subscription_warn` on a metered account -> `POLICY_DENIED`; the same on a subscription account still grants; `metered`/`metered_advisory`/`shadow` on a metered account still grant (the negative control for the narrowed fix, see decision 1) |
 | Fix round tk-7d7fd9023f8c | `FixRoundNonEnforcingLeases`, `FixRoundReadingAccountAuthorization`, `FixRoundWireAdapter`, `FixRoundIdempotencyKey`, `FixRoundPlanAndLimitEvents`, `FixRoundCheckRequestIdUuid`, `FixRoundIPv6Bind` (`tests/test_card5.py`) - one class per finding; see the Fix round section below for the finding -> fix -> test -> commit table |
 | Fix round 2 tk-dae9aab24ef8 | `FixRound2SettleReplayIdentity`, `FixRound2WireIdentity`, `FixRound2LimitEventContentIdentity`, `FixRound2LimitEventEvidenceMerge`, `FixRound2LimitEventEvidenceKindType`, `FixRound2WireOptionalKeysAndGatewaySnapshot`, `FixRound2PlanOptionalTaskClass`, `FixRound2PlanAuthorization` (`tests/test_card5.py`) - one class per finding (N1-N7 + the escalated authorization observation); see the Fix round 2 section below for the finding -> fix -> test -> commit table |
+| Fix round 3 tk-f9018a7e573e | `FixRound3AtomicWireIdentity`, `FixRound3LegacyLimitEventMigration`, `FixRound3PlanAuthorizationReporters`, `FixRound3PlanUnknownResetPoisonsRetryAt`, `FixRound3GatewaySnapshotMixedKeyRefused` (`tests/test_card5.py`) - one class per finding (F1-F5); see the Fix round 3 section below for the finding -> fix -> test -> commit table |
 
 ## Evidence
 
@@ -561,6 +562,109 @@ above; design silent or ambiguous, fail-closed reading):
   scratch): `Ran 504 tests in 179.9s ... OK` (501 at the `2177407` WIP
   commit + 3 net new from the mutation-survivor fixes above). `git diff
   --check` clean.
+
+## Fix round 3 tk-f9018a7e573e (F1-F5)
+
+Branch `card-5`, still on top of the commits above. A second, independent
+delta read of fix round 2 (card-5 `d93c64c`, by then already pushed),
+over real loopback sockets and a real v6-to-current upgrade. The reader
+closed N1, N3-N7 and the authorization escalation outright and found two
+MAJOR persistence defects plus a SHOULD/two MINOR gaps.
+
+| # | Sev | Finding | Fix | Test(s) | Commit |
+|---|---|---|---|---|---|
+| F1 | MAJOR | The HTTP wire-identity check/record ran in a SEPARATE transaction from the durable business effect: two concurrent same-key, different-body requests could both succeed, and an injected failure between the mutation's own commit and the identity write left the mutation committed with no identity row, letting a later, changed body claim the key | `lease.py`/`store.py`: `_check_http_identity`/`_record_http_identity` (one small pair per module, duplicated rather than shared - the two modules deliberately do not import each other) now run INSIDE `lease.grant`'s and `store.reading_import`'s own single `BEGIN IMMEDIATE` transaction - the check right after the write lock is taken, the record right before COMMIT, on every commit path (fresh and replay). `http_api.py`'s `_check_wire_identity`/`_remember_wire_identity` are gone; `handle_grant`/`handle_readings` pass `wire_identity=(route, key, hash)` straight through | `FixRound3AtomicWireIdentity` (4 tests: a real `threading.Barrier`-synchronized concurrent grant, and reading, with different bodies under the same key each get exactly one 201/202 and one 409, never two winners; an injected `sqlite3.OperationalError` at the identity-write point, for both grant and reading, rolls back the ENTIRE mutation - zero lease/reading rows, zero identity rows - so a changed-body retry afterward is a genuinely fresh request, and the original body retried after THAT is the one that now conflicts) | (this fix round) |
+| F2 | MAJOR | Migration v7 created `limit_events` EMPTY, forgetting every limit-event identity a pre-v7 store already had; a v6 creator event, cleared for account recovery, then replayed after the v6->v7 upgrade, created a SECOND, parked block sharing the same `source_event_id` | `migrate.py`: migration v8 adds `limit_events.legacy` and backfills one row per pre-v7 CREATOR event from `blocks.source_event_id` (excluding receipt/settle-conflict blocks, which also set that column but to a settle event id, never a limit-event one), flagged `legacy=1` since its turn_id/observed_at/exhausted_windows have no v6 equivalent at all (synthesized placeholders, not evidence). `lease.py`: `record_limit_event`'s replay branch skips content comparison AND evidence merging entirely for a legacy row - it only ever returns the block's CURRENT state, exactly like a content-matching replay | `FixRound3LegacyLimitEventMigration` (2 tests, using the real `store.init_db` upgrade path against a hand-assembled pre-v7 fixture, never a pretend schema: a cleared v6 block's creator event, replayed after upgrade, stays cleared with no second block; a legacy replay with a DELIBERATELY different-looking model_id/resets_at still returns the same block unchanged, not `IDEMPOTENCY_CONFLICT` - content is never compared for a legacy row) | (this fix round) |
+| F3 | SHOULD | Plan authorization (fix round 2) recognized only the project_accounts/seat chain; a machine with a real gateway on a project account, or a project account's own configured billing reporter, but no seat at all, could already prove reporting authority via `POST /v1/readings` (202) yet was refused the plan (403) | `http_api.py`: `_authorized_project_reporter` - the existing project_accounts/seat chain (`_authorized_reporter_for_account`, unchanged, still scoped to what it always was: reading authorization) OR a gateway on the account bound to this machine (`gateways.machine_id`) OR this account's configured billing reporter (`billing_policies.reporter_machine_id`) - the same two relationships `_reduce_gateway_snapshot`/`_reduce_provider_billing` already trust by construction. `_authorized_for_project` calls this instead of the narrower helper | `FixRound3PlanAuthorizationReporters` (3 tests: a no-seat machine owning a project account's gateway - proven first by a successful `gateway_snapshot` POST - can read the plan; a no-seat machine named as a project account's `billing_policies.reporter_machine_id` can read the plan; a machine with NONE of the three relationships is still 403) | (this fix round) |
+| F4 | MINOR, inherited | `GET /v1/plan`'s `retry_at` dropped an unknown (null) reset in favor of a known, later one from an unrelated block, even when the unknown-reset block was the one actually keeping a candidate blocked | `http_api.py`: `_plan_for_task_class` now keys every live block's `retry_at` by the exact `(account_id, model_id-or-None)` it belongs to, and only collects the retry_ats of blocks that actually keep some BLOCKED candidate blocked (never every block across the project's accounts indiscriminately); the merge over those is conservative, matching `_merge_retry_at`'s own rule - any unknown among them poisons `retry_at` to null | `FixRound3PlanUnknownResetPoisonsRetryAt` (an account-wide block with an unknown reset, plus a model-scoped block on the SAME model with a known later reset, both keeping the sole candidate blocked: `retry_at` is null, not the known timestamp) | (this fix round) |
+| F5 | MINOR | `gateway_snapshot` translation silently overwrote a client-supplied internal-only `gateway` key with the resolved alias, instead of refusing the mixed payload | `http_api.py`: `_translate_gateway_snapshot_payload` refuses a payload naming BOTH `gateway_id` (the documented wire field) and `gateway` (the internal-only key) before any translation happens | `FixRound3GatewaySnapshotMixedKeyRefused` (a payload with both keys is `400 INVALID_REQUEST`) | (this fix round) |
+
+**New decisions from this round** (numbered continuing from the list
+above; design silent or ambiguous, fail-closed reading):
+
+25. **The HTTP wire-identity ledger (`http_request_identity`) is now
+    read and written by `lease.py`/`store.py` directly, not only by
+    `http_api.py`.** This crosses a layering line this file's own module
+    docstring otherwise holds to ("no admission/reconciliation logic is
+    reimplemented" outside `http_api.py`) - but atomicity with the
+    durable business effect (finding F1's own required correction) is
+    only achievable by sharing the SAME transaction/write lock, and
+    `lease.grant`/`store.reading_import` are the only functions that
+    already own that transaction end to end. `wire_identity` is an
+    opaque `(route, key, hash)` triple or `None`; neither module
+    interprets its CONTENTS (the hash itself, and what it is a hash OF,
+    stays entirely `http_api.py`'s own concern) - only the row's
+    existence and byte-equality.
+26. **A legacy limit-event's content is trusted for NOTHING - not
+    identity comparison, not evidence merging, not even its own stored
+    `resets_at`.** The migration v8 backfill's `resets_at` (copied
+    faithfully from `blocks.retry_at`) is still used as-is for the
+    block's OWN current `retry_at` (nothing before this round changes
+    that value) - a legacy row only stops being consulted as a SOURCE of
+    comparison or merge input going forward; it does not retroactively
+    invalidate the block's already-stored state.
+27. **A joiner's pre-v7 identity is NOT backfilled - only creators.**
+    `blocks.source_event_id` names exactly one event (whichever created
+    the block); no earlier card recorded which OTHER event_ids joined an
+    already-live block before limit_events existed at all. A delayed
+    pre-upgrade retry of a JOINING (not creating) event is therefore
+    still capable of the old bug (re-parking or duplicate-auditing) if
+    replayed after upgrade - a residual limitation, not silently
+    claimed as fixed. Operationally low-risk: the window is bounded to
+    in-flight retries from BEFORE this store's own v7 upgrade, which by
+    now (two fix rounds later) has no realistic surviving traffic.
+28. **`_authorized_reporter_for_account` itself is UNCHANGED, still
+    scoped to what finding 2 (fix round tk-7d7fd9023f8c) always meant it
+    for: cli_window reading authorization.** `_authorized_project_
+    reporter` (finding F3) is a NEW, separate function for plan
+    authorization specifically, layering the SAME two relationships
+    other reading kinds already trust (gateway, billing reporter) on
+    TOP of the existing chain - not a widening of what
+    `_authorized_reporter_for_account` itself checks, which would have
+    also (unintentionally) widened cli_window's own authorization.
+
+**Evidence.**
+- Red: with `http_api.py`/`lease.py`/`store.py`/`migrate.py` stashed back
+  to `d93c64c` (this round's own pre-fix head) and every test file kept
+  at its fix-round-3 state, 9 of the 11 new `FixRound3*` tests failed or
+  errored for the exact reason each finding describes (e.g. the
+  concurrent-barrier grant/reading tests got two successes instead of
+  one 409; the injected-failure tests found the mutation had already
+  committed; the legacy-migration tests errored on `MIGRATION_V8` not
+  existing yet - the schema fix itself being part of what is under
+  test). The remaining 2 (`test_plan_read_by_a_truly_unrelated_machine_
+  is_still_403`, a duplicate of round 2's own outsider-403 control) also
+  errored, but on the SAME missing-`MIGRATION_V8` fixture-build failure,
+  not for a reason specific to F3 - collateral from stashing schema and
+  behavior together, not additional red evidence for F3 itself, which
+  round 2 already covered. Kept: `card-5/evidence3/red-fixround3.txt`.
+- Green: `test_card5.py` in full: 118 tests OK (106 before this round,
+  +12 net new - 11 first-drafted `FixRound3*` tests plus one added
+  isolating control, `test_reading_replay_with_a_foreign_seat_id_is_
+  forbidden_not_a_conflict`, once F1's atomic refactor changed check
+  ORDER: a cross-machine seat_id change now correctly hits `_wire_to_
+  reading`'s ownership check - 403 - before the wire-identity check ever
+  runs, whereas the original N2 content-conflict test needed a
+  same-machine seat instead to isolate the conflict alone).
+- Targeted regression: `test_card1.py`, `test_card2b1.py`, `test_card4.py`,
+  `test_card4_seat_kind_fix.py` together: 50 tests OK (the same three
+  hardcoded schema-version literals bumped again, 7->8, plus their
+  "newer than current" sentinels, 8->9 - the identical mechanical update
+  every schema-bumping round has needed).
+- Mutation re-run (`card-5/mutate5.py`, expanded with this round's own 9
+  new mutations targeting: F1's check/record logic in BOTH `lease.py`'s
+  and `store.py`'s own copies (4); F2's legacy-skip guard (1); F3's
+  gateway/billing reporter checks (2); F4's retry_at merge (1); F5's
+  mixed-key refusal (1). `store.py` is a mutation target for the first
+  time this round, added alongside `http`/`lease`). Run in two
+  foreground chunks (8 then 1), each well under the ~9-minute ceiling;
+  `git diff d93c64c -- quota_balancer` confirmed empty (content-identical
+  to the fixed backup, modulo the LF/CRLF normalization `http_api.py`
+  alone is subject to in this checkout) after every chunk. First and
+  only pass: 9 killed, 0 survivors.
+- Full suite, once, foreground (`PYTHONPATH=<clone>`, `TEMP`/`TMP` under
+  scratch): `Ran 516 tests in 183.5s ... OK` (504 at the `d93c64c` head +
+  12 net new, all in `test_card5.py`). `git diff --check` clean.
 
 ## Residual risk
 
