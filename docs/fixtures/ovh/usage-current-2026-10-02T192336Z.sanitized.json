@@ -1,0 +1,72 @@
+{
+  "_capture": {
+    "captured_at": "20261002T192336Z",
+    "endpoint": "GET /cloud/project/<project>/usage/current",
+    "note": "identifiers, URLs and opaque strings replaced; component names are public OVH model SKUs and were kept",
+    "sanitized_fields": 6
+  },
+  "hourlyUsage": {
+    "instance": [],
+    "instanceBandwidth": [],
+    "instanceOption": [],
+    "managedKubernetesService": [],
+    "quantum": {
+      "notebook": [],
+      "processingUnit": []
+    },
+    "rancher": [],
+    "snapshot": [],
+    "storage": [],
+    "volume": []
+  },
+  "lastUpdate": "2026-10-02T19:09:51.739Z",
+  "monthlyUsage": {
+    "certification": [],
+    "instance": [],
+    "instanceOption": [],
+    "savingsPlan": []
+  },
+  "period": {
+    "from": "2026-10-01T00:00:00.000Z",
+    "to": "2026-11-01T00:00:00.000Z"
+  },
+  "resourcesUsage": [
+    {
+      "resources": [
+        {
+          "components": [
+            {
+              "id": "<REDACTED-id>",
+              "name": "qwen-3-8-27b-output_tokens",
+              "quantity": {
+                "unit": "Unit",
+                "value": 189808
+              },
+              "resourceId": "<REDACTED-resourceId>",
+              "totalPrice": 0.512482
+            },
+            {
+              "id": "<REDACTED-id>",
+              "name": "qwen-3-8-27b-input_tokens",
+              "quantity": {
+                "unit": "Unit",
+                "value": 15562011
+              },
+              "resourceId": "<REDACTED-resourceId>",
+              "totalPrice": 6.224804
+            }
+          ],
+          "region": ""
+        }
+      ],
+      "totalPrice": 6.737286,
+      "type": "ai-endpoints"
+    }
+  ],
+  "totalPrice": {
+    "currencyCode": "EUR",
+    "priceInUcents": 673728600,
+    "text": "6.74 EUR",
+    "value": 6.737286
+  }
+}

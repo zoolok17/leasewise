@@ -197,3 +197,33 @@ Tests: the four named checks (`round_components`, `projection_denied`,
 `fallback_tier`, `privacy_3`) plus the arithmetic rules; the named tests
 are shown red at the migration-only commit and green with the
 arithmetic — see docs/STEP-CARD-3.md.
+
+## Card 2b-3 — pure OVH billing adapter
+
+No new CLI verb, no daemon, no credential file, no network: one pure
+function, `quota_balancer/ovh_adapter.py::poll_once`, turns ONE OVH
+"project usage, current" HTTP answer into a version-3 reading-import
+document with exactly one `provider_billing` reading, or into a closed
+failure `{auth, transport, rate_limit, schema, currency, period, tls}`.
+Credential, transport, clock and jitter are injected; exactly one
+transport call per invocation, never a retry. Standard library only.
+
+- **Output.** Success `{"document", "next_attempt_at"}`, failure
+  `{"failure", "next_attempt_at"}`; nothing else (no messages, no bodies,
+  no URL, no key). The document feeds the existing `reading-import`.
+- **Money.** `total_micro_eur = ceil(priceInUcents / 100)` in integer
+  arithmetic; JSON numbers parse as `Decimal`, never binary floats;
+  `currencyCode` must be `EUR`.
+- **non_ai_spend_present** is an exact boolean: true iff a category other
+  than `ai-endpoints` bills more than zero; an unseen `hourlyUsage` /
+  `monthlyUsage` element makes the answer unknown, i.e. failure `schema`,
+  never false.
+- **Schedule.** `next_attempt_at = max(now + poll + jitter, Retry-After)`,
+  jitter an injected integer in [0, 90]; Retry-After counts on a 429 only,
+  and any valid value (seconds or HTTP-date) wins over the poll schedule, however
+  far out (clamped to int64).
+- **TLS.** A non-https base URL or a transport that does not report
+  verification on is refused before any call.
+- **Fixtures.** `docs/fixtures/ovh/` (two REAL sanitized captures, the rest
+  labelled SYNTHETIC); tests: `tests/test_card2b3.py`. Decisions, the
+  acceptance-row map and residual risk: docs/STEP-CARD-2B-3.md.
