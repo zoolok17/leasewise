@@ -6,10 +6,12 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 
 from . import errors
 from .errors import QuotaError
 from .http_api import DEFAULT_HOST, BindRefused, make_server
+from .lease import block_clear, expire_sweep
 from .store import (
     billing_policy_import,
     import_config,
@@ -82,6 +84,19 @@ def _build_parser():
                           help="the opaque identity value the ingress presents")
     identity.add_argument("--enabled", required=True, type=_bool,
                           help="'true' or 'false'")
+    clearer = sub.add_parser(
+        "block-clear",
+        help="clear a live block of an account (operator-only, audited)")
+    clearer.add_argument("--account", required=True, help="account alias")
+    clearer.add_argument("--model", default=None,
+                         help="model alias (default: the account-wide block)")
+    # Not argparse `choices`: a rejected value must not be echoed back.
+    clearer.add_argument("--reason", required=True,
+                         help="reset_observed | false_positive | "
+                              "operator_override")
+    sub.add_parser(
+        "expire-sweep",
+        help="move every expired active lease to uncertain (holds kept)")
     serve = sub.add_parser(
         "serve", help="run the card-5 private /v1 HTTP server (blocking)"
     )
@@ -109,6 +124,13 @@ def main(argv=None):
         elif args.verb == "identity-set":
             set_machine_identity(args.db, args.machine, args.identity_ref,
                                  args.enabled)
+        elif args.verb == "block-clear":
+            print(json.dumps(block_clear(
+                args.db, args.account, args.model, args.reason,
+                int(time.time() * 1000)), separators=(",", ":")))
+        elif args.verb == "expire-sweep":
+            print(json.dumps(expire_sweep(
+                args.db, int(time.time() * 1000)), separators=(",", ":")))
         elif args.verb == "serve":
             try:
                 make_server(args.db, host=args.host, port=args.port).serve_forever()

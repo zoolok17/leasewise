@@ -905,19 +905,128 @@ def expire(path, lease_id, now_ms):
                 return _lease_dict(row, replayed=True)
             if now_ms < row["expires_at"]:
                 _invalid()  # not expired: expiry is an effect of the TTL
-            conn.execute(
-                "UPDATE leases SET state='uncertain' WHERE id=?",
-                (lease_id,))
-            conn.execute(
-                "INSERT INTO audit(actor_alias, action, object_id, at, "
-                "redacted_details) VALUES(?,?,?,?,?)",
-                ("coordinator", "lease_expired", lease_id, now_ms,
-                 json.dumps({"refunded": 0})))
+            _mark_uncertain(conn, lease_id, now_ms)
             conn.execute("COMMIT")
             return _lease_dict(_lease_row(conn, lease_id))
         except BaseException:
             rollback_quietly(conn)
             raise
+    finally:
+        conn.close()
+
+
+def _mark_uncertain(conn, lease_id, now_ms):
+    # Expiry is never a refund: the state changes, the holds and the live
+    # slot stay (section 4); one audit row records it.
+    conn.execute("UPDATE leases SET state='uncertain' WHERE id=?",
+                 (lease_id,))
+    conn.execute(
+        "INSERT INTO audit(actor_alias, action, object_id, at, "
+        "redacted_details) VALUES(?,?,?,?,?)",
+        ("coordinator", "lease_expired", lease_id, now_ms,
+         json.dumps({"refunded": 0})))
+
+
+def expire_sweep(path, now_ms):
+    """Apply the expiry rule to every active lease whose TTL has elapsed
+    (now_ms >= expires_at), in one BEGIN IMMEDIATE transaction. Returns the
+    closed summary {"expired": count}. Idempotent (a second sweep finds
+    nothing active and expired); never settles, refunds or deletes."""
+    policy._check_int(now_ms, 1)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            due = conn.execute(
+                "SELECT id FROM leases WHERE state='active' AND "
+                "expires_at <= ? ORDER BY expires_at, id",
+                (now_ms,)).fetchall()
+            for (lease_id,) in due:
+                _mark_uncertain(conn, lease_id, now_ms)
+            conn.execute("COMMIT")
+            return {"expired": len(due)}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
+
+
+# --- block-clear (operator-only; card L1a turn 3) ---------------------------------
+
+CLEAR_REASONS = ("reset_observed", "false_positive", "operator_override")
+
+
+def block_clear(path, account_alias, model_alias, reason, now_ms):
+    """Clear the live (parked or probing) block of an account (or of one of
+    its models), audited, with the N3 safety rule: in the same transaction
+    EVERY unresolved adjustment of the account (not only the block's source
+    event) refuses the clear with ACCOUNT_PARKED - the account stays parked
+    until the reconciliation card can resolve the overrun. No live block:
+    NOT_FOUND when none ever existed for the scope; a scope whose block is
+    already cleared is a no-op that reports the cleared state (no second
+    audit row). Returns {"state": "cleared", "replayed": bool}.
+    """
+    policy._check_alias(account_alias)
+    if model_alias is not None:
+        policy._check_alias(model_alias)
+    if not isinstance(reason, str) or reason not in CLEAR_REASONS:
+        _invalid()
+    policy._check_int(now_ms, 1)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            account = conn.execute("SELECT id FROM accounts WHERE alias=?",
+                                   (account_alias,)).fetchone()
+            if account is None:
+                _not_found()
+            model_id = None
+            if model_alias is not None:
+                model = conn.execute(
+                    "SELECT id FROM models WHERE account_id=? AND alias=?",
+                    (account[0], model_alias)).fetchone()
+                if model is None:
+                    _not_found()
+                model_id = model[0]
+            live = conn.execute(
+                "SELECT id, state FROM blocks WHERE account_id=? AND "
+                "model_id IS ? AND state IN ('parked','probing')",
+                (account[0], model_id)).fetchone()
+            if live is None:
+                cleared = conn.execute(
+                    "SELECT 1 FROM blocks WHERE account_id=? AND "
+                    "model_id IS ? AND state='cleared' LIMIT 1",
+                    (account[0], model_id)).fetchone()
+                if cleared is None:
+                    _not_found()
+                conn.execute("COMMIT")
+                return {"state": "cleared", "replayed": True}
+            # N3: scan EVERY unresolved adjustment of the account.
+            if conn.execute(
+                    "SELECT 1 FROM adjustments WHERE account_id=? AND "
+                    "resolved_at IS NULL LIMIT 1",
+                    (account[0],)).fetchone() is not None:
+                raise QuotaError(errors.CODE_ACCOUNT_PARKED,
+                                 errors.MSG_ACCOUNT_PARKED)
+            block_id, previous = live
+            conn.execute(
+                "UPDATE blocks SET state='cleared', updated_at=? WHERE id=?",
+                (now_ms, block_id))
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("operator", "block_cleared", block_id, now_ms,
+                 json.dumps({"reason": reason, "previous_state": previous})))
+            conn.execute("COMMIT")
+            return {"state": "cleared", "replayed": False}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
     finally:
         conn.close()
 
@@ -1146,16 +1255,37 @@ def _settle(conn, receipt, now_ms):
                      overrun[1], "overrun"))
                 # An observed overrun blocks further work on the account
                 # until reconciled (section 4): parked, no timed retry.
-                # OR IGNORE: the account may already be parked (the
-                # blocks_live index allows one live block per
-                # (account, model-or-null)).
+                # The blocks_live index allows one live block per
+                # (account, model-or-null): an existing parked block stays
+                # parked, a probing one is parked again (a probe cannot
+                # clear an unreconciled overrun), and every overrun's event
+                # id is audited so concurrent overruns sharing the one
+                # block stay traceable (card L1a turn 3, N3).
+                live = conn.execute(
+                    "SELECT id, state FROM blocks WHERE account_id=? AND "
+                    "model_id IS NULL AND state IN ('parked','probing')",
+                    (lease["account_id"],)).fetchone()
+                if live is None:
+                    block_id, previous = str(_uuid.uuid4()), None
+                    conn.execute(
+                        "INSERT INTO blocks(id, account_id, model_id, "
+                        "reason, retry_at, state, source_event_id, "
+                        "updated_at) VALUES(?,?,?,?,NULL,'parked',?,?)",
+                        (block_id, lease["account_id"], None, "overrun",
+                         receipt["event_id"], now_ms))
+                else:
+                    block_id, previous = live
+                    if previous == "probing":
+                        conn.execute(
+                            "UPDATE blocks SET state='parked', "
+                            "retry_at=NULL, updated_at=? WHERE id=?",
+                            (now_ms, block_id))
                 conn.execute(
-                    "INSERT OR IGNORE INTO blocks(id, account_id, "
-                    "model_id, reason, retry_at, state, "
-                    "source_event_id, updated_at) "
-                    "VALUES(?,?,?,?,NULL,'parked',?,?)",
-                    (str(_uuid.uuid4()), lease["account_id"], None,
-                     "overrun", receipt["event_id"], now_ms))
+                    "INSERT INTO audit(actor_alias, action, object_id, "
+                    "at, redacted_details) VALUES(?,?,?,?,?)",
+                    ("coordinator", "overrun_block", block_id, now_ms,
+                     json.dumps({"event_id": receipt["event_id"],
+                                 "previous_state": previous})))
             conn.execute(
                 "INSERT INTO audit(actor_alias, action, object_id, at, "
                 "redacted_details) VALUES(?,?,?,?,?)",

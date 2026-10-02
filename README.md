@@ -268,3 +268,20 @@ in `policy_snapshot`, which also records `task_class` and the profile's
 above the profile (`POLICY_DENIED`), and uses the profile's `margin_bps` for the
 estimate. A replay returns the stored lease before any of this, so a later
 profile edit never changes a granted lease. See docs/STEP-CARD-L1A.md.
+
+**Turn 3: two operator verbs.**
+- `block-clear --account A [--model M] --reason R` clears the live block of an
+  account (or of one model) and writes an audit row (actor `operator`, action
+  `block_cleared`, only the reason and the previous state). `R` is one of
+  `reset_observed`, `false_positive`, `operator_override`. It refuses with
+  `ACCOUNT_PARKED` (exit 2, nothing changed) while ANY adjustment of the account
+  is unresolved, so a block caused by a money overrun cannot be cleared until
+  the reconciliation card can resolve it; a block from a provider usage limit
+  can. No live block is `NOT_FOUND`; a repeat of a clear reports
+  `{"state":"cleared","replayed":true}` and adds no audit row. Output:
+  `{"state":"cleared","replayed":false}`.
+- `expire-sweep` moves every active lease whose time has run out to
+  `uncertain` (holds and slot kept, never a refund) and prints
+  `{"expired":N}`; a second run prints `{"expired":0}`.
+- An overrun now turns a `probing` block back to `parked` and audits every
+  overrun's event id. See docs/STEP-CARD-L1A.md for the card summary.

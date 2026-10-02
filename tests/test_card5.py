@@ -21,6 +21,7 @@ agreeing Idempotency-Key header).
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2052,6 +2053,7 @@ class FixRound3LegacyLimitEventMigration(_ServerCase):
         if base:
             os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base, prefix="quota-card5-v6-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)  # N-001: no leaked temp dir
         db = os.path.join(tmp, "v6.db")
         conn = sqlite3.connect(db)
         try:
@@ -2377,6 +2379,7 @@ class FixRound4LegacyReplayAccountBinding(_ServerCase):
         if base:
             os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base, prefix="quota-card5-v6r2-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)  # N-001: no leaked temp dir
         db = os.path.join(tmp, "v6.db")
         conn = sqlite3.connect(db)
         try:

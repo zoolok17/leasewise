@@ -384,7 +384,7 @@ class ExpireSweep(_T3):
         turn = self.rows("SELECT turn_id FROM leases")[0][0]
         later = self.enforcing_lease(now_ms=self.t0 + 60_000,
                                      turn=str(uuid.uuid4()))
-        settled = self.enforcing_lease(now_ms=self.t0 + 1,
+        settled = self.enforcing_lease(now_ms=self.t0,   # also due, but settled
                                        turn=str(uuid.uuid4()))
         lease.settle(self.db, {
             "event_id": str(uuid.uuid4()), "lease_id": settled["lease_id"],
@@ -414,7 +414,7 @@ class ExpireSweep(_T3):
         self.assertEqual([r[1] for r in audit], [expired["lease_id"]])
         self.assertEqual(audit[0][0], "coordinator")
         # the slot is kept: the same seat and turn still conflicts
-        body = request(_ids(self), now_ms=sweep_at)
+        body = request(_ids(self), seat="s3", now_ms=sweep_at)
         body["turn_id"] = turn
         with mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True):
             with self.assertRaises(QuotaError) as caught:
@@ -477,6 +477,7 @@ class PrivacyL1aTurn3(_T3):
                  "/etc/sentinel-passwd", "sk-sentinel-key-0001")
 
     def test_block_clear_outputs_and_errors_carry_no_sentinel(self):
+        made = self.enforcing_lease()
         self.limit_block()
         for sentinel in self.SENTINELS:
             for args in (("--account", sentinel, "--reason", "reset_observed"),
@@ -486,8 +487,7 @@ class PrivacyL1aTurn3(_T3):
                 result = run_cli("--db", self.db, "block-clear", *args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn(sentinel, result.stdout + result.stderr)
-        # a refused clear (unresolved adjustment) and a successful one
-        made = self.enforcing_lease()
+        # a refused clear (unresolved adjustment)
         self.overrun(made["lease_id"])
         refused = self.clear()
         self.assertEqual(refused.stderr.strip(), ERROR_PARKED)

@@ -364,3 +364,173 @@ they serialise; not new).
   caps, so a client can re-plan.
 - Seven older fixtures grew a SQL profile row; if the profile columns change
   (turn 3 or R1), those fixtures need the same edit.
+
+## Turn 3 — work order tk-aa1b48b41f77
+
+In plain words: two operator tools were missing. A block that stops an
+account (after a provider usage limit or a money overrun) could only be removed
+by editing the database, and leases whose time ran out stayed "active" for
+ever because nothing called the expiry rule. Turn 3 adds `block-clear`, which
+is audited and refuses to clear an account that still has an unexplained
+overrun, and `expire-sweep`, which moves expired leases to "uncertain" without
+refunding or freeing anything. It also stops the card-5 tests leaving temporary
+folders behind. There is no "probe" command: setting a block to `probing` by
+hand is not the single-probe protocol the design needs, so that is a later card.
+
+### Files
+
+- `quota_balancer/lease.py` — `block_clear`, `expire_sweep` (plus a small
+  shared `_mark_uncertain` that `expire` now uses too), and the overrun path.
+- `quota_balancer/cli.py` — the verbs `block-clear` and `expire-sweep`.
+- `tests/test_cardl1a_t3.py` — 30 tests. `tests/test_card5.py` — temp-dir clean-up.
+- `docs/STEP-CARD-L1A.md`, README.
+
+### Design as implemented
+
+**`block-clear --account A [--model M] --reason R`** (CLI only, no HTTP route).
+`R` is one of `reset_observed`, `false_positive`, `operator_override`; it is
+checked in the function (not by argparse `choices`, which would echo a rejected
+value back). One `BEGIN IMMEDIATE` transaction:
+1. unknown account or model alias -> `NOT_FOUND`;
+2. find the live (`parked` or `probing`) block of exactly that scope (the
+   account-wide block when no model is named; a model's own block when one is);
+3. none live: if a cleared block exists for the scope, report
+   `{"state":"cleared","replayed":true}` and change nothing (no second audit
+   row); if none ever existed, `NOT_FOUND`;
+4. **the N3 rule:** scan EVERY adjustment of the account with
+   `resolved_at IS NULL` (not only the block's `source_event_id`); any one
+   refuses with `ACCOUNT_PARKED` and changes nothing;
+5. otherwise set the block `cleared`, `updated_at` = now, and write one audit
+   row: actor `operator`, action `block_cleared`, object the block id, details
+   exactly `{"reason": ..., "previous_state": "parked"|"probing"}`.
+Output `{"state":"cleared","replayed":false}`; no ids or aliases.
+
+**The overrun path.** When a final receipt overruns a money hold, the account
+is parked as before, but the old `INSERT OR IGNORE` is replaced: if a live
+account-wide block exists, a `parked` one stays parked (and keeps its source
+event), a `probing` one becomes `parked` again (retry time cleared,
+`updated_at` = the settle time); if none exists a new parked block is created.
+Every overrun writes one audit row `overrun_block` (object the block id,
+details `{"event_id": ..., "previous_state": null|"parked"|"probing"}`), so
+overruns that share one block stay traceable. Model-scoped blocks are separate
+(the overrun is account-wide). The limit-event block path is unchanged.
+
+**`expire-sweep`.** One transaction: every `active` lease with
+`expires_at <= now` becomes `uncertain` (the existing `expire` rule, one audit
+row each, holds and live slot kept); a second run finds nothing. The CLI uses
+the wall clock; `lease.expire_sweep(path, now_ms)` takes the time as an
+argument. Output `{"expired": N}`. It never settles, refunds or deletes. A late
+final receipt can still settle an uncertain lease (tested).
+
+**N-001.** The card-5 helpers that used `tempfile.mkdtemp` (the two v6-store
+builders) never removed their folders; each now registers
+`shutil.rmtree` as a test cleanup.
+
+### Decisions (the lead's five, then mine)
+
+1. `block-clear`: CLI-only, closed reason enum, audit row as specified.
+2. The N3 rule as specified; refusal code **`ACCOUNT_PARKED`** (exit 2, static
+   message "the account is parked"). Why this existing code: it is exactly the
+   state of the account (it stays parked, and a new grant gets the same code),
+   it is already in the closed set and exit mapping, and no other code says
+   "an operator action is refused because the account still carries an
+   unresolved overrun" without echoing anything. The replayed clear and the
+   missing block follow the brief (`replayed:true`, `NOT_FOUND`).
+3. The overrun path as specified (probing -> parked, audit of every overrun).
+4. `expire-sweep` as specified.
+5. N-001 as specified.
+
+Mine:
+6. **Scope exactness.** `--model` clears only that model's block; no `--model`
+   clears only the account-wide block. A clear of an account-wide scope never
+   touches a model block and the reverse.
+7. **A replay reports `cleared` for a scope that was cleared even if a
+   long-ago cleared row is the only trace** (the table keeps cleared rows); a
+   scope that never had a block is `NOT_FOUND`.
+8. **A probing block's retry time is cleared when an overrun re-parks it**
+   (an overrun is not a timed retry; the block waits for reconciliation).
+9. **Argparse usage errors still echo an unrecognised option.** That is
+   existing behaviour of every verb (a stray `--something` is printed back by
+   argparse); the new verbs avoid it for their own values (reason, aliases) but
+   I did not change the global parser. Residual risk below.
+10. **`block-clear` of a block that an unresolved adjustment protects cannot be
+    forced** (no flag): the intended consequence until card R1 can resolve
+    adjustments.
+
+### Rows -> tests (`tests/test_cardl1a_t3.py`)
+
+| Row | Tests |
+|---|---|
+| block_clear_audited | `BlockClearAudited`: a usage-limit block clears with the exact output, `updated_at` set, the audit row (actor, object, only reason and previous state); the account can be granted again; every reason, from a `probing` block; a replay is a no-op with no second audit row; model block and account-wide block are separate; a new block after a clear clears again |
+| block_clear_refuses_unresolved_adjustment | `BlockClearRefusesUnresolvedAdjustment`: an overrun block refuses (static `ACCOUNT_PARKED`, nothing changes); an adjustment whose event is NOT the block's source event refuses; two adjustments with one resolved still refuses; once resolved the clear succeeds; another account's adjustment does not block |
+| block_clear_not_found | `BlockClearNotFound`: no block; exact scope (account-wide vs model); unknown account and model; reason outside the enum and malformed aliases are `INVALID_REQUEST`, nothing changes |
+| overrun_reparks_probing | `OverrunReparksProbing`: a probing block becomes parked (`updated_at`, audit); a parked block stays parked and keeps its source; two overruns share one block and both are in the audit; a model block is not the account's overrun block |
+| expire_sweep | `ExpireSweep`: expired active -> uncertain with holds, `money_hold`, receipts and lease rows unchanged and one audit row; the unexpired and the settled lease untouched; the same seat and turn still conflicts; `expires_at` exactly now is expired and one ms early is not; a second sweep changes nothing; a late final receipt still settles; advisory leases expire too; the CLI prints `{"expired":1}` then `{"expired":0}`; a missing store is exit 3 |
+| privacy_l1a (extension) | `PrivacyL1aTurn3`: four sentinels in the account, model and reason never reach stdout, stderr or the audit; the audit vocabulary is closed; the sweep prints no ids or aliases; the lease module still has no file/env/network access |
+
+### Pre-existing tests changed, and why
+
+- `tests/test_card5.py`: the two `mkdtemp` helpers (`_build_v6_store_with_legacy_block`
+  and `_build_upgraded_legacy_store`) gain a cleanup. No assertion touched.
+- Nothing else. The overrun change keeps the old behaviour for a fresh account
+  (`test_overrun_blocks_account` and the other settle tests pass unchanged).
+
+### Evidence
+
+- **Red first.** Commit `38df396` (tests only, turn-2 production code), run in a
+  detached worktree: `python -m unittest tests.test_cardl1a_t3` -> `Ran 30
+  tests ... FAILED (failures=20, errors=7)`: 27 of 30 fail (no verbs, no sweep,
+  no re-park); 3 pass trivially (e.g. the lease module's no-file-access scan).
+  After that commit I corrected three set-up mistakes in my own tests (order of
+  a lease and a block, the seat of a conflict grant, one sweep boundary case).
+- **Green.** `tests.test_cardl1a_t3`: 30 tests OK. Full suite `python -m
+  unittest discover -s tests`: `Ran 607 tests in 271.2s ... OK` (577 + 30).
+- **N-001 check.** With `TMP`/`TEMP` pointed at an empty folder, `test_card5`
+  alone left 5 `quota-card5-v6*` folders before the fix; after the fix a full
+  run of the whole suite (607 tests) leaves the folder empty (0 entries).
+  Other test files already used `TemporaryDirectory` (they were clean in the
+  same run).
+- **Mutation spot-check.** 10 single-point mutations (the adjustment scan, its
+  `resolved_at` filter, the re-park, the overrun audit, the `<=` boundary, the
+  state filter of the sweep, the clear audit, the replay, the scope, the reason
+  enum): all killed. The first run left one survivor (the sweep's state filter:
+  the settled lease in my test was not yet due); the test now makes the settled
+  lease due, and the mutant dies.
+
+### Judged not testable
+
+Concurrent `block-clear` against a settling overrun: both take `BEGIN
+IMMEDIATE` and serialise; the refusal rule is checked inside the same
+transaction as the state change.
+
+### Residual risk
+
+- Until card R1 can resolve adjustments, an account blocked by an overrun
+  cannot be unblocked by any product path (intended, decision 10); an operator
+  must resolve it in the database, which is audited nowhere.
+- A stray unrecognised command-line option is echoed by argparse for every verb
+  (decision 9).
+- `expire-sweep` is a manual verb: nothing calls it on a timer yet, so leases
+  stay "active" until an operator (or a later scheduler) runs it.
+
+## Closing summary of card L1a (turns 1-3)
+
+What L1a now provides:
+- **Loading policy:** `config-import` version 2 loads projects, teams,
+  project-account links, seats, models, profiles and limits from one document
+  (aliases only, one transaction, retained ids, referenced removals refused).
+- **Safer metered grants:** a metered seat is always granted advisory leases
+  until card R1's activation gate (register R-003 closed as an interim).
+- **Profiles at grant:** the task class keys a profile; grant checks the
+  candidate model, the five ceilings and the margin, stores the class, and a
+  profile edit never changes a lease already granted.
+- **Operator tools:** an audited `block-clear` that refuses while an overrun is
+  unresolved, an overrun path that re-parks a probing block and audits every
+  overrun, and `expire-sweep`.
+- **Hygiene:** card-5 tests no longer leak temporary folders (N-001).
+
+What it deliberately does not do: no probe verb or probe protocol (a later
+card, with 7d-1's local slots); no way to resolve adjustments or activate
+enforcing metered leases (card R1); no status projection of the policy tables
+and no scheduler for the sweep; the wire still cannot name a profile revision;
+nothing for L1b.
