@@ -502,6 +502,98 @@ class HttpPath(_L1b):
             self.assertIn(key, body)
 
 
+class MarkerInteractionWithL1a(_L1b):
+    """Card L1a's replay format marker (task_class in the policy snapshot)
+    and its token rule must keep working with the unknown-context path."""
+
+    @staticmethod
+    def legacy_hash(body):
+        import hashlib
+        canonical = {k: v for k, v in body.items()
+                     if k not in ("request_hash", "task_class")}
+        return hashlib.sha256(json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def test_an_unknown_context_snapshot_carries_the_l1a_marker(self):
+        body, now = self.unknown()
+        made = self.grant(body, now)
+        snapshot = json.loads(self.rows(
+            "SELECT policy_snapshot FROM leases WHERE id=?",
+            (made["lease_id"],))[0][0])
+        self.assertEqual(snapshot["task_class"], "bounded_read")
+        self.assertEqual(snapshot["policy_revision"], 1)
+        self.assertEqual(snapshot["input_cap_basis"], "model_ceiling")
+        # so the current fingerprint is used on its replay
+        stored = self.rows("SELECT request_hash FROM leases")[0][0]
+        self.assertEqual(stored, lease._content_hash(body))
+        self.assertTrue(self.grant(copy.deepcopy(body), now + 1)["replayed"])
+        other = dict(copy.deepcopy(body), task_class="implement")
+        with self.assertRaises(QuotaError) as caught:
+            self.grant(other, now)
+        self.assertEqual(caught.exception.code,
+                         errors.CODE_IDEMPOTENCY_CONFLICT)
+
+    def test_a_pre_l1a_shadow_lease_replays_before_the_context_checks(self):
+        body, now = self.known("s6")
+        made = self.grant(body, now)
+        snapshot = json.loads(self.rows(
+            "SELECT policy_snapshot FROM leases WHERE id=?",
+            (made["lease_id"],))[0][0])
+        snapshot.pop("task_class")
+        snapshot.pop("policy_revision")
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE leases SET request_hash=?, task_class='opus', "
+                     "policy_snapshot=? WHERE id=?",
+                     (self.legacy_hash(body),
+                      json.dumps(snapshot, sort_keys=True), made["lease_id"]))
+        conn.commit()
+        conn.close()
+        # The seat is later reconfigured to a non-shadow mode: the identical
+        # request still replays the stored lease (the versioned comparison
+        # runs first, before CONTEXT_UNKNOWN or any profile check).
+        d = doc()
+        for seat in d["seats"]:
+            if seat["alias"] == "s6":
+                seat["enforcement"] = "metered_advisory"
+        self.import_ok(d)
+        replay = self.grant(copy.deepcopy(body), now + 1000)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["lease_id"], made["lease_id"])
+
+    def test_shadow_leases_stay_non_token_bearing(self):
+        for gate in (False, True):
+            with mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", gate):
+                self.assertFalse(lease.token_bearing("shadow"))
+                self.assertFalse(lease.token_bearing("metered_advisory"))
+
+    def test_a_shadow_unknown_context_lease_cannot_pass_check(self):
+        self.assertEqual(run_cli(
+            "--db", self.db, "identity-set", "--machine", "desktop",
+            "--identity-ref", "identity-desktop", "--enabled",
+            "true").returncode, 0)
+        now = self.now()
+        wire = request(_ids(self), seat="s6", now_ms=now, gateway_id=None)
+        del wire["request_hash"]
+        wire["context"] = unknown_context(now)
+        identity = (self.ids("machines")["desktop"], "desktop")
+        status, made = http_api.handle_grant(self.db, identity, wire, now,
+                                             wire["request_id"])
+        self.assertEqual(status, 201)
+        self.assertIsNone(made["lease_token"])
+        for gate in (False, True):
+            with mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", gate):
+                with self.assertRaises(QuotaError) as caught:
+                    http_api.handle_check(
+                        self.db, identity, made["lease_id"],
+                        {"request_id": str(uuid.uuid4())}, "any-token", now)
+                self.assertEqual(caught.exception.code, errors.CODE_FORBIDDEN)
+        status, replay = http_api.handle_grant(self.db, identity, wire, now,
+                                               wire["request_id"])
+        self.assertEqual(status, 200)
+        self.assertIsNone(replay["lease_token"])
+
+
 class PrivacyL1b(_L1b):
     """privacy_l1b: nothing from a rejected request is echoed or stored."""
 

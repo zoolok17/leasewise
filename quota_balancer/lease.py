@@ -145,6 +145,18 @@ _PLATFORM_ID = PLATFORM_ID  # one definition, shared with config-import v2
 # post-activation arithmetic (holds, settlement, expiry) patch it to True;
 # nothing in the product sets it.
 METERED_ENFORCEMENT_ACTIVATED = False
+
+
+def token_bearing(enforcement):
+    """True when a lease of this stored enforcement may carry a lease token
+    and pass /check. The ONE place the R-003 gate is applied to permission:
+    while the gate is closed a stored `metered` lease (for example one the
+    code before L1a granted) is treated like a non-enforcing one - no token
+    on a replay, no /check - though its holds, settlement and expiry are
+    untouched. Card R1 replaces this condition with its activation gate."""
+    if enforcement == "metered":
+        return METERED_ENFORCEMENT_ACTIVATED
+    return enforcement not in ("metered_advisory", "shadow")
 # Section 7: the admission estimate must be at most 120 seconds old.
 _EST_FRESH_MS = 120_000
 
@@ -306,6 +318,34 @@ def _content_hash(request):
     return hashlib.sha256(
         json.dumps(canonical, sort_keys=True,
                    separators=(",", ":")).encode()).hexdigest()
+
+
+def _legacy_content_hash(request):
+    # The replay fingerprint exactly as the code before card L1a computed
+    # it: that code never saw task_class (the wire adapter dropped it), so
+    # the field is left out. Used only to compare against a lease stored in
+    # that format (see _stored_hash_matches).
+    canonical = {k: v for k, v in request.items()
+                 if k not in ("request_hash", "task_class")}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest()
+
+
+def _stored_hash_matches(stored_hash, policy_snapshot, request):
+    # A lease written by card L1a or later records "task_class" in its
+    # policy_snapshot (the marker: the snapshot is a fixed set of keys built
+    # by grant, none of them client-chosen, so an older snapshot can never
+    # contain it) and was fingerprinted with task_class. An older lease is
+    # compared with the older fingerprint, so its identical request still
+    # replays after the upgrade. New grants always store the current hash.
+    try:
+        current = "task_class" in json.loads(policy_snapshot)
+    except ValueError as exc:
+        _store_error(exc)
+    expected = (_content_hash(request) if current
+                else _legacy_content_hash(request))
+    return stored_hash == expected
 
 
 def _lease_row(conn, lease_id):
@@ -611,10 +651,11 @@ def _grant(conn, request, now_ms, wire_identity=None):
         # even if the account parked since the grant.
         content_hash = _content_hash(request)
         existing = conn.execute(
-            "SELECT id, request_hash FROM leases WHERE machine_id=? AND "
-            "request_id=?", (machine_id, request["request_id"])).fetchone()
+            "SELECT id, request_hash, policy_snapshot FROM leases WHERE "
+            "machine_id=? AND request_id=?",
+            (machine_id, request["request_id"])).fetchone()
         if existing is not None:
-            if existing[1] != content_hash:
+            if not _stored_hash_matches(existing[1], existing[2], request):
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
@@ -645,7 +686,12 @@ def _grant(conn, request, now_ms, wire_identity=None):
             candidates = json.loads(profile[0])
         except ValueError as exc:
             _store_error(exc)
-        if not isinstance(candidates, list) or model[2] not in candidates:
+        if not isinstance(candidates, list) or not all(
+                isinstance(alias, str) for alias in candidates):
+            # config-import writes only a list of aliases: anything else
+            # is a damaged store, not a policy decision.
+            raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+        if model[2] not in candidates:
             # 'park' is implicit and never stored (STEP-CARD-L1A, turn 1).
             raise QuotaError(errors.CODE_POLICY_DENIED,
                              errors.MSG_POLICY_DENIED)

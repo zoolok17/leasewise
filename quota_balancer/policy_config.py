@@ -204,6 +204,32 @@ def _upsert_limits(conn, limits, scope_ids):
 
 # --- removals ---------------------------------------------------------------
 
+# Everything that still points at a policy row, by declared foreign key or by
+# a logical (unconstrained) column: removal of the row is refused while any of
+# these exists. A test compares the foreign-key part with the live schema.
+# Deliberately NOT guarded: leases.task_class -> profiles (history; a replay
+# needs no profile and leases stored before card L1a hold the effort alias
+# there), audit.object_id and blocks.source_event_id (history of events).
+REMOVAL_GUARDS = {
+    "limits": (("holds", "limit_id"),),
+    "seats": (("leases", "seat_id"), ("readings", "seat_id"),
+              ("limits", "scope_id"), ("daily_totals", "scope_id")),
+    "teams": (("seats", "team_id"), ("limits", "scope_id"),
+              ("daily_totals", "scope_id")),
+    "projects": (("teams", "project_id"), ("project_accounts", "project_id"),
+                 ("limits", "scope_id"), ("daily_totals", "scope_id")),
+    "models": (("leases", "model_id"), ("blocks", "model_id"),
+               ("limit_events", "model_id")),
+}
+
+
+def _guard(conn, target, entity_id):
+    for table, column in REMOVAL_GUARDS[target]:
+        if _referenced(conn, "SELECT 1 FROM " + table + " WHERE " + column
+                       + "=? LIMIT 1", (entity_id,)):
+            _refuse()
+
+
 def _delete_limits(conn, limits, scope_ids):
     keep = {_store_key(lim, scope_ids) for lim in limits}
     for lid, s, si, m, p, w in conn.execute(
@@ -212,9 +238,7 @@ def _delete_limits(conn, limits, scope_ids):
         if (s, si, m, p, w) in keep:
             continue
         # A limit that holds still point at is history a settle needs.
-        if _referenced(conn, "SELECT 1 FROM holds WHERE limit_id=? LIMIT 1",
-                       (lid,)):
-            _refuse()
+        _guard(conn, "limits", lid)
         conn.execute("DELETE FROM limits WHERE id=?", (lid,))
 
 
@@ -223,9 +247,7 @@ def _delete_seats(conn, seat_ids):
     for (sid,) in conn.execute("SELECT id FROM seats").fetchall():
         if sid in keep:
             continue
-        if _referenced(conn, "SELECT 1 FROM leases WHERE seat_id=? LIMIT 1",
-                       (sid,)):
-            _refuse()
+        _guard(conn, "seats", sid)
         conn.execute("DELETE FROM seats WHERE id=?", (sid,))
 
 
@@ -233,9 +255,7 @@ def _delete_teams(conn, team_ids):
     keep = set(team_ids.values())
     for (tid,) in conn.execute("SELECT id FROM teams").fetchall():
         if tid not in keep:
-            if _referenced(conn, "SELECT 1 FROM seats WHERE team_id=? "
-                           "LIMIT 1", (tid,)):
-                _refuse()
+            _guard(conn, "teams", tid)
             conn.execute("DELETE FROM teams WHERE id=?", (tid,))
 
 
@@ -262,13 +282,7 @@ def _delete_models(conn, model_ids):
     for (mid,) in conn.execute("SELECT id FROM models").fetchall():
         if mid in keep:
             continue
-        if (_referenced(conn, "SELECT 1 FROM leases WHERE model_id=? "
-                        "LIMIT 1", (mid,))
-                or _referenced(conn, "SELECT 1 FROM blocks WHERE model_id=? "
-                               "LIMIT 1", (mid,))
-                or _referenced(conn, "SELECT 1 FROM limit_events WHERE "
-                               "model_id=? LIMIT 1", (mid,))):
-            _refuse()
+        _guard(conn, "models", mid)
         conn.execute("DELETE FROM models WHERE id=?", (mid,))
 
 
@@ -277,9 +291,5 @@ def _delete_projects(conn, project_ids):
     for (pid,) in conn.execute("SELECT id FROM projects").fetchall():
         if pid in keep:
             continue
-        if (_referenced(conn, "SELECT 1 FROM teams WHERE project_id=? "
-                        "LIMIT 1", (pid,))
-                or _referenced(conn, "SELECT 1 FROM project_accounts WHERE "
-                               "project_id=? LIMIT 1", (pid,))):
-            _refuse()
+        _guard(conn, "projects", pid)
         conn.execute("DELETE FROM projects WHERE id=?", (pid,))

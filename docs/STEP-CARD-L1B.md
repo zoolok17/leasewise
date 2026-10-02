@@ -159,3 +159,30 @@ IMMEDIATE`; not new).
   that learns the size can only report it in its receipts (token counts).
 - A subscription lease's usage is still only the token counts in its receipts;
   the per-model usage reading kind stays a later card.
+
+## Sync with the fixed card L1a (fix round 1, head 16a2a88)
+
+In plain words: this branch was built on L1a's first head. L1a was then fixed,
+and its fixes touch the same grant and settle code, so the fixed L1a is merged
+in here. Git found no text conflicts; the risk was in how the two behaviours
+combine, so that is what was checked and tested.
+
+What had to keep working together (all verified, with the new tests
+`MarkerInteractionWithL1a` in `tests/test_cardl1b.py`):
+- **Replay first.** L1a's versioned replay comparison (`_stored_hash_matches`,
+  the older fingerprint for snapshots without `task_class`) runs before the
+  unknown-context and `CONTEXT_UNKNOWN` checks. Tested: a shadow lease stored in
+  the pre-L1a format replays for its identical request even after the seat was
+  reconfigured to a non-shadow mode.
+- **The format marker.** The `policy_snapshot` of an unknown-context lease
+  contains `task_class` (and `policy_revision`) next to `input_cap_basis`, so the
+  current fingerprint is used on its replay; a changed task class conflicts.
+- **Tokens.** Shadow stays non-token-bearing with the gate closed or open; a
+  shadow unknown-context lease gets no token on grant or replay and cannot pass
+  `/check` (`FORBIDDEN`).
+- **Settle.** L1b's null money fields for leases without a money hold are
+  unchanged by L1a's changes (the existing `NonMoneyReporting` tests pass).
+
+Evidence: 4 mutations of the combined code (the current hash, the legacy hash,
+the shadow token rule, the snapshot marker) are all caught. Full suite: see the
+reply of this task.
