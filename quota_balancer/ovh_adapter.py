@@ -231,9 +231,14 @@ def _retry_after_ms(headers, now_ms):
     if not text:
         return None
     if text.isascii() and text.isdigit():
-        if len(text) > 18:  # beyond int64 milliseconds anyway
+        # Magnitude is judged on the significant digits: leading zeros
+        # carry none (all zeros is 0 seconds), and int() is only ever
+        # called on at most 18 digits (anything longer overflows int64
+        # milliseconds and the caller clamps).
+        digits = text.lstrip("0")
+        if len(digits) > 18:
             return INT64_MAX
-        return now_ms + int(text) * 1000
+        return now_ms + int(digits or "0") * 1000
     try:
         # An HTTP-date names its zone: a naive result raises TypeError here.
         when = parsedate_to_datetime(text)

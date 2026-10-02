@@ -228,7 +228,7 @@ sound. Tests first at `03f35d9`, fixes after.
 |---|---|---|---|
 | 1 | Money arithmetic depended on the caller's Decimal context (prec 6 turned success into `schema`, an Inexact trap escaped, the addition rounded 1.00000100000000000000000000001 - 1 onto the tolerance) | Every money number is bounded in representation (<= 15 digits before, <= 12 after the point, judged on the parsed sign/digits/exponent), else `schema`. All money arithmetic runs in ONE module-level `decimal.Context` (prec 60; Inexact, InvalidOperation, Overflow, DivisionByZero trapped, Rounded not) via `localcontext(_MONEY_CONTEXT)`, including the category sum; a trapped signal -> `schema`. The integer path is unchanged | `FixRound1MoneyContext`: caller prec 6 / 1, caller traps (Inexact, Rounded, all) give the identical document; a schema failure is also context-independent; the 29-digit case and the 12-decimal case (1 vs 1.000001000001) -> `schema`; 1.000001 / 0.999999 / 1.0000009 accepted, 1.0000011 / 0.9999989 rejected; 12 vs 13 decimals (incl. trailing zeros, `1E-13`); integer-digit bound |
 | 2 | A number literal such as 1e9999999999999999999 made `json.loads(parse_float=Decimal)` raise `InvalidOperation` out of `poll_once` | `parse_float` / `parse_int` reject literals longer than 64 characters and build the Decimal with `Decimal(text, _MONEY_CONTEXT)` (explicit trapped context, so the caller's traps cannot turn it into NaN); `ArithmeticError` is caught at the parser boundary. The 400 "Invalid signature" recogniser uses the same parser: an unparsable 400 body is not the signature case -> `schema` | `FixRound1ExtremeNumbers`: 200 and 400 bodies with four extreme literals (ignored field) -> closed `schema` with `next_attempt_at`; one in a known field; caller context with the traps off; the 64/65-character boundary for floats and ints |
-| 3 | A malformed `base_url` raised a raw `ValueError` quoting the URL out of `urlsplit` | `_check_base_url` in `_validate_inputs`, before any call: printable ASCII only, parses (port included), no userinfo, query or fragment, non-empty host for https; failures raise the static `QuotaError(INVALID_CONFIG)` raised outside any `except` and `from None`, so neither `__cause__` nor `__context__` exists. A well-formed non-https URL still fails `tls` before the transport | `FixRound1MalformedBaseUrl`: the reviewer's sentinel URL and 13 more malformed forms -> static error, zero transport calls, sentinel absent from `str`, `repr`, `args`, `__cause__`, `__context__` and the formatted traceback; non-https still `tls`; a URL with port and trailing slash works |
+| 3 | A malformed `base_url` raised a raw `ValueError` quoting the URL out of `urlsplit` | `_check_base_url` in `_validate_inputs`, before any call: printable ASCII only, parses (port included), no userinfo, query or fragment, non-empty host for https; failures raise the static `QuotaError(INVALID_CONFIG)` raised outside any `except` and `from None`, so the adapter's own URL-parser exception never appears (a caller that invokes `poll_once` while handling its own exception may see that outer exception in `__context__`, with `__suppress_context__` True, and the formatted traceback omits it). A well-formed non-https URL still fails `tls` before the transport | `FixRound1MalformedBaseUrl`: the reviewer's sentinel URL and 13 more malformed forms -> static error, zero transport calls, sentinel absent from `str`, `repr`, `args`, `__cause__`, `__context__` and the formatted traceback; non-https still `tls`; a URL with port and trailing slash works |
 | 4 | Decision 11 capped Retry-After at 24 h and silently scheduled the poll instead (172800 -> now+900000) | Cap removed (revised decision 11 above); result clamped to int64 | `BillingPollSchedule`: 86400, 172800, a date two days ahead and a year-end date respected; `9*40`, `9*5000`, int64 max and the first overflowing second clamp to int64 max, the last fitting second is exact; the invalid-header list lost its cap-based entries |
 
 **Red before.** At `03f35d9` (tests only, production unchanged):
@@ -252,11 +252,14 @@ that must survive the fix.)
 **Mutation spot-check of the fix.** 17 single-point mutations (explicit vs
 ambient context, the trap list, both representation bounds, both literal
 bounds, explicit-context parse, the ArithmeticError catch, each base-URL
-rule, the clamp, the date branch): 14 killed. 3 equivalent survivors, kept as
-defence: the 15-integer-digit bound (any consistent amount is already limited
-by the int64 ucents total, so it is unobservable), `from None` (the error is
-raised outside any `except`, so there is no context to hide), and the 18-digit
-shortcut for Retry-After (longer strings overflow int64 and clamp anyway).
+rule, the clamp, the date branch): 14 killed. Two survivors were equivalent and kept as defence: the
+15-integer-digit bound (any consistent amount is already limited by the int64
+ucents total, so it is unobservable) and `from None` (with the adapter's own
+URL-parser exception raised outside any `except` there is nothing of its own to
+hide; the suppression matters only when a caller is already handling an
+exception, see finding 3). The third survivor, a shortcut that clamped
+Retry-After by digit-string LENGTH, was NOT equivalent: it was the defect found
+by the delta read (fix round 2, finding F5 below).
 
 New decisions:
 
@@ -274,3 +277,21 @@ New decisions:
     transport, as in the first build.
 23. **Number literals** are bounded to 64 characters (floats and ints)
     before conversion; the 64/65 boundary is pinned.
+
+## Fix round 2 (tk-8cfe35ffe95f)
+
+Delta read of head `c367e96`: the four original findings closed; one new
+defect and one documentation inaccuracy. Tests first at `5364f6d`.
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| F5 (major) | `_retry_after_ms` judged magnitude by the digit string's LENGTH: 19 zeros, or 20 zeros + 1200, scheduled the int64 maximum instead of now+poll / now+1200 s (a zero delay stalled polling) | leading zeros are stripped before judging magnitude (all zeros = 0 seconds); only more than 18 significant digits clamps to int64; `int()` is only called on at most 18 digits; `max(now+poll+jitter, retry_after)` unchanged | `FixRound2RetryAfterLeadingZeros`: `0`, `00`, 19/20/5000 zeros -> now+poll; 20 or 5000 zeros + `1200` -> now+1200 s; `0001200`, 19 zeros + 172800, 40 zeros + 86400; the last fitting second (with and without 30 leading zeros) exact, one more, `9`*19/40/5000, zeros + 40 nines and `1` + 5000 zeros clamp to int64 max; invalid headers (`-0`, `+0`, `0.5`, `0x0`, `1_0`, ...) still ignored |
+| F6 (minor, docs) | The record claimed `from None` leaves no `__context__` and was therefore equivalent | text narrowed (finding 3 row and the mutation note): the adapter's own URL-parser exception never appears; a caller's outer exception may sit in `__context__` with `__suppress_context__` True, and the formatted traceback omits it. The code (`from None`) is unchanged. The "18-digit shortcut is equivalent" note is corrected: F5 disproves it | n/a (documentation) |
+
+**Red before.** At `5364f6d`: `python -m unittest tests.test_card2b3` -> `Ran
+101 tests ... FAILED (failures=3)`: `test_zeros_mean_zero_seconds_and_never_stall_the_poll`,
+`test_leading_zeros_do_not_change_the_value`,
+`test_genuine_overflow_still_clamps_and_the_edges_hold` (the last because its
+zero-prefixed edge case also hit the length shortcut).
+
+**Green after.** `tests.test_card2b3`: `Ran 101 tests ... OK` (97 + 4). Full suite `python -m unittest discover -s tests`: `Ran 621 tests in 188.3s ... OK` (520 on main + 101).
