@@ -502,6 +502,78 @@ class HttpPath(_L1b):
             self.assertIn(key, body)
 
 
+class UnknownContextInputCapBoundary(_L1b):
+    """Fix round 1 (tk-e17c89165391): the unknown-context input bound
+    (context ceiling x allowed calls) is checked signed-64 arithmetic, so an
+    extreme but accepted ceiling is a controlled refusal, never a raw error."""
+
+    def with_ceiling(self, ceiling):
+        d = doc()
+        d["models"][0]["context_ceiling"] = ceiling
+        self.import_ok(d)
+
+    def counts(self):
+        return (self.rows("SELECT COUNT(*) FROM leases"),
+                self.rows("SELECT COUNT(*) FROM holds"),
+                self.rows("SELECT COUNT(*) FROM audit"))
+
+    def test_a_product_beyond_signed_64_is_invalid_request(self):
+        self.with_ceiling(2 ** 62)                  # 4611686018427387904
+        before = self.counts()
+        body, now = self.unknown(max_calls=2)
+        exc = self.assert_code(errors.CODE_INVALID_REQUEST, body, now)
+        self.assertEqual(exc.message, errors.MSG_INVALID_REQUEST)
+        self.assertEqual(self.counts(), before)
+
+    def test_the_largest_product_that_fits_is_granted(self):
+        self.with_ceiling(2 ** 62 - 1)              # 4611686018427387903
+        body, now = self.unknown(max_calls=2)
+        made = self.grant(body, now)
+        self.assertEqual(made["caps"]["input_cap"], 2 ** 63 - 2)
+        self.assertEqual(self.rows("SELECT input_cap FROM leases"),
+                         [(9223372036854775806,)])
+
+    def test_other_call_counts_at_the_edge(self):
+        self.with_ceiling(2 ** 63 - 1)
+        body, now = self.unknown(max_calls=1)       # exactly the maximum
+        self.assertEqual(self.grant(body, now)["caps"]["input_cap"], 2 ** 63 - 1)
+        body, now = self.unknown(max_calls=2)       # one call too many
+        self.assert_code(errors.CODE_INVALID_REQUEST, body, now)
+
+    def test_over_http_the_refusal_is_400_not_503(self):
+        import threading
+        from tests.test_cardl1a import _call
+        self.assertEqual(run_cli(
+            "--db", self.db, "identity-set", "--machine", "desktop",
+            "--identity-ref", "identity-desktop", "--enabled",
+            "true").returncode, 0)
+        self.with_ceiling(2 ** 62)
+        server = http_api.make_server(self.db, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            now = self.now()
+            wire = request(_ids(self), seat="s6", now_ms=now, gateway_id=None)
+            del wire["request_hash"]
+            wire["context"] = unknown_context(now)
+            before = self.counts()
+            status, answer = _call(base, "/v1/leases", wire, wire["request_id"])
+            self.assertEqual(status, 400, answer)
+            self.assertEqual(answer["error"]["code"], "INVALID_REQUEST")
+            self.assertEqual(self.counts(), before)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_known_context_path_is_unchanged_for_the_same_model(self):
+        self.with_ceiling(2 ** 62)
+        body, now = self.known("s6", max_calls=2)
+        made = self.grant(body, now)             # estimate path, own bounds
+        self.assertEqual(made["state"], "active")
+
+
 class MarkerInteractionWithL1a(_L1b):
     """Card L1a's replay format marker (task_class in the policy snapshot)
     and its token rule must keep working with the unknown-context path."""

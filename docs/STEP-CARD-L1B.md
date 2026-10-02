@@ -186,3 +186,34 @@ What had to keep working together (all verified, with the new tests
 Evidence: 4 mutations of the combined code (the current hash, the legacy hash,
 the shadow token rule, the snapshot marker) are all caught. Full suite: see the
 reply of this task.
+
+## Fix round 1 (tk-e17c89165391)
+
+In plain words: the cold read found no way for an unknown-context shadow lease to
+gain spending authority. One defect remained: a model whose context ceiling is
+huge but still accepted by the policy loader made the unknown-context grant fail
+with a raw database error (shown to the caller as a 503 "store fault", which
+invites a useless retry) instead of a clear "bad request". It is now a controlled
+refusal.
+
+| Finding | Fix | Tests (`UnknownContextInputCapBoundary`, `tests/test_cardl1b.py`) |
+|---|---|---|
+| F1 (major): the unknown-context input bound `context_ceiling x max_calls` was computed unchecked; with a ceiling of 4611686018427387904 and two calls the product (9223372036854775808) overflowed the column, raising `OverflowError`, which grant's `sqlite3.Error` handler does not catch | the product goes through the module's checked integer rule (`policy._check_int`, signed 64-bit) before any write: too large -> `INVALID_REQUEST` (400, exit 2, the static message) | `test_a_product_beyond_signed_64_is_invalid_request` (store: static message, no lease, hold or audit row written); `test_the_largest_product_that_fits_is_granted` (ceiling 4611686018427387903, two calls -> granted, `input_cap` 9223372036854775806 in the response and the table); `test_other_call_counts_at_the_edge` (ceiling 2^63-1: one call is granted at exactly the maximum, two calls refused); `test_over_http_the_refusal_is_400_not_503`; `test_a_known_context_path_is_unchanged_for_the_same_model` |
+
+**Other arithmetic checked (the same class).** Everything L1b added or touched:
+- `request["max_calls"] * model[4]` (the output bound, `lease.py` ~737) is only compared, never stored, and Python integers do not overflow: no gap.
+- `policy.estimate` and the output/per-call checks on the known path were already checked by card 3 and are unchanged.
+- `hold_sized` is `None` on the unknown path and nothing multiplies it; `money_hold` stays null.
+- The settle change is a null rule with no arithmetic; the `released`/`retained` nulls are assignments.
+- `expires_at = now_ms + ttl_ms` already had its own signed-64 check (`lease.py` ~856).
+- The snapshot only carries `input_cap` (now checked) and constants.
+So the one unchecked product was the unknown-context input cap.
+
+**Evidence.** Red first at `f5bda58` (tests only, production unchanged):
+`python -m unittest tests.test_cardl1b.UnknownContextInputCapBoundary` -> `Ran 5
+tests ... FAILED (failures=1, errors=2)`: ERROR
+`test_a_product_beyond_signed_64_is_invalid_request` and
+`test_other_call_counts_at_the_edge` (`OverflowError: Python int too large to
+convert to SQLite INTEGER`), FAIL `test_over_http_the_refusal_is_400_not_503`
+(503 `STORE_ERROR`); the two boundary-fits tests pass already (they pin the
+largest accepted values). Green: the 5 new tests pass; `tests.test_cardl1b`: 41 tests OK; full suite `Ran 783 tests in 318.2s ... OK` (778 before + 5), nothing left in an empty TMP.

@@ -748,7 +748,10 @@ def _grant(conn, request, now_ms, wire_identity=None):
             policy.check_per_call_output_cap(
                 model_dict, request["per_call_output_cap"])
             est = {"context": "unknown"}
-            input_cap = model[3] * request["max_calls"]
+            # Checked signed-64 arithmetic (section 7): a model ceiling the
+            # loader accepts can still make the product too large for the
+            # column, which is a bad request (400), not a store fault.
+            input_cap = policy._check_int(model[3] * request["max_calls"])
             hold_sized = None
         else:
             est = policy.estimate(
