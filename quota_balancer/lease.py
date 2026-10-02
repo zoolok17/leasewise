@@ -607,6 +607,36 @@ def _grant(conn, request, now_ms, wire_identity=None):
             "WHERE id=?", (request["seat_id"],)).fetchone()
         if seat is None:
             _not_found()
+        machine_id = seat[1]
+        # Idempotency: same (machine, request_id) + same content replays
+        # the stored lease without adding a hold; different content is a
+        # conflict. The content hash is computed server-side over the
+        # canonical request - a client-supplied hash cannot make a
+        # changed replay look identical. The replay comes before the
+        # parked check: a lost-response retry of a granted lease
+        # replays the stored lease (section 7: replay returns 200)
+        # even if the account parked since the grant.
+        # Card L1d: the replay lookup comes BEFORE every policy-dependent
+        # check (team, project, model, effort, account, project link, the
+        # profile, the ceilings, the parked block, freshness). Only the
+        # closed shape check and the seat lookup (which names the machine)
+        # precede it. A request that was granted always replays, whatever
+        # the operator edited since, and an error such as ESTIMATE_STALE
+        # therefore proves that no lease exists for this request id.
+        content_hash = _content_hash(request)
+        existing = conn.execute(
+            "SELECT id, request_hash, policy_snapshot FROM leases WHERE "
+            "machine_id=? AND request_id=?",
+            (machine_id, request["request_id"])).fetchone()
+        if existing is not None:
+            if not _stored_hash_matches(existing[1], existing[2], request):
+                raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
+                                 errors.MSG_IDEMPOTENCY_CONFLICT)
+            row = _lease_row(conn, existing[0])
+            _record_http_identity(conn, wire_identity, now_ms)
+            conn.execute("COMMIT")
+            return _lease_dict(row, replayed=True)
+
         team = conn.execute("SELECT id, project_id FROM teams WHERE id=?",
                             (seat[2],)).fetchone()
         if team is None:
@@ -633,7 +663,6 @@ def _grant(conn, request, now_ms, wire_identity=None):
             (model[1],)).fetchone()
         if account is None:
             _not_found()
-        machine_id = seat[1]
         account_id, account_kind, budget = account
         # Project authorization (section 7: children share project
         # authorization; the server derives membership): the model's
@@ -649,28 +678,6 @@ def _grant(conn, request, now_ms, wire_identity=None):
         # (the scope spans every seat, so it applies to all of them).
         chain = {"platform": _PLATFORM_ID, "project": project[0],
                  "team": team[0], "seat": seat[0]}
-
-        # Idempotency: same (machine, request_id) + same content replays
-        # the stored lease without adding a hold; different content is a
-        # conflict. The content hash is computed server-side over the
-        # canonical request - a client-supplied hash cannot make a
-        # changed replay look identical. The replay comes before the
-        # parked check: a lost-response retry of a granted lease
-        # replays the stored lease (section 7: replay returns 200)
-        # even if the account parked since the grant.
-        content_hash = _content_hash(request)
-        existing = conn.execute(
-            "SELECT id, request_hash, policy_snapshot FROM leases WHERE "
-            "machine_id=? AND request_id=?",
-            (machine_id, request["request_id"])).fetchone()
-        if existing is not None:
-            if not _stored_hash_matches(existing[1], existing[2], request):
-                raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
-                                 errors.MSG_IDEMPOTENCY_CONFLICT)
-            row = _lease_row(conn, existing[0])
-            _record_http_identity(conn, wire_identity, now_ms)
-            conn.execute("COMMIT")
-            return _lease_dict(row, replayed=True)
 
         # An unknown context is a shadow-only request (card L1b): refused
         # for every other derived enforcement, after the replay check and
@@ -721,7 +728,11 @@ def _grant(conn, request, now_ms, wire_identity=None):
         observed_at = request["context"]["observed_at"]
         if (now_ms - observed_at > _EST_FRESH_MS
                 or observed_at > now_ms + reduce.FUTURE_SLOP_MS):
-            _invalid()
+            # Card L1d: its own code, so a caller can tell "rebuild with a
+            # fresh estimate" from every other bad request. It runs after
+            # the replay lookup, so it also proves no lease exists.
+            raise QuotaError(errors.CODE_ESTIMATE_STALE,
+                             errors.MSG_ESTIMATE_STALE)
 
         # Derive the caps through the card-3 arithmetic: the model row
         # feeds the pure estimate; the request carries the context.

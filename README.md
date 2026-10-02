@@ -352,3 +352,20 @@ sorted. It prints nothing else (no identity references, vendors, budgets or rate
 and changes nothing. The observe-only reporter of card 7a takes these ids as its
 configuration in v1, copied by the operator; an HTTP lookup is deferred. See
 docs/STEP-CARD-L1C.md.
+
+## Card L1d - a granted lease always replays, and `ESTIMATE_STALE`
+
+If a lease was granted but the answer was lost, sending the **same** request again
+now always returns that lease, even when the operator has since removed the model,
+removed an effort name, unlinked the project's account, changed the account, the
+seat or the profile, or parked the account. Only the shape check and the seat
+lookup happen before the replay lookup; every policy check comes after it. A
+request with the same id but different content is still `IDEMPOTENCY_CONFLICT`.
+
+A request whose `observed_at` is more than 120 seconds old, or more than 30 seconds
+in the future, now gets its own error, `ESTIMATE_STALE` (HTTP 400, exit 2, the fixed
+text "the admission estimate is stale"), instead of `INVALID_REQUEST`. It is checked
+last among the policy checks and never for a replay, so receiving it proves that no
+lease exists for that request id: the caller may rebuild the request with a
+fresh estimate. Every other bad request is still `INVALID_REQUEST`. See
+docs/STEP-CARD-L1D.md.
