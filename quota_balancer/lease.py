@@ -86,12 +86,13 @@ from . import errors, policy, reduce
 from .errors import QuotaError
 from .migrate import rollback_quietly
 from .store import _connect
+from .validate_config_v2 import PLATFORM_ID
 
 # --- request shapes (closed) ---------------------------------------------------
 
 _GRANT_KEYS = frozenset((
     "request_id", "request_hash", "turn_id", "seat_id", "model_id",
-    "effort", "gateway_id", "parent_lease_id", "context",
+    "task_class", "effort", "gateway_id", "parent_lease_id", "context",
     "expected_calls", "max_calls", "output_cap", "per_call_output_cap",
     "ttl_ms"))
 _CONTEXT_KEYS = frozenset((
@@ -130,7 +131,26 @@ _MAX_TTL_MS = _DAY_MS
 # limits rows carried by this reserved id. The scope spans every seat,
 # so the grant's chain always carries it and every platform row applies
 # to every lease (card-3: a chain scope id is always a UUID).
-_PLATFORM_ID = "00000000-0000-0000-0000-000000000000"
+_PLATFORM_ID = PLATFORM_ID  # one definition, shared with config-import v2
+# R-003 interim gate (card L1a): False means NO grant is ever an enforcing
+# metered lease, whatever a gateway reports. Card R1 replaces this constant
+# with a real, explicit activation gate; until it merges the desktop lead's
+# decision stands (metered leases stay advisory). Tests that exercise the
+# post-activation arithmetic (holds, settlement, expiry) patch it to True;
+# nothing in the product sets it.
+METERED_ENFORCEMENT_ACTIVATED = False
+
+
+def token_bearing(enforcement):
+    """True when a lease of this stored enforcement may carry a lease token
+    and pass /check. The ONE place the R-003 gate is applied to permission:
+    while the gate is closed a stored `metered` lease (for example one the
+    code before L1a granted) is treated like a non-enforcing one - no token
+    on a replay, no /check - though its holds, settlement and expiry are
+    untouched. Card R1 replaces this condition with its activation gate."""
+    if enforcement == "metered":
+        return METERED_ENFORCEMENT_ACTIVATED
+    return enforcement not in ("metered_advisory", "shadow")
 # Section 7: the admission estimate must be at most 120 seconds old.
 _EST_FRESH_MS = 120_000
 
@@ -199,6 +219,7 @@ def _validate_grant_request(request):
     if (not isinstance(request["request_hash"], str)
             or not policy._HASH_RE.fullmatch(request["request_hash"])):
         _invalid()
+    policy._check_alias(request["task_class"])
     policy._check_alias(request["effort"])
     for key in ("gateway_id", "parent_lease_id"):
         value = request[key]
@@ -279,6 +300,34 @@ def _content_hash(request):
     return hashlib.sha256(
         json.dumps(canonical, sort_keys=True,
                    separators=(",", ":")).encode()).hexdigest()
+
+
+def _legacy_content_hash(request):
+    # The replay fingerprint exactly as the code before card L1a computed
+    # it: that code never saw task_class (the wire adapter dropped it), so
+    # the field is left out. Used only to compare against a lease stored in
+    # that format (see _stored_hash_matches).
+    canonical = {k: v for k, v in request.items()
+                 if k not in ("request_hash", "task_class")}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest()
+
+
+def _stored_hash_matches(stored_hash, policy_snapshot, request):
+    # A lease written by card L1a or later records "task_class" in its
+    # policy_snapshot (the marker: the snapshot is a fixed set of keys built
+    # by grant, none of them client-chosen, so an older snapshot can never
+    # contain it) and was fingerprinted with task_class. An older lease is
+    # compared with the older fingerprint, so its identical request still
+    # replays after the upgrade. New grants always store the current hash.
+    try:
+        current = "task_class" in json.loads(policy_snapshot)
+    except ValueError as exc:
+        _store_error(exc)
+    expected = (_content_hash(request) if current
+                else _legacy_content_hash(request))
+    return stored_hash == expected
 
 
 def _lease_row(conn, lease_id):
@@ -584,16 +633,49 @@ def _grant(conn, request, now_ms, wire_identity=None):
         # even if the account parked since the grant.
         content_hash = _content_hash(request)
         existing = conn.execute(
-            "SELECT id, request_hash FROM leases WHERE machine_id=? AND "
-            "request_id=?", (machine_id, request["request_id"])).fetchone()
+            "SELECT id, request_hash, policy_snapshot FROM leases WHERE "
+            "machine_id=? AND request_id=?",
+            (machine_id, request["request_id"])).fetchone()
         if existing is not None:
-            if existing[1] != content_hash:
+            if not _stored_hash_matches(existing[1], existing[2], request):
                 raise QuotaError(errors.CODE_IDEMPOTENCY_CONFLICT,
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
             _record_http_identity(conn, wire_identity, now_ms)
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
+
+        # The profile is the server-side policy for the task class
+        # (section 6/7). It is read AFTER the replay check: a granted
+        # lease is never changed (or lost) by a later profile edit.
+        profile = conn.execute(
+            "SELECT candidates, expected_calls, margin_bps, max_calls, "
+            "output_cap, per_call_output_cap, ttl_ms, policy_revision "
+            "FROM profiles WHERE task_class=?",
+            (request["task_class"],)).fetchone()
+        if profile is None:
+            _not_found()   # an unknown task class, like an unknown model
+        try:
+            candidates = json.loads(profile[0])
+        except ValueError as exc:
+            _store_error(exc)
+        if not isinstance(candidates, list) or not all(
+                isinstance(alias, str) for alias in candidates):
+            # config-import writes only a list of aliases: anything else
+            # is a damaged store, not a policy decision.
+            raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+        if model[2] not in candidates:
+            # 'park' is implicit and never stored (STEP-CARD-L1A, turn 1).
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
+        # A request may ask for less than the profile, never more.
+        for key, ceiling in zip(
+                ("expected_calls", "max_calls", "output_cap",
+                 "per_call_output_cap", "ttl_ms"), profile[1:2] + profile[3:7]):
+            if request[key] > ceiling:
+                raise QuotaError(errors.CODE_POLICY_DENIED,
+                                 errors.MSG_POLICY_DENIED)
+        margin_bps, policy_revision = profile[2], profile[7]
 
         _parked_block_error(conn, account_id, model[0])
         # Section 7: the admission estimate must be at most 120 seconds
@@ -623,7 +705,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
         est = policy.estimate(
             context["initial_tokens"] + context["dispatch_tokens"],
             request["expected_calls"], context["growth_tokens_per_call"],
-            request["output_cap"], request["max_calls"], model_dict)
+            request["output_cap"], request["max_calls"], model_dict,
+            margin_bps)
         policy.check_per_call_output_cap(
             model_dict, request["per_call_output_cap"])
         input_cap, hold_sized = est["input_cap"], est["hold_sized"]
@@ -673,7 +756,12 @@ def _grant(conn, request, now_ms, wire_identity=None):
         if enforcement == "metered":
             if sized_ready is None:
                 _invalid()  # gateway is null only for subscriptions
-            if not sized_ready:
+            # R-003 interim: a gateway's own report (sized_ready, kept as
+            # telemetry) must never switch a seat to enforcing metered
+            # leases. The desktop lead decided metered leases stay
+            # advisory until card R1 merges its explicit activation gate,
+            # which replaces METERED_ENFORCEMENT_ACTIVATED.
+            if not (sized_ready and METERED_ENFORCEMENT_ACTIVATED):
                 enforcement = "metered_advisory"
         metered = enforcement == "metered"
         money_hold = hold_sized if metered else None
@@ -736,6 +824,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
             },
             "chain": dict(chain, account=account_id),
             "effort": request["effort"],
+            "task_class": request["task_class"],
+            "policy_revision": policy_revision,
             "caps": {"input_cap": input_cap, "hold_sized": hold_sized,
                      "output_cap": request["output_cap"],
                      "max_calls": request["max_calls"],
@@ -753,7 +843,7 @@ def _grant(conn, request, now_ms, wire_identity=None):
             (lease_id, machine_id, seat[0], account_id, model[0],
              request["gateway_id"], request["parent_lease_id"],
              request["turn_id"], request["request_id"],
-             content_hash, None, request["effort"],
+             content_hash, None, request["task_class"],
              context["mode"], enforcement, json.dumps(est, sort_keys=True),
              policy_snapshot, input_cap, request["output_cap"],
              request["max_calls"], request["per_call_output_cap"],
@@ -861,19 +951,128 @@ def expire(path, lease_id, now_ms):
                 return _lease_dict(row, replayed=True)
             if now_ms < row["expires_at"]:
                 _invalid()  # not expired: expiry is an effect of the TTL
-            conn.execute(
-                "UPDATE leases SET state='uncertain' WHERE id=?",
-                (lease_id,))
-            conn.execute(
-                "INSERT INTO audit(actor_alias, action, object_id, at, "
-                "redacted_details) VALUES(?,?,?,?,?)",
-                ("coordinator", "lease_expired", lease_id, now_ms,
-                 json.dumps({"refunded": 0})))
+            _mark_uncertain(conn, lease_id, now_ms)
             conn.execute("COMMIT")
             return _lease_dict(_lease_row(conn, lease_id))
         except BaseException:
             rollback_quietly(conn)
             raise
+    finally:
+        conn.close()
+
+
+def _mark_uncertain(conn, lease_id, now_ms):
+    # Expiry is never a refund: the state changes, the holds and the live
+    # slot stay (section 4); one audit row records it.
+    conn.execute("UPDATE leases SET state='uncertain' WHERE id=?",
+                 (lease_id,))
+    conn.execute(
+        "INSERT INTO audit(actor_alias, action, object_id, at, "
+        "redacted_details) VALUES(?,?,?,?,?)",
+        ("coordinator", "lease_expired", lease_id, now_ms,
+         json.dumps({"refunded": 0})))
+
+
+def expire_sweep(path, now_ms):
+    """Apply the expiry rule to every active lease whose TTL has elapsed
+    (now_ms >= expires_at), in one BEGIN IMMEDIATE transaction. Returns the
+    closed summary {"expired": count}. Idempotent (a second sweep finds
+    nothing active and expired); never settles, refunds or deletes."""
+    policy._check_int(now_ms, 1)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            due = conn.execute(
+                "SELECT id FROM leases WHERE state='active' AND "
+                "expires_at <= ? ORDER BY expires_at, id",
+                (now_ms,)).fetchall()
+            for (lease_id,) in due:
+                _mark_uncertain(conn, lease_id, now_ms)
+            conn.execute("COMMIT")
+            return {"expired": len(due)}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
+    finally:
+        conn.close()
+
+
+# --- block-clear (operator-only; card L1a turn 3) ---------------------------------
+
+CLEAR_REASONS = ("reset_observed", "false_positive", "operator_override")
+
+
+def block_clear(path, account_alias, model_alias, reason, now_ms):
+    """Clear the live (parked or probing) block of an account (or of one of
+    its models), audited, with the N3 safety rule: in the same transaction
+    EVERY unresolved adjustment of the account (not only the block's source
+    event) refuses the clear with ACCOUNT_PARKED - the account stays parked
+    until the reconciliation card can resolve the overrun. No live block:
+    NOT_FOUND when none ever existed for the scope; a scope whose block is
+    already cleared is a no-op that reports the cleared state (no second
+    audit row). Returns {"state": "cleared", "replayed": bool}.
+    """
+    policy._check_alias(account_alias)
+    if model_alias is not None:
+        policy._check_alias(model_alias)
+    if not isinstance(reason, str) or reason not in CLEAR_REASONS:
+        _invalid()
+    policy._check_int(now_ms, 1)
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            account = conn.execute("SELECT id FROM accounts WHERE alias=?",
+                                   (account_alias,)).fetchone()
+            if account is None:
+                _not_found()
+            model_id = None
+            if model_alias is not None:
+                model = conn.execute(
+                    "SELECT id FROM models WHERE account_id=? AND alias=?",
+                    (account[0], model_alias)).fetchone()
+                if model is None:
+                    _not_found()
+                model_id = model[0]
+            live = conn.execute(
+                "SELECT id, state FROM blocks WHERE account_id=? AND "
+                "model_id IS ? AND state IN ('parked','probing')",
+                (account[0], model_id)).fetchone()
+            if live is None:
+                cleared = conn.execute(
+                    "SELECT 1 FROM blocks WHERE account_id=? AND "
+                    "model_id IS ? AND state='cleared' LIMIT 1",
+                    (account[0], model_id)).fetchone()
+                if cleared is None:
+                    _not_found()
+                conn.execute("COMMIT")
+                return {"state": "cleared", "replayed": True}
+            # N3: scan EVERY unresolved adjustment of the account.
+            if conn.execute(
+                    "SELECT 1 FROM adjustments WHERE account_id=? AND "
+                    "resolved_at IS NULL LIMIT 1",
+                    (account[0],)).fetchone() is not None:
+                raise QuotaError(errors.CODE_ACCOUNT_PARKED,
+                                 errors.MSG_ACCOUNT_PARKED)
+            block_id, previous = live
+            conn.execute(
+                "UPDATE blocks SET state='cleared', updated_at=? WHERE id=?",
+                (now_ms, block_id))
+            conn.execute(
+                "INSERT INTO audit(actor_alias, action, object_id, at, "
+                "redacted_details) VALUES(?,?,?,?,?)",
+                ("operator", "block_cleared", block_id, now_ms,
+                 json.dumps({"reason": reason, "previous_state": previous})))
+            conn.execute("COMMIT")
+            return {"state": "cleared", "replayed": False}
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        _store_error(exc)
     finally:
         conn.close()
 
@@ -1102,16 +1301,37 @@ def _settle(conn, receipt, now_ms):
                      overrun[1], "overrun"))
                 # An observed overrun blocks further work on the account
                 # until reconciled (section 4): parked, no timed retry.
-                # OR IGNORE: the account may already be parked (the
-                # blocks_live index allows one live block per
-                # (account, model-or-null)).
+                # The blocks_live index allows one live block per
+                # (account, model-or-null): an existing parked block stays
+                # parked, a probing one is parked again (a probe cannot
+                # clear an unreconciled overrun), and every overrun's event
+                # id is audited so concurrent overruns sharing the one
+                # block stay traceable (card L1a turn 3, N3).
+                live = conn.execute(
+                    "SELECT id, state FROM blocks WHERE account_id=? AND "
+                    "model_id IS NULL AND state IN ('parked','probing')",
+                    (lease["account_id"],)).fetchone()
+                if live is None:
+                    block_id, previous = str(_uuid.uuid4()), None
+                    conn.execute(
+                        "INSERT INTO blocks(id, account_id, model_id, "
+                        "reason, retry_at, state, source_event_id, "
+                        "updated_at) VALUES(?,?,?,?,NULL,'parked',?,?)",
+                        (block_id, lease["account_id"], None, "overrun",
+                         receipt["event_id"], now_ms))
+                else:
+                    block_id, previous = live
+                    if previous == "probing":
+                        conn.execute(
+                            "UPDATE blocks SET state='parked', "
+                            "retry_at=NULL, updated_at=? WHERE id=?",
+                            (now_ms, block_id))
                 conn.execute(
-                    "INSERT OR IGNORE INTO blocks(id, account_id, "
-                    "model_id, reason, retry_at, state, "
-                    "source_event_id, updated_at) "
-                    "VALUES(?,?,?,?,NULL,'parked',?,?)",
-                    (str(_uuid.uuid4()), lease["account_id"], None,
-                     "overrun", receipt["event_id"], now_ms))
+                    "INSERT INTO audit(actor_alias, action, object_id, "
+                    "at, redacted_details) VALUES(?,?,?,?,?)",
+                    ("coordinator", "overrun_block", block_id, now_ms,
+                     json.dumps({"event_id": receipt["event_id"],
+                                 "previous_state": previous})))
             conn.execute(
                 "INSERT INTO audit(actor_alias, action, object_id, at, "
                 "redacted_details) VALUES(?,?,?,?,?)",

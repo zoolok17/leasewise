@@ -227,3 +227,91 @@ transport call per invocation, never a retry. Standard library only.
 - **Fixtures.** `docs/fixtures/ovh/` (two REAL sanitized captures, the rest
   labelled SYNTHETIC); tests: `tests/test_card2b3.py`. Decisions, the
   acceptance-row map and residual risk: docs/STEP-CARD-2B-3.md.
+
+## Card L1a (turn 1) — policy import, config-import version 2
+
+`config-import --file` now also accepts **version 2**: the version-1 inventory
+(`accounts`, `machines`, `gateways`, unchanged) plus the seven policy tables
+`projects`, `teams`, `project_accounts`, `seats`, `models`, `profiles`,
+`limits`. Every key is required (an empty list is fine), no key may be added at
+any level, and every reference is an **alias**, never a UUID. A version-1
+document still imports exactly as before and leaves the policy tables alone;
+any other version is `SCHEMA_UNSUPPORTED`.
+
+The whole document applies in one transaction or not at all. Retained aliases
+keep their UUID and update config-owned columns only (never `seats.last_seen_at`);
+a removed alias is deleted only if nothing references it (leases, blocks,
+holds, readings, limits), otherwise `INVALID_CONFIG` (exit 2) and nothing
+changes. `context_rules` and `calibration` must be `{}` for now; a trailing
+`"park"` in `candidates` is accepted (it is implicit and not stored); model
+aliases are unique across all accounts.
+
+```json
+{
+  "version": 2,
+  "accounts": [{"alias": "meter", "vendor": "ovh", "kind": "metered",
+                "budget_micro_eur": 100000000}],
+  "machines": [{"alias": "desktop"}],
+  "gateways": [{"alias": "g1", "account": "meter", "machine": "desktop",
+                "share_micro_eur": 100000000, "period": "utc_month"}],
+  "projects": [{"alias": "org"}],
+  "teams": [{"project": "org", "alias": "dev"}],
+  "project_accounts": [{"project": "org", "account": "meter"}],
+  "seats": [{"team": {"project": "org", "team": "dev"}, "machine": "desktop",
+             "alias": "s1", "role": "main", "enforcement": "metered_advisory"}],
+  "models": [{"account": "meter", "alias": "opus", "context_ceiling": 180000,
+              "output_ceiling": 18000, "tariff_input_rate": 1,
+              "tariff_output_rate": 1, "reserve_input_rate": 1000000,
+              "reserve_output_rate": 1000000, "reservation_mode": "sized",
+              "policy_hash": "abababababababababababababababababababababababababababababababab",
+              "effort_aliases": ["opus"]}],
+  "profiles": [{"task_class": "bounded_read", "candidates": ["opus", "park"],
+                "context_rules": {}, "calibration": {}, "expected_calls": 1,
+                "growth_tokens": 0, "margin_bps": 12500, "max_calls": 2,
+                "output_cap": 1000, "per_call_output_cap": 500,
+                "ttl_ms": 1800000, "policy_revision": 1}],
+  "limits": [
+    {"scope": "platform", "metric": "concurrency", "period": "turn",
+     "window_key": null, "soft": null, "hard": 4},
+    {"scope": "team", "project": "org", "team": "dev",
+     "metric": "money_micro_eur", "period": "month", "window_key": null,
+     "soft": 50000000, "hard": 100000000},
+    {"scope": "seat", "machine": "desktop", "seat": "s1",
+     "metric": "window_bps", "period": "window", "window_key": "five_hour",
+     "soft": null, "hard": 9000}]
+}
+```
+
+**R-003 interim fix.** A seat whose `enforcement` is `metered` is always
+granted `metered_advisory` (no money hold, no token, cannot pass `/check`),
+whatever a gateway reports as `sized_ready` (still stored as telemetry). Card
+R1 replaces the interim constant `lease.METERED_ENFORCEMENT_ACTIVATED` with an
+explicit activation gate. See docs/STEP-CARD-L1A.md.
+
+**Turn 2: the profile at grant.** The wire's `task_class` now reaches the
+store: it keys the profile (imported by config-import v2), is part of the
+replay content hash and is stored in `leases.task_class` (the effort alias stays
+in `policy_snapshot`, which also records `task_class` and the profile's
+`policy_revision`). Grant refuses an unknown class like an unknown model
+(`NOT_FOUND`), denies a model outside the profile's `candidates` and any
+`expected_calls`, `max_calls`, `output_cap`, `per_call_output_cap` or `ttl_ms`
+above the profile (`POLICY_DENIED`), and uses the profile's `margin_bps` for the
+estimate. A replay returns the stored lease before any of this, so a later
+profile edit never changes a granted lease. See docs/STEP-CARD-L1A.md.
+
+**Turn 3: two operator verbs.**
+- `block-clear --account A [--model M] --reason R` clears the live block of an
+  account (or of one model) and writes an audit row (actor `operator`, action
+  `block_cleared`, only the reason and the previous state). `R` is one of
+  `reset_observed`, `false_positive`, `operator_override`. It refuses with
+  `ACCOUNT_PARKED` (exit 2, nothing changed) while ANY adjustment of the account
+  is unresolved, so a block caused by a money overrun cannot be cleared until
+  the reconciliation card can resolve it; a block from a provider usage limit
+  can. No live block is `NOT_FOUND`; a repeat of a clear reports
+  `{"state":"cleared","replayed":true}` and adds no audit row. Output:
+  `{"state":"cleared","replayed":false}`.
+- `expire-sweep` moves every active lease whose time has run out to
+  `uncertain` (holds and slot kept, never a refund) and prints
+  `{"expired":N}`; a second run prints `{"expired":0}`.
+- An overrun now turns a `probing` block back to `parked` and audits every
+  overrun's event id. See docs/STEP-CARD-L1A.md for the card summary.

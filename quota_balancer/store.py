@@ -42,7 +42,9 @@ from .reduce import (
     reduce_window,
     window_freshness,
 )
+from .policy_config import apply_policy
 from .validate import validate
+from .validate_config_v2 import VERSION as CONFIG_V2, validate_v2
 from .validate_policies import (
     allocation_within_cap,
     validate_billing_policies,
@@ -133,14 +135,22 @@ def import_config(path, file):
         # pathologically deep nesting: a bad document, not a store fault.
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
-    accounts, machines, gateways = validate(doc)
+    # Version 2 adds the policy tables; version 1 (and an absent version)
+    # keeps validate()'s contract and an unknown version is its
+    # SCHEMA_UNSUPPORTED. A version-1 import never touches the policy tables.
+    policy_doc = None
+    if (isinstance(doc, dict) and type(doc.get("version")) is int
+            and doc["version"] == CONFIG_V2):
+        accounts, machines, gateways, policy_doc = validate_v2(doc)
+    else:
+        accounts, machines, gateways = validate(doc)
 
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
-            _upsert(conn, accounts, machines, gateways)
+            _upsert(conn, accounts, machines, gateways, policy_doc)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -151,7 +161,7 @@ def import_config(path, file):
         conn.close()
 
 
-def _upsert(conn, accounts, machines, gateways):
+def _upsert(conn, accounts, machines, gateways, policy_doc=None):
     """Reconcile the inventory to the document. Inside the import's BEGIN
     IMMEDIATE. Expects the normalized tuples from validate.validate().
 
@@ -279,37 +289,56 @@ def _upsert(conn, accounts, machines, gateways):
                  machine_ids[machine], share, period),
             )
 
+    # Version 2: reconcile the seven policy tables NOW, before the
+    # inventory deletions below, so rows of a removed account/machine are
+    # removed (or refuse the import) first and the guards below then see the
+    # post-import policy state. A version-1 import skips this and leaves the
+    # policy tables as they are.
+    if policy_doc is not None:
+        apply_policy(conn, policy_doc, account_ids, machine_ids)
+
     # Removed aliases, children before parents. validate() guarantees no
-    # retained/new gateway references a removed account or machine, so the
-    # only live references to a removed alias are readings, windows, and
-    # the card-3 policy tables (seats.machine_id, models.account_id,
-    # project_accounts.account_id - empty in this card, guarded from the
-    # moment the tables exist).
+    # retained/new gateway references a removed account or machine. Every
+    # other reference is checked against REMOVAL_GUARDS, so a referenced
+    # removal is always the static INVALID_CONFIG (the foreign keys stay as
+    # the backstop, never the first line: their failure would read as a
+    # store fault).
     for alias in set(old_gateways) - {g[0] for g in gateways}:
+        _refuse_if_referenced(conn, "gateways", old_gateways[alias])
         conn.execute("DELETE FROM gateways WHERE id=?", (old_gateways[alias],))
     for alias in set(old_machines) - set(machines):
-        if (_references(conn, "readings", "machine_id", old_machines[alias])
-                or _references(conn, "seats", "machine_id",
-                               old_machines[alias])
-                or _references(conn, "billing_policies",
-                               "reporter_machine_id",
-                               old_machines[alias])):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        _refuse_if_referenced(conn, "machines", old_machines[alias])
         conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
     for alias in set(old_accounts) - {a[0] for a in accounts}:
-        if (_references(conn, "readings", "account_id", old_accounts[alias])
-                or _references(conn, "windows", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "models", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "project_accounts", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "billing_policies", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "billing_totals", "account_id",
-                               old_accounts[alias])):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        _refuse_if_referenced(conn, "accounts", old_accounts[alias])
         conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))
+
+
+# Every (table, column) that points at an inventory row, declared by a
+# foreign key. A test compares this list with the live schema's foreign
+# keys, so a new reference cannot be forgotten.
+REMOVAL_GUARDS = {
+    "accounts": (
+        ("readings", "account_id"), ("windows", "account_id"),
+        ("gateways", "account_id"), ("models", "account_id"),
+        ("project_accounts", "account_id"),
+        ("billing_policies", "account_id"), ("billing_totals", "account_id"),
+        ("blocks", "account_id"), ("leases", "account_id"),
+        ("adjustments", "account_id"), ("limit_events", "account_id")),
+    "machines": (
+        ("readings", "machine_id"), ("gateways", "machine_id"),
+        ("seats", "machine_id"), ("leases", "machine_id"),
+        ("billing_policies", "reporter_machine_id")),
+    "gateways": (
+        ("leases", "gateway_id"), ("receipts", "gateway_id"),
+        ("adjustments", "gateway_id")),
+}
+
+
+def _refuse_if_referenced(conn, target, entity_id):
+    for table, column in REMOVAL_GUARDS[target]:
+        if _references(conn, table, column, entity_id):
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
 
 def _references(conn, table, column, entity_id):

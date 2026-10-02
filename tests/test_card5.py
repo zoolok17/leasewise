@@ -21,6 +21,7 @@ agreeing Idempotency-Key header).
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 import uuid
@@ -283,6 +285,12 @@ class _ServerCase(unittest.TestCase):
             os.makedirs(base, exist_ok=True)
         self._tmp = tempfile.TemporaryDirectory(dir=base, prefix="quota-card5-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
         self.db = None
         self.server = None
         self.thread = None
@@ -1916,7 +1924,9 @@ class FixRound3AtomicWireIdentity(_ServerCase):
         self.start()
         request_id = str(uuid.uuid4())
         req_a = _grant_request(request_id=request_id)
-        req_b = dict(req_a, task_class="an_alternate_task_class")
+        # (Card L1a turn 2: an unknown task_class would now be a 404, so the
+        # second body differs in a profile-valid field instead.)
+        req_b = dict(req_a, output_cap=req_a["output_cap"] - 1)
         barrier = threading.Barrier(2)
         results = [None, None]
 
@@ -1987,7 +1997,9 @@ class FixRound3AtomicWireIdentity(_ServerCase):
         # same key is now a genuinely fresh first request, not a
         # conflict - and the ORIGINAL body, tried afterward, is now the
         # one that conflicts.
-        changed = dict(request, task_class="an_alternate_task_class")
+        # (Card L1a turn 2: task_class now keys a real profile, so the changed
+        # body differs in another field the profile allows.)
+        changed = dict(request, output_cap=request["output_cap"] - 1)
         status2, body2 = _call(
             self.base, "POST", "/v1/leases", body=changed, identity=IDENTITY_A,
             idempotency_key=request["request_id"])
@@ -2041,6 +2053,7 @@ class FixRound3LegacyLimitEventMigration(_ServerCase):
         if base:
             os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base, prefix="quota-card5-v6-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)  # N-001: no leaked temp dir
         db = os.path.join(tmp, "v6.db")
         conn = sqlite3.connect(db)
         try:
@@ -2366,6 +2379,7 @@ class FixRound4LegacyReplayAccountBinding(_ServerCase):
         if base:
             os.makedirs(base, exist_ok=True)
         tmp = tempfile.mkdtemp(dir=base, prefix="quota-card5-v6r2-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)  # N-001: no leaked temp dir
         db = os.path.join(tmp, "v6.db")
         conn = sqlite3.connect(db)
         try:

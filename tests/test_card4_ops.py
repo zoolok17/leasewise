@@ -16,9 +16,11 @@ calls the store operations directly - there is no HTTP layer until card 5.
 import hashlib
 import multiprocessing
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 import quota_balancer.migrate as migrate
@@ -69,6 +71,7 @@ def _grant_request(request_id, turn_id, request_hash):
         "turn_id": turn_id,
         "seat_id": SEAT,
         "model_id": MODEL,
+        "task_class": "bounded_read",
         "effort": "opus",
         "gateway_id": GATEWAY,
         "parent_lease_id": None,
@@ -149,6 +152,18 @@ def _build_store(tmp, name, budget, gateway_sized=1):
             "policy_hash, effort_aliases) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (MODEL, ACCOUNT, "opus", 180000, 18000, 1, 1, 1000000,
              1000000, "sized", POLICY_HASH, "opus"))
+        # Card L1a turn 2: grant reads the task class's profile, so every
+        # fixture carries one (candidates: every model of the fixture).
+        conn.execute(
+            "INSERT INTO profiles(id, task_class, candidates, "
+            "context_rules, calibration, expected_calls, growth_tokens, "
+            "margin_bps, max_calls, output_cap, per_call_output_cap, "
+            "ttl_ms, policy_revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "bounded_read",
+             json.dumps([r[0] for r in conn.execute(
+                 "SELECT alias FROM models ORDER BY alias")]),
+             "{}", "{}", 1, 0, 12500, 2, 1000, 500, 1800000, 1))
         conn.commit()
     finally:
         conn.close()
@@ -182,6 +197,9 @@ def _race_worker(store_path, worker_id):
     """ATTEMPTS_PER_WORKER sequential grants from one process; unique
     turn/request ids per attempt so only the budget can refuse. Returns
     the per-attempt outcomes."""
+    # A spawned process does not inherit the test's mock patch: open the
+    # R-003 interim gate here (card L1a; reachable only after card R1).
+    lease.METERED_ENFORCEMENT_ACTIVATED = True
     results = []
     for i in range(ATTEMPTS_PER_WORKER):
         tag = "%d-%d" % (worker_id, i)
@@ -205,6 +223,12 @@ class Card4Turn2Test(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=base,
                                                 prefix="quota-card4-t2-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
 
     def tearDown(self):
         self._tmp.cleanup()

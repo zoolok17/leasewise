@@ -252,14 +252,18 @@ that must survive the fix.)
 **Mutation spot-check of the fix.** 17 single-point mutations (explicit vs
 ambient context, the trap list, both representation bounds, both literal
 bounds, explicit-context parse, the ArithmeticError catch, each base-URL
-rule, the clamp, the date branch): 14 killed. Two survivors were equivalent and kept as defence: the
-15-integer-digit bound (any consistent amount is already limited by the int64
-ucents total, so it is unobservable) and `from None` (with the adapter's own
-URL-parser exception raised outside any `except` there is nothing of its own to
-hide; the suppression matters only when a caller is already handling an
-exception, see finding 3). The third survivor, a shortcut that clamped
-Retry-After by digit-string LENGTH, was NOT equivalent: it was the defect found
-by the delta read (fix round 2, finding F5 below).
+rule, the clamp, the date branch): 14 killed. Three survived, and they are not
+all alike:
+- the 15-integer-digit bound is the only truly equivalent one (any consistent
+  amount is already limited by the int64 ucents total, so removing it cannot
+  change a result); it is kept as defence;
+- removing `from None` was a test-coverage gap, NOT an equivalence: it matters
+  when a caller invokes `poll_once` while handling its own exception, and no
+  test did that. It is now covered (`test_a_callers_exception_is_suppressed_from_the_traceback`,
+  added after the final read; it fails when `from None` is removed). The
+  production code keeps `from None` and was always correct;
+- the shortcut that clamped Retry-After by digit-string LENGTH was the defect
+  found by the delta read (fix round 2, finding F5 below).
 
 New decisions:
 

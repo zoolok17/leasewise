@@ -17,6 +17,7 @@ account by test_card4_turn_c_fix.test_shadow_consumes_no_concurrency_slot.
 
 import hashlib
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -53,7 +54,7 @@ def _grant_request(gateway_id=None):
         "request_id": request_id, "request_hash":
             hashlib.sha256(request_id.encode()).hexdigest(),
         "turn_id": str(uuid.uuid4()), "seat_id": SEAT, "model_id": MODEL,
-        "effort": "opus", "gateway_id": gateway_id, "parent_lease_id": None,
+        "task_class": "bounded_read", "effort": "opus", "gateway_id": gateway_id, "parent_lease_id": None,
         "context": {
             "mode": "FRESH", "initial_tokens": 1000, "dispatch_tokens": 0,
             "source": "tokenizer", "observed_at": NOW - 1000,
@@ -103,6 +104,18 @@ def _build_store(tmp, account_kind, enforcement, budget=10 * HOLD):
             "policy_hash, effort_aliases) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (MODEL, ACCOUNT, "opus", 180000, 18000, 1, 1, 1_000_000,
              1_000_000, "sized", POLICY_HASH, "opus"))
+        # Card L1a turn 2: grant reads the task class's profile, so every
+        # fixture carries one (candidates: every model of the fixture).
+        conn.execute(
+            "INSERT INTO profiles(id, task_class, candidates, "
+            "context_rules, calibration, expected_calls, growth_tokens, "
+            "margin_bps, max_calls, output_cap, per_call_output_cap, "
+            "ttl_ms, policy_revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "bounded_read",
+             json.dumps([r[0] for r in conn.execute(
+                 "SELECT alias FROM models ORDER BY alias")]),
+             "{}", "{}", 1, 0, 12500, 2, 1000, 500, 1800000, 1))
         conn.commit()
     finally:
         conn.close()

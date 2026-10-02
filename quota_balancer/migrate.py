@@ -178,8 +178,9 @@ _DDL_V3 = (
     " effort_aliases TEXT NOT NULL,\n"
     " UNIQUE(account_id, alias)) STRICT;",
     # profiles: the per-task-class policy (section 6). candidates is the
-    # ordered tier list (last tier is 'park'); the numeric caps are the
-    # admission-plan defaults the arithmetic applies.
+    # ordered list of model aliases (JSON; the terminal 'park' tier is
+    # implicit - every candidate blocked parks - and is never stored);
+    # the numeric caps are the per-class ceilings grant enforces.
     "CREATE TABLE profiles(\n"
     " id TEXT PRIMARY KEY,\n"
     " task_class TEXT NOT NULL UNIQUE,\n"

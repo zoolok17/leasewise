@@ -36,6 +36,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 import quota_balancer.migrate as migrate
@@ -93,6 +94,7 @@ def _grant_request(request_id, turn_id, request_hash, model_id=MODEL,
         "turn_id": turn_id,
         "seat_id": seat_id,
         "model_id": model_id,
+        "task_class": "bounded_read",
         "effort": "opus",
         "gateway_id": gateway_id,
         "parent_lease_id": None,
@@ -192,6 +194,18 @@ def _build_store(tmp, name, budget):
             "policy_hash, effort_aliases) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (MODEL2, ACCOUNT2, "opus", 180000, 18000, 1, 1, 1000000,
              1000000, "sized", POLICY_HASH, "opus"))
+        # Card L1a turn 2: grant reads the task class's profile, so every
+        # fixture carries one (candidates: every model of the fixture).
+        conn.execute(
+            "INSERT INTO profiles(id, task_class, candidates, "
+            "context_rules, calibration, expected_calls, growth_tokens, "
+            "margin_bps, max_calls, output_cap, per_call_output_cap, "
+            "ttl_ms, policy_revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "bounded_read",
+             json.dumps([r[0] for r in conn.execute(
+                 "SELECT alias FROM models ORDER BY alias")]),
+             "{}", "{}", 1, 0, 12500, 2, 1000, 500, 1800000, 1))
         conn.commit()
     finally:
         conn.close()
@@ -222,6 +236,12 @@ class Card4EnforceFixTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=base,
                                                 prefix="quota-card4-fb-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -315,6 +335,12 @@ class Card4EnforceFixTest(unittest.TestCase):
 
     def test_ttl_ms_bounded(self):
         db = self._store("ttl.db", 10 * HOLD)
+        # Card L1a turn 2: the profile caps ttl_ms; this test is about the
+        # 24 h ABSOLUTE maximum, so its profile allows exactly 24 h.
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE profiles SET ttl_ms=86400000")
+        conn.commit()
+        conn.close()
         # Above the 24h absolute maximum (section 6): a static
         # INVALID_REQUEST; the int64 overflow case must not leak a
         # raw OverflowError.

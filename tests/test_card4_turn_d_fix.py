@@ -31,6 +31,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 from quota_balancer import lease
@@ -71,6 +72,12 @@ class Card4TurnDFixTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=base,
                                                 prefix="quota-card4-fd-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -94,6 +101,12 @@ class Card4TurnDFixTest(unittest.TestCase):
         # admitted; 24 h + 1 ms, the old 24-day value, and the int64
         # overflow case are refused.
         db = self._store("ttl.db", 10 * HOLD)
+        # Card L1a turn 2: the profile caps ttl_ms; this test is about the
+        # 24 h ABSOLUTE maximum, so its profile allows exactly 24 h.
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE profiles SET ttl_ms=86400000")
+        conn.commit()
+        conn.close()
         ok = self._grant(db, NOW, ttl_ms=86_400_000)
         self.assertEqual(ok["state"], "active")
         self.assertEqual(ok["expires_at"], NOW + 86_400_000)
