@@ -553,9 +553,8 @@ class BillingPollSchedule(unittest.TestCase):
 
     def test_invalid_retry_after_is_ignored(self):
         for bad in ("", "soon", "-5", "1.5", "1e3", "+30", " ", "0x10",
-                    "Fri, 99 Oct 2026 20:00:00 GMT", "9" * 40,
-                    "Fri, 02 Oct 2026 20:00:00",   # no zone: not an HTTP-date
-                    "86401", "Mon, 05 Oct 2026 20:00:00 GMT"):
+                    "Fri, 99 Oct 2026 20:00:00 GMT",
+                    "Fri, 02 Oct 2026 20:00:00"):  # no zone: not an HTTP-date
             transport = FakeTransport(answer(429, b"{}", {"Retry-After": bad}))
             self.assertEqual(
                 run(transport, jitter=3),
@@ -569,10 +568,34 @@ class BillingPollSchedule(unittest.TestCase):
             result = run(FakeTransport(response))
             self.assertEqual(result["next_attempt_at"], NOW_MS + 900_000)
 
-    def test_retry_after_is_one_day_at_most(self):
-        transport = FakeTransport(answer(429, b"{}", {"Retry-After": "86400"}))
+    def test_valid_retry_after_beyond_a_day_is_respected(self):
+        # Fix round 1 finding 4 (lead decision 6): max(now+poll+jitter, any
+        # valid Retry-After); there is no 24 h cap.
+        for header, expected in (
+                ("86400", NOW_MS + 86_400_000),
+                ("172800", NOW_MS + 172_800_000),
+                ("Sun, 04 Oct 2026 19:23:36 GMT", NOW_MS + 172_800_000),
+                ("Thu, 31 Dec 2026 23:59:59 GMT", _ms(2026, 12, 31, 23, 59, 59))):
+            transport = FakeTransport(answer(429, b"{}",
+                                             {"Retry-After": header}))
+            self.assertEqual(run(transport)["next_attempt_at"], expected,
+                             header)
+
+    def test_absurd_retry_after_clamps_to_int64_never_earlier(self):
+        top = 2 ** 63 - 1
+        for header in ("9" * 40, "9" * 5000, "9223372036854775807",
+                       str((top - NOW_MS) // 1000 + 1)):
+            transport = FakeTransport(answer(429, b"{}",
+                                             {"Retry-After": header}))
+            result = run(transport)
+            self.assertEqual(result, {"failure": "rate_limit",
+                                      "next_attempt_at": top}, header[:20])
+        # The last second that still fits is not clamped.
+        fits = (top - NOW_MS) // 1000
+        transport = FakeTransport(answer(429, b"{}",
+                                         {"Retry-After": str(fits)}))
         self.assertEqual(run(transport)["next_attempt_at"],
-                         NOW_MS + 86_400_000)
+                         NOW_MS + fits * 1000)
 
     def test_exactly_one_transport_call_on_every_outcome(self):
         responses = (ok(), answer(429, b"{}"), answer(500), answer(400, b"{}"),
@@ -944,6 +967,225 @@ class Privacy2b(unittest.TestCase):
                        "import requests", "import time", "datetime.now",
                        "time.time(", "random"):
             self.assertFalse(needle in source, needle)
+
+
+def money_body(value, amount, ucents=None):
+    """The real body with total `value` (a literal string, kept exact) and
+    one category of `amount` (a literal string)."""
+    body = real_body()
+    body["totalPrice"].update(
+        priceInUcents=int(Decimal(value) * 10 ** 8) if ucents is None
+        else ucents, value="VALUE_LITERAL")
+    body["resourcesUsage"] = [{"type": "ai-endpoints",
+                               "totalPrice": "AMOUNT_LITERAL"}]
+    raw = dump(body).replace(b'"VALUE_LITERAL"', value.encode())
+    return raw.replace(b'"AMOUNT_LITERAL"', amount.encode())
+
+
+class FixRound1MoneyContext(unittest.TestCase):
+    """Fix round 1 finding 1: money validation is independent of the
+    caller's Decimal context and exact on bounded inputs."""
+
+    def test_caller_precision_does_not_change_the_result(self):
+        expected = run(FakeTransport(ok()))
+        self.assertIn("document", expected)
+        import decimal
+        with decimal.localcontext() as ctx:
+            ctx.prec = 6
+            self.assertEqual(run(FakeTransport(ok())), expected)
+        with decimal.localcontext() as ctx:
+            ctx.prec = 1
+            self.assertEqual(run(FakeTransport(ok())), expected)
+
+    def test_caller_traps_do_not_change_the_result(self):
+        import decimal
+        expected = run(FakeTransport(ok()))
+        for traps in ((decimal.Inexact,), (decimal.Rounded,),
+                      (decimal.Inexact, decimal.Rounded,
+                       decimal.InvalidOperation, decimal.Overflow)):
+            with decimal.localcontext() as ctx:
+                ctx.prec = 6
+                for trap in traps:
+                    ctx.traps[trap] = True
+                self.assertEqual(run(FakeTransport(ok())), expected)
+
+    def test_caller_context_does_not_change_a_schema_failure_either(self):
+        import decimal
+        raw = money_body("1", "1.000001000001")
+        baseline = run(FakeTransport(ok_raw(raw)))
+        self.assertEqual(failure_of(baseline), "schema")
+        with decimal.localcontext() as ctx:
+            ctx.prec = 200
+            ctx.traps[decimal.Inexact] = True
+            self.assertEqual(run(FakeTransport(ok_raw(raw))), baseline)
+
+    def test_subtolerance_noise_cannot_round_onto_the_tolerance(self):
+        # Under the default 28-digit context 1.00000100000000000000000000001
+        # - 1 rounds to exactly 0.000001 and used to be accepted.
+        raw = money_body("1", "1.00000100000000000000000000001")
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+
+    def test_twelve_decimal_case_just_over_tolerance_is_schema(self):
+        raw = money_body("1", "1.000001000001")
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+
+    def test_exactly_one_micro_eur_is_still_accepted(self):
+        for amount, expected in (("1.000001", True), ("0.999999", True),
+                                 ("1.0000009", True), ("1.0000011", False),
+                                 ("0.9999989", False)):
+            result = run(FakeTransport(ok_raw(money_body("1", amount))))
+            self.assertEqual("document" in result, expected, amount)
+
+    def test_representation_bound_on_money_numbers(self):
+        # At most 15 digits before the point and 12 after, judged on the
+        # parsed Decimal: 12 decimals pass, 13 (even trailing zeros) fail.
+        def zero_total(amount):
+            body = real_body()
+            body["totalPrice"].update(priceInUcents=0, value=0)
+            body["resourcesUsage"] = [{"type": "ai-endpoints",
+                                       "totalPrice": "AMOUNT_LITERAL"}]
+            return dump(body).replace(b'"AMOUNT_LITERAL"', amount.encode())
+
+        for amount, expected in (("0.000000000001", True),
+                                 ("0.0000000000001", False),
+                                 ("0.0000000000000", False),
+                                 ("1E-13", False),
+                                 ("1E-12", True),
+                                 ("0", True)):
+            result = run(FakeTransport(ok_raw(zero_total(amount))))
+            self.assertEqual("document" in result, expected, amount)
+            if not expected:
+                self.assertEqual(failure_of(result), "schema", amount)
+
+    def test_representation_bound_on_the_integer_digits(self):
+        # 16 integer digits is out; so is any exponent that makes it so.
+        for literal in ("1" + "0" * 15 + ".5", "1E+15", "1E+400",
+                        "9999999999999999"):
+            body = real_body()
+            body["totalPrice"].update(value="VALUE_LITERAL")
+            raw = dump(body).replace(b'"VALUE_LITERAL"', literal.encode())
+            self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))),
+                             "schema", literal)
+        body = real_body()
+        body["resourcesUsage"][0]["totalPrice"] = "AMOUNT_LITERAL"
+        raw = dump(body).replace(b'"AMOUNT_LITERAL"', b"1E+15")
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+
+
+class FixRound1ExtremeNumbers(unittest.TestCase):
+    """Fix round 1 finding 2: a number literal can never escape as a raw
+    exception, whichever field carries it."""
+
+    EXTREME = (b"1e9999999999999999999", b"-1e9999999999999999999",
+               b"1E+99999999999999999999999", b"1e-9999999999999999999")
+
+    def test_200_body_with_an_ignored_extreme_exponent_is_schema(self):
+        for literal in self.EXTREME:
+            raw = dump(real_body())[:-1] + b', "ignored": ' + literal + b"}"
+            result = run(FakeTransport(ok_raw(raw)), jitter=3)
+            self.assertEqual(result, {"failure": "schema",
+                                      "next_attempt_at": NOW_MS + 903_000},
+                             literal)
+
+    def test_extreme_exponent_in_a_known_field_is_schema(self):
+        raw = dump(real_body()).replace(b'"value": 6.737286',
+                                        b'"value": 1e9999999999999999999')
+        self.assertIn(b"e9999999999999999999", raw)
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+
+    def test_400_body_with_an_extreme_exponent_is_schema(self):
+        for literal in self.EXTREME:
+            raw = (b'{"class": "Client::BadRequest", "message": '
+                   b'"Invalid signature", "ignored": ' + literal + b"}")
+            result = run(FakeTransport(answer(400, raw)), jitter=3)
+            self.assertEqual(result, {"failure": "schema",
+                                      "next_attempt_at": NOW_MS + 903_000},
+                             literal)
+
+    def test_untrapped_caller_context_cannot_turn_it_into_nan(self):
+        import decimal
+        raw = dump(real_body())[:-1] + b', "ignored": 1e9999999999999999999}'
+        with decimal.localcontext() as ctx:
+            ctx.traps[decimal.InvalidOperation] = False
+            ctx.traps[decimal.Overflow] = False
+            self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))),
+                             "schema")
+
+    def test_number_literals_are_bounded_to_64_characters(self):
+        def with_ignored(literal):
+            return dump(real_body())[:-1] + b', "ignored": ' + literal + b"}"
+
+        ok64 = b"0." + b"1" * 62               # exactly 64 characters
+        too_long = b"0." + b"1" * 63           # 65
+        self.assertEqual(len(ok64), 64)
+        self.assertIn("document", run(FakeTransport(ok_raw(with_ignored(ok64)))))
+        self.assertEqual(failure_of(run(FakeTransport(
+            ok_raw(with_ignored(too_long))))), "schema")
+        self.assertEqual(failure_of(run(FakeTransport(
+            ok_raw(with_ignored(b"1" * 65))))), "schema")
+        self.assertIn("document", run(FakeTransport(
+            ok_raw(with_ignored(b"1" * 64)))))
+
+
+class FixRound1MalformedBaseUrl(unittest.TestCase):
+    """Fix round 1 finding 3: a malformed base_url raises the static
+    invalid-input error before any transport call, with nothing of it
+    reachable from the exception."""
+
+    SENTINEL = "SYNTHETIC-URL-SENTINEL"
+
+    def assert_static_and_clean(self, base_url, sentinels):
+        import traceback
+        transport = FakeTransport(ok())
+        with self.assertRaises(QuotaError) as caught:
+            run(transport, base_url=base_url)
+        exc = caught.exception
+        self.assertEqual(exc.code, CODE_INVALID_CONFIG)
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(exc.__cause__)
+        self.assertIsNone(exc.__context__)
+        text = "\n".join((str(exc), repr(exc), repr(exc.args),
+                          "".join(traceback.format_exception(exc))))
+        for sentinel in sentinels:
+            self.assertNotIn(sentinel, text)
+
+    def test_the_reviewers_sentinel_url(self):
+        self.assert_static_and_clean(
+            "https://" + self.SENTINEL + "／host.invalid/1.0",
+            (self.SENTINEL, "host.invalid"))
+
+    def test_other_malformed_urls(self):
+        cases = (
+            "https://" + self.SENTINEL + "\x00host.invalid/1.0",
+            "https://" + self.SENTINEL + " host.invalid/1.0",
+            "https://héllo-" + self.SENTINEL + ".invalid/1.0",
+            "https://user:" + self.SENTINEL + "@host.invalid/1.0",
+            "https://" + self.SENTINEL + "@host.invalid/1.0",
+            "https://host.invalid/1.0?token=" + self.SENTINEL,
+            "https://host.invalid/1.0#" + self.SENTINEL,
+            "https:///" + self.SENTINEL,
+            "https://host.invalid:" + self.SENTINEL + "/1.0",
+            "https://host.invalid:99999999/" + self.SENTINEL,
+            "https://[" + self.SENTINEL + "/1.0",
+            "https://\t" + self.SENTINEL + ".invalid/1.0",
+            "https://" + self.SENTINEL + "\n.invalid/1.0",
+        )
+        for base_url in cases:
+            self.assert_static_and_clean(base_url, (self.SENTINEL,))
+
+    def test_well_formed_non_https_urls_still_fail_tls(self):
+        for base in ("http://api.example.invalid/1.0", "ftp://x/1.0",
+                     "HTTP://api.example.invalid/1.0"):
+            transport = FakeTransport(ok())
+            self.assertEqual(failure_of(run(transport, base_url=base)), "tls")
+            self.assertEqual(transport.calls, [])
+
+    def test_a_wellformed_https_url_with_a_port_and_path_works(self):
+        transport = FakeTransport(ok())
+        result = run(transport, base_url="https://api.example.invalid:8443/1.0/")
+        self.assertIn("document", result)
+        self.assertTrue(transport.calls[0][0].startswith(
+            "https://api.example.invalid:8443/1.0/cloud/project/"))
 
 
 class EndToEndIngest(unittest.TestCase):
