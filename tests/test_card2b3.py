@@ -798,6 +798,27 @@ class BillingOutputErrors(unittest.TestCase):
             self.assertEqual(
                 failure_of(run(FakeTransport(ok_raw(raw)))), "schema", raw[:20])
 
+    def test_non_finite_numbers_are_never_read_as_numbers(self):
+        # Zero totals everywhere except a NaN/Infinity where a number goes:
+        # were the constant read as 0 this body would be a valid document.
+        def zero(b):
+            b["totalPrice"].update(priceInUcents=0, value=0)
+            b["resourcesUsage"] = []
+        raw = dump(mutated(zero)).replace(b'"value": 0', b'"value": NaN')
+        self.assertIn(b"NaN", raw)
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+        raw = raw.replace(b"NaN", b"-Infinity")
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(raw)))), "schema")
+
+    def test_body_size_limit_is_enforced_on_valid_json(self):
+        padded = dump(real_body()) + b" " * ovh.MAX_BODY_BYTES
+        self.assertEqual(failure_of(run(FakeTransport(ok_raw(padded)))),
+                         "schema")
+        edge = dump(real_body())
+        edge += b" " * (ovh.MAX_BODY_BYTES - len(edge))
+        self.assertEqual(len(edge), ovh.MAX_BODY_BYTES)
+        self.assertIn("document", run(FakeTransport(ok_raw(edge))))
+
     def test_duplicate_keys_cannot_hide_a_field(self):
         raw = dump(real_body()).replace(
             b'"currencyCode": "EUR"',

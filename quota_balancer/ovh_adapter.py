@@ -205,9 +205,8 @@ def _retry_after_ms(headers, now_ms):
             return None
         return now_ms + int(text) * 1000
     try:
+        # An HTTP-date names its zone: a naive result raises TypeError here.
         when = parsedate_to_datetime(text)
-        if when.tzinfo is None:  # an HTTP-date names its zone
-            return None
         target = (when - _EPOCH) // _MS
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
