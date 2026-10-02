@@ -333,3 +333,22 @@ Leases that reserved no money (shadow, subscription, advisory) report on the
 existing `/v1/leases/{id}/settle`: any number of non-final receipts, then a final
 one with `actual_micro_eur` null; their response now carries `null`, not 0, for
 `released_micro_eur` and `retained_micro_eur`. See docs/STEP-CARD-L1B.md.
+
+## Card L1c - unknown usage for shadow leases, and `policy-ids`
+
+A report (`/settle` receipt) about a **shadow** lease may now say "unknown" for
+its token counts: `input_tokens`, `cached_input_tokens` and `output_tokens` may each
+be `null` (stored as NULL, not 0); `calls` stays a required whole number. Every
+other kind of lease (metered, advisory, subscription) must still report whole
+numbers; a `null` there is `INVALID_REQUEST`. Shadow reports are observe-only:
+whether known or unknown, they never count toward any token or money limit. This
+needs schema version 9 (`init` upgrades a version-8 store in one transaction,
+keeping every receipt).
+
+`policy-ids --json` is a read-only command that prints, on one line, the ids a lease
+request has to name: every seat (project, team, machine, seat aliases and the seat
+id), every model (account alias, model alias, id) and the profile task classes,
+sorted. It prints nothing else (no identity references, vendors, budgets or rates)
+and changes nothing. The observe-only reporter of card 7a takes these ids as its
+configuration in v1, copied by the operator; an HTTP lookup is deferred. See
+docs/STEP-CARD-L1C.md.

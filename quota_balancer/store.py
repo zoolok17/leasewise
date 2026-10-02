@@ -1015,6 +1015,45 @@ def _project_billing(conn, now_ms):
     return entries
 
 
+def policy_ids(path):
+    """The ids a lease request names, read-only (card L1c): every seat with
+    its machine, team and project aliases, every model with its account
+    alias, and the profile task classes - sorted, aliases and local UUIDs
+    only. Never an identity reference, a vendor, a budget, a rate, a path or
+    any other stored value. One read transaction; nothing is written."""
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN")
+        try:
+            require_supported(conn)
+            seats = [
+                {"machine": machine, "team": team, "project": project,
+                 "seat": seat, "id": seat_id}
+                for machine, team, project, seat, seat_id in conn.execute(
+                    "SELECT m.alias, t.alias, p.alias, s.alias, s.id "
+                    "FROM seats s JOIN machines m ON m.id = s.machine_id "
+                    "JOIN teams t ON t.id = s.team_id "
+                    "JOIN projects p ON p.id = t.project_id "
+                    "ORDER BY p.alias, t.alias, m.alias, s.alias")]
+            models = [
+                {"account": account, "model": model, "id": model_id}
+                for account, model, model_id in conn.execute(
+                    "SELECT a.alias, mo.alias, mo.id FROM models mo "
+                    "JOIN accounts a ON a.id = mo.account_id "
+                    "ORDER BY a.alias, mo.alias")]
+            task_classes = [row[0] for row in conn.execute(
+                "SELECT task_class FROM profiles ORDER BY task_class")]
+            conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+    return {"seats": seats, "models": models, "task_classes": task_classes}
+
+
 def status(path):
     """Project the inventory plus card-2 windows/reports and the card-2b-1
     billing state, sorted by alias.

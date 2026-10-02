@@ -48,7 +48,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -486,9 +486,50 @@ _DDL_V8 = (
 # The canonical version-8 migration script, kept for byte-for-byte comparison.
 MIGRATION_V8 = "\n".join(_DDL_V8) + "\nPRAGMA user_version=8;\n"
 
+# Card L1c (migration version 9): a receipt on a SHADOW lease may say
+# "unknown" for its token counts, so the three token columns of receipts
+# allow NULL (their >= 0 check stays for a non-null value). Every other
+# column, check, foreign key and the receipt_final partial index are the
+# version-5 ones. SQLite cannot relax NOT NULL in place, so the table is
+# rebuilt exactly like readings was in version 4: new table, copy every row
+# (same values, same order of columns), drop, rename, recreate the index.
+# Which leases may report NULL (shadow only) is enforced by settle, in the
+# transaction that reads the lease; a CHECK cannot see the lease.
+_DDL_V9 = (
+    "CREATE TABLE receipts_new(\n"
+    " event_id TEXT PRIMARY KEY,\n"
+    " lease_id TEXT NOT NULL REFERENCES leases(id),\n"
+    " gateway_id TEXT REFERENCES gateways(id),\n"
+    " seq INTEGER,\n"
+    " calls INTEGER NOT NULL CHECK(calls>=0),\n"
+    " input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens>=0),\n"
+    " cached_input_tokens INTEGER "
+    "CHECK(cached_input_tokens IS NULL OR cached_input_tokens>=0),\n"
+    " output_tokens INTEGER "
+    "CHECK(output_tokens IS NULL OR output_tokens>=0),\n"
+    " actual_micro_eur INTEGER "
+    "CHECK(actual_micro_eur IS NULL OR actual_micro_eur>=0),\n"
+    " outcome TEXT,\n"
+    " final INTEGER NOT NULL DEFAULT 0 CHECK(final IN (0,1)),\n"
+    " observed_at INTEGER NOT NULL,\n"
+    " received_at INTEGER NOT NULL) STRICT;",
+    "INSERT INTO receipts_new(event_id, lease_id, gateway_id, seq, calls,\n"
+    " input_tokens, cached_input_tokens, output_tokens, actual_micro_eur,\n"
+    " outcome, final, observed_at, received_at)\n"
+    " SELECT event_id, lease_id, gateway_id, seq, calls, input_tokens,\n"
+    " cached_input_tokens, output_tokens, actual_micro_eur, outcome, final,\n"
+    " observed_at, received_at FROM receipts;",
+    "DROP TABLE receipts;",
+    "ALTER TABLE receipts_new RENAME TO receipts;",
+    "CREATE UNIQUE INDEX receipt_final ON receipts(lease_id) WHERE final=1;",
+)
+
+# The canonical version-9 migration script, kept for comparison.
+MIGRATION_V9 = "\n".join(_DDL_V9) + "\nPRAGMA user_version=9;\n"
+
 # Step N upgrades a store from version N-1 to version N.
 _STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
-          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8}
+          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8, 9: _DDL_V9}
 
 
 def schema_version(conn):

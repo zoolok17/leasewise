@@ -19,6 +19,7 @@ from .store import (
     reading_import,
     reconcile,
     set_coverage,
+    policy_ids,
     set_machine_identity,
     status,
 )
@@ -60,6 +61,10 @@ def _build_parser():
         "--file", required=True, help="path to the JSON document")
     stater = sub.add_parser("status", help="print the inventory status")
     stater.add_argument("--json", action="store_true", required=True)
+    ids = sub.add_parser(
+        "policy-ids",
+        help="list the seat and model ids a lease request names (read-only)")
+    ids.add_argument("--json", action="store_true", required=True)
     reader = sub.add_parser(
         "reading-import", help="apply a card-2 reading document (fixture)"
     )
@@ -131,6 +136,9 @@ def main(argv=None):
         elif args.verb == "expire-sweep":
             print(json.dumps(expire_sweep(
                 args.db, int(time.time() * 1000)), separators=(",", ":")))
+        elif args.verb == "policy-ids":
+            print(json.dumps(policy_ids(args.db), sort_keys=True,
+                             separators=(",", ":")))
         elif args.verb == "serve":
             try:
                 make_server(args.db, host=args.host, port=args.port).serve_forever()

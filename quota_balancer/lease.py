@@ -112,6 +112,9 @@ _SETTLE_KEYS = frozenset((
     "event_id", "lease_id", "outcome", "calls", "input_tokens",
     "cached_input_tokens", "output_tokens", "actual_micro_eur",
     "gateway_id", "seq", "final", "observed_at", "received_at"))
+# The three receipt token counts. On a shadow lease each may be null
+# ("unknown"); on every other lease they are required integers (card L1c).
+_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 _OUTCOMES = frozenset(("completed", "cancelled", "failed",
                        "provider_limit"))
 
@@ -273,9 +276,11 @@ def _validate_settle_receipt(receipt):
     if receipt["outcome"] not in _OUTCOMES:
         _invalid()
     policy._check_int(receipt["calls"])
-    policy._check_int(receipt["input_tokens"])
-    policy._check_int(receipt["cached_input_tokens"])
-    policy._check_int(receipt["output_tokens"])
+    # Unknown (null) token counts are shapes this static check admits; the
+    # lease's enforcement decides who may use them (see _settle: shadow only).
+    for key in _TOKEN_FIELDS:
+        if receipt[key] is not None:
+            policy._check_int(receipt[key])
     if receipt["actual_micro_eur"] is not None:
         policy._check_int(receipt["actual_micro_eur"])
     if receipt["gateway_id"] is not None:
@@ -526,6 +531,9 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
             settled = conn.execute(
                 "SELECT COALESCE(SUM(" + column + "),0) FROM receipts r "
                 "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
+                # A shadow lease is observe-only: its report (a known or an
+                # unknown count) never counts toward any limit (card L1c).
+                "l.enforcement <> 'shadow' AND "
                 + settled_bucket + "=? AND " + _chain_pred(scope),
                 (ps,) + _chain_bind(scope, scope_id)).fetchone()[0]
             # The platform singleton matches every platform row loaded
@@ -560,6 +568,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         acct_settled = conn.execute(
             "SELECT COALESCE(SUM(r.actual_micro_eur),0) FROM receipts r "
             "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
+            "l.enforcement <> 'shadow' AND "
             "l.period_start=? AND l.account_id=?",
             (month, account_id)).fetchone()[0]
         acct_holds = conn.execute(
@@ -1200,6 +1209,13 @@ def _settle(conn, receipt, now_ms):
         lease = _lease_row(conn, receipt["lease_id"])
         if lease is None:
             _not_found()
+        # Unknown token counts are for shadow leases only: every other
+        # enforcement reports whole numbers, since its usage feeds limits
+        # and liability (card L1c). Decided here, in the transaction that
+        # read the lease; a table CHECK cannot see the lease.
+        if lease["enforcement"] != "shadow" and any(
+                receipt[key] is None for key in _TOKEN_FIELDS):
+            _invalid()
         # The receipt must be attributed to the lease's own gateway
         # (a NULL names no other): a report naming a foreign gateway
         # is a conflicting account of this lease (static
