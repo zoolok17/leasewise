@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 import uuid
@@ -283,6 +284,12 @@ class _ServerCase(unittest.TestCase):
             os.makedirs(base, exist_ok=True)
         self._tmp = tempfile.TemporaryDirectory(dir=base, prefix="quota-card5-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
         self.db = None
         self.server = None
         self.thread = None

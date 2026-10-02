@@ -36,6 +36,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 import quota_balancer.migrate as migrate
@@ -222,6 +223,12 @@ class Card4EnforceFixTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=base,
                                                 prefix="quota-card4-fb-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
 
     def tearDown(self):
         self._tmp.cleanup()

@@ -19,6 +19,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 import quota_balancer.migrate as migrate
@@ -182,6 +183,9 @@ def _race_worker(store_path, worker_id):
     """ATTEMPTS_PER_WORKER sequential grants from one process; unique
     turn/request ids per attempt so only the budget can refuse. Returns
     the per-attempt outcomes."""
+    # A spawned process does not inherit the test's mock patch: open the
+    # R-003 interim gate here (card L1a; reachable only after card R1).
+    lease.METERED_ENFORCEMENT_ACTIVATED = True
     results = []
     for i in range(ATTEMPTS_PER_WORKER):
         tag = "%d-%d" % (worker_id, i)
@@ -205,6 +209,12 @@ class Card4Turn2Test(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(dir=base,
                                                 prefix="quota-card4-t2-")
         self.tmp = self._tmp.name
+        # R-003 interim gate (card L1a): this test exercises enforcing
+        # metered leases (holds, tokens, settlement), reachable only once
+        # card R1's activation gate replaces the interim constant.
+        _gate = mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True)
+        _gate.start()
+        self.addCleanup(_gate.stop)
 
     def tearDown(self):
         self._tmp.cleanup()

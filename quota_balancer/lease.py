@@ -86,6 +86,7 @@ from . import errors, policy, reduce
 from .errors import QuotaError
 from .migrate import rollback_quietly
 from .store import _connect
+from .validate_config_v2 import PLATFORM_ID
 
 # --- request shapes (closed) ---------------------------------------------------
 
@@ -130,7 +131,14 @@ _MAX_TTL_MS = _DAY_MS
 # limits rows carried by this reserved id. The scope spans every seat,
 # so the grant's chain always carries it and every platform row applies
 # to every lease (card-3: a chain scope id is always a UUID).
-_PLATFORM_ID = "00000000-0000-0000-0000-000000000000"
+_PLATFORM_ID = PLATFORM_ID  # one definition, shared with config-import v2
+# R-003 interim gate (card L1a): False means NO grant is ever an enforcing
+# metered lease, whatever a gateway reports. Card R1 replaces this constant
+# with a real, explicit activation gate; until it merges the desktop lead's
+# decision stands (metered leases stay advisory). Tests that exercise the
+# post-activation arithmetic (holds, settlement, expiry) patch it to True;
+# nothing in the product sets it.
+METERED_ENFORCEMENT_ACTIVATED = False
 # Section 7: the admission estimate must be at most 120 seconds old.
 _EST_FRESH_MS = 120_000
 
@@ -673,7 +681,12 @@ def _grant(conn, request, now_ms, wire_identity=None):
         if enforcement == "metered":
             if sized_ready is None:
                 _invalid()  # gateway is null only for subscriptions
-            if not sized_ready:
+            # R-003 interim: a gateway's own report (sized_ready, kept as
+            # telemetry) must never switch a seat to enforcing metered
+            # leases. The desktop lead decided metered leases stay
+            # advisory until card R1 merges its explicit activation gate,
+            # which replaces METERED_ENFORCEMENT_ACTIVATED.
+            if not (sized_ready and METERED_ENFORCEMENT_ACTIVATED):
                 enforcement = "metered_advisory"
         metered = enforcement == "metered"
         money_hold = hold_sized if metered else None

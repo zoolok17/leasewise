@@ -42,7 +42,9 @@ from .reduce import (
     reduce_window,
     window_freshness,
 )
+from .policy_config import apply_policy
 from .validate import validate
+from .validate_config_v2 import VERSION as CONFIG_V2, validate_v2
 from .validate_policies import (
     allocation_within_cap,
     validate_billing_policies,
@@ -133,14 +135,22 @@ def import_config(path, file):
         # pathologically deep nesting: a bad document, not a store fault.
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
-    accounts, machines, gateways = validate(doc)
+    # Version 2 adds the policy tables; version 1 (and an absent version)
+    # keeps validate()'s contract and an unknown version is its
+    # SCHEMA_UNSUPPORTED. A version-1 import never touches the policy tables.
+    policy_doc = None
+    if (isinstance(doc, dict) and type(doc.get("version")) is int
+            and doc["version"] == CONFIG_V2):
+        accounts, machines, gateways, policy_doc = validate_v2(doc)
+    else:
+        accounts, machines, gateways = validate(doc)
 
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
-            _upsert(conn, accounts, machines, gateways)
+            _upsert(conn, accounts, machines, gateways, policy_doc)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -151,7 +161,7 @@ def import_config(path, file):
         conn.close()
 
 
-def _upsert(conn, accounts, machines, gateways):
+def _upsert(conn, accounts, machines, gateways, policy_doc=None):
     """Reconcile the inventory to the document. Inside the import's BEGIN
     IMMEDIATE. Expects the normalized tuples from validate.validate().
 
@@ -278,6 +288,14 @@ def _upsert(conn, accounts, machines, gateways):
                 (gateway_id, alias, account_ids[account],
                  machine_ids[machine], share, period),
             )
+
+    # Version 2: reconcile the seven policy tables NOW, before the
+    # inventory deletions below, so rows of a removed account/machine are
+    # removed (or refuse the import) first and the guards below then see the
+    # post-import policy state. A version-1 import skips this and leaves the
+    # policy tables as they are.
+    if policy_doc is not None:
+        apply_policy(conn, policy_doc, account_ids, machine_ids)
 
     # Removed aliases, children before parents. validate() guarantees no
     # retained/new gateway references a removed account or machine, so the

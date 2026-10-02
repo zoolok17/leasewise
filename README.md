@@ -197,3 +197,63 @@ Tests: the four named checks (`round_components`, `projection_denied`,
 `fallback_tier`, `privacy_3`) plus the arithmetic rules; the named tests
 are shown red at the migration-only commit and green with the
 arithmetic — see docs/STEP-CARD-3.md.
+
+## Card L1a (turn 1) — policy import, config-import version 2
+
+`config-import --file` now also accepts **version 2**: the version-1 inventory
+(`accounts`, `machines`, `gateways`, unchanged) plus the seven policy tables
+`projects`, `teams`, `project_accounts`, `seats`, `models`, `profiles`,
+`limits`. Every key is required (an empty list is fine), no key may be added at
+any level, and every reference is an **alias**, never a UUID. A version-1
+document still imports exactly as before and leaves the policy tables alone;
+any other version is `SCHEMA_UNSUPPORTED`.
+
+The whole document applies in one transaction or not at all. Retained aliases
+keep their UUID and update config-owned columns only (never `seats.last_seen_at`);
+a removed alias is deleted only if nothing references it (leases, blocks,
+holds, readings, limits), otherwise `INVALID_CONFIG` (exit 2) and nothing
+changes. `context_rules` and `calibration` must be `{}` for now; a trailing
+`"park"` in `candidates` is accepted (it is implicit and not stored); model
+aliases are unique across all accounts.
+
+```json
+{
+  "version": 2,
+  "accounts": [{"alias": "meter", "vendor": "ovh", "kind": "metered",
+                "budget_micro_eur": 100000000}],
+  "machines": [{"alias": "desktop"}],
+  "gateways": [{"alias": "g1", "account": "meter", "machine": "desktop",
+                "share_micro_eur": 100000000, "period": "utc_month"}],
+  "projects": [{"alias": "org"}],
+  "teams": [{"project": "org", "alias": "dev"}],
+  "project_accounts": [{"project": "org", "account": "meter"}],
+  "seats": [{"team": {"project": "org", "team": "dev"}, "machine": "desktop",
+             "alias": "s1", "role": "main", "enforcement": "metered_advisory"}],
+  "models": [{"account": "meter", "alias": "opus", "context_ceiling": 180000,
+              "output_ceiling": 18000, "tariff_input_rate": 1,
+              "tariff_output_rate": 1, "reserve_input_rate": 1000000,
+              "reserve_output_rate": 1000000, "reservation_mode": "sized",
+              "policy_hash": "abababababababababababababababababababababababababababababababab",
+              "effort_aliases": ["opus"]}],
+  "profiles": [{"task_class": "bounded_read", "candidates": ["opus", "park"],
+                "context_rules": {}, "calibration": {}, "expected_calls": 1,
+                "growth_tokens": 0, "margin_bps": 12500, "max_calls": 2,
+                "output_cap": 1000, "per_call_output_cap": 500,
+                "ttl_ms": 1800000, "policy_revision": 1}],
+  "limits": [
+    {"scope": "platform", "metric": "concurrency", "period": "turn",
+     "window_key": null, "soft": null, "hard": 4},
+    {"scope": "team", "project": "org", "team": "dev",
+     "metric": "money_micro_eur", "period": "month", "window_key": null,
+     "soft": 50000000, "hard": 100000000},
+    {"scope": "seat", "machine": "desktop", "seat": "s1",
+     "metric": "window_bps", "period": "window", "window_key": "five_hour",
+     "soft": null, "hard": 9000}]
+}
+```
+
+**R-003 interim fix.** A seat whose `enforcement` is `metered` is always
+granted `metered_advisory` (no money hold, no token, cannot pass `/check`),
+whatever a gateway reports as `sized_ready` (still stored as telemetry). Card
+R1 replaces the interim constant `lease.METERED_ENFORCEMENT_ACTIVATED` with an
+explicit activation gate. See docs/STEP-CARD-L1A.md.
