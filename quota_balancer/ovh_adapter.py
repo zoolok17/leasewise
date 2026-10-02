@@ -29,6 +29,7 @@ import re
 import ssl
 import uuid
 from collections.abc import Mapping
+import decimal
 from decimal import Decimal, localcontext
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
@@ -64,16 +65,25 @@ EVENT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL,
 
 JITTER_MAX_SECONDS = 90
 MAX_POLL_SECONDS = 7 * 86_400
-# A Retry-After further out than this is ignored as implausible: it would
-# silence the poller for days on one header.
-MAX_RETRY_AFTER_SECONDS = 86_400
 MAX_BODY_BYTES = 1_048_576
 TIMEOUT_SECONDS = 30
 AI_CATEGORY = "ai-endpoints"
-# Money in a body is bounded far below int64 before any arithmetic.
-_MAX_EUR = Decimal(10) ** 13
+# Every JSON number literal is bounded before conversion, and a money number
+# is bounded in representation (digits before and after the point, judged on
+# the parsed Decimal) so that the arithmetic below is exact.
+MAX_NUMBER_LITERAL = 64
+MAX_MONEY_INT_DIGITS = 15
+MAX_MONEY_FRAC_DIGITS = 12
+# The one Decimal context the money path runs in, whatever the caller's
+# ambient context is. prec=60 holds a bounded sum exactly; Inexact,
+# InvalidOperation and Overflow are trapped (not Rounded: it also fires on
+# dropping trailing zeros) and a trapped signal means a schema failure.
+_MONEY_CONTEXT = decimal.Context(
+    prec=60, rounding=decimal.ROUND_HALF_EVEN, Emin=-999_999, Emax=999_999,
+    traps=[decimal.Inexact, decimal.InvalidOperation, decimal.Overflow,
+           decimal.DivisionByZero])
 _UCENTS_PER_MICRO_EUR = 100
-_MICRO_EUR = Decimal(10) ** -6
+_MICRO_EUR = Decimal("0.000001")
 
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 _MS = datetime.timedelta(milliseconds=1)
@@ -82,6 +92,7 @@ _TIME_RE = re.compile(
     r"(?:\.([0-9]{1,9}))?Z")
 _PROJECT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _PRINTABLE_RE = re.compile(r"[\x21-\x7e]{1,512}")
+_URL_RE = re.compile(r"[\x21-\x7e]{0,512}")
 
 TransportResponse = collections.namedtuple(
     "TransportResponse", ("status", "headers", "body"))
@@ -122,7 +133,7 @@ class _Failure(Exception):
 
 
 def _invalid():
-    raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG) from None
 
 
 def _is_int(value):
@@ -174,14 +185,32 @@ def _validate_inputs(credential, clock, jitter_seconds, config, poll_seconds,
         _invalid()
     if not _is_int(poll_seconds) or not 1 <= poll_seconds <= MAX_POLL_SECONDS:
         _invalid()
-    if not isinstance(base_url, str):
-        _invalid()
+    _check_base_url(base_url)
     if not callable(clock):
         _invalid()
     now_ms = clock()
     if not _is_int(now_ms) or not 0 <= now_ms <= INT64_MAX // 4:
         _invalid()
     return now_ms
+
+
+def _check_base_url(base_url):
+    """A malformed base URL is a caller bug: the static error, raised
+    outside any except block so no raw parser exception (which can quote
+    the URL) survives as __context__. A well-formed URL of another scheme
+    is not malformed: poll_once refuses it as a tls failure."""
+    if not isinstance(base_url, str) or not _URL_RE.fullmatch(base_url):
+        _invalid()
+    well_formed = True
+    try:
+        parts = urlsplit(base_url)
+        parts.port  # noqa: B018 - raises ValueError for a bad port
+    except ValueError:
+        well_formed = False
+    if (not well_formed or "@" in parts.netloc or parts.query
+            or parts.fragment or "?" in base_url or "#" in base_url
+            or (parts.scheme.lower() == "https" and not parts.hostname)):
+        _invalid()
 
 
 def _get_header(headers, name):
@@ -192,8 +221,9 @@ def _get_header(headers, name):
 
 
 def _retry_after_ms(headers, now_ms):
-    """Retry-After as an epoch-ms instant: delta-seconds or an HTTP-date, at
-    most a day ahead; None when absent or invalid."""
+    """Retry-After as an epoch-ms instant: ASCII-digit delta-seconds or an
+    HTTP-date that names its zone; None when absent or invalid. There is no
+    upper limit on a valid value (the caller clamps to int64)."""
     value = _get_header(headers, "retry-after")
     if not isinstance(value, str):
         return None
@@ -201,18 +231,15 @@ def _retry_after_ms(headers, now_ms):
     if not text:
         return None
     if text.isascii() and text.isdigit():
-        if len(text) > 12 or int(text) > MAX_RETRY_AFTER_SECONDS:
-            return None
+        if len(text) > 18:  # beyond int64 milliseconds anyway
+            return INT64_MAX
         return now_ms + int(text) * 1000
     try:
         # An HTTP-date names its zone: a naive result raises TypeError here.
         when = parsedate_to_datetime(text)
-        target = (when - _EPOCH) // _MS
+        return (when - _EPOCH) // _MS
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    if target > now_ms + MAX_RETRY_AFTER_SECONDS * 1000:
-        return None
-    return target
 
 
 def _no_constants(_name):
@@ -228,6 +255,20 @@ def _no_duplicates(pairs):
     return out
 
 
+def _parse_float(text):
+    if len(text) > MAX_NUMBER_LITERAL:
+        raise ValueError("number literal too long")
+    # The explicit context decides the signals (an extreme exponent raises
+    # InvalidOperation whatever the caller's traps are).
+    return Decimal(text, _MONEY_CONTEXT)
+
+
+def _parse_int(text):
+    if len(text) > MAX_NUMBER_LITERAL:
+        raise ValueError("number literal too long")
+    return int(text)
+
+
 def _parse_json(raw):
     if isinstance(raw, str):
         try:
@@ -237,10 +278,10 @@ def _parse_json(raw):
     if len(raw) > MAX_BODY_BYTES:
         raise _Failure(FAILURE_SCHEMA)
     try:
-        return json.loads(bytes(raw).decode("utf-8"), parse_float=Decimal,
-                          parse_constant=_no_constants,
+        return json.loads(bytes(raw).decode("utf-8"), parse_float=_parse_float,
+                          parse_int=_parse_int, parse_constant=_no_constants,
                           object_pairs_hook=_no_duplicates)
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, ArithmeticError):
         raise _Failure(FAILURE_SCHEMA)
 
 
@@ -267,13 +308,19 @@ def _timestamp_ms(text):
 
 
 def _money(value):
-    """A JSON number as a non-negative Decimal euro amount; schema failure
-    for anything else (bool, string, null, negative, absurdly large)."""
+    """A JSON number as a non-negative Decimal euro amount, bounded in
+    representation (at most 15 digits before and 12 after the point, judged
+    on the parsed digits and exponent); schema failure for anything else
+    (bool, string, null, negative, non-finite, over-long)."""
     if type(value) is int:
-        value = Decimal(value)
+        value = Decimal(value, _MONEY_CONTEXT)
     if not isinstance(value, Decimal) or not value.is_finite():
         _schema()
-    if value < 0 or value >= _MAX_EUR:
+    if value < 0:
+        _schema()
+    _sign, digits, exponent = value.as_tuple()
+    if (max(-exponent, 0) > MAX_MONEY_FRAC_DIGITS
+            or (value != 0 and len(digits) + exponent > MAX_MONEY_INT_DIGITS)):
         _schema()
     return value
 
@@ -317,26 +364,32 @@ def _read_usage(body, now_ms):
     if not isinstance(categories, list):
         _schema()
     non_ai = False
-    category_sum = Decimal(0)
+    amounts = []
     for entry in categories:
         if not isinstance(entry, dict) or not isinstance(
                 entry.get("type"), str):
             _schema()
         amount = _money(entry.get("totalPrice"))
-        category_sum += amount
+        amounts.append(amount)
         if entry["type"] != AI_CATEGORY and amount > 0:
             non_ai = True
     _require_empty_usage(body.get("hourlyUsage"))
     _require_empty_usage(body.get("monthlyUsage"))
 
-    with localcontext() as ctx:
-        ctx.prec = 80
-        # priceInUcents is the money; value must agree within 1 micro-EUR,
-        # and the categories must add up to value within 1 micro-EUR each.
-        if abs(value * 100_000_000 - ucents) > _UCENTS_PER_MICRO_EUR:
-            _schema()
-        if abs(category_sum - value) > _MICRO_EUR * len(categories):
-            _schema()
+    try:
+        # Bounded inputs make every step below exact; a trapped signal (it
+        # should be unreachable) is a schema failure, never an escape.
+        with localcontext(_MONEY_CONTEXT):
+            category_sum = sum(amounts, Decimal(0))
+            # priceInUcents is the money; value must agree within 1
+            # micro-EUR, and the categories must add up to value within 1
+            # micro-EUR each.
+            if abs(value * 100_000_000 - ucents) > _UCENTS_PER_MICRO_EUR:
+                _schema()
+            if abs(category_sum - value) > _MICRO_EUR * len(categories):
+                _schema()
+    except ArithmeticError:
+        _schema()
 
     observed_at = _timestamp_ms(body.get("lastUpdate"))
     period = body.get("period")
@@ -436,7 +489,8 @@ def poll_once(*, credential, transport, clock, jitter_seconds, config,
 
     def failed(failure, retry_after=None):
         return {"failure": failure,
-                "next_attempt_at": max(next_attempt, retry_after or 0)}
+                "next_attempt_at": min(max(next_attempt, retry_after or 0),
+                                       INT64_MAX)}
 
     # The transport contract: HTTPS only and verification on, refused
     # BEFORE any call. Fixtures test this refusal, not real certificates.

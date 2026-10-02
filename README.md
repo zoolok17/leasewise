@@ -219,7 +219,9 @@ transport call per invocation, never a retry. Standard library only.
   `monthlyUsage` element makes the answer unknown, i.e. failure `schema`,
   never false.
 - **Schedule.** `next_attempt_at = max(now + poll + jitter, Retry-After)`,
-  jitter an injected integer in [0, 90]; Retry-After counts on a 429 only.
+  jitter an injected integer in [0, 90]; Retry-After counts on a 429 only,
+  and any valid value (seconds or HTTP-date) wins over the poll schedule, however
+  far out (clamped to int64).
 - **TLS.** A non-https base URL or a transport that does not report
   verification on is refused before any call.
 - **Fixtures.** `docs/fixtures/ovh/` (two REAL sanitized captures, the rest

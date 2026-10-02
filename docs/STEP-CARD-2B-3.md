@@ -98,7 +98,7 @@ poll_seconds=900, base_url=OVH_EU_BASE_URL)`.
 |---|---|
 | billing_adapter | `BillingAdapter`: exact document for the real capture (total 6737286, observed_at from lastUpdate, period bounds, event id pinned); passes the existing validator; not the poll time; unchanged poll byte-identical; event id lowercase uuid5 and every identity field moves it; fractional ucents ceil (5 cases); zero total; Decimal not float; `priceInUcents` exact non-negative int64 (bool/float/string/overflow/`.0`/exponent form); currency `USD`/`eur`/blank -> `currency`, non-string/missing -> `schema`; `value` vs ucents boundary (+-1 micro-EUR pass, beyond fail); category-sum boundary (1 and 2 entries, no entries); `lastUpdate` missing/unparsable/fraction forms; period not one month (6 cases), missing/unparsable -> `schema`; December rollover; `lastUpdate` outside the period and exactly at either bound; +30 s / +30.001 s boundary; unknown keys ignored |
 | billing_non_ai | `BillingNonAi`: ai-only false; positive synthetic category true (fixture, total 8237286); zero (int and float) false; smallest positive (1 micro-EUR) true; non-empty `hourlyUsage` fixture -> `schema`; non-empty array at five places (incl. nested `quantum`, an unseen key, a deep dict) -> `schema`; missing/misshapen sections -> `schema`; bad category entries (no type, bad type, no/str/bool/null/negative price, non-dict) -> `schema`; components not needed; no token counts in the document |
-| billing_poll_schedule | `BillingPollSchedule`: jitter 0/1/89/90; out-of-range, bool, float, string, None jitter -> typed error with zero transport calls; `poll_seconds` validation and scaling; Retry-After seconds, header-name case, HTTP-date, shorter than the poll, in the past, 13 invalid forms, 429 only, the 24 h limit; exactly one transport call on every outcome and every exception kind; failure schedule; the signed request (URL, headers, timeout); the signature for one known input; default OVH EU base; bad injected parts raise with no call and no secret in the error |
+| billing_poll_schedule | `BillingPollSchedule`: jitter 0/1/89/90; out-of-range, bool, float, string, None jitter -> typed error with zero transport calls; `poll_seconds` validation and scaling; Retry-After seconds, header-name case, HTTP-date, shorter than the poll, in the past, invalid forms, 429 only, beyond 24 h respected, int64 clamp; exactly one transport call on every outcome and every exception kind; failure schedule; the signed request (URL, headers, timeout); the signature for one known input; default OVH EU base; bad injected parts raise with no call and no secret in the error |
 | billing_tls | `BillingTls`: `http`, `ftp`, scheme-relative, bare host, empty, uppercase `HTTP` refused before any call; `HTTPS` uppercase accepted; verification off/None/0/"yes"/1 and an attribute-less transport refused before any call; `TlsError`, `ssl.SSLError`, `ssl.SSLCertVerificationError` -> `tls`; other errors -> `transport`; `KeyboardInterrupt` propagates |
 | billing_output_errors | `BillingOutputErrors`: the failure enum is exactly the seven; the REAL 400 `Invalid signature` -> `auth`; other 400 shapes -> `schema`; 401/403 -> `auth`; other 4xx -> `schema`; synthetic 429 fixture -> `rate_limit`; 5xx (HTML fixture) -> `transport`; connection errors/timeouts -> `transport`; unexpected statuses -> `schema`; malformed 200s (HTML page, truncated JSON, missing `totalPrice`, empty, NaN, duplicate key, depth bombs, trailing text, oversize) -> `schema`; a duplicate key cannot hide a field; malformed transport answers -> `transport`; every result is closed, int `next_attempt_at`, JSON-serialisable, all seven enums seen |
 | privacy_2b (this card) | `Privacy2b`: sentinel strings in the credential, project id, URL, response body, error text of raised exceptions and Retry-After never appear in any of 12 result kinds nor in `repr`/`str` of the credential or the typed error; the signature and timestamp are not in any result; the module source has no file, environment, socket, `urllib.request`, `time`, `random` or SQLite use |
@@ -159,11 +159,15 @@ The ten from the work order (followed as written):
 
 Added by this card (the brief left them open):
 
-11. **Retry-After limits.** Delta-seconds must be plain ASCII digits (no
-    sign, fraction or exponent); an HTTP-date must name its zone; a value
-    more than 24 h past now is ignored as invalid, so one header cannot
-    silence the poller for days. A date in the past is valid but loses the
-    `max`. Flag for review if a longer horizon is wanted.
+11. **Retry-After** (REVISED by the lead after review, fix round 1
+    finding 4; the first build capped it at 24 h and silently overrode a
+    valid header). Any syntactically valid Retry-After on a 429 counts:
+    ASCII-digit delta-seconds or an HTTP-date that names its zone; anything
+    else is ignored. There is no upper limit; `next_attempt_at` is clamped
+    to the int64 maximum (including digit strings too long to convert), so
+    the adapter never schedules earlier than the provider asked. A date in
+    the past is valid but loses the `max`. Downstream a stalled billing
+    source becomes stale billing, which the evaluator reports as an ALERT.
 12. **Order of failures** when a body breaks several rules: structure ->
     currency -> money -> usage sections -> timestamps -> period. Only the
     first is reported (a single enum).
@@ -213,3 +217,60 @@ Added by this card (the brief left them open):
   card owns time sync.
 - No end-to-end test against a real transport; the deployment checklist in
   section 11 (tested TLS, grants, secret ACLs, redaction, canary) stays open.
+
+## Fix round 1 (tk-76e822bde522)
+
+Cold read (codex-lw-reviewer-1) of head `1a761e6`: verdict FIX, four
+reproduced defects; the mapping, ceil, non-AI rule and replay were judged
+sound. Tests first at `03f35d9`, fixes after.
+
+| # | Finding | Fix | Tests (`tests/test_card2b3.py`) |
+|---|---|---|---|
+| 1 | Money arithmetic depended on the caller's Decimal context (prec 6 turned success into `schema`, an Inexact trap escaped, the addition rounded 1.00000100000000000000000000001 - 1 onto the tolerance) | Every money number is bounded in representation (<= 15 digits before, <= 12 after the point, judged on the parsed sign/digits/exponent), else `schema`. All money arithmetic runs in ONE module-level `decimal.Context` (prec 60; Inexact, InvalidOperation, Overflow, DivisionByZero trapped, Rounded not) via `localcontext(_MONEY_CONTEXT)`, including the category sum; a trapped signal -> `schema`. The integer path is unchanged | `FixRound1MoneyContext`: caller prec 6 / 1, caller traps (Inexact, Rounded, all) give the identical document; a schema failure is also context-independent; the 29-digit case and the 12-decimal case (1 vs 1.000001000001) -> `schema`; 1.000001 / 0.999999 / 1.0000009 accepted, 1.0000011 / 0.9999989 rejected; 12 vs 13 decimals (incl. trailing zeros, `1E-13`); integer-digit bound |
+| 2 | A number literal such as 1e9999999999999999999 made `json.loads(parse_float=Decimal)` raise `InvalidOperation` out of `poll_once` | `parse_float` / `parse_int` reject literals longer than 64 characters and build the Decimal with `Decimal(text, _MONEY_CONTEXT)` (explicit trapped context, so the caller's traps cannot turn it into NaN); `ArithmeticError` is caught at the parser boundary. The 400 "Invalid signature" recogniser uses the same parser: an unparsable 400 body is not the signature case -> `schema` | `FixRound1ExtremeNumbers`: 200 and 400 bodies with four extreme literals (ignored field) -> closed `schema` with `next_attempt_at`; one in a known field; caller context with the traps off; the 64/65-character boundary for floats and ints |
+| 3 | A malformed `base_url` raised a raw `ValueError` quoting the URL out of `urlsplit` | `_check_base_url` in `_validate_inputs`, before any call: printable ASCII only, parses (port included), no userinfo, query or fragment, non-empty host for https; failures raise the static `QuotaError(INVALID_CONFIG)` raised outside any `except` and `from None`, so neither `__cause__` nor `__context__` exists. A well-formed non-https URL still fails `tls` before the transport | `FixRound1MalformedBaseUrl`: the reviewer's sentinel URL and 13 more malformed forms -> static error, zero transport calls, sentinel absent from `str`, `repr`, `args`, `__cause__`, `__context__` and the formatted traceback; non-https still `tls`; a URL with port and trailing slash works |
+| 4 | Decision 11 capped Retry-After at 24 h and silently scheduled the poll instead (172800 -> now+900000) | Cap removed (revised decision 11 above); result clamped to int64 | `BillingPollSchedule`: 86400, 172800, a date two days ahead and a year-end date respected; `9*40`, `9*5000`, int64 max and the first overflowing second clamp to int64 max, the last fitting second is exact; the invalid-header list lost its cap-based entries |
+
+**Red before.** At `03f35d9` (tests only, production unchanged):
+`python -m unittest tests.test_card2b3` -> `Ran 97 tests ... FAILED
+(failures=8, errors=5)`: ERROR `test_200_body_with_an_ignored_extreme_exponent_is_schema`,
+`test_400_body_with_an_extreme_exponent_is_schema`,
+`test_extreme_exponent_in_a_known_field_is_schema`,
+`test_the_reviewers_sentinel_url`, `test_caller_traps_do_not_change_the_result`;
+FAIL `test_absurd_retry_after_clamps_to_int64_never_earlier`,
+`test_valid_retry_after_beyond_a_day_is_respected`,
+`test_number_literals_are_bounded_to_64_characters`,
+`test_untrapped_caller_context_cannot_turn_it_into_nan`,
+`test_other_malformed_urls`, `test_caller_precision_does_not_change_the_result`,
+`test_representation_bound_on_money_numbers`,
+`test_subtolerance_noise_cannot_round_onto_the_tolerance`. (Boundary guards
+such as the 12-decimal over-tolerance case already passed: they pin behaviour
+that must survive the fix.)
+
+**Green after.** `tests.test_card2b3`: `Ran 97 tests ... OK` (79 + 18 net new; the cap tests were replaced). Full suite `python -m unittest discover -s tests`: `Ran 617 tests in 188.3s ... OK` (520 on main + 97).
+
+**Mutation spot-check of the fix.** 17 single-point mutations (explicit vs
+ambient context, the trap list, both representation bounds, both literal
+bounds, explicit-context parse, the ArithmeticError catch, each base-URL
+rule, the clamp, the date branch): 14 killed. 3 equivalent survivors, kept as
+defence: the 15-integer-digit bound (any consistent amount is already limited
+by the int64 ucents total, so it is unobservable), `from None` (the error is
+raised outside any `except`, so there is no context to hide), and the 18-digit
+shortcut for Retry-After (longer strings overflow int64 and clamp anyway).
+
+New decisions:
+
+20. **Representation bound.** Money numbers (`value`, every category
+    `totalPrice`): finite, non-negative, <= 15 integer digits and <= 12
+    decimals as parsed (`1E-13` and `0.0000000000000` are out; the check is on
+    the exponent, not the numeric value). Lead decision.
+21. **One explicit money context** (prec 60, Inexact / InvalidOperation /
+    Overflow / DivisionByZero trapped, Rounded not); the ambient context is
+    never used; a trapped signal -> `schema`. Lead decision.
+22. **Base URL.** Printable ASCII, parseable (port included), no userinfo /
+    query / fragment, host required for https; else the static invalid-input
+    error. Anything else well-formed but not https (including a scheme-less
+    string, which carries no scheme to trust) stays `tls`, refused before the
+    transport, as in the first build.
+23. **Number literals** are bounded to 64 characters (floats and ints)
+    before conversion; the 64/65 boundary is pinned.
