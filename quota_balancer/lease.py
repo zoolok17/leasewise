@@ -92,7 +92,7 @@ from .validate_config_v2 import PLATFORM_ID
 
 _GRANT_KEYS = frozenset((
     "request_id", "request_hash", "turn_id", "seat_id", "model_id",
-    "effort", "gateway_id", "parent_lease_id", "context",
+    "task_class", "effort", "gateway_id", "parent_lease_id", "context",
     "expected_calls", "max_calls", "output_cap", "per_call_output_cap",
     "ttl_ms"))
 _CONTEXT_KEYS = frozenset((
@@ -207,6 +207,7 @@ def _validate_grant_request(request):
     if (not isinstance(request["request_hash"], str)
             or not policy._HASH_RE.fullmatch(request["request_hash"])):
         _invalid()
+    policy._check_alias(request["task_class"])
     policy._check_alias(request["effort"])
     for key in ("gateway_id", "parent_lease_id"):
         value = request[key]
@@ -603,6 +604,33 @@ def _grant(conn, request, now_ms, wire_identity=None):
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
 
+        # The profile is the server-side policy for the task class
+        # (section 6/7). It is read AFTER the replay check: a granted
+        # lease is never changed (or lost) by a later profile edit.
+        profile = conn.execute(
+            "SELECT candidates, expected_calls, margin_bps, max_calls, "
+            "output_cap, per_call_output_cap, ttl_ms, policy_revision "
+            "FROM profiles WHERE task_class=?",
+            (request["task_class"],)).fetchone()
+        if profile is None:
+            _not_found()   # an unknown task class, like an unknown model
+        try:
+            candidates = json.loads(profile[0])
+        except ValueError as exc:
+            _store_error(exc)
+        if not isinstance(candidates, list) or model[2] not in candidates:
+            # 'park' is implicit and never stored (STEP-CARD-L1A, turn 1).
+            raise QuotaError(errors.CODE_POLICY_DENIED,
+                             errors.MSG_POLICY_DENIED)
+        # A request may ask for less than the profile, never more.
+        for key, ceiling in zip(
+                ("expected_calls", "max_calls", "output_cap",
+                 "per_call_output_cap", "ttl_ms"), profile[1:2] + profile[3:7]):
+            if request[key] > ceiling:
+                raise QuotaError(errors.CODE_POLICY_DENIED,
+                                 errors.MSG_POLICY_DENIED)
+        margin_bps, policy_revision = profile[2], profile[7]
+
         _parked_block_error(conn, account_id, model[0])
         # Section 7: the admission estimate must be at most 120 seconds
         # old - a stale observed_at is a stale admission basis - and at
@@ -631,7 +659,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
         est = policy.estimate(
             context["initial_tokens"] + context["dispatch_tokens"],
             request["expected_calls"], context["growth_tokens_per_call"],
-            request["output_cap"], request["max_calls"], model_dict)
+            request["output_cap"], request["max_calls"], model_dict,
+            margin_bps)
         policy.check_per_call_output_cap(
             model_dict, request["per_call_output_cap"])
         input_cap, hold_sized = est["input_cap"], est["hold_sized"]
@@ -749,6 +778,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
             },
             "chain": dict(chain, account=account_id),
             "effort": request["effort"],
+            "task_class": request["task_class"],
+            "policy_revision": policy_revision,
             "caps": {"input_cap": input_cap, "hold_sized": hold_sized,
                      "output_cap": request["output_cap"],
                      "max_calls": request["max_calls"],
@@ -766,7 +797,7 @@ def _grant(conn, request, now_ms, wire_identity=None):
             (lease_id, machine_id, seat[0], account_id, model[0],
              request["gateway_id"], request["parent_lease_id"],
              request["turn_id"], request["request_id"],
-             content_hash, None, request["effort"],
+             content_hash, None, request["task_class"],
              context["mode"], enforcement, json.dumps(est, sort_keys=True),
              policy_snapshot, input_cap, request["output_cap"],
              request["max_calls"], request["per_call_output_cap"],

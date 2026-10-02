@@ -101,6 +101,12 @@ class Card4TurnDFixTest(unittest.TestCase):
         # admitted; 24 h + 1 ms, the old 24-day value, and the int64
         # overflow case are refused.
         db = self._store("ttl.db", 10 * HOLD)
+        # Card L1a turn 2: the profile caps ttl_ms; this test is about the
+        # 24 h ABSOLUTE maximum, so its profile allows exactly 24 h.
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE profiles SET ttl_ms=86400000")
+        conn.commit()
+        conn.close()
         ok = self._grant(db, NOW, ttl_ms=86_400_000)
         self.assertEqual(ok["state"], "active")
         self.assertEqual(ok["expires_at"], NOW + 86_400_000)

@@ -495,6 +495,7 @@ def _grant_request(ids, seat, gateway, now_ms, turn=None):
         "turn_id": turn or str(uuid.uuid4()),
         "seat_id": ids["seats"][seat],
         "model_id": ids["models"]["opus"],
+        "task_class": "bounded_read",
         "effort": "opus",
         "gateway_id": ids["gateways"][gateway],
         "parent_lease_id": None,

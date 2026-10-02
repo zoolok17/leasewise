@@ -257,3 +257,14 @@ granted `metered_advisory` (no money hold, no token, cannot pass `/check`),
 whatever a gateway reports as `sized_ready` (still stored as telemetry). Card
 R1 replaces the interim constant `lease.METERED_ENFORCEMENT_ACTIVATED` with an
 explicit activation gate. See docs/STEP-CARD-L1A.md.
+
+**Turn 2: the profile at grant.** The wire's `task_class` now reaches the
+store: it keys the profile (imported by config-import v2), is part of the
+replay content hash and is stored in `leases.task_class` (the effort alias stays
+in `policy_snapshot`, which also records `task_class` and the profile's
+`policy_revision`). Grant refuses an unknown class like an unknown model
+(`NOT_FOUND`), denies a model outside the profile's `candidates` and any
+`expected_calls`, `max_calls`, `output_cap`, `per_call_output_cap` or `ttl_ms`
+above the profile (`POLICY_DENIED`), and uses the profile's `margin_bps` for the
+estimate. A replay returns the stored lease before any of this, so a later
+profile edit never changes a granted lease. See docs/STEP-CARD-L1A.md.

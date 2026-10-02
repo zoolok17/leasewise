@@ -1923,7 +1923,9 @@ class FixRound3AtomicWireIdentity(_ServerCase):
         self.start()
         request_id = str(uuid.uuid4())
         req_a = _grant_request(request_id=request_id)
-        req_b = dict(req_a, task_class="an_alternate_task_class")
+        # (Card L1a turn 2: an unknown task_class would now be a 404, so the
+        # second body differs in a profile-valid field instead.)
+        req_b = dict(req_a, output_cap=req_a["output_cap"] - 1)
         barrier = threading.Barrier(2)
         results = [None, None]
 
@@ -1994,7 +1996,9 @@ class FixRound3AtomicWireIdentity(_ServerCase):
         # same key is now a genuinely fresh first request, not a
         # conflict - and the ORIGINAL body, tried afterward, is now the
         # one that conflicts.
-        changed = dict(request, task_class="an_alternate_task_class")
+        # (Card L1a turn 2: task_class now keys a real profile, so the changed
+        # body differs in another field the profile allows.)
+        changed = dict(request, output_cap=request["output_cap"] - 1)
         status2, body2 = _call(
             self.base, "POST", "/v1/leases", body=changed, identity=IDENTITY_A,
             idempotency_key=request["request_id"])

@@ -411,7 +411,9 @@ def _wire_to_grant(body):
         raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
     if not isinstance(body["task_class"], str) or not _is_alias(body["task_class"]):
         raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
-    internal = {k: v for k, v in body.items() if k != "task_class"}
+    # task_class reaches grant: it keys the profile (server-side policy),
+    # is part of the replay content hash and is stored on the lease.
+    internal = dict(body)
     internal["request_hash"] = "0" * 64
     return internal
 

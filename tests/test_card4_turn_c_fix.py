@@ -34,6 +34,7 @@ so the holds line up: HOLD per grant.
 
 import hashlib
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -90,6 +91,7 @@ def _grant_request(request_id, turn_id, request_hash, model_id=MODEL,
         "turn_id": turn_id,
         "seat_id": seat_id,
         "model_id": model_id,
+        "task_class": "bounded_read",
         "effort": "opus",
         "gateway_id": gateway_id,
         "parent_lease_id": None,
@@ -182,6 +184,18 @@ def _build_store(tmp, name, budget):
             "policy_hash, effort_aliases) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (MODEL, ACCOUNT, "opus", 180000, 18000, 1, 1, 1000000,
              1000000, "sized", POLICY_HASH, "opus"))
+        # Card L1a turn 2: grant reads the task class's profile, so every
+        # fixture carries one (candidates: every model of the fixture).
+        conn.execute(
+            "INSERT INTO profiles(id, task_class, candidates, "
+            "context_rules, calibration, expected_calls, growth_tokens, "
+            "margin_bps, max_calls, output_cap, per_call_output_cap, "
+            "ttl_ms, policy_revision) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "bounded_read",
+             json.dumps([r[0] for r in conn.execute(
+                 "SELECT alias FROM models ORDER BY alias")]),
+             "{}", "{}", 1, 0, 12500, 2, 1000, 500, 1800000, 1))
         conn.commit()
     finally:
         conn.close()

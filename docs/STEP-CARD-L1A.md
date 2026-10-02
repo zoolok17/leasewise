@@ -226,3 +226,141 @@ Mine:
 - Retained-alias semantics for models: effort aliases and rates update in
   place, so an in-flight lease keeps the policy snapshot it was granted under
   (its stored `policy_snapshot`), not the new numbers.
+
+## Turn 2 — work order tk-63885b367128
+
+The wire accepted `task_class` and dropped it, the store put the effort alias
+in the `task_class` column, and grant never read the profile. Turn 2 makes the
+profile the server-side policy of every grant (DESIGN.md sections 6-7). Same
+branch, on top of the turn-1 head `6096030`.
+
+### Files
+
+- `quota_balancer/lease.py` — `task_class` joins the closed grant request;
+  the profile is read inside the grant transaction after the replay check;
+  candidate and ceiling checks; `margin_bps` from the profile; `task_class`
+  stored; `policy_snapshot` also records `task_class` and `policy_revision`.
+- `quota_balancer/http_api.py` — `_wire_to_grant` keeps `task_class` (it was
+  validated and dropped).
+- `quota_balancer/migrate.py` — comment only (the stale "last tier is 'park'");
+  the DDL strings are byte-identical (`MIGRATION_V3` unchanged).
+- `tests/test_cardl1a_t2.py` — 22 tests. Changed older tests: below.
+- `docs/STEP-CARD-L1A.md`, README section.
+
+### Design as implemented
+
+Order inside `_grant`, after the existing seat/team/project/model/account
+lookups and the project-account check, and AFTER the replay check:
+1. profile by `request["task_class"]`; none -> `_not_found()` (the same error
+   as an unknown model id);
+2. the requested model's alias must be in the profile's `candidates` (JSON list
+   of aliases; `park` is implicit and never stored) else `POLICY_DENIED`;
+3. each of `expected_calls`, `max_calls`, `output_cap`, `per_call_output_cap`,
+   `ttl_ms` must be <= the profile's value else `POLICY_DENIED`;
+4. `policy.estimate(..., margin_bps)` with the profile's `margin_bps`; the
+   request has no way to set it (the closed request has no such key).
+The absolute bounds are untouched and still run first for the request's own
+shape (N<=M<=100, the 24 h TTL maximum, the model ceilings). The replay path is
+unchanged and returns the stored lease before any profile access, so a profile
+edited or deleted after a grant never changes or breaks a granted lease.
+`task_class` is part of the server-side content hash (it hashes every request
+field but `request_hash`), so the same `request_id` with another class is
+`IDEMPOTENCY_CONFLICT`. `leases.task_class` holds the class; the effort stays
+in `policy_snapshot`.
+
+### Decisions (the lead's eight, then mine)
+
+1. task_class carried end to end, hashed, stored; snapshot gains `task_class`
+   and `policy_revision`; store callers pass it (closed request shape).
+2. Unknown class: `_not_found()` after the replay check.
+3. Candidate check -> `POLICY_DENIED`.
+4. Profile margin replaces the default.
+5. Five ceilings, request <= profile, else `POLICY_DENIED`.
+6. Replay first; pinned by a store and an HTTP test.
+7. `migrate.py` comment fixed, DDL untouched (checked).
+8. Fixtures grown a profile (list below).
+
+Mine:
+9. **Failure order** when several rules break: unknown class (404) -> candidate
+   -> ceilings (both 403/POLICY_DENIED) -> parked block -> estimate freshness
+   -> estimate arithmetic. A test pins that an unknown class beats a ceiling
+   breach.
+10. **A request's own absolute bound beats the profile**: a request above the
+    24 h TTL maximum or with `max_calls` > 100 is `INVALID_REQUEST` even when
+    the profile (config-import accepts up to `ttl_ms` int64, calls <= 100) would
+    allow it; this is the existing static validation, unchanged.
+11. **No profile lookup on a replay** also means a replay of a lease whose class
+    was later deleted still succeeds; only new requests meet the new profile.
+12. **A corrupted `candidates` value** (not a JSON list) is a store fault
+    (`STORE_ERROR`), not a policy denial: config-import v2 can never write one.
+
+### Rows -> tests (`tests/test_cardl1a_t2.py`)
+
+| Row | Tests |
+|---|---|
+| task_class_stored | `TaskClassStored`: the class (not the effort) is in `leases.task_class`; the snapshot has effort, task_class and the profile's `policy_revision` (and follows a bump); `task_class` is required and an alias in the closed request |
+| unknown_task_class | `UnknownTaskClass`: identical code and message to an unknown model id; no lease row; an empty profile table refuses every class |
+| candidate_denied | `CandidateDenied`: a model outside the candidates -> `POLICY_DENIED`, a listed one is granted; every listed candidate works; a model that belongs to another class's profile is denied here |
+| profile_margin_applied | `ProfileMarginApplied`: pinned numbers from the card-3 arithmetic (E=1000: margin 12500 -> I=1250, H=2253; 20000 -> I=2000, H=3003; 10000 -> I=1000, H=2003) equal the lease caps, the stored estimate and the snapshot; the request cannot carry a margin |
+| profile_ceilings | `ProfileCeilings`: each of the five fields at the profile value is granted and at +1 is `POLICY_DENIED`; less than the profile is granted; raising the profile raises the ceiling; absolute bounds still apply above a generous profile; unknown class beats a ceiling breach |
+| replay_after_profile_edit | `ReplayAfterProfileEdit`: after tightening the profile (candidates, margin, ceilings, revision) and after deleting it, the identical request replays the identical stored lease, rows unchanged; a new request meets the new profile |
+| content_hash_includes_task_class | `ContentHashIncludesTaskClass`: same request_id, other class -> `IDEMPOTENCY_CONFLICT`, one lease row; the identical request replays |
+| HTTP path | `HttpPath`: `/v1/leases` on rows imported by config-import v2 returns 201 and stores the class; 404 unknown class, `POLICY_DENIED` for candidate and TTL; replay after the profile was deleted returns 200 with the same lease |
+
+### Pre-existing tests changed, and why (decision 8)
+
+No assertion weakened or removed.
+- `tests/test_card4_ops.py`, `test_card4_expiry.py`, `test_card4_settle_fix.py`,
+  `test_card4_turn_c_fix.py`, `test_card4_enforce_fix.py`,
+  `test_card4_seat_kind_fix.py`: their `_grant_request` helper now carries
+  `"task_class": "bounded_read"` (the request shape is closed) and their
+  `_build_store` fixture inserts one SQL profile row with that class,
+  candidates = every model alias of the fixture and the values the requests
+  already used (1 call, 2 max, 1000 / 500 output, 30 min, margin 12500), so
+  every number they assert (holds, caps) is unchanged. They are SQL because
+  these fixtures build a store at a fixed schema version with raw rows (they
+  predate config-import v2 and test hand-built states such as a v4 store).
+  `test_card4_turn_d_fix.py` shares turn-c's helper.
+- `tests/test_card4_turn_d_fix.py::test_ttl_24h_boundary` and
+  `tests/test_card4_enforce_fix.py::test_ttl_ms_bounded`: they test the 24 h
+  ABSOLUTE TTL maximum, which the 30-minute profile now caps first. Each now
+  raises its fixture profile's `ttl_ms` to 86_400_000 (one `UPDATE` after the
+  store is built) so the same boundary is exercised with the same
+  assertions.
+- `tests/test_card5.py::test_grant_failed_identity_write_rolls_back_the_whole_mutation`:
+  its "changed body" used `task_class="an_alternate_task_class"`, which now
+  (correctly) names no profile and is a 404. The changed body now differs in
+  `output_cap` (one lower, within the profile); the idempotency intent (a
+  different body under the same key is a fresh first request, the original then
+  conflicts) and every assertion are unchanged. The card-5 fixture already had a
+  `bounded_read` profile. The second card-5 edit is
+  `test_concurrent_grant_same_key_different_body_gets_one_conflict` (same
+  reason, same fix). A card-5 wire-identity test that replays a key with a
+  nonexistent class still gets its 409 from the wire layer and is unchanged.
+- `tests/test_cardl1a.py`: its request helper carries `task_class`
+  (turn-1 tests; its imported base document already has the profile).
+
+### Evidence
+
+- **Red first.** Commit `5552ad0` (tests only, on the turn-1 production code),
+  run in a detached worktree: `python -m unittest tests.test_cardl1a_t2` ->
+  `Ran 22 tests ... FAILED (failures=7, errors=11)`: 18 of 22 fail (the closed
+  request has no `task_class`, no profile is consulted).
+- **Green.** `tests.test_cardl1a_t2`: 22 tests OK. Full suite `python -m unittest discover -s tests`: `Ran 577 tests in 234.3s ... OK` (555 after turn 1 + 22). Before the fixture edits the older files had 13 failures and 54 errors; that list drove the changed-tests section above. A racy card-5 test (`test_concurrent_grant_same_key_different_body_gets_one_conflict`) whose second body used an unknown task_class now differs in `output_cap` (same intent: one 201, one 409).
+- Mutation spot-check: 8 single-point mutations of the lease change (unknown
+  class check, candidate check, ceiling comparison, the TTL ceiling, margin,
+  stored task_class, snapshot revision, hash excluding task_class) all killed.
+
+### Judged not testable
+
+Concurrent profile edits against a grant (both run under BEGIN IMMEDIATE, so
+they serialise; not new).
+
+### Residual risk
+
+- The wire body still has no way to name a profile revision: a client that
+  planned under revision N and is granted under N+1 sees only the new ceilings
+  (a denial is `POLICY_DENIED` with no detail). `/v1/plan` returns the same
+  caps, so a client can re-plan.
+- Seven older fixtures grew a SQL profile row; if the profile columns change
+  (turn 3 or R1), those fixtures need the same edit.
