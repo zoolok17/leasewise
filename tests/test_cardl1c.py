@@ -298,6 +298,7 @@ class AdmissionIgnoresUnknownShadowUsage(_L1c):
 
     def test_a_shadow_money_figure_never_counts_toward_the_budget(self):
         # the account budget sums receipt money; shadow leases are exempt
+        self.import_ok(doc())                 # no token limit in the way
         made, now = self.shadow_lease()
         receipt = self.receipt(made["lease_id"], True, actual=10 ** 12)
         receipt["input_tokens"] = receipt["cached_input_tokens"] = None
