@@ -1,0 +1,1 @@
+{"_synthetic":"SYNTHETIC: not an OVH capture","http_status":429,"body":{"class":"Client::TooManyRequests","message":"synthetic"},"relevant_headers":{"Retry-After":"120"}}

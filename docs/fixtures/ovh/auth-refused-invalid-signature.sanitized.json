@@ -1,0 +1,15 @@
+{
+  "_capture": {
+    "captured_at": "20261002T192336Z",
+    "endpoint": "GET /cloud/project with a deliberately invalid signature",
+    "sanitized_fields": 0
+  },
+  "body": {
+    "class": "Client::BadRequest",
+    "message": "Invalid signature"
+  },
+  "http_status": 400,
+  "relevant_headers": {
+    "Content-Type": "application/json; charset=utf-8"
+  }
+}
