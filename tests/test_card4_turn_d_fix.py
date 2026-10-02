@@ -125,10 +125,10 @@ class Card4TurnDFixTest(unittest.TestCase):
         ok = self._grant(db, NOW, observed_at=NOW + 30_000)
         self.assertEqual(ok["state"], "active")
         _assert_quota_error(
-            self, errors.CODE_INVALID_REQUEST,
+            self, errors.CODE_ESTIMATE_STALE,
             lambda: self._grant(db, NOW, observed_at=NOW + 30_001))
         _assert_quota_error(
-            self, errors.CODE_INVALID_REQUEST,
+            self, errors.CODE_ESTIMATE_STALE,
             lambda: self._grant(
                 db, NOW, observed_at=NOW + 365 * 86_400_000))
 

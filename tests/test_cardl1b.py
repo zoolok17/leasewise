@@ -188,9 +188,9 @@ class UnknownContextShadowGranted(_L1b):
     def test_observed_at_must_still_be_fresh(self):
         body, now = self.unknown()
         body["context"]["observed_at"] = now - 120_001
-        self.assert_code(errors.CODE_INVALID_REQUEST, body, now)
+        self.assert_code(errors.CODE_ESTIMATE_STALE, body, now)
         body["context"]["observed_at"] = now + 30_001
-        self.assert_code(errors.CODE_INVALID_REQUEST, body, now)
+        self.assert_code(errors.CODE_ESTIMATE_STALE, body, now)
         body["context"]["observed_at"] = now - 120_000
         self.assertEqual(self.grant(body, now)["state"], "active")
 

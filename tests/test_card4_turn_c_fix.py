@@ -332,7 +332,7 @@ class Card4TurnCFixTest(unittest.TestCase):
         # Section 7: estimates must be at most 120 seconds old.
         db = self._store("stale.db", 10 * HOLD)
         _assert_quota_error(
-            self, errors.CODE_INVALID_REQUEST,
+            self, errors.CODE_ESTIMATE_STALE,
             lambda: self._grant(db, NOW, observed_at=NOW - 121_000))
         # Exactly 120 seconds old is still fresh.
         ok = self._grant(db, NOW, observed_at=NOW - 120_000)

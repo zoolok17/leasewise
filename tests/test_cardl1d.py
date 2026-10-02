@@ -39,6 +39,11 @@ class _L1d(_L1b):
         finally:
             conn.close()
 
+    def reset(self):
+        """A fresh store for the next sub-case of a loop."""
+        self._tmp.cleanup()
+        self.setUp()
+
     def mutations(self):
         """name -> (seat, statements, error a NEW request then gets)."""
         ids = _ids(self)
@@ -90,7 +95,7 @@ class ReplaySurvivesPolicyEdits(_L1d):
     def test_a_granted_lease_replays_after_each_policy_edit(self):
         for name in sorted(self.mutations()):
             with self.subTest(name):
-                self.setUp()
+                self.reset()
                 seat, edits, _code = self.mutations()[name]
                 body, now = self.fresh(seat)
                 first = self.grant(body, now)
@@ -104,7 +109,7 @@ class ReplaySurvivesPolicyEdits(_L1d):
     def test_a_new_request_gets_the_old_error_after_each_edit(self):
         for name in sorted(self.mutations()):
             with self.subTest(name):
-                self.setUp()
+                self.reset()
                 seat, edits, code = self.mutations()[name]
                 body, now = self.fresh(seat)
                 self.grant(body, now)
@@ -127,7 +132,7 @@ class ChangedReplayConflicts(_L1d):
     def test_changed_content_conflicts_even_after_each_edit(self):
         for name in sorted(self.mutations()):
             with self.subTest(name):
-                self.setUp()
+                self.reset()
                 seat, edits, _code = self.mutations()[name]
                 body, now = self.fresh(seat)
                 self.grant(body, now)
@@ -333,7 +338,7 @@ class HttpPath(_L1d):
         return doc()
 
     def test_a_stale_new_request_is_400_estimate_stale(self):
-        for delta in (-120_001, 30_001):
+        for delta in (-125_000, 40_000):
             body = self.wire()
             body["context"]["observed_at"] = self.now() + delta
             status, out = self.post(body)
