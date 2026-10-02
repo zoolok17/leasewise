@@ -94,8 +94,9 @@ DEFAULT_HOST = "127.0.0.1"
 
 # metered_advisory/shadow are non-enforcing: section 7 requires a null
 # token and a refused /check for both, not merely for a terminal state
-# (fix round tk-7d7fd9023f8c finding 1).
-_NON_ENFORCING = frozenset({"metered_advisory", "shadow"})
+# (fix round tk-7d7fd9023f8c finding 1). The rule now lives in
+# lease.token_bearing (card L1a fix round 1), which also keeps a stored
+# `metered` lease token-less and un-checkable while the R-003 gate is closed.
 
 _LEASE_ACTION = re.compile(r"^/v1/leases/([^/]+)/(check|settle)$")
 
@@ -572,7 +573,7 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
     result = lease.grant(db_path, internal, now_ms,
                          wire_identity=("leases", idempotency_key, wire_hash))
     lease_token = None
-    if result["state"] != "settled" and result["enforcement"] not in _NON_ENFORCING:
+    if result["state"] != "settled" and lease.token_bearing(result["enforcement"]):
         lease_token = _new_token()
         _set_token_hash(db_path, result["lease_id"], _hash_token(lease_token))
     wire = {k: result[k] for k in (
@@ -631,7 +632,8 @@ def handle_check(db_path, identity, lease_id, body, token, now_ms):
     if row is not None:
         owner_machine, token_hash, enforcement = row
         presented = _hash_token(token) if token else None
-        if (owner_machine != machine_id or enforcement in _NON_ENFORCING
+        if (owner_machine != machine_id
+                or not lease.token_bearing(enforcement)
                 or token_hash is None or presented != token_hash):
             raise QuotaError(errors.CODE_FORBIDDEN, errors.MSG_FORBIDDEN)
     result = lease.check(db_path, lease_id, now_ms)

@@ -298,36 +298,47 @@ def _upsert(conn, accounts, machines, gateways, policy_doc=None):
         apply_policy(conn, policy_doc, account_ids, machine_ids)
 
     # Removed aliases, children before parents. validate() guarantees no
-    # retained/new gateway references a removed account or machine, so the
-    # only live references to a removed alias are readings, windows, and
-    # the card-3 policy tables (seats.machine_id, models.account_id,
-    # project_accounts.account_id - empty in this card, guarded from the
-    # moment the tables exist).
+    # retained/new gateway references a removed account or machine. Every
+    # other reference is checked against REMOVAL_GUARDS, so a referenced
+    # removal is always the static INVALID_CONFIG (the foreign keys stay as
+    # the backstop, never the first line: their failure would read as a
+    # store fault).
     for alias in set(old_gateways) - {g[0] for g in gateways}:
+        _refuse_if_referenced(conn, "gateways", old_gateways[alias])
         conn.execute("DELETE FROM gateways WHERE id=?", (old_gateways[alias],))
     for alias in set(old_machines) - set(machines):
-        if (_references(conn, "readings", "machine_id", old_machines[alias])
-                or _references(conn, "seats", "machine_id",
-                               old_machines[alias])
-                or _references(conn, "billing_policies",
-                               "reporter_machine_id",
-                               old_machines[alias])):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        _refuse_if_referenced(conn, "machines", old_machines[alias])
         conn.execute("DELETE FROM machines WHERE id=?", (old_machines[alias],))
     for alias in set(old_accounts) - {a[0] for a in accounts}:
-        if (_references(conn, "readings", "account_id", old_accounts[alias])
-                or _references(conn, "windows", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "models", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "project_accounts", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "billing_policies", "account_id",
-                               old_accounts[alias])
-                or _references(conn, "billing_totals", "account_id",
-                               old_accounts[alias])):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        _refuse_if_referenced(conn, "accounts", old_accounts[alias])
         conn.execute("DELETE FROM accounts WHERE id=?", (old_accounts[alias],))
+
+
+# Every (table, column) that points at an inventory row, declared by a
+# foreign key. A test compares this list with the live schema's foreign
+# keys, so a new reference cannot be forgotten.
+REMOVAL_GUARDS = {
+    "accounts": (
+        ("readings", "account_id"), ("windows", "account_id"),
+        ("gateways", "account_id"), ("models", "account_id"),
+        ("project_accounts", "account_id"),
+        ("billing_policies", "account_id"), ("billing_totals", "account_id"),
+        ("blocks", "account_id"), ("leases", "account_id"),
+        ("adjustments", "account_id"), ("limit_events", "account_id")),
+    "machines": (
+        ("readings", "machine_id"), ("gateways", "machine_id"),
+        ("seats", "machine_id"), ("leases", "machine_id"),
+        ("billing_policies", "reporter_machine_id")),
+    "gateways": (
+        ("leases", "gateway_id"), ("receipts", "gateway_id"),
+        ("adjustments", "gateway_id")),
+}
+
+
+def _refuse_if_referenced(conn, target, entity_id):
+    for table, column in REMOVAL_GUARDS[target]:
+        if _references(conn, table, column, entity_id):
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
 
 
 def _references(conn, table, column, entity_id):

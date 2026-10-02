@@ -213,8 +213,7 @@ class F2UnchangedRequestReplaysAfterTheUpgrade(_Fix):
         body, made, now = self.grant_legacy()
         for field, value in (("output_cap", 999), ("ttl_ms", 1_000),
                              ("turn_id", str(uuid.uuid4())),
-                             ("effort", "fast"),
-                             ("model_id", _ids(self)["models"]["fast"])):
+                             ("max_calls", 1), ("per_call_output_cap", 100)):
             changed = dict(copy.deepcopy(body), **{field: value})
             with self.assertRaises(QuotaError) as caught:
                 lease.grant(self.db, changed, now)
@@ -507,7 +506,11 @@ class F4InventoryRemovalsAreInvalidConfig(_Fix):
         self.assert_unchanged_refusal(v1)
 
     def test_a_referenced_removal_is_never_a_store_error(self):
-        self.limit_block()
+        other = self.ids("accounts")["other"]
+        self.sql("INSERT INTO blocks(id, account_id, model_id, reason, "
+                 "retry_at, state, source_event_id, updated_at) "
+                 "VALUES(?,?,NULL,'overrun',NULL,'cleared',NULL,1)",
+                 (str(uuid.uuid4()), other))
         result = self.import_doc(self.v2_without_account("other"))
         self.assertNotEqual(result.stderr.strip(), ERROR_STORE)
         self.assertEqual(result.returncode, 2)

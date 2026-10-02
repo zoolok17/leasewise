@@ -534,3 +534,107 @@ card, with 7d-1's local slots); no way to resolve adjustments or activate
 enforcing metered leases (card R1); no status projection of the policy tables
 and no scheduler for the sweep; the wire still cannot name a profile revision;
 nothing for L1b.
+
+## Fix round 1 (tk-80472a29a673)
+
+In plain words: the cold read of this card found five problems. Three are about
+data written by the version before L1a (Leasewise has never been deployed, but
+the code must not rely on that): an old "enforcing" lease could still pass the
+permission check while enforcement is switched off; a request that was already
+granted could no longer be repeated safely; and a broken stored profile looked
+like an ordinary refusal. Two are about deletions: the policy loader could
+remove a seat that reading history still points at, and some removals of
+accounts and machines failed as a database fault instead of a clear
+"configuration refused". All five are fixed, each with a test that failed first.
+
+| # | Finding | Fix | Tests (`tests/test_cardl1a_fix1.py`) |
+|---|---|---|---|
+| F1 (major) | A `metered` lease stored by the code before L1a still got 200 from `/check` and a rotated token on replay while `METERED_ENFORCEMENT_ACTIVATED` was False | one function, `lease.token_bearing(enforcement)`, decides whether a lease may carry a token or pass `/check`: a stored `metered` lease counts only when the gate is open; the other values are as before. `http_api` uses it for token issuance and for `/check`. R1 replaces that one condition. Holds, settle, late receipts, expiry and the sweep are untouched | `F1OldEnforcingLeaseCannotCheck`: `/check` -> `FORBIDDEN` with the gate closed and 200 when open; a replay returns no token and does not rotate the stored hash; settle (non-final then final) releases and retains as before and the holds stay; expiry and the sweep keep the hold; the condition's table |
+| F2 (major) | A lease stored before L1a has a fingerprint without `task_class`; its identical request returned `IDEMPOTENCY_CONFLICT` | on replay the stored lease is compared by format: a lease whose `policy_snapshot` has a `task_class` key is compared with the current fingerprint (task_class included); one without it with the legacy fingerprint (computed exactly as the old code did: every field but `request_hash` and `task_class`). New grants always store the current hash | `F2UnchangedRequestReplaysAfterTheUpgrade`: a legacy-format lease plus its identical request replays (store and HTTP, with the wire-identity ledger); a changed body conflicts for five fields; a current-format lease with another task class conflicts; new grants store the current hash and the marker |
+| F3 (major) | Removing a seat deleted a `readings.seat_id` reference (no foreign key) | the policy removal guard is now one table, `policy_config.REMOVAL_GUARDS`, covering declared foreign keys and logical references (audit below) | `F3LogicalReferencesGuardRemoval`: a reading, daily totals of a seat, a team and a project, a held limit, a lease each refuse (INVALID_CONFIG, whole store unchanged); an unreferenced seat is deleted; a profile may be removed while leases name its class; a test compares the table with the live schema's foreign keys |
+| F4 (minor) | An account referenced only by a block or limit event hit the database foreign key: STORE_ERROR, exit 3 | the inventory removals use one table, `store.REMOVAL_GUARDS`, for accounts, machines and gateways, in both document versions; the foreign key remains the backstop | `F4InventoryRemovalsAreInvalidConfig`: block + limit event (the reviewer's case), block only, adjustment only (accounts); lease, receipt, adjustment (gateways); lease (machines); both document versions; never `STORE_ERROR`; a test compares the table with the live schema's foreign keys |
+| F5 (minor) | A stored `candidates` that is valid JSON but not a list of strings (for example `{}`) read as `POLICY_DENIED` | a malformed stored shape is `STORE_ERROR` (exit 3, static message); a valid list that does not contain the model stays `POLICY_DENIED` | `F5BrokenStoredProfile`: eleven malformed values -> store error; the wire layer sees the same error; valid lists with and without the model; a replay still needs no profile |
+
+**Marker for F2.** `"task_class" in policy_snapshot`. The snapshot is a
+fixed set of keys built by grant (`policy_hash`, `reservation_mode`, `rates`,
+`chain`, `effort`, `caps`, `period_start`, and since L1a `task_class`,
+`policy_revision`); none is chosen by a client, so a snapshot written before
+L1a can never contain `task_class`, and one written after always does. Known
+limit: the old fingerprint never saw `task_class`, so for a legacy lease a
+changed task class cannot be told apart (pinned by a test); on the HTTP path
+the wire-identity ledger, which hashes the whole wire body, still catches it.
+
+### Audit 1 - references into the seven policy tables (F3)
+
+| Reference (table.column) | Target | Kind | Guarded? | Why |
+|---|---|---|---|---|
+| teams.project_id | projects | foreign key | yes | existing |
+| project_accounts.project_id | projects | foreign key | yes | the project's links are deleted first; any left refuses |
+| limits.scope_id (scope project) | projects | logical | yes (new) | limits are removed first; a held limit refuses; any left refuses |
+| daily_totals.scope_id (scope project) | projects | logical | yes (new) | totals are history nothing may orphan |
+| seats.team_id | teams | foreign key | yes | existing |
+| limits.scope_id (scope team) | teams | logical | yes (new) | as above |
+| daily_totals.scope_id (scope team) | teams | logical | yes (new) | as above |
+| leases.seat_id | seats | foreign key | yes | existing |
+| readings.seat_id | seats | logical (no FK) | yes (new) | the reviewer's case |
+| limits.scope_id (scope seat) | seats | logical | yes (new) | as above |
+| daily_totals.scope_id (scope seat) | seats | logical | yes (new) | as above |
+| leases.model_id | models | foreign key | yes | existing |
+| blocks.model_id | models | foreign key | yes | existing |
+| limit_events.model_id | models | foreign key | yes | existing |
+| holds.limit_id | limits | logical | yes | existing (turn 1): holds of settled leases are history |
+| leases.task_class | profiles | logical (text) | NO, on purpose | history, not a live reference: a replay needs no profile (turn-2 decision 11), leases stored before L1a hold the effort alias in that column, and nothing joins on it. Removing a profile with leases is allowed (tested) |
+| audit.object_id, blocks.source_event_id | various | logical (history) | no | event history, not a reference |
+| project_accounts | - | nothing points at it | n/a | deleted when absent from the document |
+
+### Audit 2 - references into the inventory (F4)
+
+| Reference | Target | Before | Now |
+|---|---|---|---|
+| readings.account_id, windows.account_id, models.account_id, project_accounts.account_id, billing_policies.account_id, billing_totals.account_id | accounts | guarded | guarded |
+| blocks.account_id, limit_events.account_id, adjustments.account_id, leases.account_id, gateways.account_id | accounts | NOT guarded (database fault) | guarded |
+| readings.machine_id, seats.machine_id, billing_policies.reporter_machine_id | machines | guarded | guarded |
+| leases.machine_id, gateways.machine_id | machines | NOT guarded | guarded |
+| leases.gateway_id, receipts.gateway_id, adjustments.gateway_id | gateways | NOT guarded (database fault) | guarded |
+
+Honest note: `leases.account_id` and `leases.machine_id` can only fire alone if
+a lease row existed without its seat and model, which the foreign keys forbid
+(the seat and model guards refuse first). They are guarded as a backstop and
+covered by the two schema-completeness tests, not by a separate scenario.
+
+### Evidence
+
+- **Red first.** Commit `12ed41b` (tests only, production code unchanged):
+  `python -m unittest tests.test_cardl1a_fix1` -> 33 tests, 20 red. Failing
+  (before my test-set-up corrections, then re-run): F1
+  `test_check_is_forbidden_while_the_gate_is_closed`,
+  `test_a_replay_returns_no_token_and_never_rotates_one`,
+  `test_the_condition_lives_in_one_place`; F2
+  `test_the_identical_request_replays_the_stored_lease`,
+  `test_over_http_the_identical_wire_body_replays`,
+  `test_a_changed_task_class_cannot_be_told_apart_on_a_legacy_lease`,
+  `test_a_changed_body_is_a_conflict`; F3
+  `test_a_seat_with_a_reading_cannot_be_removed`,
+  `test_a_scope_with_daily_totals_cannot_be_removed`,
+  `test_the_policy_guard_list_covers_every_reference`; F4 the account block,
+  limit-event, adjustment and gateway lease, receipt and adjustment tests,
+  `test_a_referenced_removal_is_never_a_store_error`,
+  `test_the_inventory_guard_lists_cover_every_foreign_key`; F5
+  `test_malformed_shapes_are_store_errors`,
+  `test_the_store_error_is_exit_3_and_reaches_the_wire_layer`.
+  (Two tests of mine were corrected after the red commit: an effort value the
+  model does not allow, and a block on the wrong account.)
+- **Green.** `tests.test_cardl1a_fix1`: 33 tests OK. Full suite: `Ran 742 tests
+  in 288.4s ... OK` (709 + 33); with TMP at an empty folder nothing was left.
+- **Mutation spot-check.** 13 single-point mutations (the gate condition, token
+  issuance, the check, both fingerprint branches, five guard entries, the gateway
+  guard, the shape check): all killed.
+- **Changed pre-existing tests:** none.
+
+### Decisions
+
+11. The gate is applied to permission in ONE function, `lease.token_bearing`.
+12. The replay marker is `task_class` in `policy_snapshot` (above).
+13. `leases.task_class -> profiles` is deliberately not guarded (audit 1).
+14. The guard lists are plain tables compared with the live schema's foreign
+    keys by tests, so a new reference cannot be forgotten silently.
