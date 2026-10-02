@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest import mock
 
 from quota_balancer import errors, http_api, lease
 from quota_balancer.errors import QuotaError
@@ -123,6 +124,27 @@ class ReplaySurvivesPolicyEdits(_L1d):
         replay = self.grant(copy.deepcopy(body), now + 10 * 60_000)
         self.assertEqual(replay["lease_id"], first["lease_id"])
         self.assertTrue(replay["replayed"])
+
+
+class RebuildAfterStale(_L1d):
+    """The reporter's rebuild contract at store level."""
+
+    def test_a_stale_request_rebuilt_with_a_fresh_estimate_is_granted(self):
+        body, now = self.fresh("s6")
+        stale = copy.deepcopy(body)
+        stale["context"]["observed_at"] = now - 500_000
+        self.assert_code("ESTIMATE_STALE", stale, now)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM leases"), [(0,)])
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM http_request_identity"), [(0,)])
+        rebuilt = copy.deepcopy(body)
+        rebuilt["context"]["observed_at"] = now - 1000
+        first = self.grant(rebuilt, now)
+        self.assertEqual(first["state"], "active")
+        again = self.grant(copy.deepcopy(rebuilt), now + 1000)
+        self.assertTrue(again["replayed"])
+        self.assertEqual(again["lease_id"], first["lease_id"])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM leases"), [(1,)])
 
 
 class ChangedReplayConflicts(_L1d):
@@ -350,10 +372,50 @@ class HttpPath(_L1d):
         body = self.wire()
         status, first = self.post(body)
         self.assertEqual(status, 201, first)
-        # the same bytes later: observed_at is now old, but it replays
-        time.sleep(0.01)
-        status, again = self.post(copy.deepcopy(body))
+        # Move the server's clock ten minutes on: the stored estimate is
+        # now far older than 120 s, yet the same bytes replay.
+        later = time.time() + 600
+
+        class _Later:
+            @staticmethod
+            def time():
+                return later
+
+        with mock.patch.object(http_api, "time", _Later):
+            status, again = self.post(copy.deepcopy(body))
+            # proof the clock moved: a NEW request with that estimate is stale
+            fresh_id = copy.deepcopy(body)
+            fresh_id["request_id"] = str(uuid.uuid4())
+            fresh_id["turn_id"] = str(uuid.uuid4())
+            stale_status, stale = self.post(fresh_id)
         self.assertEqual(status, 200, again)
+        self.assertEqual(again["lease_id"], first["lease_id"])
+        self.assertEqual((stale_status, stale["error"]["code"]),
+                         (400, "ESTIMATE_STALE"))
+
+    def test_a_stale_request_rebuilt_with_a_fresh_estimate_is_granted(self):
+        """The reporter's contract: ESTIMATE_STALE stores nothing, the same
+        request id rebuilt with a fresh observed_at is granted, and the
+        rebuilt body then replays - all under one Idempotency-Key."""
+        body = self.wire()
+        stale = copy.deepcopy(body)
+        stale["context"]["observed_at"] = self.now() - 500_000
+        key = body["request_id"]
+        status, out = _call(self.base, "/v1/leases", stale, key)
+        self.assertEqual((status, out["error"]["code"]),
+                         (400, "ESTIMATE_STALE"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM leases"), [(0,)])
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM http_request_identity"), [(0,)])
+        rebuilt = copy.deepcopy(body)
+        rebuilt["context"]["observed_at"] = self.now() - 1000
+        status, first = _call(self.base, "/v1/leases", rebuilt, key)
+        self.assertEqual(status, 201, first)
+        status, again = _call(self.base, "/v1/leases",
+                              copy.deepcopy(rebuilt), key)
+        self.assertEqual(status, 200, again)
+        self.assertEqual(again["lease_id"], first["lease_id"])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM leases"), [(1,)])
 
     def test_a_changed_replay_is_409_after_an_edit(self):
         body = self.wire()

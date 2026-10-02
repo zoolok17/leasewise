@@ -19,7 +19,7 @@ Part 9, F6). Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only.
    `observed_at` used to be a plain `INVALID_REQUEST`. It is now `ESTIMATE_STALE`
    (HTTP 400, exit 2, a fixed message). Because that check runs after the replay
    lookup, receiving it proves no lease exists for the request id, so the caller
-   may safely build the request again once. Everything else that is wrong with a
+   may rebuild the request with a fresh estimate. Everything else that is wrong with a
    request is still `INVALID_REQUEST`.
 
 Nothing else changes: a successful new grant, the replay answer, the token rules

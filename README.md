@@ -366,6 +366,6 @@ A request whose `observed_at` is more than 120 seconds old, or more than 30 seco
 in the future, now gets its own error, `ESTIMATE_STALE` (HTTP 400, exit 2, the fixed
 text "the admission estimate is stale"), instead of `INVALID_REQUEST`. It is checked
 last among the policy checks and never for a replay, so receiving it proves that no
-lease exists for that request id: the caller may rebuild the request once with a
+lease exists for that request id: the caller may rebuild the request with a
 fresh estimate. Every other bad request is still `INVALID_REQUEST`. See
 docs/STEP-CARD-L1D.md.
