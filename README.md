@@ -315,3 +315,21 @@ profile edit never changes a granted lease. See docs/STEP-CARD-L1A.md.
   `{"expired":N}`; a second run prints `{"expired":0}`.
 - An overrun now turns a `probing` block back to `parked` and audits every
   overrun's event id. See docs/STEP-CARD-L1A.md for the card summary.
+
+## Card L1b - the shadow-request contract
+
+A wrapper that only observes cannot know the size of the agent's context before
+a turn, so it may now say so: `context.mode` = `"UNKNOWN"` with
+`initial_tokens`, `dispatch_tokens` and `growth_tokens_per_call` all `null` and
+`source` = `"unknown"` (`observed_at` stays required and fresh). Any mixture of
+unknown and known fields is `INVALID_REQUEST`. An unknown context is granted to
+**shadow seats only**; every other seat gets the new error `CONTEXT_UNKNOWN`
+(HTTP 400, exit 2). The stored lease says so explicitly (`context_mode`
+`UNKNOWN`, estimate `{"context":"unknown"}`) and its input cap is the model's own
+bound (context ceiling x calls), recorded as `input_cap_basis` `model_ceiling`;
+nothing is invented. A replay is matched first, as for every grant.
+
+Leases that reserved no money (shadow, subscription, advisory) report on the
+existing `/v1/leases/{id}/settle`: any number of non-final receipts, then a final
+one with `actual_micro_eur` null; their response now carries `null`, not 0, for
+`released_micro_eur` and `retained_micro_eur`. See docs/STEP-CARD-L1B.md.

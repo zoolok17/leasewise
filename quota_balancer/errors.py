@@ -10,6 +10,7 @@ CODE_STORE_ERROR = "STORE_ERROR"
 CODE_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 CODE_INVALID_REQUEST = "INVALID_REQUEST"
 CODE_CONTEXT_PROJECTION_EXCEEDED = "CONTEXT_PROJECTION_EXCEEDED"
+CODE_CONTEXT_UNKNOWN = "CONTEXT_UNKNOWN"
 CODE_POLICY_DENIED = "POLICY_DENIED"
 
 # Card 2b closed billing errors (docs/DESIGN.md section 11). The billing
@@ -59,6 +60,7 @@ EXIT_CODES = {
     # class, exit 2. None of them is a store fault (exit 3).
     CODE_INVALID_REQUEST: 2,
     CODE_CONTEXT_PROJECTION_EXCEEDED: 2,
+    CODE_CONTEXT_UNKNOWN: 2,
     CODE_POLICY_DENIED: 2,
     # Card 4: the 404/409/410/429 contract of section 7 (exit 2: the
     # request, its id or its timing is the problem, not the store).
@@ -88,6 +90,7 @@ MSG_INVALID_REQUEST = "the request is invalid"
 MSG_CONTEXT_PROJECTION_EXCEEDED = (
     "the projected context exceeds the model input ceiling"
 )
+MSG_CONTEXT_UNKNOWN = "an unknown context is accepted for shadow leases only"
 MSG_POLICY_DENIED = "the request is denied by policy"
 MSG_NOT_FOUND = "the requested object was not found"
 MSG_RECEIPT_CONFLICT = "a receipt for this lease conflicts with a stored receipt"

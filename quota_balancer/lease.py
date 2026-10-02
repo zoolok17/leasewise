@@ -101,6 +101,12 @@ _CONTEXT_KEYS = frozenset((
 # Closed enums (section 7): the context mode and its token source.
 _MODES = frozenset(("FRESH", "SUMMARY", "RESUME"))
 _SOURCES = frozenset(("tokenizer", "cli_observed", "conservative_bound"))
+# Card L1b: a wrapper that cannot know the context size says so instead of
+# inventing a mode or a number. The unknown form is a closed shape of its
+# own (mode UNKNOWN, source unknown, the three sizes null) and is granted to
+# shadow seats only.
+_MODE_UNKNOWN = "UNKNOWN"
+_SOURCE_UNKNOWN = "unknown"
 
 _SETTLE_KEYS = frozenset((
     "event_id", "lease_id", "outcome", "calls", "input_tokens",
@@ -216,13 +222,25 @@ def _validate_grant_request(request):
     context = request["context"]
     if not isinstance(context, dict) or set(context) != _CONTEXT_KEYS:
         _invalid()
-    if context["mode"] not in _MODES:
+    mode = context["mode"]
+    if not isinstance(mode, str):
         _invalid()
-    for key in ("initial_tokens", "dispatch_tokens",
-                "growth_tokens_per_call"):
-        policy._check_int(context[key])
-    if context["source"] not in _SOURCES:
-        _invalid()
+    if mode == _MODE_UNKNOWN:
+        # Never a mixture: every size null and the source "unknown".
+        if (context["source"] != _SOURCE_UNKNOWN
+                or any(context[key] is not None for key in (
+                    "initial_tokens", "dispatch_tokens",
+                    "growth_tokens_per_call"))):
+            _invalid()
+    else:
+        if mode not in _MODES:
+            _invalid()
+        for key in ("initial_tokens", "dispatch_tokens",
+                    "growth_tokens_per_call"):
+            policy._check_int(context[key])
+        if not isinstance(context["source"], str) \
+                or context["source"] not in _SOURCES:
+            _invalid()
     policy._check_int(context["observed_at"], 1)
     n = policy._check_int(request["expected_calls"], 1, policy.MAX_CALLS)
     m = policy._check_int(request["max_calls"], 1, policy.MAX_CALLS)
@@ -307,7 +325,7 @@ def _lease_dict(row, replayed=False):
         "enforcement": row["enforcement"],
         "money_hold": row["money_hold"],
         "caps": {
-            "expected_input": est["expected_input"],
+            "expected_input": est.get("expected_input"),
             "input_cap": row["input_cap"],
             "output_cap": row["output_cap"],
             "max_calls": row["max_calls"],
@@ -604,6 +622,15 @@ def _grant(conn, request, now_ms, wire_identity=None):
             conn.execute("COMMIT")
             return _lease_dict(row, replayed=True)
 
+        # An unknown context is a shadow-only request (card L1b): refused
+        # for every other derived enforcement, after the replay check and
+        # before the profile or any arithmetic. Shadow is never derived
+        # from anything but the seat's own operator setting.
+        unknown_context = request["context"]["mode"] == _MODE_UNKNOWN
+        if unknown_context and seat[3] != "shadow":
+            raise QuotaError(errors.CODE_CONTEXT_UNKNOWN,
+                             errors.MSG_CONTEXT_UNKNOWN)
+
         # The profile is the server-side policy for the task class
         # (section 6/7). It is read AFTER the replay check: a granted
         # lease is never changed (or lost) by a later profile edit.
@@ -656,14 +683,27 @@ def _grant(conn, request, now_ms, wire_identity=None):
             "policy_hash": model[10],
             "effort_aliases": model[11],
         }
-        est = policy.estimate(
-            context["initial_tokens"] + context["dispatch_tokens"],
-            request["expected_calls"], context["growth_tokens_per_call"],
-            request["output_cap"], request["max_calls"], model_dict,
-            margin_bps)
-        policy.check_per_call_output_cap(
-            model_dict, request["per_call_output_cap"])
-        input_cap, hold_sized = est["input_cap"], est["hold_sized"]
+        if unknown_context:
+            # Nothing is invented: the estimate says "unknown", and the
+            # stored input cap is the model's own honest upper bound, its
+            # context ceiling for every allowed call (the column is NOT
+            # NULL). No hold is sized (a shadow lease reserves no money).
+            if request["output_cap"] > request["max_calls"] * model[4]:
+                _invalid()
+            policy.check_per_call_output_cap(
+                model_dict, request["per_call_output_cap"])
+            est = {"context": "unknown"}
+            input_cap = model[3] * request["max_calls"]
+            hold_sized = None
+        else:
+            est = policy.estimate(
+                context["initial_tokens"] + context["dispatch_tokens"],
+                request["expected_calls"], context["growth_tokens_per_call"],
+                request["output_cap"], request["max_calls"], model_dict,
+                margin_bps)
+            policy.check_per_call_output_cap(
+                model_dict, request["per_call_output_cap"])
+            input_cap, hold_sized = est["input_cap"], est["hold_sized"]
 
         # Enforcement is derived, never requested: a metered seat grants
         # a sized hold only through a sized-ready gateway; otherwise the
@@ -785,6 +825,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
                      "max_calls": request["max_calls"],
                      "per_call_output_cap": request["per_call_output_cap"]},
             "period_start": period_start,
+            **({"input_cap_basis": "model_ceiling"} if unknown_context
+               else {}),
         }, sort_keys=True)
         conn.execute(
             "INSERT INTO leases(id, machine_id, seat_id, account_id, "
@@ -1150,6 +1192,10 @@ def _settle(conn, receipt, now_ms):
                 retained = min(stored_map["actual_micro_eur"],
                                lease["money_hold"])
                 released = lease["money_hold"] - retained
+            if lease["money_hold"] is None:
+                # No money was reserved: the money fields are null, not 0
+                # (section 7: "money fields null for subscription").
+                released = retained = None
             conn.execute("COMMIT")
             return {"state": lease["state"], "replayed": True,
                     "released_micro_eur": released,
@@ -1291,6 +1337,8 @@ def _settle(conn, receipt, now_ms):
                 "redacted_details) VALUES(?,?,?,?,?)",
                 ("coordinator", "lease_settled", receipt["lease_id"],
                  now_ms, json.dumps({"final": 1})))
+        if lease["money_hold"] is None:
+            released = retained = None   # nothing reserved (see the replay)
         conn.execute("COMMIT")
         return {"state": "settled" if receipt["final"] else lease["state"],
                 "released_micro_eur": released,

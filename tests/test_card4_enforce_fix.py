@@ -328,8 +328,10 @@ class Card4EnforceFixTest(unittest.TestCase):
         settled = lease.settle(
             db, _receipt(str(uuid.uuid4()), result["lease_id"], None), NOW)
         self.assertEqual(settled["state"], "settled")
-        self.assertEqual(settled["released_micro_eur"], 0)
-        self.assertEqual(settled["retained_micro_eur"], 0)
+        # Card L1b: a lease that reserved no money reports null money
+        # fields (design section 7), not 0/0.
+        self.assertIsNone(settled["released_micro_eur"])
+        self.assertIsNone(settled["retained_micro_eur"])
 
     # --- READ A MAJOR 6 -----------------------------------------------------------
 
