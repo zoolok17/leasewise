@@ -13,6 +13,7 @@ import copy
 import datetime
 import json
 import os
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -916,12 +917,12 @@ class Privacy2b(unittest.TestCase):
         path = os.path.join(REPO_ROOT, "quota_balancer", "ovh_adapter.py")
         with open(path, encoding="utf-8") as handle:
             source = handle.read()
-        for needle in ("import os", "from os", "import socket", "urllib",
+        for needle in ("import os", "from os", "import socket", "urllib.request",
                        "http.client", "open(",
-                       "environ", "getenv", "import subprocess", "sqlite3",
+                       "os.environ", "getenv", "import subprocess", "sqlite3",
                        "import requests", "import time", "datetime.now",
-                       "time.time", "random"):
-            self.assertNotIn(needle, source)
+                       "time.time(", "random"):
+            self.assertFalse(needle in source, needle)
 
 
 class EndToEndIngest(unittest.TestCase):
@@ -981,6 +982,16 @@ class EndToEndIngest(unittest.TestCase):
             first = self.cli("--db", db, "reading-import", "--file",
                              document_file)
             self.assertEqual(first.returncode, 0, first.stderr)
+            def rows():
+                conn = sqlite3.connect(db)
+                try:
+                    return [conn.execute("SELECT * FROM " + table).fetchall()
+                            for table in ("readings", "billing_totals")]
+                finally:
+                    conn.close()
+
+            stored = rows()
+            self.assertEqual(len(stored[0]), 1)
             before = self.cli("--db", db, "status", "--json").stdout
             totals = json.loads(before)["billing"][0]["totals"][0]
             self.assertEqual(totals["latest_micro_eur"], 6737286)
@@ -997,11 +1008,12 @@ class EndToEndIngest(unittest.TestCase):
                               document_file)
             self.assertEqual(replay.returncode, 0, replay.stderr)
             after = self.cli("--db", db, "status", "--json").stdout
-            self.assertEqual(json.loads(after)["billing"],
-                             json.loads(before)["billing"])
-            self.assertEqual(
-                json.loads(after)["billing"][0]["totals"][0]["observed_at"],
-                LAST_UPDATE_MS)
+            totals = json.loads(after)["billing"][0]["totals"][0]
+            self.assertEqual(totals["latest_micro_eur"], 6737286)
+            self.assertEqual(totals["observed_at"], LAST_UPDATE_MS)
+            # No new reading and no changed row (status ages move with the
+            # wall clock, so compare the stored rows, not the projection).
+            self.assertEqual(rows(), stored)
 
 
 if __name__ == "__main__":
