@@ -1188,6 +1188,45 @@ class FixRound1MalformedBaseUrl(unittest.TestCase):
             "https://api.example.invalid:8443/1.0/cloud/project/"))
 
 
+class FixRound2RetryAfterLeadingZeros(unittest.TestCase):
+    """Fix round 2 finding 5: magnitude is judged on the significant
+    digits, never on the string length."""
+
+    def after(self, header):
+        transport = FakeTransport(answer(429, b"{}", {"Retry-After": header}))
+        result = run(transport)
+        self.assertEqual(failure_of(result), "rate_limit")
+        return result["next_attempt_at"]
+
+    def test_zeros_mean_zero_seconds_and_never_stall_the_poll(self):
+        for header in ("0", "00", "0" * 19, "0" * 20, "0" * 5000):
+            self.assertEqual(self.after(header), NOW_MS + 900_000, header[:6])
+
+    def test_leading_zeros_do_not_change_the_value(self):
+        for header, seconds in (("0" * 20 + "1200", 1200),
+                                ("0" * 5000 + "1200", 1200),
+                                ("0001200", 1200), ("0" * 19 + "172800", 172800),
+                                ("0" * 40 + "86400", 86400)):
+            self.assertEqual(self.after(header), NOW_MS + seconds * 1000,
+                             header[-8:])
+
+    def test_genuine_overflow_still_clamps_and_the_edges_hold(self):
+        top = 2 ** 63 - 1
+        fits = (top - NOW_MS) // 1000
+        self.assertEqual(self.after(str(fits)), NOW_MS + fits * 1000)
+        self.assertEqual(self.after("0" * 30 + str(fits)), NOW_MS + fits * 1000)
+        for header in (str(fits + 1), "9" * 19, "9" * 40, "9" * 5000,
+                       "0" * 30 + "9" * 40, "1" + "0" * 5000):
+            self.assertEqual(self.after(header), top, header[:6])
+
+    def test_invalid_headers_are_still_ignored(self):
+        for header in ("", " ", "-0", "+0", "0.5", "0x0", "1_0", "soon"):
+            transport = FakeTransport(answer(429, b"{}",
+                                             {"Retry-After": header}))
+            self.assertEqual(run(transport)["next_attempt_at"],
+                             NOW_MS + 900_000, header)
+
+
 class EndToEndIngest(unittest.TestCase):
     """The adapter's document for the real capture goes through the
     existing reading-import path: accepted, then accepted again as a
