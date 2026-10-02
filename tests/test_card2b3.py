@@ -1173,6 +1173,32 @@ class FixRound1MalformedBaseUrl(unittest.TestCase):
         for base_url in cases:
             self.assert_static_and_clean(base_url, (self.SENTINEL,))
 
+    def test_a_callers_exception_is_suppressed_from_the_traceback(self):
+        # poll_once called while the caller handles its OWN exception: the
+        # static error then carries that exception as __context__, but
+        # `from None` marks it suppressed, so the formatted traceback does
+        # not show it (and the caller's message cannot leak through us).
+        import traceback
+        marker = "CALLER-OUTER-EXCEPTION-MARKER"
+        transport = FakeTransport(ok())
+        caught = None
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError:
+            try:
+                run(transport, base_url="https://host.invalid:99999999/1.0")
+            except QuotaError as exc:
+                caught = exc
+        self.assertIsNotNone(caught)
+        self.assertEqual(caught.code, CODE_INVALID_CONFIG)
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(caught.__cause__)
+        self.assertTrue(caught.__suppress_context__)
+        self.assertIsInstance(caught.__context__, RuntimeError)
+        shown = "".join(traceback.format_exception(caught))
+        self.assertNotIn(marker, shown)
+        self.assertNotIn("RuntimeError", shown)
+
     def test_well_formed_non_https_urls_still_fail_tls(self):
         for base in ("http://api.example.invalid/1.0", "ftp://x/1.0",
                      "HTTP://api.example.invalid/1.0"):
