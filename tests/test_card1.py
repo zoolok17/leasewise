@@ -513,7 +513,14 @@ class Card1ContractTests(_Base):
     def test_schema_version_rejected(self):
         run_cli("--db", self.db, "init")
         doc = copy.deepcopy(VALID_DOC)
+        # Version 2 now exists (card L1a: the policy tables), so a
+        # version-1-shaped document that claims 2 is a bad document, not an
+        # unsupported schema; the first unknown version is 3.
         doc["version"] = 2
+        bad = _import(self.db, self.tmp, doc)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stderr.strip(), ERROR_INVALID_CONFIG)
+        doc["version"] = 3
         bad = _import(self.db, self.tmp, doc)
         self.assertEqual(bad.returncode, 2)
         self.assertEqual(bad.stderr.strip(), ERROR_SCHEMA)
