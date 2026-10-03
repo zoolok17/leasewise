@@ -26,6 +26,9 @@ from .errors import QuotaError
 
 # --- the shared contract (section 7) --------------------------------------
 INT64_MAX = 2 ** 63 - 1
+# A usage total (settled money, open exposure) is an exact sum made safe for this pure rule: anything above the largest cap
+# arrives as USAGE_MAX, which is above every cap (card R1-M; `money.saturate`).
+USAGE_MAX = INT64_MAX + 1
 _ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -427,8 +430,8 @@ def check_admission(rows, metric, period, usage, new, window_key=None,
         pair = usage[key]
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             _invalid()
-        budget_settled = _check_int(pair[0])
-        budget_holds = _check_int(pair[1])
+        budget_settled = _check_int(pair[0], 0, USAGE_MAX)
+        budget_holds = _check_int(pair[1], 0, USAGE_MAX)
     if chain is not None:
         if not isinstance(chain, dict):
             _invalid()
@@ -452,8 +455,8 @@ def check_admission(rows, metric, period, usage, new, window_key=None,
         pair = usage[key]
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             _invalid()
-        settled = _check_int(pair[0])
-        holds = _check_int(pair[1])
+        settled = _check_int(pair[0], 0, USAGE_MAX)
+        holds = _check_int(pair[1], 0, USAGE_MAX)
         if settled + holds + new > hard:
             raise QuotaError(errors.CODE_POLICY_DENIED,
                              errors.MSG_POLICY_DENIED)
