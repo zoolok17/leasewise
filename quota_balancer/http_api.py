@@ -484,11 +484,10 @@ def _wire_to_reading(body, identity, conn):
     gateway_snapshot's payload is translated from the wire's `gateway_id`
     (a store UUID) to the internal `gateway` (an alias) - fix round 2
     finding N5; every other reading kind's payload already matches the
-    internal shape unchanged. `usage` is a documented section-7 kind no
-    card built has ever validated (no KIND_USAGE, no reduction rule
-    anywhere in validate_readings.py/store.py): still refused here, an
-    explicit, reported scope gap - implementing it is a new card-sized
-    dependency, not a wire-adapter fix.
+    internal shape unchanged. `usage` is a retired kind (lead decision
+    D-116: usage travels in /settle receipts, DESIGN.md section 7): it has
+    no validator and no reduction rule anywhere in
+    validate_readings.py/store.py, and it stays refused here.
 
     Fix round 3 (tk-f9018a7e573e) finding F5: a payload naming BOTH the
     wire's own `gateway_id` and the internal-only `gateway` key is
@@ -601,12 +600,10 @@ def handle_grant(db_path, identity, body, now_ms, idempotency_key):
         "lease_id", "state", "enforcement", "money_hold", "caps",
         "granted_at", "expires_at")}
     wire["lease_token"] = lease_token
-    # Not populated by the tested store surface (section 7 lists them in
-    # the /leases response; no card built so far computes them for a
-    # fresh grant). Emitted empty rather than fabricated - a residual gap,
-    # recorded in docs/STEP-CARD-5.md.
-    wire["windows"] = []
-    wire["warnings"] = []
+    # Card R1-1: the window records and the closed warnings come from the
+    # same read as the grant decision (a replay shows the current ones).
+    wire["windows"] = result["windows"]
+    wire["warnings"] = result["warnings"]
     status_code = 200 if result.get("replayed") else 201
     return status_code, wire
 

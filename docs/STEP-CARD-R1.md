@@ -85,3 +85,131 @@ named there but not defined fails by name). After: all pass.
 ### Limits
 
 Defining a word does not use it: until R1-1 and Phase 2 emit them, a caller can never see any of the new words.
+
+## Step R1-1: honest window checks and warn mode
+
+Work item `card-r1-1`, branch `card-r1-1`, from main `363c87e` (R1-0 merged). Spec: DESIGN-R1.md **section 12.2**
+(which replaces 5.1, 5.2, 11.4 and the O-R1-5 ruling) and 12.1. Commit 1 of two.
+
+### In plain words
+
+A grant used to look only at the last usage number of a window. It now decides from everything it knows: the number,
+how old it is, whether the window has reset since, and whether it is known at all. A window known to be used up
+refuses. An old or never-seen window is allowed with a warning. A window the source says it does not know refuses an
+admission seat and only warns a warn-mode seat. The answer shows the warnings and the window facts.
+
+### The table (12.2) and the tests that pin each cell
+
+Module `tests/test_cardr1_windows.py`; each cell runs in both modes unless it differs.
+
+| Window evidence | Admission | Warn | Test |
+| --- | --- | --- | --- |
+| known, current, below | admit | admit | `TheTable.test_known_current_and_below_the_ceiling_is_admitted_without_a_warning` |
+| known, at or above (equality, above, 100%) | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_known_at_the_ceiling_refuses_and_so_does_known_above_it` |
+| known, at or above, old | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_known_at_the_ceiling_refuses_even_when_the_reading_is_old` |
+| exhausted, reset time passed, no new observation | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_exhaustion_is_not_forgotten_after_the_reset_time_passes` |
+| known, below, not current | `METER_STALE` warning | same | `test_known_below_the_ceiling_but_old_is_admitted_with_a_stale_warning` |
+| explicit unknown (NULL) | `WINDOW_LIMIT` | `WINDOW_LIMIT` warning | `test_an_explicit_unknown_refuses_an_admission_seat_and_warns_a_warn_seat` |
+| never observed (no row) | `METER_STALE` warning, `confidence: missing` | same | `test_a_window_never_observed_is_admitted_with_a_stale_warning_and_is_never_an_observed_zero` |
+| shadow request | never refused | | `test_a_shadow_request_is_never_refused_by_a_window` |
+| metered or metered-advisory lease | like admission mode | | `test_a_metered_advisory_lease_follows_the_admission_rules` |
+
+Freshness (`Freshness`): `test_600_seconds_is_current_and_600_seconds_and_a_millisecond_is_not`,
+`test_a_recent_sample_whose_reset_has_passed_is_not_current`,
+`test_a_sample_taken_after_the_reset_is_current_even_though_the_reset_time_has_passed`,
+`test_an_observation_up_to_30_seconds_in_the_future_counts_as_age_zero`,
+`test_an_observation_further_in_the_future_is_not_trusted_as_current`.
+Refusals in both modes (`Refusals`): `test_a_parked_block_refuses_in_both_modes`,
+`test_the_concurrency_limit_refuses_in_both_modes`.
+Annotations (`Annotations`): one record and one warning per window with two limits, the tightest ceiling decides,
+several windows by key, closed record keys and no source identity (privacy), empty lists without a window limit, only
+the two closed codes. Replay (`Replay`): current annotations, grant untouched, never refused, shadow empty.
+
+### What changed, and what a reader may notice
+
+- **Inclusive comparison (F5).** `used_bps >= ceiling` refuses. The old generic check admitted a reading exactly at the
+  limit; that changed on purpose.
+- **Freshness** is `reduce.window_current`: the observation time (the table holds nothing else), 600 s, a reset passed
+  with no newer observation, 30 s of future slop counting as age 0.
+- **The answer** (`lease.grant`, and `http_api.handle_grant` on the wire) carries `warnings` and `windows`, built from
+  the same read as the decision. They were always empty before.
+- **Shadow** requests used to be run through the window check like everything else; they are now never refused by it.
+  No existing test relied on the old behaviour.
+- **One earlier test changed:** `test_cardr1_codes.test_nothing_in_the_product_emits_a_new_word_yet` now allows
+  `METER_STALE` in `lease.py` as a warning and checks that it is never raised as a refusal.
+- **Comment fix (M-010 nit):** the `http_api.py` note on `usage` now says the kind is retired (D-116) and stays refused.
+- **A window limit can apply to a metered or metered-advisory lease** (limits are by scope, not by seat kind). Such a
+  lease is treated like admission mode, as the brief said.
+
+### Limits (12.2, F7)
+
+- Admitting an old or never-observed reading below the ceiling is an **availability exception**. It does not bound
+  what other consumers used since the reading; the ceiling is not a safety margin for that.
+- A window known at or above its ceiling, or explicitly unknown, can lock an admission seat out until a fresh
+  observation arrives. Nothing clears it on a timer. The recovery probe is the planned way to get one.
+- The 600-second wall cap is the only freshness rule; the idle-seat allowance needs turn tracking that is not built.
+
+## Step R1-2: the month-end clamp, the advisory budget and the enforcement proof
+
+Same work item and branch (`card-r1-1`, commit 2 of two). Spec: DESIGN-R1.md **section 12.3** (which replaces 6.1 and
+6.2), 6.3 and 11.6.
+
+### In plain words
+
+A paid lease can no longer outlive its month, an advisory paid lease is refused once the account's known spend has
+reached its cap, and a test proves again that paid enforcement is impossible today.
+
+### What changed
+
+- **m3, the clamp** (`lease._next_month_start_ms`, in `_grant`, before the lease is stored): for a lease with a gateway
+  that is not shadow, `expires_at = min(now + ttl, start of the next UTC month)`. A replay returns the stored value;
+  expiry releases nothing; a late final is accepted in the original month.
+- **m7, the advisory budget** (`lease._advisory_budget_check`): a `metered_advisory` lease is refused `MONEY_LIMIT` when
+  the account's known final receipt money for the month is **at or above** the cap (inclusive, F5). Final receipts only;
+  a NULL money value counts as nothing; holds are not counted; no money limit row is needed. It runs after the replay
+  lookup and before the admission groups, so before the input group: `INPUT_USAGE_UNKNOWN` is unchanged below the cap.
+
+### Tests (`tests/test_cardr1_expiry.py`)
+
+| Requirement | Test |
+| --- | --- |
+| a grant at exact midnight UTC | `Clamp.test_a_grant_at_exact_midnight_utc_is_not_clamped_and_belongs_to_the_new_month` |
+| a grant in the last millisecond of a month | `Clamp.test_a_grant_in_the_last_millisecond_of_a_month_expires_at_the_rollover` |
+| near the rollover; before it; exactly at it; December into January | `test_a_grant_a_few_minutes_before_the_rollover_is_clamped_to_it`, `test_a_grant_whose_deadline_is_before_the_rollover_is_not_changed`, `test_december_rolls_into_the_next_year` |
+| a replay on both sides of the rollover | `test_a_replay_on_either_side_of_the_rollover_returns_the_stored_deadline` |
+| a late final after the rollover | `test_a_late_final_after_the_rollover_is_accepted_and_keeps_its_original_month` |
+| expiry releases nothing | `test_expiry_at_the_rollover_does_not_release_anything_by_itself` |
+| a shadow request carrying a gateway is not clamped | `test_a_shadow_request_carrying_a_gateway_is_not_clamped` |
+| subscription leases unchanged | `test_a_subscription_lease_has_no_gateway_and_is_not_clamped` |
+| m7 at cap - 1, cap, cap + 1 | `AdvisoryBudget.test_at_cap_minus_one_the_grant_is_admitted_at_the_cap_and_above_it_refused` |
+| no money limit rows | `test_it_needs_no_money_limit_row` |
+| legacy active holds present | `test_holds_of_legacy_enforcing_leases_are_not_counted` |
+| known and null-money advisory finals | `test_a_final_with_unknown_money_counts_as_nothing_and_a_known_one_counts` |
+| m7 against `INPUT_USAGE_UNKNOWN` | `test_money_limit_comes_before_the_unknown_input_wait_and_the_wait_is_unchanged_below_the_cap` |
+| replay never refused by m7; the month's own budget | `test_a_replay_of_an_earlier_grant_is_not_refused_when_the_cap_is_reached_later`, `test_the_budget_is_the_months_own` |
+| the enforcement proof (11.6) | `EnforcementProof.test_a_metered_seat_on_a_ready_gateway_is_granted_advisory_with_no_hold_and_no_token`; earlier: `test_cardl1a.R003MeteredNeverEnforcing.test_sized_ready_snapshot_leaves_a_metered_seat_advisory` and `.test_http_grant_has_no_token_and_cannot_check` |
+| N5, N3, m4 (6.3) | `Closures.test_n5_...`, `N3.test_an_overrun_turns_a_probing_block_parked`, `Closures.test_m4_...` |
+
+N5 (a replay after the project loses the account), N3 (an overrun re-parks a probing block) and m4 (a subscription seat
+on a paid account) are **no longer open**: they were closed by cards L1d, L1a and 5, and these tests keep them pinned.
+
+### Fix round 1: the total cannot overflow
+
+Codex found one corner: the advisory budget check added up the known spend with the database's own `SUM`, and each
+amount may be as large as the largest whole number the database keeps, so the total could overflow and answer
+`STORE_ERROR` (503, "the store failed") instead of `MONEY_LIMIT` (429, "the budget is used up"). The lease was stopped
+either way, so no money leaked, but the answer was wrong. The check now reads the known final amounts and adds them as
+whole Python numbers, stopping as soon as the total reaches the cap; nothing else about it changed. Tests:
+`AdvisoryBudget.test_a_total_larger_than_the_database_can_add_is_still_money_limit_never_store_error` (budget
+`2**63-1`; two leases granted before either settles; finals of `2**63-1` and `1`; the next grant is `MONEY_LIMIT`;
+red before the fix) and `test_a_large_history_stops_adding_as_soon_as_the_cap_is_reached`.
+Older accounting queries elsewhere in `lease.py` still use SQLite `SUM`. An overflow there fails closed with
+`STORE_ERROR`; this round does not change them.
+
+### Limits and claims (12.6)
+
+After R1 Phase 1: window checks are explicit about missing, stale and unknown evidence and a window known to be used up
+blocks; advisory paid leases stop when known spend has reached the cap; paid enforcement is impossible and a test proves
+it. **Not claimed:** that admission uses the gateway's money figures or the billing check, that stale readings bound
+anyone's use, or that money accounting is complete (a null-money final counts as nothing). Phase 2 (R1-3 onward, with
+gateway evidence) and enforcement (card 6b) are later.

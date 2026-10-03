@@ -424,6 +424,102 @@ of the input column today, and it treats unknown as a reason to wait, not as zer
 **Limit.** The gateway side that produces such receipts is not built yet (card 6a); today only a test
 or an operator can send one.
 
+## Card R1 - honest window checks, the expiry clamp and the advisory budget
+
+**Status: R1-1 and R1-2 built.** Leasewise's grant now says what it knows and what
+it does not about a usage window, and a seat in warn mode is told instead of refused where the evidence is only old
+or missing. Audience: the operator of a Leasewise store. Paid enforcement stays impossible (see the limits).
+
+### R1-1: what a grant does with a usage window
+
+A window limit says "stop above N% of this usage window". The grant used to look only at the last number. It now
+looks at everything it has: the number, how old the observation is, whether the window has reset since, and whether
+the number is known at all.
+
+| What Leasewise knows about the window | Admission seat (`subscription_admission`) | Warn seat (`subscription_warn`) |
+| --- | --- | --- |
+| a known number, recent, below the limit | admitted | admitted |
+| a known number **at or above** the limit (old or recent) | refused: `WINDOW_LIMIT` | refused: `WINDOW_LIMIT` |
+| a known number below the limit, but **old** (see below) | admitted, with a `METER_STALE` warning | the same |
+| **explicitly unknown** (the source said it does not know) | refused: `WINDOW_LIMIT` | admitted, with a `WINDOW_LIMIT` warning |
+| **never observed** (no record at all) | admitted, with a `METER_STALE` warning | the same |
+
+- **At the limit is over the limit.** The check is inclusive. Before this step a reading exactly at the limit was let
+  through; that changed on purpose.
+- **Old** means the observation is more than 600 seconds old, or the window's reset time has passed and nothing has
+  been observed since. An observation up to 30 seconds in the future (clock difference) counts as brand new. Age is
+  measured from when the source observed it, never from when it arrived.
+- **A window that was never observed is not "0%".** Its record says `confidence: missing`.
+- A metered or advisory lease on a paid account is treated like an admission seat. A shadow request (observe only)
+  is never refused by a window. A concurrency limit and a parked account (a provider usage limit) refuse in both
+  modes.
+
+**What the answer shows.** The grant answer carries two lists. `warnings` has entries `{code, window_key}` with only
+the codes `WINDOW_LIMIT` and `METER_STALE`, each once. `windows` has one record per window the lease is limited by:
+`window_key`, `used_bps`, `resets_at`, `confidence` (`observed`, `unknown` or `missing`), `source_stale`, `age_ms` and
+`current`. Neither list names where a reading came from, and neither carries any raw text. Both come from the same read
+as the decision.
+
+**A replay.** Asking again for the same grant returns the same lease with the *current* lists. It never runs the
+admission again, never changes the stored lease, and never refuses because the window changed since.
+
+**Limits of this step (please read).**
+
+- Admitting an old or never-observed reading below the limit is an **availability exception**, not a safety margin. It
+  says nothing about what other users consumed since the reading was taken.
+- A window known to be used up, or explicitly unknown, can keep an admission seat locked out **until a fresh
+  observation arrives**. Nothing clears it by timer; only a new observation does. The recovery probe (a later card) is
+  the planned way to get one.
+- The freshness rule uses the 600-second cap only. The longer allowance for an idle seat needs turn tracking that is
+  not built.
+
+### Technical detail
+
+`lease._admit_window` decides each window group from one read of the `windows` row (`_window_record`); `_window_verdict`
+holds the table; `reduce.window_current` is the freshness rule. `lease.grant` returns `windows` and `warnings`, and
+`http_api.handle_grant` puts them on the wire. A replay builds them with `_annotations` from the stored policy snapshot's
+scope chain. Tests: `tests/test_cardr1_windows.py`.
+
+### R1-2: the month boundary and the advisory budget
+
+**A paid lease never crosses into the next month.** A lease on a gateway (a paid lease) that is not observe-only now
+gets a deadline of at most the start of the next UTC month: `min(grant time + time to live, start of next month)`. A
+lease granted at 23:50 on the last day of a month therefore ends at midnight. This only matters in the last day of a
+month (a lease lives at most 24 hours). Asking again for the same grant returns the stored deadline. Expiry releases
+nothing by itself, and a final receipt that arrives after the rollover is still accepted and belongs to the month the
+lease was granted in. Subscription leases and observe-only (shadow) requests are not changed, even when a shadow
+request names a gateway.
+
+**An advisory paid lease stops when the account's known spend has reached its cap.** An advisory lease reserves no
+money, so the account budget never saw it. Now a new `metered_advisory` grant is refused `MONEY_LIMIT` when the final
+receipts already received for this account in the current month add up to **at or above** its monthly budget.
+
+- Only final receipts with a **known** cost count. A receipt whose cost is unknown counts as nothing, so this rule
+  stops work on known spend only; it does not claim complete accounting.
+- Reservations of older enforcing leases are not added.
+- No money limit row is needed: the account's own budget is the cap.
+- It runs after the "same grant again" lookup (a replay is never refused for it) and before the unknown-input wait, so a
+  full budget is reported as `MONEY_LIMIT`, and the unknown-input wait is unchanged below the cap.
+
+**Paid enforcement is still impossible.** While `METERED_ENFORCEMENT_ACTIVATED` is false, a grant for a metered seat on
+a ready gateway is always `metered_advisory`: no money hold, no holds rows and no lease token. Tests:
+`tests/test_cardr1_expiry.py` (`EnforcementProof`) and, from earlier cards, `test_cardl1a.R003MeteredNeverEnforcing`.
+
+**What this card still does not claim.** After R1 Phase 1, Leasewise's window checks are explicit about missing, stale
+and unknown evidence, and a window known to be used up blocks. Advisory paid leases stop when known spend has reached
+the cap. It does **not** claim that admission uses the gateway's money figures or the billing check, that old readings
+bound anyone's use, or that money accounting is complete. Enforcement stays off until card 6b.
+
+Three older notes are closed and pinned by tests, not open: a replay still returns its lease after the project loses
+the account (N5), an overrun turns a probing block back to parked (N3), and a subscription seat on a paid account is
+refused (m4).
+
+### Technical detail (R1-2)
+
+`lease._next_month_start_ms` and the clamp sit just before the lease row is written; `lease._advisory_budget_check`
+runs right before the admission groups, only for `metered_advisory` on an account with a budget. Tests:
+`tests/test_cardr1_expiry.py`.
+
 ## Card 7a-2 - the reporter core
 
 `quota_balancer/reporter/` is the part of the observe-only reporter that decides
