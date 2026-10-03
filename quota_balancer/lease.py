@@ -191,6 +191,15 @@ def _month_start_ms(now_ms):
     return int(first_day.timestamp()) * 1000
 
 
+def _next_month_start_ms(now_ms):
+    """The first millisecond of the UTC month after `now_ms` (the period boundary a paid lease is clamped to)."""
+    first = datetime.datetime.fromtimestamp(now_ms // 1000, tz=datetime.timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0)
+    following = (first.replace(year=first.year + 1, month=1) if first.month == 12
+                 else first.replace(month=first.month + 1))
+    return int(following.timestamp()) * 1000
+
+
 def _period_start_for(period, now_ms):
     # The month/day bucket a hold settles against; a turn-period limit is
     # per-request, so its bucket is this grant itself (stored usage for
@@ -545,6 +554,19 @@ def _annotations(conn, chain, account_id, enforcement, now_ms):
         if code is not None:
             warnings.append({"code": code, "window_key": window_key})
     return windows, warnings
+
+
+def _advisory_budget_check(conn, account_id, budget, now_ms):
+    """m7 (card R1-2): an advisory lease holds nothing, so the account budget never saw it. It is refused
+    MONEY_LIMIT once the account's KNOWN final receipt money for this month has reached the cap (inclusive).
+    Only final receipts with a known `actual_micro_eur` count (the SUM skips an unknown one); holds are not
+    added; a shadow lease never counts. This stops work on known spend only and claims no complete accounting."""
+    spent = conn.execute(
+        "SELECT COALESCE(SUM(r.actual_micro_eur),0) FROM receipts r JOIN leases l ON l.id=r.lease_id "
+        "WHERE r.final=1 AND l.enforcement <> 'shadow' AND l.period_start=? AND l.account_id=?",
+        (_month_start_ms(now_ms), account_id)).fetchone()[0]
+    if spent >= budget:
+        raise QuotaError(errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT)
 
 
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
@@ -944,6 +966,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
         if metered and budget is not None:
             groups.setdefault(("money_micro_eur", "month", None), [])
         concurrency_new = 0 if enforcement == "shadow" else 1
+        if enforcement == "metered_advisory" and budget is not None:
+            _advisory_budget_check(conn, account_id, budget, now_ms)
         windows, warnings = [], []
         for key in sorted(groups, key=lambda k: (
                 _METRIC_RANK[k[0]], _PERIOD_RANK[k[1]], k[2] or "")):
@@ -976,6 +1000,10 @@ def _grant(conn, request, now_ms, wire_identity=None):
         expires_at = now_ms + request["ttl_ms"]
         if expires_at > policy.INT64_MAX:
             _invalid()
+        if request["gateway_id"] is not None and enforcement != "shadow":
+            # m3 (card R1-2): a paid lease never lives into the next UTC month, where its holds and its
+            # period no longer match. A late final is still accepted and keeps its original month.
+            expires_at = min(expires_at, _next_month_start_ms(now_ms))
         policy_snapshot = json.dumps({
             "policy_hash": model[10],
             "reservation_mode": model[9],

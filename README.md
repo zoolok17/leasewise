@@ -426,7 +426,7 @@ or an operator can send one.
 
 ## Card R1 - honest window checks, the expiry clamp and the advisory budget
 
-**Status: R1-1 built.** (R1-2 is added below when it lands.) Leasewise's grant now says what it knows and what
+**Status: R1-1 and R1-2 built.** Leasewise's grant now says what it knows and what
 it does not about a usage window, and a seat in warn mode is told instead of refused where the evidence is only old
 or missing. Audience: the operator of a Leasewise store. Paid enforcement stays impossible (see the limits).
 
@@ -479,6 +479,46 @@ admission again, never changes the stored lease, and never refuses because the w
 holds the table; `reduce.window_current` is the freshness rule. `lease.grant` returns `windows` and `warnings`, and
 `http_api.handle_grant` puts them on the wire. A replay builds them with `_annotations` from the stored policy snapshot's
 scope chain. Tests: `tests/test_cardr1_windows.py`.
+
+### R1-2: the month boundary and the advisory budget
+
+**A paid lease never crosses into the next month.** A lease on a gateway (a paid lease) that is not observe-only now
+gets a deadline of at most the start of the next UTC month: `min(grant time + time to live, start of next month)`. A
+lease granted at 23:50 on the last day of a month therefore ends at midnight. This only matters in the last day of a
+month (a lease lives at most 24 hours). Asking again for the same grant returns the stored deadline. Expiry releases
+nothing by itself, and a final receipt that arrives after the rollover is still accepted and belongs to the month the
+lease was granted in. Subscription leases and observe-only (shadow) requests are not changed, even when a shadow
+request names a gateway.
+
+**An advisory paid lease stops when the account's known spend has reached its cap.** An advisory lease reserves no
+money, so the account budget never saw it. Now a new `metered_advisory` grant is refused `MONEY_LIMIT` when the final
+receipts already received for this account in the current month add up to **at or above** its monthly budget.
+
+- Only final receipts with a **known** cost count. A receipt whose cost is unknown counts as nothing, so this rule
+  stops work on known spend only; it does not claim complete accounting.
+- Reservations of older enforcing leases are not added.
+- No money limit row is needed: the account's own budget is the cap.
+- It runs after the "same grant again" lookup (a replay is never refused for it) and before the unknown-input wait, so a
+  full budget is reported as `MONEY_LIMIT`, and the unknown-input wait is unchanged below the cap.
+
+**Paid enforcement is still impossible.** While `METERED_ENFORCEMENT_ACTIVATED` is false, a grant for a metered seat on
+a ready gateway is always `metered_advisory`: no money hold, no holds rows and no lease token. Tests:
+`tests/test_cardr1_expiry.py` (`EnforcementProof`) and, from earlier cards, `test_cardl1a.R003MeteredNeverEnforcing`.
+
+**What this card still does not claim.** After R1 Phase 1, Leasewise's window checks are explicit about missing, stale
+and unknown evidence, and a window known to be used up blocks. Advisory paid leases stop when known spend has reached
+the cap. It does **not** claim that admission uses the gateway's money figures or the billing check, that old readings
+bound anyone's use, or that money accounting is complete. Enforcement stays off until card 6b.
+
+Three older notes are closed and pinned by tests, not open: a replay still returns its lease after the project loses
+the account (N5), an overrun turns a probing block back to parked (N3), and a subscription seat on a paid account is
+refused (m4).
+
+### Technical detail (R1-2)
+
+`lease._next_month_start_ms` and the clamp sit just before the lease row is written; `lease._advisory_budget_check`
+runs right before the admission groups, only for `metered_advisory` on an account with a budget. Tests:
+`tests/test_cardr1_expiry.py`.
 
 ## Card 7a-2 - the reporter core
 

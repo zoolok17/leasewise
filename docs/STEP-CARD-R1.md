@@ -148,3 +148,55 @@ the two closed codes. Replay (`Replay`): current annotations, grant untouched, n
 - A window known at or above its ceiling, or explicitly unknown, can lock an admission seat out until a fresh
   observation arrives. Nothing clears it on a timer. The recovery probe is the planned way to get one.
 - The 600-second wall cap is the only freshness rule; the idle-seat allowance needs turn tracking that is not built.
+
+## Step R1-2: the month-end clamp, the advisory budget and the enforcement proof
+
+Same work item and branch (`card-r1-1`, commit 2 of two). Spec: DESIGN-R1.md **section 12.3** (which replaces 6.1 and
+6.2), 6.3 and 11.6.
+
+### In plain words
+
+A paid lease can no longer outlive its month, an advisory paid lease is refused once the account's known spend has
+reached its cap, and a test proves again that paid enforcement is impossible today.
+
+### What changed
+
+- **m3, the clamp** (`lease._next_month_start_ms`, in `_grant`, before the lease is stored): for a lease with a gateway
+  that is not shadow, `expires_at = min(now + ttl, start of the next UTC month)`. A replay returns the stored value;
+  expiry releases nothing; a late final is accepted in the original month.
+- **m7, the advisory budget** (`lease._advisory_budget_check`): a `metered_advisory` lease is refused `MONEY_LIMIT` when
+  the account's known final receipt money for the month is **at or above** the cap (inclusive, F5). Final receipts only;
+  a NULL money value counts as nothing; holds are not counted; no money limit row is needed. It runs after the replay
+  lookup and before the admission groups, so before the input group: `INPUT_USAGE_UNKNOWN` is unchanged below the cap.
+
+### Tests (`tests/test_cardr1_expiry.py`)
+
+| Requirement | Test |
+| --- | --- |
+| a grant at exact midnight UTC | `Clamp.test_a_grant_at_exact_midnight_utc_is_not_clamped_and_belongs_to_the_new_month` |
+| a grant in the last millisecond of a month | `Clamp.test_a_grant_in_the_last_millisecond_of_a_month_expires_at_the_rollover` |
+| near the rollover; before it; exactly at it; December into January | `test_a_grant_a_few_minutes_before_the_rollover_is_clamped_to_it`, `test_a_grant_whose_deadline_is_before_the_rollover_is_not_changed`, `test_december_rolls_into_the_next_year` |
+| a replay on both sides of the rollover | `test_a_replay_on_either_side_of_the_rollover_returns_the_stored_deadline` |
+| a late final after the rollover | `test_a_late_final_after_the_rollover_is_accepted_and_keeps_its_original_month` |
+| expiry releases nothing | `test_expiry_at_the_rollover_does_not_release_anything_by_itself` |
+| a shadow request carrying a gateway is not clamped | `test_a_shadow_request_carrying_a_gateway_is_not_clamped` |
+| subscription leases unchanged | `test_a_subscription_lease_has_no_gateway_and_is_not_clamped` |
+| m7 at cap - 1, cap, cap + 1 | `AdvisoryBudget.test_at_cap_minus_one_the_grant_is_admitted_at_the_cap_and_above_it_refused` |
+| no money limit rows | `test_it_needs_no_money_limit_row` |
+| legacy active holds present | `test_holds_of_legacy_enforcing_leases_are_not_counted` |
+| known and null-money advisory finals | `test_a_final_with_unknown_money_counts_as_nothing_and_a_known_one_counts` |
+| m7 against `INPUT_USAGE_UNKNOWN` | `test_money_limit_comes_before_the_unknown_input_wait_and_the_wait_is_unchanged_below_the_cap` |
+| replay never refused by m7; the month's own budget | `test_a_replay_of_an_earlier_grant_is_not_refused_when_the_cap_is_reached_later`, `test_the_budget_is_the_months_own` |
+| the enforcement proof (11.6) | `EnforcementProof.test_a_metered_seat_on_a_ready_gateway_is_granted_advisory_with_no_hold_and_no_token`; earlier: `test_cardl1a.R003MeteredNeverEnforcing.test_sized_ready_snapshot_leaves_a_metered_seat_advisory` and `.test_http_grant_has_no_token_and_cannot_check` |
+| N5, N3, m4 (6.3) | `Closures.test_n5_...`, `N3.test_an_overrun_turns_a_probing_block_parked`, `Closures.test_m4_...` |
+
+N5 (a replay after the project loses the account), N3 (an overrun re-parks a probing block) and m4 (a subscription seat
+on a paid account) are **no longer open**: they were closed by cards L1d, L1a and 5, and these tests keep them pinned.
+
+### Limits and claims (12.6)
+
+After R1 Phase 1: window checks are explicit about missing, stale and unknown evidence and a window known to be used up
+blocks; advisory paid leases stop when known spend has reached the cap; paid enforcement is impossible and a test proves
+it. **Not claimed:** that admission uses the gateway's money figures or the billing check, that stale readings bound
+anyone's use, or that money accounting is complete (a null-money final counts as nothing). Phase 2 (R1-3 onward, with
+gateway evidence) and enforcement (card 6b) are later.
