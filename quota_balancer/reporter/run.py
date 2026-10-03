@@ -23,6 +23,14 @@ CREDENTIAL = "credential"           # a 401: the identity must be fixed
 MAX_SLEEP_SECONDS = 900
 
 
+def _worse(current, new):
+    """The higher-ranked of two cycle outcomes: credential, then unreachable, then None. A login
+    problem an operator must fix is never hidden by a later "the server is down"."""
+    if CREDENTIAL in (current, new):
+        return CREDENTIAL
+    return UNREACHABLE if UNREACHABLE in (current, new) else None
+
+
 def _now_ms():
     return int(time.time() * 1000)
 
@@ -126,7 +134,9 @@ class Reporter:
         belong to no seat and no message, so nothing a lease answers (a retry, a 429 from a parked
         account, a refusal) may delay one; and the limit route can fail on its own while leases
         work, so a limit retry does not stop the lease pass either. Each pass stops on its own
-        wall; `result.blocked` says if either met one."""
+        wall. `result.blocked` combines the two outcomes by RANK, so the summary never depends on which
+        pass ran last: a credential refusal (401) from either pass shows as CREDENTIAL, above
+        UNREACHABLE (no answer, 5xx, 429), above nothing."""
         self._send_pass(result, self.state.next_limit_item)
         self._send_pass(result, self.state.next_item)
 
@@ -148,10 +158,12 @@ class Reporter:
             if decision.action == decisions.DONE:
                 result.sent += 1
             elif decision.action == decisions.RETRY:
-                # Leasewise is not answering, or refuses the identity: every
-                # other request would meet the same wall. Stop this cycle.
-                result.blocked = CREDENTIAL if answer.status == 401 \
-                    else UNREACHABLE
+                # Leasewise is not answering, or refuses the identity: every other request of
+                # THIS pass would meet the same wall, so this pass stops (the other pass still
+                # runs). The summary keeps the worse of the two outcomes: credential above
+                # unreachable.
+                result.blocked = _worse(result.blocked, CREDENTIAL if answer.status == 401
+                                        else UNREACHABLE)
                 return False
         return False
 
