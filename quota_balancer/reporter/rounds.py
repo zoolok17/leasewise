@@ -17,6 +17,10 @@ from . import events as ev
 from . import mapper
 
 INF = float("inf")
+# D3c: `message_at` is the SENDING machine's clock, which can disagree with
+# the machine that writes the journal. A message whose time is earlier than
+# the successor's start plus this allowance may have reached the dead stream.
+CLOCK_SKEW_ALLOWANCE_SECONDS = 600
 MAX_REPORTS_PER_MESSAGE = 50
 
 REASON_OK = "ok"
@@ -407,7 +411,8 @@ def _assess(message, streams, ordered, clock_regions, gaps_by_stream):
             if stream.closed or stream.name == message["disposal_stream"] \
                     or stream.start >= disposed:
                 continue
-            if stream.succ_start != INF and low < stream.succ_start:
+            if stream.succ_start != INF and low < (
+                    stream.succ_start + CLOCK_SKEW_ALLOWANCE_SECONDS * 1000):
                 reasons.add("unclean_predecessor")
     return [r for r in REASONS if r in reasons]
 

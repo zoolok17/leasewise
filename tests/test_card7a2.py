@@ -24,8 +24,8 @@ from quota_balancer.reporter.mapper import AgentConfig
 from quota_balancer.reporter.rounds import run_round
 from quota_balancer.reporter.state import State, StateOwned
 
-from tests.journal_fixture import (MODEL, SEAT, T0, USAGE, Journal, iso,
-                                   line)
+from tests.journal_fixture import (MODEL, RAW_NULLS, SEAT, T0, USAGE, Journal,
+                                   iso, line)
 
 CFG = AgentConfig("alpha", SEAT, MODEL, "bounded_read", "opus", 1, 2, 1000,
                   500, 1_800_000)
@@ -103,6 +103,7 @@ def _event_obj(**over):
            "stream": "alpha.g1", "at": iso(T0), "agent": "alpha",
            "dropped_total": 0, "seq": 1, "message_id": "m1",
            "disposition": "completed", "message_at": iso(T0 - 1000)}
+    obj.update(RAW_NULLS)
     obj.update(over)
     return obj
 
@@ -127,6 +128,27 @@ class SchemaMirror(_Base):
     def test_an_unknown_schema_version_is_refused(self):
         with self.assertRaises(events.UnsupportedVersion):
             self.parse(v=2)
+
+    def test_the_five_raw_gate_fields_are_true_false_or_null(self):
+        for name in sorted(events.RAW_GATE_FIELDS):
+            for value in (True, False, None):
+                self.assertEqual(self.parse(**{name: value})[name], value)
+            for bad in (1, 0, "true", [], {}):
+                with self.assertRaises(events.JournalError, msg=name):
+                    self.parse(**{name: bad})
+            obj = _event_obj()
+            del obj[name]
+            with self.assertRaises(events.JournalError):
+                events.parse_event(line(obj).rstrip(b"\n"))
+
+    def test_raw_gate_fields_do_not_change_a_final(self):
+        s = self.journal.add_stream("g1", T0)
+        s.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        s.disposed("m1", "completed", T0 + 3000, message_at=T0 + 1000,
+                   consumed=True, landed=False, compliance_success=True,
+                   dead_lettered=True, terminal_failure=True)
+        self.round()
+        self.assertEqual(self.final("m1")["body"]["outcome"], "completed")
 
     def test_stream_records_carry_no_seq(self):
         header = {"v": 1, "kind": "stream_started",
@@ -424,14 +446,33 @@ class CompletenessD3(_Base):
         self.assertIsNone(final["body"]["input_tokens"])
         self.assertEqual(final["body"]["calls"], 1)
 
-    def test_a_message_that_arrived_after_the_successor_stays_complete(self):
+    def unclean_pair(self, arrive):
         g1 = self.journal.add_stream("g1", T0)
         g1.dispatch("other", "t-o", T0 + 1000, message_at=T0 + 500)
         g2 = self.journal.add_stream("g2", T0 + 100_000, previous="g1")
-        message(g2, "m1", T0 + 105_000, T0 + 110_000, T0 + 120_000)
+        message(g2, "m1", arrive, T0 + 2_000_000, T0 + 2_100_000)
         self.round()
+
+    def test_a_message_that_arrived_long_after_the_successor_stays_complete(
+            self):
+        self.unclean_pair(T0 + 100_000 + 700_000)
         self.assertEqual(self.status("m1")[:2], (1, "ok"))
         self.assertEqual(self.final("m1")["body"]["input_tokens"], 170)
+
+    def test_the_clock_skew_margin_has_two_sides(self):
+        edge = T0 + 100_000 + rounds.CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
+        self.assertEqual(rounds.CLOCK_SKEW_ALLOWANCE_SECONDS, 600)
+        self.unclean_pair(edge - 1)               # just inside the margin
+        self.assertIn("unclean_predecessor", self.status("m1")[2].split(","))
+
+    def test_a_message_exactly_at_the_margin_is_outside_it(self):
+        edge = T0 + 100_000 + rounds.CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
+        self.unclean_pair(edge)
+        self.assertEqual(self.status("m1")[:2], (1, "ok"))
+
+    def test_a_message_just_after_the_successor_start_is_still_suspect(self):
+        self.unclean_pair(T0 + 100_000 + 5_000)   # the old test's case
+        self.assertIn("unclean_predecessor", self.status("m1")[2].split(","))
 
     def test_a_cleanly_closed_predecessor_costs_nothing(self):
         g1 = self.journal.add_stream("g1", T0)

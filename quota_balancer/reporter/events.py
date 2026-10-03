@@ -41,6 +41,11 @@ FAILURE_CLASSES = ("poison_eligible", "known_global_infra",
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens",
               "cache_write_tokens")
 
+# D1b: the gate's raw terminal facts, each true, false or null. They are
+# recorded for readers with their own policy; finals use `disposition` only.
+RAW_GATE_FIELDS = frozenset({"consumed", "landed", "compliance_success",
+                             "dead_lettered", "terminal_failure"})
+
 _COMMON = frozenset({"v", "kind", "event_id", "stream", "at", "agent",
                      "dropped_total"})
 _SHAPES = {
@@ -55,7 +60,7 @@ _SHAPES = {
         "seq", "message_id", "turn_id", "launched", "outcome", "exit",
         "duration_ms", "usage"}), frozenset({"failure_class"})),
     KIND_MESSAGE_DISPOSED: (frozenset({
-        "seq", "message_id", "disposition", "message_at"}),
+        "seq", "message_id", "disposition", "message_at"}) | RAW_GATE_FIELDS,
         frozenset({"attempts_recorded"})),
 }
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -190,6 +195,9 @@ def parse_event(raw):
             _check_usage(obj["usage"])
         else:
             if obj["disposition"] not in DISPOSITIONS:
+                _bad()
+            if any(obj[name] is not None and type(obj[name]) is not bool
+                   for name in RAW_GATE_FIELDS):
                 _bad()
     return obj
 

@@ -55,6 +55,8 @@ What the core does:
 |---|---|---|
 | D1 | closed dispositions, `outcome_unknown` replaces `consumed_undriven` | `SchemaMirror.test_the_disposition_set_is_closed_and_renamed`, `FinalsD5.test_outcome_unknown_sends_no_final_in_either_column` |
 | D3 | an unclean predecessor that lost a whole dispatch makes a message incomplete; one that arrived after the successor started stays complete; the disposition's own stream needs no closure | `CompletenessD3`: `test_an_unclean_predecessor_that_lost_a_whole_dispatch`, `test_a_message_that_arrived_after_the_successor_stays_complete`, `test_a_cleanly_closed_predecessor_costs_nothing`, `test_the_disposition_stream_needs_no_closure` |
+| D1b | `message_disposed` carries five raw gate facts (`consumed`, `landed`, `compliance_success`, `dead_lettered`, `terminal_failure`), each true, false or null; finals still use `disposition` only | `SchemaMirror.test_the_five_raw_gate_fields_are_true_false_or_null`, `SchemaMirror.test_raw_gate_fields_do_not_change_a_final` |
+| D3c | `message_at` is the sender's clock: a message is suspect when its time is earlier than the successor's start plus `CLOCK_SKEW_ALLOWANCE_SECONDS` (600) | `CompletenessD3`: `test_the_clock_skew_margin_has_two_sides`, `test_a_message_exactly_at_the_margin_is_outside_it`, `test_a_message_just_after_the_successor_start_is_still_suspect`, `test_a_message_that_arrived_long_after_the_successor_stays_complete` |
 | D3a | a missing, unreadable or inconsistent time makes a message incomplete | `CompletenessD3`: `test_a_missing_message_time_is_incomplete`, `test_an_unreadable_message_time_is_unknown_too`, `test_a_message_time_later_than_its_disposition_is_inconsistent`, `test_a_message_time_after_its_only_event_is_inconsistent`, `test_two_different_message_times_are_inconsistent`, `test_a_stream_that_starts_before_its_predecessor_is_inconsistent`, `test_a_clock_set_back_inside_a_stream_is_inconsistent`; missing predecessors: `test_a_missing_predecessor_makes_an_old_message_incomplete`, `test_a_registered_stream_whose_files_are_all_gone_is_missing` |
 | D4 (as read) | stream records carry no `seq`; continuity over event `seq` across segments with `after_seq`; a deleted segment; a missing tail shown by `stream_closed.last_seq`; live and crash torn tails; drops | `SchemaMirror.test_stream_records_carry_no_seq`; `ContinuityD4` (continuity, deleted segment, missing tail, lost event, drop, rising drop counter, live tear, crash tail, half-written line, lost cursor, second round, reverse discovery, vanishing segment) |
 | D5 | the truth table; stored before sending; same bytes after a restart; a replayed duplicate disposition makes no second final; late observations counted, never sent | `FinalsD5` (every table cell, persist-before-send, duplicate, late, immutability, ordering), `Crashes.test_a_crash_after_the_finals_are_stored`, `ContinuityD4.test_a_lost_cursor_re_reads_without_double_counting` |
@@ -95,7 +97,12 @@ What the core does:
    blindly). A configuration fault stops only that agent.
 9. **`dispatch_ended.failure_class`** may be absent or null (the design says
    "failed or not launched only").
-10. **`now`** (the estimate time of a new acquisition) is an input of the round,
+10. **Amendment (D1b, D3c).** The five raw fields are REQUIRED keys of
+    `message_disposed` (closed schema; each `true`, `false` or `null`). The skew
+    margin applies to the unclean-predecessor rule only (as worded); the
+    missing-predecessor rule (`missing_stream`) still compares with the successor's
+    start without a margin. Marked for the lead.
+11. **`now`** (the estimate time of a new acquisition) is an input of the round,
     so the core has no clock of its own.
 
 ## Evidence
@@ -110,7 +117,9 @@ What the core does:
   cache mapping off. (Two of the first run survived and led to the tests
   `test_a_message_time_after_its_only_event_is_inconsistent` and
   `test_a_lost_cursor_re_reads_without_double_counting`.)
-- `python -m unittest tests.test_card7a2`: 91 tests OK.
+- `python -m unittest tests.test_card7a2`: 91 tests OK before the amendment; 96 after
+  it (5 new, one test replaced by four). Three more mutations (margin 0, margin
+  inclusive, raw type unchecked) are caught.
 
 ## Judged not testable here
 

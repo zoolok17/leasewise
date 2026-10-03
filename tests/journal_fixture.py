@@ -11,6 +11,8 @@ import uuid
 T0 = 1_790_000_000_000          # a fixed instant, milliseconds
 SEAT = "11111111-1111-4111-8111-111111111111"
 MODEL = "22222222-2222-4222-8222-222222222222"
+RAW_NULLS = {"consumed": None, "landed": None, "compliance_success": None,
+             "dead_lettered": None, "terminal_failure": None}
 USAGE = {"input_tokens": 100, "output_tokens": 10,
          "cache_read_tokens": 50, "cache_write_tokens": 20}
 
@@ -117,12 +119,14 @@ class Stream:
                                    end_at if end_at is not None else at + 100,
                                    **extra))
 
-    def disposed(self, message_id, disposition, at, message_at="auto"):
+    def disposed(self, message_id, disposition, at, message_at="auto",
+                 **raw):
         arrived = (at - 5000) if message_at == "auto" else message_at
         self.write(self._event(
             "message_disposed", at, message_id=message_id,
             disposition=disposition,
-            message_at=None if arrived is None else iso(arrived)))
+            message_at=None if arrived is None else iso(arrived),
+            **dict(RAW_NULLS, **raw)))
 
     def lose(self):
         """An event that was assigned a number and never reached the file."""
