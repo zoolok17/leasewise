@@ -98,9 +98,11 @@ class Sentences(_Case):
                 self.assertEqual(self.message(self.block(command=[bad])), absolute)
 
     def test_a_network_path_is_refused(self):
-        network = "gateway_receipts: the command may not start from a network path"
+        network = "gateway_receipts: the command may not start from a network or device path"
         for bad in (r"\\server\share\agenttalk.exe", "//server/share/agenttalk.exe", r"\\?\UNC\server\share\a.exe",
-                    r"\\?\C:\tools\agenttalk.exe", r"\\.\C:\tools\agenttalk.exe"):
+                    r"\\?\C:\tools\agenttalk.exe", r"\\.\C:\tools\agenttalk.exe", "//?/C:/tools/agenttalk.exe",
+                    "//./C:/tools/agenttalk.exe", r"\/server/share/a.exe", r"/\server/share/a.exe",
+                    r"//server\share\a.exe", r"\\localhost\C$\a.exe"):
             with self.subTest(bad=bad):
                 self.assertEqual(self.message(self.block(command=[bad])), network)
 

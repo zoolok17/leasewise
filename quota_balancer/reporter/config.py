@@ -13,7 +13,6 @@ A bare alias that matches more than one row is refused.
 
 import ipaddress
 import json
-import ntpath
 import os
 import re
 import sys
@@ -55,6 +54,7 @@ MAX_COMMAND_ARGS = 16
 MAX_RECEIPT_ENV = 8
 DEFAULT_COMMAND_TIMEOUT = 20
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+_DRIVE_ROOTED = re.compile(r"[A-Za-z]:\\")           # X:\ ... : fully qualified, not C:foo and not \foo
 
 # A command source (a program the reporter runs) is not part of this version (card L6a-1b, until step 3).
 MSG_NO_COMMAND_SOURCE = "Command receipt sources are not available in this version; use a fixture file."
@@ -219,12 +219,12 @@ def _receipt_command(value, where):
     if not isinstance(value, list) or not 0 < len(value) <= MAX_COMMAND_ARGS \
             or not all(isinstance(item, str) and 0 < len(item) <= 1024 for item in value):
         _invalid("%s: the command must be a list of 1 to %d texts" % (where, MAX_COMMAND_ARGS))
-    program = value[0]
-    drive, rest = ntpath.splitdrive(program)
-    if not drive or rest[:1] not in ("\\", "/"):
+    program = value[0].replace("/", "\\")         # Windows reads both slashes the same way: check what it will see
+    if program.startswith("\\\\"):
+        # \\server, //server, \\?\ and \\.\ (a local \\?\C:\ too): a network or device path, never a local file
+        _invalid("%s: the command may not start from a network or device path" % where)
+    if _DRIVE_ROOTED.match(program) is None:
         _invalid("%s: the command must start with an absolute path" % where)
-    if program.startswith(("\\\\", "//")):
-        _invalid("%s: the command may not start from a network path" % where)
     if not program.lower().endswith(".exe"):
         # Windows runs a .bat or .cmd file through cmd.exe, which splits arguments by other rules than our quoting.
         _invalid("%s: the command must start with an .exe file" % where)
