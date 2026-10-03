@@ -44,13 +44,13 @@ _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
 # Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
 # or `command` (an argument list, run without a shell).
-_RECEIPT_KEYS = ("gateway", "admission_store")
-_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "max_bytes", "env", "page_limit")
+_RECEIPT_KEYS = ("gateway", "admission_store", "fixture")
+_RECEIPT_OPTIONAL = ("max_bytes", "page_limit")
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1000
-MAX_COMMAND_ARGS = 16
-MAX_RECEIPT_ENV = 8
-_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+
+# A command source (a program the reporter runs) is not part of this version (card L6a-1b).
+MSG_NO_COMMAND_SOURCE = "Command receipt sources are not available in this version; use a fixture file."
 
 CONFIG_INVALID = "CONFIG_INVALID"
 CONFIG_PERMISSIONS = "CONFIG_PERMISSIONS"
@@ -187,11 +187,9 @@ def _limit_sources(table, state_path):
 
 class GatewayReceipts:
     """The receipt source of card L6a-1. `gateway_id` is None until `resolve_gateway_receipts`
-    fills it from the policy-ids snapshot. The repr hides everything (a command line and an
-    environment can name a deployment)."""
+    fills it from the policy-ids snapshot. The repr hides everything (a path can name a deployment)."""
 
-    __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "command", "timeout_seconds", "max_bytes",
-                 "env", "page_limit")
+    __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "max_bytes", "page_limit")
 
     def __repr__(self):
         return "GatewayReceipts(<hidden>)"
@@ -199,52 +197,21 @@ class GatewayReceipts:
     __str__ = __repr__
 
 
-def _text_list(value, where):
-    if not isinstance(value, list) or not 0 < len(value) <= MAX_COMMAND_ARGS:
-        _invalid("%s: the command must be a list of 1 to %d texts" % (where, MAX_COMMAND_ARGS))
-    for item in value:
-        _text(item, where, 1024)
-        if "\x00" in item:
-            _invalid("%s: the command has a character it may not have" % where)
-    if not os.path.isabs(value[0]):
-        _invalid("%s: the command must start with an absolute path" % where)
-    if "--after" in value or "--limit" in value:
-        _invalid("%s: the command may not name --after or --limit; the reporter adds them" % where)
-    return tuple(value)
-
-
-def _receipt_env(table, where):
-    if not isinstance(table, dict) or len(table) > MAX_RECEIPT_ENV:
-        _invalid("%s: env must be a table of at most %d texts" % (where, MAX_RECEIPT_ENV))
-    for name, value in table.items():
-        if not isinstance(name, str) or _ENV_NAME.fullmatch(name) is None:
-            _invalid("%s: an env name is not valid" % where)
-        _text(value, where, 1024)
-        if "\x00" in value:
-            _invalid("%s: an env value has a character it may not have" % where)
-    return tuple(sorted(table.items()))
-
-
 def _gateway_receipts(table):
     where = "gateway_receipts"
     if not isinstance(table, dict):
         _invalid("%s: must be a table" % where)
+    if "command" in table:
+        _invalid(MSG_NO_COMMAND_SOURCE)
     _closed_keys(table, _RECEIPT_KEYS, _RECEIPT_OPTIONAL, where)
-    if ("fixture" in table) == ("command" in table):
-        _invalid("%s: name exactly one of fixture or command" % where)
     row = GatewayReceipts()
     row.gateway = _alias(table["gateway"], where)
     row.gateway_id = None
     row.admission_store = _path(table["admission_store"], where)
-    row.fixture = _path(table["fixture"], where) if "fixture" in table else None
-    row.command = _text_list(table["command"], where) if "command" in table else None
-    row.timeout_seconds = table.get("timeout_seconds", 20)
-    if type(row.timeout_seconds) is not int or not 1 <= row.timeout_seconds <= 60:
-        _invalid("%s: timeout_seconds must be a whole number from 1 to 60" % where)
+    row.fixture = _path(table["fixture"], where)
     row.max_bytes = table.get("max_bytes", 1024 * 1024)
     if type(row.max_bytes) is not int or not 1024 <= row.max_bytes <= 4 * 1024 * 1024:
         _invalid("%s: max_bytes must be a whole number from 1024 to 4194304" % where)
-    row.env = _receipt_env(table["env"], where) if "env" in table else ()
     row.page_limit = table.get("page_limit", DEFAULT_PAGE_LIMIT)
     if type(row.page_limit) is not int or not 1 <= row.page_limit <= MAX_PAGE_LIMIT:
         _invalid("%s: page_limit must be a whole number from 1 to %d" % (where, MAX_PAGE_LIMIT))

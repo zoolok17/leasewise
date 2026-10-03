@@ -38,7 +38,7 @@ sets `pending`), which made all 14 of them fail before the code was restored.
   even when empty, `after_seq`, `next_seq`, `has_more`, receipts with nullable token counts and an ISO close
   time). A wrong version, a key that is not allowed, a wrong type or bound, a repeated key, a gap or repeat in
   `seq`, or an `after_seq` that is not the one asked for refuses the whole page: nothing is stored, a counter goes
-  up. A missing file, a command that fails or is too slow, or text that is not JSON is "read again later".
+  up. A missing file or text that is not JSON is "read again later".
 - **The admission store** (`reporter/admission_store.py`): the one module that holds the `admission` layout
   (reused later by the admission command) and the reader `read_bindings`, opened `mode=ro` with `query_only`.
   Missing, busy or unreadable means "read again later", never an error and never proof that a lease is unknown.
@@ -73,8 +73,8 @@ fixes each finding; the numbers are Codex's.
 
 | Finding | What was wrong, in plain words | What it does now | Tests |
 | --- | --- | --- | --- |
-| F1 (major) fair release | the reporter looked at the oldest 500 unreleased receipts every cycle, so 500 that could never be released kept every newer one waiting for ever | new receipts are labelled in one statement; the ones with a record are released first; `wrong_gateway` and `duplicate_reference` are permanent and leave the selection (still counted in `status`); `unknown_reference` ones are re-checked through a rotating window after a cursor kept in the state, so every one is looked at again over time | `test_card7l6a1_state.FairRelease` (1,200 unknown ones then a late record; 650 wrong-gateway ones; duplicates; a window of 20 over 100 rows across restarts) |
-| F2 (major) source deadline | a slow source command, or one whose child kept its output open, could freeze every upload | ONE deadline covers reading, exit and cleanup; a reader thread; the command runs in its own process group (a job object on Windows, `reporter/proctree.py`) and on a timeout, on too much output and after every run the whole tree is ended by exact process id | `test_card7l6a1_adapter.Command` (a parent that exits while its child holds the output; a program that never stops; a writer that sends too much; a good run): each returns within the deadline plus 2 s and leaves no process |
+| F1 (major) fair release | the reporter looked at the oldest 500 unreleased receipts every cycle, so 500 that could never be released kept every newer one waiting for ever | **(Reworked in fix round 2, D1.)** each cycle labels new captures without a record in one statement, then takes the captures whose reference NOW has a record, wherever they sit, oldest first, at most 500, by a direct join on the reference hash; `wrong_gateway` and `duplicate_reference` are permanent and are never selected again (still counted in `status`). The rotating window of the first fix was removed: it kept chasing the newest rows | `test_card7l6a1_state.FairRelease` (1,200 unknown ones then a late record; 650 wrong-gateway ones; duplicates; a batch limit of 4 over 30; captures arriving at the full rate of 6 pages of 1,000 for 4 cycles with a restart, and a record for row 1 releases it in the same cycle) |
+| F2 (major) source deadline | a slow source command, or one whose child kept its output open, could freeze every upload | **Cut in fix round 2 (D2, D3):** command sources are not part of this card any more (see below); `proctree.py` and the command-reading path are removed. A `command` setting is refused at start-up | `test_card7l6a1_config.Block.test_a_command_source_is_refused_at_start_up_with_a_fixed_sentence` |
 | F3 (major) relations | a damaged store could send one lease's receipt to another | before anything is copied, the reference must equal the lease id and the hash must be the SHA-256 of it; any mismatch refuses the whole read | `test_card7l6a1_admission_store` (the mismatching row), `test_card7l6a1_status.StoreTrouble` (through the whole reporter: nothing is copied or sent) |
 | F4 zero calls | `calls` = 0 with unknown counts was accepted | with no call, both counts and the money must be the number 0; the whole page is refused, nothing is captured, the cursor stays | `test_card7l6a1_adapter.Pages`, `test_card7l6a1_status.Report` |
 | F5 page limit | any page up to 1000 was accepted whatever was asked | a validated `page_limit` (1 to 1000, default 100); the reporter adds `--limit` itself (a command that names it is refused); a longer page is refused before anything is stored | adapter `Pages` and `Fixture`, `test_card7l6a1_config` |
@@ -83,18 +83,30 @@ fixes each finding; the numbers are Codex's.
 | F8 exactly 200 | `201` counted as done | a settle succeeds only on `200`; any other 2xx is retried with the same bytes and shows `MALFORMED_RESPONSE` | `test_card7l6a1_delivery` |
 | F9 words | README and status text were wrong in six places | `gateway` not `ovh-gateway`; the 7c-2 state paragraph is marked historical; `receipt_cursor` is not immutable; an omitted `admission_store` setting versus a missing file; `RECEIPT_CONFLICT` has its own action ("look at the parked account"); "keeps its hold" says an advisory lease holds nothing | `StoreTrouble.test_a_receipt_conflict_...` |
 
-**Scanner gate (fix round 2, part A).** The semgrep gate rated the Windows fallback of `proctree.py` an error: it found
-`taskkill.exe` through the `SystemRoot` environment variable, so whoever controls that variable could make the reporter run
-another program. The fallback is removed (option a): if Windows will not give the program a job object, the program is not
-run, the process that was just started is ended by its handle, and the read is "read again later" with the new closed word
-`no_job_object` (shown in `status` with the other read-later words). Killing stays by exact process id or job only. Test:
-`test_card7l6a1_adapter.Command.test_when_windows_gives_no_job_object_the_command_is_not_run_and_the_read_is_later`. The
-ruff findings of the gate set that this card added were fixed in the previous commit (E741 names, `zip(strict=True)`).
+**Fix round 2, part B (the last): releasable first, and command sources cut.**
 
-Honest note: F1 and F2 were designed against Codex's description; the new F2 process tests hang on the old reader (the
-orphan test was started against it and did not return within 100 seconds) and pass on the new one. The F1 design changed
-once while writing its tests: the first version labelled only 500 new captures a cycle, which made a late record for a
-capture not yet labelled wait several cycles; labelling is now one statement.
+- **D1.** With receipts arriving steadily, an old receipt whose lease had just been recorded could still wait for ever,
+  because the rotating scan kept chasing the newest rows. Each cycle now looks up the receipts that are releasable
+  wherever they sit (see the F1 row), so a record for the oldest row releases it in the next cycle, however much arrives.
+- **Command sources are cut (D2, D3, and the scanner finding of part A).** On Windows the program could start a child
+  before the reporter put it into its job; that child escaped the cleanup. The rest of the process code had the same root:
+  a program must be started already contained, which needs a proper design. So this card accepts only a fixture file.
+  A configured `command` is refused at start-up with a fixed sentence ("Command receipt sources are not available in this
+  version; use a fixture file."); `reporter/proctree.py`, the command-reading path and the settings only it used
+  (`timeout_seconds`, `env`) are removed, and the read-later words are now `source_missing` and `not_json`. This also
+  removes the semgrep error (the `taskkill` fallback, found through an environment variable) and the Low bandit notes for
+  `subprocess`. The card is fixture-only anyway, and agenttalk's real receipt command does not exist yet.
+- **Card L6a-1b** will add command sources. Its starting requirements, from Codex's D2 and D3: the program is created
+  suspended, assigned to its job, then resumed (POSIX: its own session, with the limit that a descendant can leave it); it
+  fails closed when it cannot be contained; one deadline covers reading, exit and cleanup, with no blocking close after a
+  timed wait; reserved options are refused in every spelling.
+- The ruff findings of the gate set that this card had added were fixed earlier (E741 names, `zip(strict=True)`).
+- D4 wording in the README is corrected (the order in which captures are considered; `receipt_state` is the mutable
+  delivery-status table).
+
+Honest note: the first F1 design (a rotating window) was wrong for continued arrival, as Codex showed. The second (a
+join on the records that exist) was written together with its tests, not red first. The process tests of the first round
+went with the code they tested.
 
 ## Requirements 6 and 7 (DESIGN-6A 19.1), and the tests that prove them
 
@@ -133,9 +145,9 @@ idempotent replay.
 
 ## Tests
 
-The L6a-1 files, after fix round 1: adapter 47, admission store 17, state 40, delivery 22, config 24, status 36,
-end to end 15, privacy 6, crash 15 (222 in all). Step 2 added 11 status, 3 end to end and 15 crash tests; fix round 1
-added 31 tests.
+The L6a-1 files, after fix round 2: adapter 33, admission store 17, state 42, delivery 22, config 23, status 36,
+end to end 15, privacy 5, crash 15 (208 in all after fix round 2, which removed the command-source tests and added
+the continued-arrival ones). Step 2 added 11 status, 3 end to end and 15 crash tests; fix round 1 added 31 tests.
 
 ## Gates
 
@@ -150,8 +162,8 @@ test file once (16 + 1 + 7 + 2 + 1 + 2 + 36 = 65 files, equal to the 65 `test_*.
 | `test_cardl6*.py` | 40 |
 | `test_cardr1*.py` | 16 |
 | `test_billing*.py` | 46 |
-| `test_card7*.py` | 749 (2 skipped, as before) |
-| **Total** | **1642** (equals the `discover` collection) |
+| `test_card7*.py` | 735 (2 skipped, as before) |
+| **Total** | **1628** (equals the `discover` collection) |
 
 `ruff --select F` is clean on the changed files.
 

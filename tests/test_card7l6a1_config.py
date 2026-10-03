@@ -1,7 +1,7 @@
 """Card L6a-1, step 2: the `gateway_receipts` configuration block and the gateway ids.
 
 The block names a gateway by ALIAS and says where its receipts are read from: exactly one of a fixture
-file or a command (an argument list). Keys are closed and every error is a fixed sentence. The
+file (a command source is not available in this version). Keys are closed and every error is a fixed sentence. The
 gateway's local id comes from `policy-ids` (a new `gateways` list: alias and id, nothing else) and the
 reporter refuses to start when the alias is missing, ambiguous or not a UUID, the way card 7c-2 did for
 accounts. Without the block nothing changes. Synthetic data only.
@@ -57,11 +57,6 @@ class _Tmp(unittest.TestCase):
         return "[gateway_receipts]\ngateway = %s\nadmission_store = %s\nfixture = %s\n%s" % (
             _q(GATEWAY_ALIAS), _q(self.store), _q(self.fixture), extra)
 
-    def command_block(self, command, extra=""):
-        return "[gateway_receipts]\ngateway = %s\nadmission_store = %s\ncommand = %s\n%s" % (
-            _q(GATEWAY_ALIAS), _q(self.store), _q(command), extra)
-
-
 class Block(_Tmp):
 
     def test_a_configuration_without_the_block_is_exactly_as_before(self):
@@ -69,17 +64,27 @@ class Block(_Tmp):
 
     def test_a_fixture_block_is_read_with_its_defaults(self):
         source = self.parse(self.fixture_block()).gateway_receipts
-        self.assertEqual((source.gateway, source.fixture, source.command), (GATEWAY_ALIAS, self.fixture, None))
-        self.assertEqual((source.timeout_seconds, source.max_bytes, source.env, source.gateway_id),
-                         (20, 1024 * 1024, (), None))
+        self.assertEqual((source.gateway, source.fixture), (GATEWAY_ALIAS, self.fixture))
+        self.assertEqual((source.max_bytes, source.page_limit, source.gateway_id), (1024 * 1024, 100, None))
 
-    def test_a_command_block_is_read_as_an_argument_list(self):
-        command = [EXE, "-m", "agenttalk", "ovh-gateway", "receipts", "--json"]
-        source = self.parse(self.command_block(command, "timeout_seconds = 5\nmax_bytes = 4096\n"
-                                                        "[gateway_receipts.env]\nAGENTTALK_ROOT = \"x\"\n"
-                                               )).gateway_receipts
-        self.assertEqual((source.command, source.fixture), (tuple(command), None))
-        self.assertEqual((source.timeout_seconds, source.max_bytes, source.env), (5, 4096, (("AGENTTALK_ROOT", "x"),)))
+    def test_a_command_source_is_refused_at_start_up_with_a_fixed_sentence(self):
+        """D2/D3: a program the reporter would run is not part of this version (card L6a-1b)."""
+        for extra in ("command = %s\n" % _q([EXE, "x"]), "command = %s\n" % _q(LOUD), "command = []\n"):
+            with self.subTest(extra=extra[:20]):
+                text = "[gateway_receipts]\ngateway = %s\nadmission_store = %s\n%s" % (
+                    _q(GATEWAY_ALIAS), _q(self.store), extra)
+                with self.assertRaises(cfg.ConfigError) as caught:
+                    self.parse(text)
+                self.assertEqual(caught.exception.message, cfg.MSG_NO_COMMAND_SOURCE)
+                self.assertEqual(caught.exception.message,
+                                 "Command receipt sources are not available in this version; use a fixture file.")
+        with self.assertRaises(cfg.ConfigError) as caught:                      # even beside a fixture
+            self.parse(self.fixture_block("command = %s\n" % _q([EXE])))
+        self.assertEqual(caught.exception.message, cfg.MSG_NO_COMMAND_SOURCE)
+
+    def test_the_command_only_settings_are_not_keys_any_more(self):
+        for extra in ("timeout_seconds = 5\n", "[gateway_receipts.env]\nA = \"x\"\n"):
+            self.refused(self.fixture_block(extra))
 
     def test_exactly_one_source_is_named(self):
         self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\n" % (_q(GATEWAY_ALIAS), _q(self.store)))
@@ -94,11 +99,6 @@ class Block(_Tmp):
         for bad in ("0", "-1", "1001", "true", "false", "5.0", "1e2", _q("5"), "[5]", "{}"):
             with self.subTest(bad=bad):
                 self.refused(self.fixture_block("page_limit = %s\n" % bad))
-
-    def test_a_command_that_names_limit_is_refused_because_the_reporter_adds_it(self):
-        self.refused(self.command_block([EXE, "--limit", "5"]))
-        self.refused(self.command_block([EXE, "x", "--after", "0"]))
-        self.parse(self.command_block([EXE, "x"], "page_limit = 25\n"))
 
     def test_the_keys_are_closed(self):
         self.refused(self.fixture_block("agent = %s\n" % _q(LOUD)))
@@ -124,29 +124,16 @@ class Block(_Tmp):
         self.assertEqual(source.admission_store, self.store)
         self.assertNotIn(self.store, repr(source))
 
-    def test_the_command_rules(self):
-        for bad in ([], ["relative-program"], [EXE, ""], [EXE, 5], [EXE] + ["x"] * 16, [EXE, "--after", "3"],
-                    [EXE, "a\x00b"], "not a list"):
-            error = self.refused(self.command_block(bad))
-            self.assertNotIn(LOUD, error.message)
-
-    def test_the_limits_and_the_environment_rules(self):
-        for extra in ("timeout_seconds = 0\n", "timeout_seconds = 61\n", "timeout_seconds = true\n",
-                      "timeout_seconds = \"5\"\n", "max_bytes = 10\n", "max_bytes = 5000000\n",
-                      "max_bytes = 1.5\n"):
+    def test_the_size_limit_rules(self):
+        for extra in ("max_bytes = 10\n", "max_bytes = 5000000\n", "max_bytes = 1.5\n"):
             self.refused(self.fixture_block(extra))
-        for env in ("[gateway_receipts.env]\nlower = \"x\"\n", "[gateway_receipts.env]\nA = 5\n",
-                    "[gateway_receipts.env]\nA = \"\"\n", "[gateway_receipts.env]\nA = \"x\\u0000y\"\n",
-                    "[gateway_receipts.env]\n" + "".join("K%d = \"x\"\n" % i for i in range(9))):
-            self.refused(self.command_block([EXE], env))
 
     def test_an_error_carries_no_value(self):
         error = self.refused(self.fixture_block("agent = %s\n" % _q(LOUD)))
         self.assertNotIn(LOUD, error.message)
         self.assertNotIn(self.fixture, error.message)
-        source = self.parse(self.command_block([EXE, LOUD])).gateway_receipts
-        self.assertNotIn(LOUD, repr(source) + str(source))
-        self.assertNotIn(EXE, repr(source))
+        source = self.parse(self.fixture_block()).gateway_receipts
+        self.assertNotIn(self.fixture, repr(source) + str(source))
 
 
 def snapshot(gateways=None, **extra):

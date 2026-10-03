@@ -2,8 +2,7 @@
 anywhere it should not.
 
 Receipts and sources carry loud markers in EVERY string field the contract has (the outcome, the
-reference, the generation, an extra key and its value) and in a loud folder name; a command source
-prints loud text on its error output; the fake server answers with a loud error word; a fault carries
+reference, the generation, an extra key and its value) and in a loud folder name; the fake server answers with a loud error word; a fault carries
 loud text. The whole path runs (adapter, queue, client, status, the command) and no loud string may
 appear in: the wire body, the stored rows, the status JSON and text, the result line, the errors, the
 notes, the counters, the logs, or anything the command prints. The wire body has exactly the allow-listed
@@ -14,13 +13,12 @@ path, the event id, the gateway id). Synthetic data only.
 import json
 import logging
 import os
-import sys
 import unittest
 from unittest import mock
 
 from quota_balancer.reporter import mapper, receipts, status
 
-from tests.l6a1_env import GATEWAY_ID, add_binding, command_source, configure, ledger, lease, receipt, write_json
+from tests.l6a1_env import GATEWAY_ID, add_binding, configure, ledger, lease, receipt, write_json
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
 from tests.test_card7l6a1_delivery import Net, error
@@ -134,30 +132,6 @@ class Privacy(unittest.TestCase):
         with mock.patch.object(self.rig.state, "capture_page", side_effect=RuntimeError(LOUD["fault"])):
             reporter.cycle()
         self.no_loud(self.everything(reporter, result))
-
-    def test_a_command_with_loud_error_output_and_loud_environment_leaks_nothing(self):
-        script = os.path.join(self.folder, "fake.py")
-        with open(script, "w", encoding="utf-8") as handle:
-            handle.write("import json, os, sys\nsys.stderr.write(%r)\n"
-                         "print(json.dumps({'envelope_version': 1, 'generation': '0' * 32, 'after_seq': int(sys.argv[2]),"
-                         " 'next_seq': int(sys.argv[2]), 'has_more': False, 'receipts': []}))\n"
-                         "sys.exit(7 if any(k.startswith('LOUD_ENV') for k in os.environ) else 0)\n"
-                         % LOUD["stderr"])
-        os.environ["LOUD_ENV_L6A1"] = LOUD["env"]
-        self.addCleanup(os.environ.pop, "LOUD_ENV_L6A1", None)
-        reporter = self.start([], Net())
-        reporter.gateway_receipts = command_source([sys.executable, script], gateway=reporter.gateway_receipts.gateway,
-                                                   gateway_id=GATEWAY_ID)
-        result = reporter.cycle()
-        self.assertEqual(reporter.report()["gateway_receipts"]["last_read_result"], "ok")
-        self.no_loud(self.everything(reporter, result), skip=("folder",))
-        # the failing run: the same, with a loud non-zero exit
-        reporter.gateway_receipts = command_source([sys.executable, "-c", "import sys; sys.stderr.write(%r); sys.exit(2)"
-                                                    % LOUD["stderr"]], gateway=reporter.gateway_receipts.gateway,
-                                                   gateway_id=GATEWAY_ID)
-        result = reporter.cycle()
-        self.assertEqual(reporter.report()["gateway_receipts"]["read_later"]["exit_code"], 1)
-        self.no_loud(self.everything(reporter, result), skip=("folder",))
 
     def test_the_command_prints_no_loud_string(self):
         good = lease()

@@ -69,15 +69,11 @@ def fixture_source(path, store=None, **over):
     row = GatewayReceipts()
     row.gateway, row.gateway_id = GATEWAY_ALIAS, GATEWAY_ID
     row.admission_store = store or os.path.join(os.path.dirname(path or ".") or ".", "admission.db")
-    row.fixture, row.command = path, None
-    row.timeout_seconds, row.max_bytes, row.env, row.page_limit = 20, 1024 * 1024, (), 100
+    row.fixture = path
+    row.max_bytes, row.page_limit = 1024 * 1024, 100
     for key, value in over.items():
         setattr(row, key, value)
     return row
-
-
-def command_source(command, **over):
-    return fixture_source(None, command=tuple(command), **over)
 
 
 # --- the admission store (written here the way card L6a-2's `reporter admit` will) ---------------------------------
@@ -117,14 +113,12 @@ def add_binding(path, one):
         conn.close()
 
 
-def block(fixture=None, command=None, gateway=GATEWAY_ALIAS, store=None, extra=""):
+def block(fixture=None, gateway=GATEWAY_ALIAS, store=None, extra=""):
     """The configuration text of the `gateway_receipts` block."""
     lines = ["[gateway_receipts]", "gateway = %s" % json.dumps(gateway),
              "admission_store = %s" % json.dumps(store or "C:/nowhere/admission.db")]
     if fixture is not None:
         lines.append("fixture = %s" % json.dumps(fixture))
-    if command is not None:
-        lines.append("command = %s" % json.dumps(list(command)))
     return "\n".join(lines) + "\n" + extra
 
 

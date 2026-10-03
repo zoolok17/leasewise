@@ -729,12 +729,12 @@ and a receipt is only released from the first to the second when the right paper
 **What waits, and what is set aside.**
 
 - A receipt whose lease has no record yet is **quarantined: `unknown_reference`**. Nothing is sent.
-  The reporter looks again over time: a receipt whose record has appeared is found and released within a
-  cycle, and the others are re-checked through a rotating, bounded look (a few thousand per cycle, from a
-  place that is kept across restarts), so no number of waiting receipts can keep a newer one from being
+  New captures with bindings are considered first. Previously quarantined captures are reconsidered on every
+  cycle once their binding exists: each cycle looks up the waiting receipts whose record has appeared, wherever
+  they sit in the list, oldest first, up to 500, so no number of waiting receipts can keep another from being
   released.
 - A receipt whose record names **another gateway** is quarantined: `wrong_gateway`. Nothing is ever sent
-  for it. This (and `duplicate_reference`) is permanent: a record never changes, so it leaves the re-check
+  for it. This (and `duplicate_reference`) is permanent: a record never changes, so it is never looked at again
   and stays visible in `status`. The same holds if a source's name is later pointed at a different gateway: the receipts already
   kept stay tied to the gateway they came from, and the new mapping starts a separate source with its
   own counters.
@@ -788,28 +788,23 @@ id, an amount or a path):
 
 1. **Save the ids again.** `policy-ids` also lists `gateways` (alias and local id). Save its output
    again; an older snapshot has none, and the reporter then refuses to start if `gateway_receipts` is set.
-2. **Add the block** to the reporter configuration. Name `admission_store` and exactly one of `fixture`
-   or `command`:
+2. **Add the block** to the reporter configuration. Name `admission_store` and a `fixture` file. **A `command`
+   source (a program the reporter would run) is not available in this version**: the reporter refuses to start with
+   "Command receipt sources are not available in this version; use a fixture file." Live use needs card L6a-1b (see
+   the limits):
 
 ```toml
 [gateway_receipts]
 gateway = "g1"                                  # a Leasewise gateway alias
 admission_store = "C:/path/to/admission.db"     # the admission store, an absolute path (read only here)
-fixture = "C:/path/to/receipts.json"            # a ledger file (tests); or:
-# command = ["C:/path/to/program", "gateway", "receipts", "--json"]   # run without a shell
-# timeout_seconds = 20                          # 1 to 60: ONE deadline for reading, exit and cleanup
-# max_bytes = 1048576                           # 1024 to 4194304
-# page_limit = 100                              # receipts asked for in one page, 1 to 1000
-# [gateway_receipts.env]                        # the only environment the command gets, besides
-# SOME_NAME = "value"                           # what a program needs to start
+fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
+# max_bytes = 1048576                           # 1024 to 4194304: the largest fixture read
+# page_limit = 100                              # receipts in one page, 1 to 1000
 ```
 
-   The fixture holds `{"generation": "<32 hex>", "receipts": [...]}`, or one finished page. The reporter
-   adds `--after <number> --limit <page_limit>` to a command itself (a command that already names either is
-   refused); the command prints one page (version 1: `generation`, `after_seq`, `next_seq`, `has_more`,
-   `receipts`) of at most the limit asked for. The command is started in its own process group (a job on
-   Windows); when the deadline passes, or it prints more than `max_bytes`, it and everything it started are
-   ended by exact process id, and a child that keeps the output open cannot hold the reporter.
+   The fixture holds `{"generation": "<32 hex>", "receipts": [...]}` (the reporter makes the page after the
+   last number it took, of at most `page_limit` receipts), or one finished page (version 1: `generation`,
+   `after_seq`, `next_seq`, `has_more`, `receipts`), which is refused if it is longer than `page_limit`.
 3. **Start the reporter** as before. It refuses to start, with a fixed sentence, when the gateway alias
    is missing from the snapshot, appears twice, has an id that is not a UUID, or when the `admission_store`
    setting is left out or is not an absolute path. A file that the setting names but that is not there yet
@@ -823,6 +818,12 @@ fixture = "C:/path/to/receipts.json"            # a ledger file (tests); or:
   unknown (quarantined), and `status` shows `admission store: history_limit` with a sentence. Reading only what
   is new is a prerequisite for live use; it comes with card L6a-2, through a durable grant order value. Never
   delete admissions to get below the limit.
+- **Command sources are not available yet (card L6a-1b).** This version reads receipts from a fixture file only.
+  A source that is a program the reporter runs needs its own card, because the program must be started already
+  contained. Its starting requirements: the program is created suspended, put into its job, then resumed (on POSIX
+  its own session, with the limit that a descendant can leave it); it fails closed when it cannot be contained; one
+  deadline covers reading, exit and cleanup, with no blocking close after a timed wait; and the reserved options
+  (`--after`, `--limit`) are refused in every spelling.
 - **Fixture-only.** agenttalk does not have the receipt command yet (its card 6a-1), so the page format
   is our reading of the design and lives in one file (`quota_balancer/reporter/receipts.py`).
 - **Nothing is compacted.** Kept receipts and their messages are never edited or deleted. A page with a
@@ -851,10 +852,10 @@ State version 3: `receipt_source` (a name and the gateway it was bound to, immut
 (one per source and generation; its `last_seq` and `page_ord` are updated as pages are taken and as the
 generation read last changes; `first_seen_ms` is when it first appeared), `receipt_binding` (copied from the admission store, immutable), `receipt_capture` (stage 1,
 immutable evidence, the source's gateway frozen on the row), `receipt_delivery` (stage 2, immutable, the
-settle text), and `receipt_state` (the only mutable table: `captured`, `quarantined`, `pending`, `sent`,
+settle text), and `receipt_state` (the mutable delivery-status table: `captured`, `quarantined`, `pending`, `sent`,
 `failed_permanent`, with a closed reason). Stage 1 and stage 2 are each one `BEGIN IMMEDIATE`. Stage 2 labels
-all new captures without a record in one statement, works on at most 500 per cycle, and re-checks the
-`unknown_reference` ones through a window of 5,000 after a cursor kept in the `note` table.
+all new captures without a record in one statement, then works on the captures whose reference has a record, oldest
+first, at most 500 per cycle, found by a direct join on the reference hash (`receipt_capture_ref` indexes it).
 `event_id` is a UUIDv5 of the reference hash and the ledger generation. The pass order is limit, receipt,
 lease; `status_version` is 3. The admission store is opened with `mode=ro` and `query_only`; its layout is
 in `quota_balancer/reporter/admission_store.py`, the one module the admission command will reuse.

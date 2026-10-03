@@ -7,40 +7,16 @@ nullable token counts and an ISO close time, and numbers that rise by exactly on
 "read again later", never a settle. The command source is tried with fake scripts only. Synthetic data only.
 """
 
-import json
 import os
-import sys
 import tempfile
-import time
 import unittest
 
 from quota_balancer.reporter import receipts
 
-from tests.l6a1_env import (GENERATION, GENERATION_B, command_source, encode, fixture_source, lease, ledger, page,
+from tests.l6a1_env import (GENERATION, GENERATION_B, encode, fixture_source, lease, ledger, page,
                             receipt, write_json, write_raw)
 
 LOUD = "loud-secret-l6a1-adapter"
-
-
-def alive(pid):
-    """Is a process with this id still running? (By its id only.)"""
-    if sys.platform == "win32":
-        import ctypes
-        kernel = ctypes.windll.kernel32
-        handle = kernel.OpenProcess(0x1000, False, pid)           # query limited information
-        if not handle:
-            return False
-        code = ctypes.c_ulong()
-        kernel.GetExitCodeProcess(handle, ctypes.byref(code))
-        kernel.CloseHandle(handle)
-        return code.value == 259                                   # still active
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def parse(doc, after=0, limit=receipts.MAX_ROWS):
@@ -307,186 +283,6 @@ class Fixture(_Dir):
         write_json(self.fixture, ledger([receipt(lease(), 1)]))
         result = receipts.read_page(fixture_source(self.fixture, max_bytes=100), 0)
         self.assertEqual((result.status, result.reason), (receipts.REFUSED, "too_large"))
-
-
-SCRIPT = r"""
-import json, os, sys
-mode = sys.argv[1]
-after = int(sys.argv[sys.argv.index("--after") + 1])
-if mode == "good":
-    print(os.environ["FAKE_PAGE"])
-elif mode == "echo":
-    print(json.dumps({"argv": sys.argv[1:], "env": sorted(os.environ)}))
-elif mode == "slow":
-    import time
-    time.sleep(30)
-elif mode == "big":
-    sys.stdout.write("[" + " " * 5000 + "]")
-elif mode == "exit":
-    sys.stderr.write("LOUD-STDERR-TEXT")
-    sys.stdout.write("{}")
-    sys.exit(3)
-elif mode == "orphan_good":
-    import subprocess
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)    # a child that holds nothing open
-    with open(os.environ["PIDFILE"], "w") as handle:
-        handle.write("%d %d" % (os.getpid(), child.pid))
-    print(os.environ["FAKE_PAGE"])
-elif mode in ("orphan", "hang_tree", "flood"):
-    import subprocess, time
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])      # inherits our output
-    with open(os.environ["PIDFILE"], "w") as handle:
-        handle.write("%d %d" % (os.getpid(), child.pid))
-    if mode == "orphan":
-        sys.exit(0)                                   # the program is gone; its child still holds the output open
-    if mode == "hang_tree":
-        time.sleep(120)
-    while True:
-        sys.stdout.write("x" * 65536)
-        sys.stdout.flush()
-elif mode == "badjson":
-    print("{oops")
-elif mode == "stderr":
-    sys.stderr.write("LOUD-STDERR-TEXT")
-    print(os.environ["FAKE_PAGE"])
-"""
-
-
-class Command(_Dir):
-
-    def setUp(self):
-        super().setUp()
-        self.script = os.path.join(self.dir, "fake.py")
-        with open(self.script, "w", encoding="utf-8") as handle:
-            handle.write(SCRIPT)
-
-    def run_mode(self, mode, after=0, env=(), **over):
-        source = command_source([sys.executable, self.script, mode], env=tuple(env), **over)
-        return receipts.read_page(source, after)
-
-    def test_a_good_run_returns_the_page_and_is_told_the_last_number(self):
-        doc = page([receipt(lease(), 5), receipt(lease(), 6)], after=4)
-        result = self.run_mode("good", after=4, env=[("FAKE_PAGE", json.dumps(doc))])
-        self.assertEqual((result.status, [r.seq for r in result.page.receipts]), (receipts.OK, [5, 6]))
-
-    def test_a_page_for_another_number_than_asked_is_refused(self):
-        doc = page([receipt(lease(), 3)], after=2)
-        result = self.run_mode("good", after=4, env=[("FAKE_PAGE", json.dumps(doc))])
-        self.assertEqual((result.status, result.reason), (receipts.REFUSED, "wrong_after"))
-
-    def test_the_command_gets_its_arguments_unchanged_and_no_inherited_secret(self):
-        os.environ["LEASEWISE_LOUD_SECRET_L6A1"] = LOUD
-        self.addCleanup(os.environ.pop, "LEASEWISE_LOUD_SECRET_L6A1", None)
-        source = command_source([sys.executable, self.script, "echo", "a b", "x;y", "$(z)"], env=(("ONE", "1"),))
-        refused = receipts.read_page(source, 7)
-        self.assertEqual((refused.status, refused.reason), (receipts.REFUSED, "bad_version"))   # it ran: not a page
-        raw = receipts._read_command(source, 7)
-        said = json.loads(raw.decode())
-        self.assertEqual(said["argv"], ["echo", "a b", "x;y", "$(z)", "--after", "7", "--limit", "100"])
-        self.assertNotIn("LEASEWISE_LOUD_SECRET_L6A1", said["env"])
-        self.assertIn("ONE", said["env"])
-        self.assertNotIn(LOUD, raw.decode())
-
-    def test_a_slow_command_is_stopped_and_read_later(self):
-        result = self.run_mode("slow", timeout_seconds=1)
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "timeout"))
-
-    def test_too_much_output_is_refused(self):
-        result = self.run_mode("big", max_bytes=1000)
-        self.assertEqual((result.status, result.reason), (receipts.REFUSED, "too_large"))
-
-    def test_a_non_zero_exit_is_read_later_even_if_it_printed_a_page(self):
-        result = self.run_mode("exit")
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "exit_code"))
-
-    def test_bad_json_is_read_later(self):
-        result = self.run_mode("badjson")
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "not_json"))
-
-    def test_error_output_is_never_kept(self):
-        doc = page([])
-        result = self.run_mode("stderr", env=[("FAKE_PAGE", json.dumps(doc))])
-        self.assertEqual((result.status, result.page.receipts), (receipts.OK, ()))
-        self.assertNotIn("LOUD-STDERR-TEXT", repr(result.page) + str(result.reason))
-
-    # --- fix round 1, F2: ONE deadline bounds reading, exit and cleanup, and no process is left running ---
-
-    def tree_run(self, mode, **over):
-        pidfile = os.path.join(self.dir, "pids-%s.txt" % mode)
-        started = time.monotonic()
-        result = self.run_mode(mode, env=[("PIDFILE", pidfile)], **over)
-        elapsed = time.monotonic() - started
-        with open(pidfile, "r", encoding="ascii") as handle:
-            parent, child = (int(number) for number in handle.read().split())
-        return result, elapsed, parent, child
-
-    def assertGone(self, *pids):
-        for pid in pids:
-            for _ in range(40):                                  # a killed process needs a moment to be reaped
-                if not alive(pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(alive(pid), "process %d is still running" % pid)
-
-    def test_a_program_that_exits_while_its_child_still_holds_the_output_is_bounded_and_leaves_nothing(self):
-        result, elapsed, parent, child = self.tree_run("orphan", timeout_seconds=2)
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "timeout"))
-        self.assertLess(elapsed, 2 + receipts.CLEANUP_SECONDS + 2)
-        self.assertGone(parent, child)
-
-    def test_a_program_that_never_stops_is_ended_with_its_children_at_the_deadline(self):
-        result, elapsed, parent, child = self.tree_run("hang_tree", timeout_seconds=2)
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "timeout"))
-        self.assertLess(elapsed, 2 + receipts.CLEANUP_SECONDS + 2)
-        self.assertGone(parent, child)
-
-    def test_a_program_that_writes_too_much_is_ended_at_once_with_its_children(self):
-        result, elapsed, parent, child = self.tree_run("flood", timeout_seconds=20, max_bytes=100_000)
-        self.assertEqual((result.status, result.reason), (receipts.REFUSED, "too_large"))
-        self.assertLess(elapsed, 10)                                 # long before the deadline: the cap ended it
-        self.assertGone(parent, child)
-
-    def test_a_good_run_leaves_no_process_behind_either(self):
-        doc = page([receipt(lease(), 1)], after=0)
-        pidfile = os.path.join(self.dir, "pids-good.txt")
-        result = self.run_mode("orphan_good", env=[("FAKE_PAGE", json.dumps(doc)), ("PIDFILE", pidfile)])
-        self.assertEqual((result.status, [r.seq for r in result.page.receipts]), (receipts.OK, [1]))
-        with open(pidfile, "r", encoding="ascii") as handle:
-            parent, child = (int(number) for number in handle.read().split())
-        self.assertGone(parent, child)
-
-    def test_the_command_is_asked_for_the_configured_page_length(self):
-        source = command_source([sys.executable, self.script, "echo"], page_limit=7)
-        said = json.loads(receipts._read_command(source, 3).decode())
-        self.assertEqual(said["argv"][-4:], ["--after", "3", "--limit", "7"])
-
-    @unittest.skipUnless(sys.platform == "win32", "job objects exist on Windows only")
-    def test_when_windows_gives_no_job_object_the_command_is_not_run_and_the_read_is_later(self):
-        """No `taskkill` fallback and no path from the environment: without a job the program is ended at once and the
-        read is "later" with its own closed word."""
-        from unittest import mock
-        from quota_balancer.reporter import proctree
-        started = []
-        real = proctree.subprocess.Popen
-
-        def watch(*args, **kwargs):
-            started.append(real(*args, **kwargs))
-            return started[-1]
-        with mock.patch.object(proctree, "_make_job", return_value=None),                 mock.patch.object(proctree.subprocess, "Popen", side_effect=watch):
-            result = self.run_mode("hang_tree", env=[("PIDFILE", os.path.join(self.dir, "unused.txt"))])
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "no_job_object"))
-        self.assertEqual(len(started), 1)
-        self.assertIsNotNone(started[0].poll())                      # the process that was started has been ended
-        self.assertFalse(alive(started[0].pid))
-        with open(proctree.__file__, encoding="utf-8") as handle:
-            source = handle.read()
-        self.assertNotIn("taskkill", source)                         # the fallback is gone from the code
-        self.assertNotIn("SystemRoot", source)                       # and no program path comes from the environment
-
-    def test_a_command_that_cannot_start_is_read_later(self):
-        result = receipts.read_page(command_source([os.path.join(self.dir, "no-such-program")]), 0)
-        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "cannot_run"))
 
 
 if __name__ == "__main__":

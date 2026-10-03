@@ -1,48 +1,38 @@
 """The receipt source adapter (card L6a-1): the ONE place that knows how a gateway's receipts reach us.
 
 A gateway keeps one final receipt for every quota lease it served and hands them out in PAGES (DESIGN-6A 5.4). This
-module reads one page from one of two sources and hands back a checked, closed value, or says why it could not:
-
-* a fixture file (the tests, and the only source until agenttalk ships its receipt command): either a whole
-  ledger document `{"generation": ..., "receipts": [...]}`, from which the page after the asked-for number is
-  made, or an already made page, served as it is;
-* a configured local command: an argument list (never a shell), a time limit, a size cap, and an environment with
-  nothing inherited but what a program needs to start. It is run with `--after <seq>` added and must print ONE page.
+module reads one page from its source and hands back a checked, closed value, or says why it could not. In this
+version the only source is a fixture file (the tests, and the only source until agenttalk ships its receipt command):
+either a whole ledger document `{"generation": ..., "receipts": [...]}`, from which the page after the asked-for number
+is made, or an already made page, served as it is. A command source (a program the reporter would run) is NOT part of
+this version: it needs its own card (L6a-1b), because the program must be started already contained.
 
 A page is one JSON object with exactly these keys: `envelope_version` (1), `generation` (the ledger's own
 identity, even when the page is empty), `after_seq` (the number asked for), `next_seq`, `has_more`, `receipts`.
 A receipt has exactly the keys of `KEYS`; its token counts are whole numbers or null (unknown), never 0 by
 guesswork. Numbers rise by exactly one from `after_seq`: a gap or a repeat is damage.
 
-Nothing from a receipt that is not one of the closed fields below, and nothing from a command's error output or a
-fault's text, is ever kept. The page format is a PROPOSAL until the gateway side answers (DESIGN-6A section 11);
+Nothing from a receipt that is not one of the closed fields below, and nothing from a fault's text, is ever kept. The page format is a PROPOSAL until the gateway side answers (DESIGN-6A section 11);
 if it changes, only this file changes.
 
 An answer is one of three words (`ReadResult.status`):
   ok          a checked page (possibly with no receipts);
-  read_later  the source could not be read just now (missing file, command not started, too slow, a non-zero exit,
-              text that is not JSON): nothing is stored and it is asked again;
+  read_later  the source could not be read just now (a missing file, text that is not JSON): nothing is stored and it
+              is asked again;
   refused     it was read but is not what the contract allows (a wrong key, type, bound, version or order, a
               repeated key, too much): nothing from it is stored, and a counter says so.
 """
 
-import contextlib
 import datetime
 import json
-import os
 import re
-import subprocess
-import threading
-import time
-
-from . import proctree
 
 OK = "ok"
 READ_LATER = "read_later"
 REFUSED = "refused"
 
 # The closed reasons, per status. These words (and counts of them) are all the status ever shows.
-LATER_REASONS = ("source_missing", "cannot_run", "no_job_object", "timeout", "exit_code", "not_json")
+LATER_REASONS = ("source_missing", "not_json")
 REFUSED_REASONS = ("not_an_object", "bad_version", "bad_envelope", "wrong_after", "too_many", "too_large",
                    "duplicate_key", "bad_row", "bad_order")
 
@@ -62,10 +52,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 _GENERATION = re.compile(r"[0-9a-f]{32}")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 
-CLEANUP_SECONDS = 2.0                # after the deadline, how long ending the tree and the reader may take
-DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_MAX_BYTES = 1024 * 1024
-_ENV_KEPT = ("SYSTEMROOT", "SYSTEMDRIVE", "PATH")      # what a program needs to start; no secrets
 
 
 class Receipt:
@@ -229,83 +216,11 @@ def _read_fixture(path, max_bytes):
     return raw
 
 
-def _environment(extra):
-    env = {name: os.environ[name] for name in _ENV_KEPT if name in os.environ}
-    env.update(dict(extra))
-    return env
-
-
-def _read_command(source, after_seq):
-    """Run the configured command once. No shell, no standard input, no error text kept, and ONE deadline
-    (`timeout_seconds`) that covers reading the output, the exit and the cleanup, so a program that hangs, that
-    leaves a child holding its output open, or that never stops writing cannot hold the reporter. The program is
-    started in its own session or job (`proctree`); on a timeout, on too much output and after every run the whole
-    tree is ended by exact process id, and the reader is given only a short, fixed time to finish."""
-    argv = list(source.command) + ["--after", str(after_seq), "--limit", str(source.page_limit)]
-    deadline = time.monotonic() + source.timeout_seconds
-    try:
-        tree = proctree.start(argv, _environment(source.env), subprocess.PIPE)
-    except proctree.NoJobObject:
-        raise _Later("no_job_object") from None      # Windows would not give it a job: it was not run at all
-    except (OSError, ValueError):
-        raise _Later("cannot_run") from None
-    chunks, seen = [], [0]
-    finished, too_big = threading.Event(), threading.Event()
-
-    def pump():
-        """Read until the end of the output or one byte past the cap. Never inspects what it reads."""
-        try:
-            stream = tree.proc.stdout
-            while True:
-                data = stream.read1(65536)
-                if not data:
-                    return
-                seen[0] += len(data)
-                if seen[0] > source.max_bytes:
-                    too_big.set()
-                    return
-                chunks.append(data)
-        except (OSError, ValueError):
-            return
-        finally:
-            finished.set()
-
-    reader = threading.Thread(target=pump, daemon=True)
-    reader.start()
-    timed_out = False
-    try:
-        if not finished.wait(max(0.0, deadline - time.monotonic())):
-            timed_out = True                             # still writing, or a child holds the output open
-        elif not too_big.is_set():
-            try:
-                code = tree.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                timed_out = True                         # the output ended but the program did not
-    finally:
-        tree.kill()                                      # the program and every child, by exact id
-        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-            tree.proc.wait(timeout=CLEANUP_SECONDS)
-        reader.join(CLEANUP_SECONDS)
-        with contextlib.suppress(OSError, ValueError):
-            tree.proc.stdout.close()
-        tree.close()
-    if too_big.is_set():
-        raise _Refused("too_large")
-    if timed_out:
-        raise _Later("timeout")
-    if code != 0:
-        raise _Later("exit_code")
-    return b"".join(chunks)
-
-
 def read_page(source, after_seq):
     """One page of `source` after `after_seq` -> ReadResult. Never raises on bad input."""
     try:
-        if source.command is not None:
-            page = parse_page(_read_command(source, after_seq), after_seq, source.page_limit)
-        else:
-            page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes,
-                                 source.page_limit)
+        page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes,
+                             source.page_limit)
     except _Later as exc:
         return ReadResult(READ_LATER, exc.args[0])
     except _Refused as exc:

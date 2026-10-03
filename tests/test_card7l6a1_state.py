@@ -30,6 +30,14 @@ def parsed(rows, after=0, generation=GENERATION):
     return receipts.parse_page(encode(page(rows, after=after, generation=generation)), after)
 
 
+def binding_for_hash(ref_sha256, gateway_id=GATEWAY_ID):
+    """A binding for a capture whose reference HASH is known (the lease id itself is not needed to release it)."""
+    one = admission_store.Binding()
+    one.ref_sha256, one.lease_id, one.gateway_id = ref_sha256, str(uuid.uuid4()), gateway_id
+    one.agent, one.message_id, one.expires_ms = "alpha", "m-" + uuid.uuid4().hex[:6], NOW + 1_800_000
+    return one
+
+
 def binding(lease_id, gateway_id=GATEWAY_ID):
     one = admission_store.Binding()
     one.ref_sha256, one.lease_id, one.gateway_id = mapper.lease_ref_hash(lease_id), lease_id, gateway_id
@@ -560,8 +568,7 @@ class FairRelease(_Tmp):
         leases = self.many(state, 10)
         state.copy_bindings([binding(one, OTHER_GATEWAY_ID) for one in leases[:4]], NOW)
         state.release_waiting(NOW + 1)
-        ids, _cursor = state._release_candidates()
-        self.assertEqual(ids, [])                                                # nothing left that can change
+        self.assertEqual(state._release_candidates(), [])                        # nothing left that can change
         self.assertEqual(self.raw("SELECT reason, COUNT(*) FROM receipt_state GROUP BY reason ORDER BY reason"),
                          [("unknown_reference", 6), ("wrong_gateway", 4)])
 
@@ -578,39 +585,61 @@ class FairRelease(_Tmp):
         state.release_waiting(NOW + 2)
         self.assertEqual(self.raw("SELECT s.state, s.reason FROM receipt_state s ORDER BY s.capture_id"),
                          [("pending", None), ("quarantined", "duplicate_reference"), ("pending", None)])
-        ids, _cursor = state._release_candidates()
-        self.assertEqual(ids, [])
+        self.assertEqual(state._release_candidates(), [])
 
-    def test_every_unknown_capture_is_looked_at_again_over_time_through_a_cursor_that_survives_a_restart(self):
-        with mock.patch.object(state_mod, "RELEASE_BATCH", 5), mock.patch.object(state_mod, "RELEASE_WINDOW", 20):
-            state = self.open()
-            leases = self.many(state, 100)
-            state.release_waiting(NOW)                                          # all become `unknown_reference`
-            state.copy_bindings([binding(leases[90])], NOW + 1)                  # a late record, far down the list
-            seen = []
-            for cycle in range(8):
-                released = state.release_waiting(NOW + 2 + cycle)
-                note = state.note(state_mod.RELEASE_CURSOR_NOTE)
-                seen.append((released, note[0]))
-                if cycle % 2 == 0:
-                    state = self.reopen()                                        # a restart in the middle
-                    self.assertEqual(state.note(state_mod.RELEASE_CURSOR_NOTE)[0], note[0])
-            self.assertEqual(sum(released for released, _cursor in seen), 1)     # found once the cursor got there
-            self.assertEqual(self.raw("SELECT state FROM receipt_state WHERE capture_id=91"), [("pending",)])
-            cursors = [int(cursor) for _released, cursor in seen]
-            self.assertIn(0, cursors)                                            # it wrapped back to the start
-            self.assertEqual(cursors[:3], [40, 60, 80])                           # and moved a window at a time
+    def test_a_binding_for_an_old_row_releases_it_in_the_next_cycle_while_captures_keep_arriving_at_full_rate(self):
+        """D1: with receipts arriving steadily (6 pages of 1,000 every cycle) and a restart in the middle, an old row whose
+        lease has just been recorded is released in the very next cycle, wherever it sits in the list."""
+        state = self.open()
+        first = []
+        position = 0
+        for cycle in range(4):
+            for _page in range(6):
+                rows = [receipt(lease(), position + n + 1) for n in range(1000)]
+                if position == 0:
+                    first = rows[0]
+                self.capture(state, rows, after=position)
+                position += 1000
+            if cycle == 0:
+                self.assertEqual(state.release_waiting(NOW + cycle), 0)
+            if cycle == 1:
+                state = self.reopen()                                              # a restart in the middle
+                self.assertEqual(state.release_waiting(NOW + cycle), 0)
+            if cycle == 2:
+                one = binding_for_hash(first["quota_lease_ref_sha256"])
+                state.copy_bindings([one], NOW + cycle)                            # the very first row gets its record
+                self.assertEqual(state.release_waiting(NOW + cycle), 1)            # released in this very cycle
+                self.assertEqual(self.raw("SELECT state FROM receipt_state WHERE capture_id=1"), [("pending",)])
+            if cycle == 3:
+                self.assertEqual(state.release_waiting(NOW + cycle), 0)
+        self.assertEqual(self.raw("SELECT COUNT(*) FROM receipt_capture"), [(24000,)])
 
-    def test_new_captures_are_looked_at_first_even_behind_many_unknown_ones(self):
-        with mock.patch.object(state_mod, "RELEASE_BATCH", 5), mock.patch.object(state_mod, "RELEASE_WINDOW", 10):
-            state = self.open()
-            self.many(state, 40)
-            state.release_waiting(NOW)
-            state.release_waiting(NOW + 1)
-            fresh = lease()
-            self.capture(state, [receipt(fresh, 41)], after=40)
-            state.copy_bindings([binding(fresh)], NOW + 2)
-            self.assertEqual(state.release_waiting(NOW + 3), 1)                  # a new capture does not wait its turn
+    def test_the_work_of_one_cycle_is_bounded_by_the_batch_however_many_are_releasable(self):
+        state = self.open()
+        leases = self.many(state, 30)
+        state.copy_bindings([binding(one) for one in leases], NOW)
+        with mock.patch.object(state_mod, "RELEASE_BATCH", 4):
+            counts = [state.release_waiting(NOW + n) for n in range(9)]
+        self.assertEqual(counts, [4, 4, 4, 4, 4, 4, 4, 2, 0])                       # oldest first, four at a time
+        self.assertEqual(self.raw("SELECT COUNT(*) FROM receipt_state WHERE state='pending'"), [(30,)])
+
+    def test_nothing_that_cannot_change_is_ever_selected(self):
+        state = self.open()
+        leases = self.many(state, 12)
+        state.copy_bindings([binding(one, OTHER_GATEWAY_ID) for one in leases[:5]], NOW)
+        state.release_waiting(NOW + 1)
+        self.assertEqual(state._release_candidates(), [])                          # the unknown ones have no record
+        self.assertEqual(self.raw("SELECT reason, COUNT(*) FROM receipt_state GROUP BY reason ORDER BY reason"),
+                         [("unknown_reference", 7), ("wrong_gateway", 5)])
+
+    def test_new_captures_with_a_record_are_taken_at_once_behind_any_number_of_unknown_ones(self):
+        state = self.open()
+        self.many(state, 1200)
+        state.release_waiting(NOW)
+        fresh = lease()
+        self.capture(state, [receipt(fresh, 1201)], after=1200)
+        state.copy_bindings([binding(fresh)], NOW + 1)
+        self.assertEqual(state.release_waiting(NOW + 2), 1)
 
 
 class Offer(_Tmp):
