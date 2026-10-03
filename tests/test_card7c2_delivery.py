@@ -122,29 +122,43 @@ class Order(_Rig):
         self.assertIsNone(result.blocked)
         self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM agent_state")[0], 0)
 
-    def test_a_limit_row_that_gets_no_answer_stops_the_cycle_before_the_lease_pass(self):
-        net = Net(limit=[(None, {})])
+    def test_the_two_passes_stay_separate_even_after_a_limit_row_gets_a_retry(self):
+        # Fix round 1 (16.6): the limit route can fail on its own (a 503 for that route only) while
+        # leases work, so a limit RETRY never stops the lease pass either.
+        lease = str(uuid.uuid4())
+        net = Net(lease=[(201, {"lease_id": lease, "state": "active"}), (200, {})], limit=[(503, {})])
         reporter = self.start(net)
         doc = self.put()
-        net.limit = [OSError("down")]
+        result = reporter.cycle()
+        self.assertEqual(result.blocked, UNREACHABLE)             # the limit route is down: said so
+        self.assertEqual(self.row(doc["event_id"])[:2], ("pending", 1))
+        self.assertEqual(self.net.paths()[0], LIMIT_PATH)
+        self.assertEqual(self.acquisition()[0], "acquired")       # and the lease pass still ran, and worked
+        self.assertIn("/v1/leases/%s/settle" % lease, self.net.paths())
+
+    def test_a_limit_row_that_gets_no_answer_is_retried_with_its_own_back_off(self):
+        net = Net(limit=[OSError("down")])
+        reporter = self.start(net, message=False)
+        doc = self.put()
         result = reporter.cycle()
         self.assertEqual(result.blocked, UNREACHABLE)
-        self.assertEqual(self.net.paths(), [LIMIT_PATH])          # the lease pass met the same wall: not tried
-        self.assertEqual(self.row(doc["event_id"])[:2], ("pending", 1))
-        self.assertEqual(self.acquisition()[:2], ("pending", 0))
+        row = self.row(doc["event_id"])
+        self.assertEqual(row[:2], ("pending", 1))
+        self.assertGreater(row[3], self.rig.clock.ms)
 
     def test_a_row_waiting_out_its_own_back_off_is_not_resent_but_the_lease_pass_runs(self):
-        net = Net(limit=[(503, {})])
-        reporter = self.start(net)
+        lease = str(uuid.uuid4())
+        net = Net(lease=[(201, {"lease_id": lease, "state": "active"}), (200, {})], limit=[(503, {})])
+        reporter = self.start(net, message=False)
         doc = self.put()
-        reporter.cycle()                                          # 503: back-off, and the lease pass was skipped
+        reporter.cycle()                                          # 503: the row backs off
+        one_message(self.rig.journal, self.rig.clock.ms, mid="m2", stream="g2")      # a lease message arrives
         calls = len(net.calls)
         net.limit = [(202, {})]
-        result = reporter.cycle()                                 # still inside its back-off
+        reporter.cycle()                                          # the row is still inside its back-off
         self.assertEqual(self.row(doc["event_id"])[0], "pending")
         self.assertNotIn(LIMIT_PATH, net.paths()[calls:])
         self.assertIn("/v1/leases", net.paths()[calls:])          # the lease pass was not held by it
-        self.assertEqual(result.blocked, UNREACHABLE)
         self.rig.clock.advance(1_000)
         reporter.cycle()
         self.assertEqual(self.row(doc["event_id"])[0], "sent")
@@ -162,6 +176,26 @@ class Order(_Rig):
         reporter.cycle()
         self.assertEqual(self.row(doc["event_id"])[0], "sent")
         self.assertIsNone(self.rig.state.note("credential_active"))
+
+
+class Credential(_Rig):
+
+    def test_a_202_then_a_lease_401_then_recovery_by_a_later_limit_request(self):
+        unauthenticated = (401, {"error": {"code": "UNAUTHENTICATED", "message": "x"}})
+        net = Net(lease=[unauthenticated], limit=[(202, {})])
+        reporter = self.start(net)
+        first = self.put()
+        result = reporter.cycle()                                  # the limit event is recorded, then a lease 401
+        state = self.rig.state
+        self.assertEqual(self.row(first["event_id"])[0], "sent")
+        self.assertEqual(result.blocked, CREDENTIAL)
+        self.assertIsNotNone(state.note("credential_active"))      # a credential problem is now reported
+        self.assertIsNotNone(state.note("last_401"))
+        later = self.put()
+        reporter.cycle()                                           # the lease is still backing off: not due
+        self.assertEqual(self.row(later["event_id"])[0], "sent")
+        self.assertIsNone(state.note("credential_active"))         # a good limit request ended the fault
+        self.assertIsNotNone(state.note("last_401"))               # the history stays
 
 
 class Bytes(_Rig):

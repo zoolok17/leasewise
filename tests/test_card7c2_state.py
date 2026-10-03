@@ -287,6 +287,42 @@ class Scheduling(_Tmp):
         self.assertIsNone(state.next_item(NOW))
 
 
+class Atomic(_Tmp):
+    """The credential notes move in the SAME transaction as the delivery state (fix round 1, 16.6): a
+    failure while writing the state leaves the notes as they were."""
+
+    def armed(self):
+        state = self.open()
+        doc = body()
+        state.add_limit_event(ALIAS, doc, NOW)
+        item = state.next_limit_item(NOW)
+        state.conn.execute("CREATE TEMP TRIGGER boom BEFORE UPDATE ON limit_event BEGIN "
+                           "SELECT RAISE(ABORT, 'the delivery state could not be written'); END")
+        return state, item
+
+    def test_a_success_clears_the_credential_note_only_together_with_the_row_state(self):
+        state, item = self.armed()
+        with state.txn():
+            state.set_note(state_mod.NOTE_CREDENTIAL_ACTIVE, "UNAUTHENTICATED", NOW)
+        with self.assertRaises(sqlite3.DatabaseError):
+            state.apply(item, decisions.Response(202), NOW + 1, 0.0)
+        self.assertIsNotNone(state.note(state_mod.NOTE_CREDENTIAL_ACTIVE))          # not cleared
+        self.assertIsNone(state.note("last_ok:" + state_mod.LIMIT_AGENT))            # not recorded
+        self.assertEqual(self.rows()[0][4], "pending")
+        state.conn.execute("DROP TRIGGER boom")
+        state.apply(item, decisions.Response(202), NOW + 1, 0.0)                     # and it works afterwards
+        self.assertIsNone(state.note(state_mod.NOTE_CREDENTIAL_ACTIVE))
+        self.assertEqual(self.rows()[0][4], "sent")
+
+    def test_a_401_starts_the_credential_notes_only_together_with_the_retry_state(self):
+        state, item = self.armed()
+        with self.assertRaises(sqlite3.DatabaseError):
+            state.apply(item, decisions.Response(401, "UNAUTHENTICATED"), NOW + 1, 0.0)
+        self.assertIsNone(state.note(state_mod.NOTE_CREDENTIAL_ACTIVE))
+        self.assertIsNone(state.note(state_mod.NOTE_LAST_401))
+        self.assertEqual(self.rows()[0][5], 0)                                       # no try counted either
+
+
 class Apply(_Tmp):
 
     def go(self, status, code=None, now=NOW + 1_000):

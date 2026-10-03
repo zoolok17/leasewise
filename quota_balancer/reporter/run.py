@@ -103,12 +103,13 @@ class Reporter:
                                 self.clock())
 
     def _send(self, result):
-        """Two passes, the limit pass FIRST (card 7c-2). Limit events belong to no seat and no
-        message, so nothing a lease answers (a retry, a 429 from a parked account, a refusal) may
-        delay one. If the limit pass itself meets the wall (no answer, 5xx, 429, 401) the lease
-        pass would meet the same one, so the cycle stops."""
-        if self._send_pass(result, self.state.next_limit_item):
-            self._send_pass(result, self.state.next_item)
+        """Two passes, the limit pass FIRST (card 7c-2), and the two stay SEPARATE. Limit events
+        belong to no seat and no message, so nothing a lease answers (a retry, a 429 from a parked
+        account, a refusal) may delay one; and the limit route can fail on its own while leases
+        work, so a limit retry does not stop the lease pass either. Each pass stops on its own
+        wall; `result.blocked` says if either met one."""
+        self._send_pass(result, self.state.next_limit_item)
+        self._send_pass(result, self.state.next_item)
 
     def _send_pass(self, result, pick):
         """Send what `pick` offers, one request at a time. True if the pass ran out of due items;
