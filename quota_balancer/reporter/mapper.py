@@ -22,8 +22,11 @@ LIMIT_BODY_KEYS = frozenset({"event_id", "account_id", "turn_id", "observed_at",
                              "resets_at", "exhausted_windows"})
 LIMIT_EVIDENCE_KINDS = frozenset({"claude_exhausted", "codex_exhausted", "provider_usage_429"})
 LIMIT_RESET_CEILING = INT64_MAX - 30_000
+# The ONLY window words a limit event may carry: the producer's own (agenttalk's park marker). The
+# strict reader uses this same tuple, so what it lets through the queue always accepts, and a private
+# phrase can never be stored or sent as a window.
+LIMIT_WINDOWS = ("five_hour", "seven_day")
 _LIMIT_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_LIMIT_WINDOW = re.compile(r"[a-z][a-z0-9_]{0,31}")
 
 
 def _plain_int(value, low, high):
@@ -41,13 +44,13 @@ def limit_body_text(body):
             raise ValueError("id")
     if not _plain_int(body["observed_at"], 1, INT64_MAX):
         raise ValueError("observed_at")
-    if body["evidence_kind"] not in LIMIT_EVIDENCE_KINDS:
-        raise ValueError("evidence_kind")
+    if type(body["evidence_kind"]) is not str or body["evidence_kind"] not in LIMIT_EVIDENCE_KINDS:
+        raise ValueError("evidence_kind")      # the type first: a list or an object is not hashable
     if body["resets_at"] is not None and not _plain_int(body["resets_at"], 1, LIMIT_RESET_CEILING):
         raise ValueError("resets_at")
     windows = body["exhausted_windows"]
     if type(windows) is not list or len(windows) > 4 or not all(
-            type(w) is str and _LIMIT_WINDOW.fullmatch(w) for w in windows):
+            type(w) is str and w in LIMIT_WINDOWS for w in windows):
         raise ValueError("windows")
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 

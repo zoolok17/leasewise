@@ -16,7 +16,7 @@ Counts of what was skipped describe the LAST scan; they carry no text from any f
 """
 
 from . import mapper, parkreader
-from .state import LIMIT_AGENT
+from .state import LIMIT_AGENT  # noqa: F401  (re-exported: the counters of a scan are kept under this word)
 
 # What a scan counts (closed words). `captured` (new events) is cumulative, kept by the state.
 SKIP_COUNTS = ("read_later", "refused", "stale", "reset_passed", "unmapped", "window_unknown",

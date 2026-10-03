@@ -27,6 +27,7 @@ import os
 import re
 
 from .events import _NAME
+from .mapper import LIMIT_WINDOWS
 
 OK = "ok"
 READ_LATER = "read_later"
@@ -37,7 +38,7 @@ MAX_ENTRIES = 256
 MAX_BYTES = 4096
 SCHEMA_VERSION = 1
 PROVIDERS = ("claude",)
-WINDOWS = ("five_hour", "seven_day")
+WINDOWS = LIMIT_WINDOWS                  # ONE list, shared with the queue's validator (mapper)
 MARKER_STATE = "usage_limit_parked"
 STALE_SECONDS = 300                       # agenttalk's MARKER_STALE_SECONDS
 MAX_EPOCH = 4_102_444_800                 # 2100-01-01: no marker time is later than this
