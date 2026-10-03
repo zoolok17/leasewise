@@ -274,8 +274,9 @@ class Rig:
         from quota_balancer.reporter.run import Reporter
         from quota_balancer.reporter.state import State
         config = cfg.load_config(self.ws.config)
-        agents = cfg.resolve_agents(config, cfg.load_snapshot(
-            config.policy_ids_path))
+        snapshot = cfg.load_snapshot(config.policy_ids_path)
+        agents = cfg.resolve_agents(config, snapshot)
+        limit_sources = cfg.resolve_limit_sources(config, snapshot)       # card 7c-2; () without the block
         self.state = State(self.ws.state)
         real = HttpClient(config.scheme, config.host, config.port,
                           config.identity)._http
@@ -284,7 +285,8 @@ class Rig:
                             config.identity, transport=transport or self.net)
         self.reporter = Reporter(config, agents, self.state, client,
                                  clock=self.clock, rng=lambda: 0.5,
-                                 stop=stop, fault=fault)
+                                 stop=stop, fault=fault,
+                                 limit_sources=limit_sources)
         return self.reporter
 
     def close(self):

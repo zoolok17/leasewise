@@ -1688,10 +1688,11 @@ class FixRound2LimitEventEvidenceMerge(_ServerCase):
         status, b = self.limit_event(resets_at=NOW + 3_600_000)
         self.assertEqual(status, 202, b)
         self.assertEqual(b["block_id"], a["block_id"])
-        self.assertEqual(b["retry_at"], NOW + 3_600_000)
+        # Card 7c-2 step 1: the retry is the reset plus the 30-second margin.
+        self.assertEqual(b["retry_at"], NOW + 3_600_000 + 30_000)
         self.assertEqual(
             _rows(self.db, "SELECT retry_at FROM blocks WHERE id=?",
-                 (a["block_id"],)), [(NOW + 3_600_000,)])
+                 (a["block_id"],)), [(NOW + 3_600_000 + 30_000,)])
 
     def test_a_smaller_reset_from_a_later_joining_event_does_not_regress_the_retry_at(self):
         # The reviewer's own wording: "never schedule an earlier retry
@@ -1704,15 +1705,18 @@ class FixRound2LimitEventEvidenceMerge(_ServerCase):
         status, b = self.limit_event(resets_at=NOW + 60_000)
         self.assertEqual(status, 202, b)
         self.assertEqual(b["block_id"], a["block_id"])
-        self.assertEqual(b["retry_at"], NOW + 3_600_000)
+        # Card 7c-2 step 1: still the later reset, with the margin added once.
+        self.assertEqual(b["retry_at"], NOW + 3_600_000 + 30_000)
         self.assertEqual(
             _rows(self.db, "SELECT retry_at FROM blocks WHERE id=?",
-                 (a["block_id"],)), [(NOW + 3_600_000,)])
+                 (a["block_id"],)), [(NOW + 3_600_000 + 30_000,)])
 
     def test_unknown_reset_from_a_joining_event_poisons_the_merged_retry_at(self):
         self.start()
         status, a = self.limit_event(resets_at=NOW + 60_000)
         self.assertEqual(status, 202, a)
+        # Card 7c-2 step 1: the first, known reset carries the margin ...
+        self.assertEqual(a["retry_at"], NOW + 60_000 + 30_000)
         status, b = self.limit_event(resets_at=None)
         self.assertEqual(status, 202, b)
         self.assertEqual(b["block_id"], a["block_id"])

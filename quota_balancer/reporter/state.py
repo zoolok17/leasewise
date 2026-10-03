@@ -7,11 +7,17 @@ stored once, never changed, and sent from the stored bytes (Part 12 D5).
 
 import contextlib
 import json
+import re
 import sqlite3
 
 from . import decisions, mapper
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2       # 2: card 7c-2 added the limit_event table (version 1 files are migrated)
+
+# The agent word on a limit item. Real agent names start with a letter or a digit, so this can
+# never be one: a limit event belongs to no seat and no message.
+LIMIT_AGENT = "_limit_events"
+_ALIAS = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 
 # Facts about the reporter itself, kept in the `note` table (see _NOTE_DDL).
@@ -36,7 +42,7 @@ class StateOwned(StateError):
 _NOTE_DDL = ("CREATE TABLE IF NOT EXISTS note(name TEXT PRIMARY KEY, code TEXT,"
              " at_ms INTEGER NOT NULL) STRICT")
 
-_DDL = (
+_DDL_V1 = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT",
     "CREATE TABLE cursor(stream TEXT NOT NULL, segment INTEGER NOT NULL,"
     " offset INTEGER NOT NULL, PRIMARY KEY(stream, segment)) STRICT",
@@ -103,6 +109,25 @@ _DDL = (
     _NOTE_DDL,
 )
 
+# Version 2 (card 7c-2): the limit-event outbox. One row per limit fact, keyed by `event_id`; the
+# body is the frozen canonical JSON text and is never recomputed. Identity and body cannot change
+# and a row cannot be deleted; only the delivery columns move.
+_LIMIT_DDL = (
+    "CREATE TABLE limit_event(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " event_id TEXT NOT NULL UNIQUE, account_alias TEXT NOT NULL,"
+    " body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN"
+    " ('pending','sent','failed_permanent')), tries INTEGER NOT NULL DEFAULT 0,"
+    " not_before_ms INTEGER NOT NULL DEFAULT 0, last_error_code TEXT,"
+    " captured_ms INTEGER NOT NULL) STRICT",
+    "CREATE TRIGGER limit_event_immutable BEFORE UPDATE OF event_id, account_alias, body,"
+    " captured_ms ON limit_event BEGIN"
+    " SELECT RAISE(ABORT, 'a limit event is immutable'); END",
+    "CREATE TRIGGER limit_event_keep BEFORE DELETE ON limit_event BEGIN"
+    " SELECT RAISE(ABORT, 'a limit event is immutable'); END",
+)
+
+_DDL = _DDL_V1 + _LIMIT_DDL
+
 
 class State:
     def __init__(self, path):
@@ -140,6 +165,12 @@ class State:
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version == 0:
             for statement in _DDL:
+                self.conn.execute(statement)
+            self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        elif version == 1 and SCHEMA_VERSION >= 2:
+            # Version 1 -> 2, inside the caller's transaction: all or nothing.
+            self.conn.execute(_NOTE_DDL)            # a file made before card 7a-3
+            for statement in _LIMIT_DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
@@ -208,6 +239,64 @@ class State:
         fixed the cause only has to restart. Items that already failed for
         good stay failed; a still-broken agent stops again on its next answer."""
         return self.conn.execute("DELETE FROM agent_state").rowcount
+
+    # --- the limit-event outbox (card 7c-2) -----------------------------------
+
+    def add_limit_event(self, account_alias, body, now_ms):
+        """Store one limit event, frozen, in one transaction. True if it is new, False if a row
+        with that `event_id` already exists (the first bytes stay; nothing is changed). The body
+        must be exactly the allow-listed shape: anything else raises StateError with a fixed
+        sentence that carries no value."""
+        with self.txn():
+            return self._put_limit_event(account_alias, body, now_ms)
+
+    def _put_limit_event(self, account_alias, body, now_ms):
+        """The insert itself, inside the caller's transaction."""
+        try:
+            text = mapper.limit_body_text(body)
+        except ValueError:
+            raise StateError("a limit event body is not valid") from None
+        if type(account_alias) is not str or _ALIAS.fullmatch(account_alias) is None:
+            raise StateError("a limit event body is not valid")
+        added = self.conn.execute(
+            "INSERT OR IGNORE INTO limit_event(event_id, account_alias, body, captured_ms)"
+            " VALUES(?,?,?,?)", (body["event_id"], account_alias, text, now_ms))
+        return added.rowcount == 1
+
+    def record_capture(self, items, counts, now_ms):
+        """One scan's result, in ONE transaction: each new event (a row that already exists is left
+        exactly as it is), the cumulative `captured` count, and the counts of the LAST scan (absolute,
+        so a stale file seen every cycle does not pile up). -> the number of new events."""
+        added = 0
+        with self.txn():
+            for account_alias, body in items:
+                if self._put_limit_event(account_alias, body, now_ms):
+                    added += 1
+            if added:
+                self.bump(LIMIT_AGENT, "captured", added)
+            for name, value in counts.items():
+                self.conn.execute(
+                    "INSERT INTO counter(agent, name, value) VALUES(?,?,?) ON CONFLICT(agent, name) "
+                    "DO UPDATE SET value=excluded.value", (LIMIT_AGENT, "scan:" + name, value))
+            self.set_note("limit_last_scan", None, now_ms)
+        return added
+
+    def note_capture_fault(self, now_ms):
+        """A capture pass failed as a whole: count it (no text) and say when."""
+        with self.txn():
+            self.bump(LIMIT_AGENT, "capture_fault")
+            self.set_note("limit_last_fault", None, now_ms)
+
+    def next_limit_item(self, now_ms):
+        """The oldest limit row that is pending and due, as an Item, or None. Limit events belong
+        to no agent and no message: nothing about a lease or a stopped agent holds one back."""
+        row = self.one(
+            "SELECT id, event_id, body FROM limit_event WHERE state='pending' AND not_before_ms<=?"
+            " ORDER BY id LIMIT 1", (now_ms,))
+        if row is None:
+            return None
+        return Item(decisions.LIMIT, LIMIT_AGENT, "", "/v1/limit-events", json.loads(row[2]),
+                    row[1], ("limit_event", row[0]), None)
 
     # --- the outbox -------------------------------------------------------
 

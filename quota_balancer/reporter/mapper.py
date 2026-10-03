@@ -5,6 +5,8 @@ only, so a restart or a lost answer yields the same bytes (DESIGN-7A.md
 4.4 and 4.6). No clock, no I/O, no randomness except what the caller passes.
 """
 
+import json
+import re
 import uuid
 
 from .events import INT64_MAX
@@ -12,6 +14,72 @@ from .events import INT64_MAX
 # A fixed namespace: ids derived from it must never change between releases.
 NAMESPACE = uuid.UUID("5d0c8e4a-7a2b-4c61-9f3e-2b6a1c9d7e10")
 MODE_UNKNOWN = "UNKNOWN"
+
+
+# Card 7c-2: the ONLY fields a limit event may carry (the allow-list, DESIGN-7C2.md section 4).
+# Leasewise adds a 30-second margin to `resets_at`, so the ceiling leaves room for it.
+LIMIT_BODY_KEYS = frozenset({"event_id", "account_id", "turn_id", "observed_at", "evidence_kind",
+                             "resets_at", "exhausted_windows"})
+LIMIT_EVIDENCE_KINDS = frozenset({"claude_exhausted", "codex_exhausted", "provider_usage_429"})
+LIMIT_RESET_CEILING = INT64_MAX - 30_000
+# The ONLY window words a limit event may carry: the producer's own (agenttalk's park marker). The
+# strict reader uses this same tuple, so what it lets through the queue always accepts, and a private
+# phrase can never be stored or sent as a window.
+LIMIT_WINDOWS = ("five_hour", "seven_day")
+_LIMIT_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _plain_int(value, low, high):
+    return type(value) is int and low <= value <= high
+
+
+def limit_body_text(body):
+    """The canonical text of a limit-event body, or ValueError if it is not exactly the
+    allow-listed shape. The same canonical form the client sends, so a stored body and the
+    bytes on the wire are the same bytes."""
+    if type(body) is not dict or frozenset(body) != LIMIT_BODY_KEYS:
+        raise ValueError("shape")
+    for key in ("event_id", "account_id", "turn_id"):
+        if type(body[key]) is not str or _LIMIT_UUID.fullmatch(body[key]) is None:
+            raise ValueError("id")
+    if not _plain_int(body["observed_at"], 1, INT64_MAX):
+        raise ValueError("observed_at")
+    if type(body["evidence_kind"]) is not str or body["evidence_kind"] not in LIMIT_EVIDENCE_KINDS:
+        raise ValueError("evidence_kind")      # the type first: a list or an object is not hashable
+    if body["resets_at"] is not None and not _plain_int(body["resets_at"], 1, LIMIT_RESET_CEILING):
+        raise ValueError("resets_at")
+    windows = body["exhausted_windows"]
+    if type(windows) is not list or len(windows) > 4 or not all(
+            type(w) is str and w in LIMIT_WINDOWS for w in windows):
+        raise ValueError("windows")
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+def limit_key(machine, account_alias, window, reset_epoch, parked_at_ms):
+    """One limit fact: (installation, account alias, evidence kind, window, reset). With an unknown
+    reset the marker's park time (milliseconds) joins the key. The seat, the message and the wrapper
+    generation are NOT in it, so two seats on one account that hit one limit make one event."""
+    tail = str(reset_epoch) if reset_epoch is not None else "unknown|%d" % parked_at_ms
+    return "|".join((machine, account_alias, "claude_exhausted", window, tail))
+
+
+def limit_event_id(key):
+    return str(uuid.uuid5(NAMESPACE, "limit|" + key))
+
+
+def limit_turn_id(key):
+    """For a limit event `turn_id` names the limit fact, not a lease turn (Leasewise only checks that
+    it is a valid id and keeps it for the replay comparison)."""
+    return str(uuid.uuid5(NAMESPACE, "limit-turn|" + key))
+
+
+def limit_body(key, account_id, parked_at_ms, reset_epoch, window):
+    """The limit-event body, built field by field. `resets_at` is RAW (Leasewise adds the margin);
+    there is no `model_id`, so the block is account-wide."""
+    return {"event_id": limit_event_id(key), "account_id": account_id, "turn_id": limit_turn_id(key),
+            "observed_at": parked_at_ms, "evidence_kind": "claude_exhausted",
+            "resets_at": None if reset_epoch is None else reset_epoch * 1000,
+            "exhausted_windows": [window]}
 
 
 class AgentConfig:

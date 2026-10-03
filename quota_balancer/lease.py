@@ -1435,6 +1435,19 @@ _LIMIT_EVENT_KEYS = frozenset((
 _EVIDENCE_KINDS = frozenset((
     "codex_exhausted", "claude_exhausted", "provider_usage_429"))
 
+# Card 7c-2 (DESIGN.md:197: "retry_at is latest exhausted-window reset +30
+# seconds"): an account stays parked until this long AFTER the reset a
+# reporter states, so the provider has really reopened. It is added in ONE
+# place, record_limit_event, to the NEW event's reset only. The reset a
+# reporter sent stays raw in limit_events.resets_at (and in the replay
+# identity); a replay is a pure read and never recomputes anything. The
+# ceiling LIMIT_RESETS_AT_MAX keeps the sum inside a signed 64-bit integer;
+# it is checked for a NEW event only (fix round 1): a replay of an event
+# Leasewise already holds keeps the old domain.
+LIMIT_RETRY_MARGIN_MS = 30_000
+# The largest reset a NEW event may state: the margin must still fit in a signed 64-bit integer.
+LIMIT_RESETS_AT_MAX = policy.INT64_MAX - LIMIT_RETRY_MARGIN_MS
+
 
 def _validate_limit_event(event):
     if not isinstance(event, dict) or frozenset(event) != _LIMIT_EVENT_KEYS:
@@ -1443,6 +1456,9 @@ def _validate_limit_event(event):
     policy._check_uuid(event["account_id"])
     if event["model_id"] is not None:
         policy._check_uuid(event["model_id"])
+    # For a limit event turn_id is only a validated id kept for the replay
+    # comparison. It is not linked to a lease (leases.turn_id is a separate
+    # column): a reporter derives it from the limit fact it reports.
     policy._check_uuid(event["turn_id"])
     policy._check_int(event["observed_at"], 1)
     # Type-checked BEFORE membership (fix round 2, tk-dae9aab24ef8
@@ -1453,6 +1469,9 @@ def _validate_limit_event(event):
             or event["evidence_kind"] not in _EVIDENCE_KINDS:
         _invalid()
     if event["resets_at"] is not None:
+        # The OLD domain, up to INT64_MAX: what Leasewise accepted before the margin. A replay of an
+        # event it already holds must keep behaving exactly as before, so the smaller ceiling
+        # (LIMIT_RESETS_AT_MAX) is checked only once the event is known to be NEW.
         policy._check_int(event["resets_at"], 1)
     windows = event["exhausted_windows"]
     if not isinstance(windows, list) or not all(isinstance(w, str) for w in windows):
@@ -1479,6 +1498,12 @@ def record_limit_event(path, event, now_ms, authorized_for_account=None):
     """Publish a reporter-observed limit exhaustion as a parked block on
     the account (section 7: "POST /limit-events... 202
     {block_id,retry_at,state}").
+
+    The block's retry_at is the reset the reporter stated PLUS
+    LIMIT_RETRY_MARGIN_MS (card 7c-2): added once, to this event's own
+    reset only, never to a value already on a block. limit_events keeps the
+    reset as sent. Blocks that existed before the margin keep their stored
+    retry_at (no backfill).
 
     A block is account-wide (model_id NULL) or model-scoped, matching the
     blocks_live partial index (one live block per (account,
@@ -1558,6 +1583,10 @@ def record_limit_event(path, event, now_ms, authorized_for_account=None):
                 conn.execute("COMMIT")
                 return {"block_id": block_id, "retry_at": block[0],
                         "state": block[1]}
+            # Known to be NEW now (an insert or a join): the margin needs room.
+            if (event["resets_at"] is not None
+                    and event["resets_at"] > LIMIT_RESETS_AT_MAX):
+                _invalid()
             account = conn.execute("SELECT id FROM accounts WHERE id=?",
                                    (event["account_id"],)).fetchone()
             if account is None:
@@ -1572,9 +1601,12 @@ def record_limit_event(path, event, now_ms, authorized_for_account=None):
                 "SELECT id, retry_at, state FROM blocks WHERE account_id=? "
                 "AND model_id IS ? AND state IN ('parked','probing')",
                 (event["account_id"], event["model_id"])).fetchone()
+            # The margin goes on this event's own reset only; null stays null.
+            new_retry_at = (None if event["resets_at"] is None
+                            else event["resets_at"] + LIMIT_RETRY_MARGIN_MS)
             if live is None:
                 block_id = str(_uuid.uuid4())
-                retry_at, state = event["resets_at"], "parked"
+                retry_at, state = new_retry_at, "parked"
                 conn.execute(
                     "INSERT INTO blocks(id, account_id, model_id, "
                     "reason, retry_at, state, source_event_id, updated_at) "
@@ -1584,7 +1616,7 @@ def record_limit_event(path, event, now_ms, authorized_for_account=None):
                      event["event_id"], now_ms))
             else:
                 block_id, old_retry_at, state = live
-                retry_at = _merge_retry_at(old_retry_at, event["resets_at"])
+                retry_at = _merge_retry_at(old_retry_at, new_retry_at)
                 conn.execute(
                     "UPDATE blocks SET retry_at=?, updated_at=? WHERE id=?",
                     (retry_at, now_ms, block_id))

@@ -55,7 +55,7 @@ class HttpClient:
 
     def send(self, item):
         """POST one outbox item; always returns a Response."""
-        if not _safe_path(item.path):
+        if not _allowed(item.kind, item.path):
             return Response(None, BAD_ANSWER)
         body = json.dumps(item.body, sort_keys=True,
                           separators=(",", ":")).encode("utf-8")
@@ -71,6 +71,18 @@ class HttpClient:
         except Exception:               # no text is kept: see the module note
             return Response(None)
         return _response(item.kind, status, raw, self._identity)
+
+
+LIMIT_PATH = "/v1/limit-events"
+
+
+def _allowed(kind, path):
+    """The kind and the path are checked as a PAIR (card 7c-2): a limit row may be sent to exactly
+    LIMIT_PATH and to nothing else; every other kind keeps the lease rule, which never allows
+    LIMIT_PATH. Nothing else can reach it."""
+    if kind == decisions.LIMIT:
+        return path == LIMIT_PATH
+    return _safe_path(path)
 
 
 def _safe_path(path):
@@ -116,6 +128,10 @@ def _response(kind, status, raw, identity=""):
     if isinstance(error, dict):
         # Only Leasewise's own words: anything else is UNKNOWN_CODE.
         code = decisions.closed_code(error.get("code"))
+    if kind == decisions.LIMIT:
+        # A limit answer is its status and its error word, nothing else: no field of a 202 body
+        # (block, retry time, state) is read, kept or shown.
+        return Response(status, code)
     value = doc.get("lease_id")
     if isinstance(value, str):
         if identity and identity in value:

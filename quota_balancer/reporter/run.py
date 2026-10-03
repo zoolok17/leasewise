@@ -13,7 +13,7 @@ import random
 import threading
 import time
 
-from . import decisions, events, rounds, status
+from . import capture, decisions, events, rounds, status
 
 # What a cycle ended with.
 OK = "ok"
@@ -21,6 +21,18 @@ UNREACHABLE = "unreachable"         # no answer, 5xx or 429: try again later
 CREDENTIAL = "credential"           # a 401: the identity must be fixed
 
 MAX_SLEEP_SECONDS = 900
+# While limit capture is configured the wait between cycles never exceeds this, even while Leasewise
+# is not answering: the wrapper refreshes a park file about once a minute and a file counts as fresh
+# for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
+LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
+
+
+def _worse(current, new):
+    """The higher-ranked of two cycle outcomes: credential, then unreachable, then None. A login
+    problem an operator must fix is never hidden by a later "the server is down"."""
+    if CREDENTIAL in (current, new):
+        return CREDENTIAL
+    return UNREACHABLE if UNREACHABLE in (current, new) else None
 
 
 def _now_ms():
@@ -28,9 +40,10 @@ def _now_ms():
 
 
 class CycleResult:
-    __slots__ = ("new_events", "sent", "blocked", "journal_stopped")
+    __slots__ = ("new_events", "sent", "blocked", "journal_stopped", "new_limit_events")
 
     def __init__(self):
+        self.new_limit_events = 0       # card 7c-2: limit events captured this cycle
         self.new_events = 0
         self.sent = 0
         self.blocked = None             # None, UNREACHABLE or CREDENTIAL
@@ -45,8 +58,9 @@ class CycleResult:
 
 class Reporter:
     def __init__(self, config, agents, state, client, *, clock=_now_ms,
-                 rng=random.random, stop=None, fault=None):
+                 rng=random.random, stop=None, fault=None, limit_sources=()):
         self.config = config
+        self.limit_sources = tuple(limit_sources)   # card 7c-2: resolved account map (may be empty)
         self.agents = agents            # {agent: mapper.AgentConfig}
         self.state = state
         self.client = client
@@ -65,6 +79,8 @@ class Reporter:
         result = CycleResult()
         self._read(result)
         if not self.stop.is_set():
+            self._capture(result)
+        if not self.stop.is_set():
             self._send(result)
         # The back-off grows over consecutive blocked cycles. A cycle that
         # found nothing due (an item still waiting out its own back-off) is
@@ -80,7 +96,8 @@ class Reporter:
     def report(self):
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
-                                   self.config.silent_after_seconds)
+                                   self.config.silent_after_seconds,
+                                   self.limit_sources)
 
     def _read(self, result):
         try:
@@ -102,12 +119,40 @@ class Reporter:
             self.state.set_note(status.journal_stopped_note(), reason,
                                 self.clock())
 
+    def _capture(self, result):
+        """Notice the park markers of the configured folders and queue their limit events (card 7c-2).
+        A fault anywhere in here is caught whole: counted, no text kept, and it never stops lease
+        sending."""
+        if not self.limit_sources:
+            return
+        try:
+            result.new_limit_events = capture.run(self.state, self.limit_sources,
+                                                  self.config.machine, self.clock())
+        except Exception:               # noqa: BLE001 - nothing from the fault is kept
+            try:
+                self.state.note_capture_fault(self.clock())
+            except Exception:           # noqa: BLE001 - even the count may fail; sending goes on
+                pass
+
     def _send(self, result):
+        """Two passes, the limit pass FIRST (card 7c-2), and the two stay SEPARATE. Limit events
+        belong to no seat and no message, so nothing a lease answers (a retry, a 429 from a parked
+        account, a refusal) may delay one; and the limit route can fail on its own while leases
+        work, so a limit retry does not stop the lease pass either. Each pass stops on its own
+        wall. `result.blocked` combines the two outcomes by RANK, so the summary never depends on which
+        pass ran last: a credential refusal (401) from either pass shows as CREDENTIAL, above
+        UNREACHABLE (no answer, 5xx, 429), above nothing."""
+        self._send_pass(result, self.state.next_limit_item)
+        self._send_pass(result, self.state.next_item)
+
+    def _send_pass(self, result, pick):
+        """Send what `pick` offers, one request at a time. True if the pass ran out of due items;
+        False if it was stopped (told to stop, or blocked: result.blocked says which)."""
         while not self.stop.is_set():
             now = self.clock()
-            item = self.state.next_item(now)
+            item = pick(now)
             if item is None:
-                return
+                return True
             answer = self.client.send(item)
             if self.fault:
                 self.fault("answered")
@@ -118,11 +163,14 @@ class Reporter:
             if decision.action == decisions.DONE:
                 result.sent += 1
             elif decision.action == decisions.RETRY:
-                # Leasewise is not answering, or refuses the identity: every
-                # other request would meet the same wall. Stop this cycle.
-                result.blocked = CREDENTIAL if answer.status == 401 \
-                    else UNREACHABLE
-                return
+                # Leasewise is not answering, or refuses the identity: every other request of
+                # THIS pass would meet the same wall, so this pass stops (the other pass still
+                # runs). The summary keeps the worse of the two outcomes: credential above
+                # unreachable.
+                result.blocked = _worse(result.blocked, CREDENTIAL if answer.status == 401
+                                        else UNREACHABLE)
+                return False
+        return False
 
     # --- the commands ----------------------------------------------------------
 
@@ -142,4 +190,7 @@ class Reporter:
             if result.blocked is not None:
                 wait = max(wait, decisions.backoff_ms(
                     self.failures, self.rng()) / 1000.0)
-            self.stop.wait(min(wait, MAX_SLEEP_SECONDS))
+            longest = MAX_SLEEP_SECONDS
+            if self.limit_sources:
+                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)
+            self.stop.wait(min(wait, longest))

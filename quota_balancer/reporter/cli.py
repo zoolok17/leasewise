@@ -30,6 +30,9 @@ MSG_OWNED = ("the state is owned by another reporter: `run` and `drain` "
              "cannot overlap; stop the other one first")
 MSG_STATE = "the state file cannot be used"
 MSG_INTERNAL = "the reporter stopped on an internal fault"
+STATUS_VERSION_CODE = "STATUS_VERSION"
+MSG_STATUS_VERSION = ("the running reporter's status has a version this program does not know: "
+                      "upgrade this program, or stop the running reporter")
 
 
 def _error(code, message):
@@ -63,8 +66,9 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
         config = cfg.load_config(args.config, permissions=permissions)
         if args.verb == "status":
             return _status(config, args)
-        agents = cfg.resolve_agents(config,
-                                    cfg.load_snapshot(config.policy_ids_path))
+        snapshot = cfg.load_snapshot(config.policy_ids_path)
+        agents = cfg.resolve_agents(config, snapshot)
+        limit_sources = cfg.resolve_limit_sources(config, snapshot)
     except cfg.ConfigError as exc:
         _error(exc.code, exc.message)
         return EXIT_REFUSED
@@ -85,7 +89,8 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
                             config.identity, transport=transport)
         kwargs = {} if clock is None else {"clock": clock}
         reporter = Reporter(config, agents, state, client,
-                            stop=stop or threading.Event(), **kwargs)
+                            stop=stop or threading.Event(),
+                            limit_sources=limit_sources, **kwargs)
         return _go(reporter, args.verb)
     except Exception:
         _error(INTERNAL, MSG_INTERNAL)
@@ -146,7 +151,8 @@ def _status(config, args):
         state = State(path)
         try:
             report = status_mod.build_status(
-                state, set(config.agents), now, config.silent_after_seconds)
+                state, set(config.agents), now, config.silent_after_seconds,
+                config.limit_sources)
         finally:
             state.close()
     except StateOwned:
@@ -154,6 +160,12 @@ def _status(config, args):
             status_mod.snapshot_path(config.state_path))
         if report is None:
             _error(STATE_OWNED, MSG_OWNED + " (no snapshot yet)")
+            return EXIT_REFUSED
+        version = report.get("status_version")
+        if type(version) is not int or not 1 <= version <= status_mod.STATUS_VERSION:
+            # Older versions are shown as they are (the text view says what is missing); a version
+            # this program does not know is never guessed at.
+            _error(STATUS_VERSION_CODE, MSG_STATUS_VERSION)
             return EXIT_REFUSED
     except StateError:
         _error(STATE_FAILED, MSG_STATE)
