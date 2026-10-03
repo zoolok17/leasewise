@@ -400,9 +400,26 @@ unknown number is not a zero.
 null input or output count (`lease.usage_unknown(conn, lease_id)`), and the audit row written when the
 lease settles says `"usage_unknown": 1`.
 
+**The next lease waits (input budget).** Accepting the receipt is not enough: the admission check adds
+up the input tokens of settled leases, an addition skips unknown values, and a settled lease holds
+nothing any more (an advisory lease never held anything). So unknown input would silently vanish from
+the next decision. Instead: **while any final receipt of a lease that is not shadow has unknown input
+tokens inside a scope's window, a new lease that needs that scope's input limit is refused with
+`INPUT_USAGE_UNKNOWN`** (HTTP 429, exit code 2, the text "input usage in this window is unknown until
+the window rolls over"). Details:
+- it applies to every scope (platform, project, team, seat) that has an input-token limit in that
+  window, and only to the scopes the receipt's lease belongs to;
+- the window is the lease's grant day or grant month, as for every other settled usage, so **the refusal
+  lasts until the window rolls over** (the next day for a daily limit, the next month for a monthly one);
+  nothing clears it earlier;
+- a receipt with **known** input and unknown **output** does not trigger it: its known input stays in
+  the sum;
+- shadow requests and shadow receipts are not affected (they never count toward any limit);
+- money is not affected: the account budget only adds up money, which a final receipt always carries.
+
 **For anyone who reads receipts later (reports, analytics): a null token count means "unknown", never
-0.** Do not add it up as zero and do not average over it. Money (`actual_micro_eur`) is always known on
-a final receipt, and the account budget, which only adds up money, is not affected.
+0.** Do not add it up as zero and do not average over it. The admission check above is the one reader
+of the input column today, and it treats unknown as a reason to wait, not as zero.
 
 **Limit.** The gateway side that produces such receipts is not built yet (card 6a); today only a test
 or an operator can send one.

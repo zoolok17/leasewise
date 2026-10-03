@@ -42,6 +42,41 @@ report or analytic must treat a null token count as unknown, never as 0**.
 No store change. `receipts` already allows null counts (card L1c rebuilt it, `migrate.py` :499-511); a test
 asserts that on the live store before anything relies on it.
 
+## Added after Codex's read (finding F1): the next quota decision must see unknown input
+
+**What Codex found.** Accepting a null-count final receipt was not enough. The admission query adds up
+`r.input_tokens` over final receipts and a SUM skips nulls; a settled lease's hold is counted only while the
+lease is active or uncertain, so keeping the hold whole does not reach admission; an advisory lease has no hold at
+all. So unknown input usage disappeared from the NEXT decision. The sentence in the design note that nothing reads
+the receipt token columns was false: the admission query reads them.
+
+**The rule (the lead's decision, the smallest conservative option).** For every scope that has an input-token limit
+in a window (grant day or grant month), if any final receipt of a lease that is not shadow has UNKNOWN input
+tokens in that scope and window, a new lease that needs that limit is refused with a closed word,
+`INPUT_USAGE_UNKNOWN`, until the window rolls over. A receipt with KNOWN input and unknown output keeps its known input
+in the sum and does not trigger it. Shadow requests and shadow receipts are unaffected.
+
+**What changed.**
+- `lease.py` `_admit_group`: for the input metric, before the usual sum, a scope that has a limit of its own in this
+  group and has an unknown-input final receipt in the same window (same bucket expression as the sum, same scope
+  predicate, non-shadow only) raises `INPUT_USAGE_UNKNOWN`. The platform singleton's loose limit list is not used for
+  this: the rule needs a limit AT the scope, so another scope's limit never makes a scope wait. A new `shadow`
+  argument keeps shadow requests out.
+- `errors.py`: the new code, its exit code (2) and its text; `http_api.py`: HTTP 429, like `INPUT_LIMIT`. The
+  reporter's closed list of Leasewise words picks it up by itself (a test checks).
+- **The refusal lasts until the window rolls over**, because the window is the lease's grant day or month and
+  nothing else clears it. Said in the README.
+
+**Tests (`tests/test_cardl6a0_admission.py`, 14 new; settle first, then acquire).** Red first: 10 of the first 12
+failed (the 2 that passed state behaviour that must not change). Advisory history (no hold at all) and a metered
+lease with holds both block the next admission; a scope with no unknown usage is not affected; a team and a
+platform limit make every seat wait; a replay of the receipt and of the earlier grant changes nothing; known input with
+unknown output keeps its input (the sum reaches `INPUT_LIMIT` on known values) and does not trigger the rule; a
+shadow request is admitted and a shadow receipt blocks nobody; the day window and the month window roll over; with
+no input limit nothing changes; the closed word, its HTTP status and exit code. Asserting the hold's `settled_actual`
+alone would not have been enough, and these tests ask for the next lease. Six deliberate breakages of the new code
+were all caught.
+
 ## Tests (`tests/test_cardl6a0_null_counts.py`, 26 new)
 
 Red first: before the change 19 of the 24 tests written first failed (15 errors, 4 failures); the other 5 are the
@@ -80,5 +115,8 @@ is clean, the identity is `leasewise-team`, the index is LF.
 
 - The gateway side that produces such receipts does not exist yet (card 6a); today only a test or an operator can
   send one.
-- No report reads token columns yet; a future one must treat null as unknown.
+- The admission check is the one reader of the input token column today and now treats unknown as "wait until the
+  window rolls over"; any later report must treat null as unknown, never as 0.
+- The refusal is deliberately blunt: one unknown receipt makes the whole scope wait for the rest of its day or month.
+  A finer rule (for example an operator action that records the real usage) is a later decision.
 - If Codex's delta read of the 6a design changes section 8.2, the change lands in this card's next commit.
