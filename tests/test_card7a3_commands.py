@@ -294,6 +294,18 @@ class RunStopsAndResumes(_Live):
         self.assertEqual(waits, [reporter.config.poll_seconds])
         self.assertEqual(reporter.failures, 0)
 
+    def test_a_quiet_cycle_does_not_end_the_back_off_streak(self):
+        self.rig.net.down = True
+        reporter = self.rig.open()
+        reporter.cycle()
+        self.assertEqual(reporter.failures, 1)
+        quiet = reporter.cycle()            # the item is still waiting
+        self.assertEqual((quiet.sent, quiet.blocked), (0, None))
+        self.assertEqual(reporter.failures, 1)
+        self.rig.clock.advance(3600)
+        reporter.cycle()
+        self.assertEqual(reporter.failures, 2)
+
     def test_the_stop_signals_are_wired_to_the_stop_flag(self):
         import signal
         flag = threading.Event()
