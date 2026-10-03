@@ -214,7 +214,7 @@ class Writer:
                                     (agent, message_id)).fetchone()
         except sqlite3.OperationalError as exc:
             raise (StoreBusy() if _busy(exc) else StoreUnusable()) from None
-        return None if row is None else dict(zip(COLUMNS, row))
+        return None if row is None else dict(zip(COLUMNS, row, strict=True))
 
     def begin_request(self, agent, message_id, request_id, body_text, now_ms):
         """Save the request and its first body, once. A row that already exists is returned as it is."""
@@ -270,4 +270,4 @@ class Writer:
                  grant["max_micro_eur"], grant["ttl_seconds"], grant["expires_ms"], admission_id))
             row = conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE id=?",  # nosec B608 - fixed column names
                                (admission_id,)).fetchone()
-            return dict(zip(COLUMNS, row))
+            return dict(zip(COLUMNS, row, strict=True))
