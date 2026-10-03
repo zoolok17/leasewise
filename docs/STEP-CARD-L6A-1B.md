@@ -159,8 +159,9 @@ the old forward-slash acceptance fail the new cases).
 - Windows only; other systems refuse a `command` at start-up (step 1).
 - The deadline is cooperative (see the notes above); the receipt-reading bound per cycle is
   `max(timeout_seconds, 30) + timeout_seconds + 2 s`, about 52 s at the default (step 3 enforces and tests it).
-- A first program that only starts the real one and exits is `leftover_process` (or `exit_code` when it failed), and the work
-  it started is ended: `command` must name the real program.
+- A helper that keeps stdout open beyond the post-exit grace causes `leftover_process`. Helpers that do not hold stdout are ended
+  during job cleanup, and a successful page may still be accepted (a test shows this). Configure a program that waits for the
+  work needed to produce its page.
 - Helpers started through another Windows service are outside any job. A drive letter mapped to remote storage is not detected.
 - No memory or processor limits in the job, only a limit on the number of processes (32).
 
@@ -269,3 +270,16 @@ In plain words: no behaviour changed. Three small things were put right after Co
   back-off); both keep the saved request. A new test with a controlled clock pins the exact deadline answer, `store_busy`.
 - **Wording (N3).** The runner, its test, `receipts.py` and the README no longer say the reporter does not call the runner, and
   the launcher limit now says what happens and what to do.
+
+## Follow-up 2: the launcher sentence, and a test helper that could not open a process
+
+In plain words: no product behaviour changed.
+
+- **The launcher sentence** (README, and the limit in step 3 above) said a program that exits before its helper always gives
+  `leftover_process` or `exit_code`. It is narrower: only a helper that keeps the output open past the half-second grace does. A
+  helper that does not hold the output is ended during cleanup, and the page can still be accepted. The wording now says so.
+- **The test helper `Watch`** (`test_card7l6a1b_runner.py`) stored nothing when Windows refused to open a process, and later
+  answered "gone". It now knows it has no handle: `opened` is False and `gone()` refuses to answer (an assertion with a clear
+  message). `Probe` keeps a watch only when it has a real handle, so it never reports ready, or runs its callback, without one; it
+  tries again on the next look, and a process that really never gives a handle ends the test at its own time-out. A new test makes
+  `OpenProcess` return 0: neither readiness nor the callback fires, and `gone()` never says True. It fails against the old helper.
