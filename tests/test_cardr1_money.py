@@ -127,6 +127,21 @@ class Unknown(unittest.TestCase):
         self.assertIs(money.exceeds([money.UNKNOWN], 0), money.UNKNOWN)
         self.assertIs(money.exceeds([2, 3], 5), False)
 
+    def test_a_limit_of_zero_is_always_reached_and_never_exceeded_by_nothing(self):
+        """Any total of non-negative amounts has reached 0, whatever the terms; it exceeds 0 only by a known positive part."""
+        def never_advanced():
+            raise AssertionError("the input was read")
+            yield 1                                                                # makes this a generator
+        self.assertIs(money.reaches([], 0), True)
+        self.assertIs(money.reaches([money.UNKNOWN], 0), True)
+        self.assertIs(money.reaches(never_advanced(), 0), True)                    # decided before any term is read
+        self.assertIs(money.exceeds([], 0), False)                                 # strict: nothing is not above 0
+        self.assertIs(money.exceeds([money.UNKNOWN], 0), money.UNKNOWN)
+        self.assertIs(money.exceeds([0], 0), False)
+        self.assertIs(money.exceeds([1, money.UNKNOWN], 0), True)
+        self.assertIs(money.reaches([], 1), False)                                 # a positive limit is unchanged
+        self.assertIs(money.reaches([money.UNKNOWN], 1), money.UNKNOWN)
+
     def test_an_unknown_limit_makes_the_comparison_unknown(self):
         self.assertIs(money.exceeds([1], money.UNKNOWN), money.UNKNOWN)
         self.assertIs(money.reaches([TOP], money.UNKNOWN), money.UNKNOWN)

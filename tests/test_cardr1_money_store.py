@@ -44,8 +44,8 @@ class _Shares(_Base):
         self.assertEqual(result.returncode, 0, result.stderr)
         return next(entry for entry in doc["accounts"] if entry["alias"] == "meter")
 
-    def policy_import(self):
-        return _billing_policy_import(self.db, self.tmp, _policy_doc([_billing_policy()]))
+    def policy_import(self, **basis):
+        return _billing_policy_import(self.db, self.tmp, _policy_doc([_billing_policy(**basis)]))
 
     def reading(self, label="r"):
         observed = _now_ms() - 1000
@@ -75,6 +75,18 @@ class PolicyImport(_Shares):
         self.set_shares(60_000_000, 40_000_001)                                       # one micro-EUR above the cap
         self.assertEqual(self.policy_import().returncode, 2)
 
+    def test_s5_an_unknown_ledger_basis_postpones_the_check_so_huge_shares_are_accepted(self):
+        self.set_shares(TOP, TOP)
+        self.assertEqual(self.policy_import(ledger_basis="unknown").returncode, 0)   # accepting is not approving
+        self.assertEqual(self.sql_count("billing_policies"), 1)
+
+    def test_s5_the_same_shares_with_a_known_ledger_basis_are_refused(self):
+        self.set_shares(TOP, TOP)
+        for basis in ("ex_vat", "invoice_total"):
+            result = self.policy_import(ledger_basis=basis, vat_bps=1900)
+            self.assertEqual((result.returncode, result.stderr.strip()), (2, ERROR_INVALID_CONFIG), basis)
+        self.assertEqual(self.sql_count("billing_policies"), 0)
+
     def sql_count(self, table):
         conn = sqlite3.connect(self.db)
         try:
@@ -88,6 +100,17 @@ class Ingest(_Shares):
     def test_s6_a_reading_after_the_shares_grew_past_the_largest_number_is_refused_as_invalid_config_not_a_store_fault(self):
         self.assertEqual(self.policy_import().returncode, 0)                          # a policy exists while the shares are normal
         self.set_shares(TOP, TOP)                                                     # then the config moves (a restore, a hand edit)
+        result = _readings_import(self.db, self.tmp, self.reading())
+        self.assertEqual((result.returncode, result.stderr.strip()), (2, ERROR_INVALID_CONFIG))
+
+    def test_s6_an_unknown_ledger_basis_postpones_the_check_so_a_reading_is_accepted_after_the_shares_grew(self):
+        self.assertEqual(self.policy_import(ledger_basis="unknown").returncode, 0)
+        self.set_shares(TOP, TOP)
+        self.assertEqual(_readings_import(self.db, self.tmp, self.reading()).returncode, 0)
+
+    def test_s6_the_same_growth_with_a_known_ledger_basis_is_refused(self):
+        self.assertEqual(self.policy_import(ledger_basis="invoice_total", vat_bps=1900).returncode, 0)
+        self.set_shares(TOP, TOP)
         result = _readings_import(self.db, self.tmp, self.reading())
         self.assertEqual((result.returncode, result.stderr.strip()), (2, ERROR_INVALID_CONFIG))
 

@@ -70,7 +70,9 @@ table without the CHECK in the tests) and refuses the sum.
 
 - `store._allocated` replaces the three `SUM(share_micro_eur)` queries: S5 (importing a billing policy), S6 (ingesting a provider
   reading) and S7 (`status`). The total is exact; the allocation check "shares + allowance <= cap" then refuses a huge one as
-  `INVALID_CONFIG` with the existing sentence (before: `STORE_ERROR`), and `status` shows it exactly.
+  `INVALID_CONFIG` with the existing sentence (before: `STORE_ERROR`), and `status` shows it exactly. This holds **when the tax basis
+  is known**. When the account's `ledger_basis` is `unknown`, the allocation check is postponed as before (`allocation_within_cap`
+  defers: accepting the evidence is not approving the allocation), so a huge allocation is accepted there. That was kept on purpose.
 - `status` gains **`allocated_above_int64: true`** on an account whose allocated total is above 2^63 - 1, and no new key otherwise (every
   ordinary account has exactly the old keys). The design called this flag `allocated_at_least`; it is renamed because the figure is exact,
   not a lower bound.
@@ -82,6 +84,20 @@ shares import as before; the boundary at the cap is unchanged. S6: a reading aft
 `INVALID_CONFIG`; a normal reading is accepted. S7: an allocation above the bound is exact and flagged; exactly 2^63 is flagged and one less is
 not; an ordinary account has exactly the old keys and the old figure; an account with no gateway allocates 0. The helper refuses a damaged store
 with a closed error. Red first: against the previous `store.py`, 5 of the 11 fail.
+
+## Fix round 1 (Codex's read)
+
+In plain words: the seven sums and the admission decisions were right. Three small things were put right.
+
+- **F1.** `money.reaches(terms, 0)` answered False for nothing to add, or only unknown amounts. A total of non-negative amounts has always
+  reached 0, so the answer is now True, decided before any term is read. The strict `exceeds` is unchanged (`exceeds([], 0)` is False,
+  `exceeds([UNKNOWN], 0)` is UNKNOWN). No grant was wrong, because the only caller passes a positive budget; later steps will use it.
+- **L1.** The text above claimed an overflowing allocation is always refused. It is refused when the tax basis is known; with an
+  unknown ledger basis the check is postponed, and that is kept (decision of the lead). Four new tests pin both cases at policy import
+  and at reading ingest (two shares of 2^63 - 1: accepted with `unknown`, `INVALID_CONFIG` with a known basis).
+- **N1.** The README now names the two wire bounds separately: 10^12 for receipt money, 10^12 - 1 for admission-answer money.
+
+Tests: one new in `test_cardr1_money.py` (red against the old helper), four new in `test_cardr1_money_store.py` (pin existing behaviour).
 
 ## Gates
 

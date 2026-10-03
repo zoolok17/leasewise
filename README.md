@@ -530,12 +530,14 @@ part will:
   amounts together pass the largest number it keeps, and that error came out as `STORE_ERROR` (residual risk R-013). Admission
   and the gateway shares now add the amounts exactly, outside the database: each number is split into a high and a low half, the
   database adds the halves (which cannot overflow), and Python puts them together. A total larger than any cap is refused as the
-  limit it is (`MONEY_LIMIT`, `INPUT_LIMIT`); a gateway allocation that is too large is `INVALID_CONFIG` with the existing sentence;
+  limit it is (`MONEY_LIMIT`, `INPUT_LIMIT`); a gateway allocation that is too large is `INVALID_CONFIG` with the existing sentence
+  **when the account's tax basis is known**; when the ledger basis is `unknown` that check is postponed, as it always was (accepting
+  the evidence is not approving the allocation), so such an allocation is accepted;
   `status` shows such an allocation exactly, with `allocated_above_int64: true` (the key is absent for every ordinary account).
   A store that breaks its own rules (a negative amount, more than 2^31 - 1 rows in one sum, a hold settled above what it
   reserved) is still `STORE_ERROR`: that is a real fault.
 - **Fixed now: one place for money arithmetic.** `quota_balancer/money.py` holds the rules: whole micro-EUR, a range check where an
-  amount enters or is stored (2^63 - 1 in storage, 10^12 on the reporter's wires), a sum compared with a limit stops as soon as it
+  amount enters or is stored (2^63 - 1 in storage; on the reporter's wires, money in a receipt accepts up to 10^12 and money in an admission answer stops at 10^12 - 1), a sum compared with a limit stops as soon as it
   decides, and an **unknown amount is never 0**: a sum with an unknown term is unknown, though a known part that already passes
   the limit still refuses.
 - **Not yet (a later step, R1-M4):** conversions between the declared tax bases (`ex_vat`, `invoice_total`) on the lease side. Both

@@ -115,6 +115,8 @@ def _compare(terms, limit, inclusive):
     if limit is UNKNOWN:
         return UNKNOWN
     check(limit, maximum=_EXACT_MAX)
+    if inclusive and limit <= 0:
+        return True                                      # a total of non-negative amounts has always reached 0: read no term
     total, unknown = 0, False
     for term in _terms(terms):
         if term is UNKNOWN:
