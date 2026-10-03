@@ -461,6 +461,29 @@ class Command(_Dir):
         said = json.loads(receipts._read_command(source, 3).decode())
         self.assertEqual(said["argv"][-4:], ["--after", "3", "--limit", "7"])
 
+    @unittest.skipUnless(sys.platform == "win32", "job objects exist on Windows only")
+    def test_when_windows_gives_no_job_object_the_command_is_not_run_and_the_read_is_later(self):
+        """No `taskkill` fallback and no path from the environment: without a job the program is ended at once and the
+        read is "later" with its own closed word."""
+        from unittest import mock
+        from quota_balancer.reporter import proctree
+        started = []
+        real = proctree.subprocess.Popen
+
+        def watch(*args, **kwargs):
+            started.append(real(*args, **kwargs))
+            return started[-1]
+        with mock.patch.object(proctree, "_make_job", return_value=None),                 mock.patch.object(proctree.subprocess, "Popen", side_effect=watch):
+            result = self.run_mode("hang_tree", env=[("PIDFILE", os.path.join(self.dir, "unused.txt"))])
+        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "no_job_object"))
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())                      # the process that was started has been ended
+        self.assertFalse(alive(started[0].pid))
+        with open(proctree.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertNotIn("taskkill", source)                         # the fallback is gone from the code
+        self.assertNotIn("SystemRoot", source)                       # and no program path comes from the environment
+
     def test_a_command_that_cannot_start_is_read_later(self):
         result = receipts.read_page(command_source([os.path.join(self.dir, "no-such-program")]), 0)
         self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "cannot_run"))

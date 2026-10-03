@@ -8,8 +8,9 @@ reader waiting. So the program is started in its own place:
 * POSIX: its own session and process group; `kill` signals that whole group by its id (the program's own pid).
 * Windows: a job object that the program is put into straight after it starts; everything it starts afterwards belongs
   to the job too, and `kill` ends the whole job. Closing the job also ends anything still in it. If a job cannot be
-  made or used (for example the system refuses a nested one), the fallback is `taskkill /T /F /PID <pid>`, again by the
-  exact process id.
+  made or used (for example the system refuses a nested one), the program is NOT started: the process that was just
+  started is ended by its handle and `NoJobObject` is raised. There is no other way to end a tree on Windows here:
+  no outside tool is run, and no program path is ever built from an environment variable.
 
 Nothing here ever looks a process up by its name.
 """
@@ -71,6 +72,10 @@ if sys.platform == "win32":
         return handle
 
 
+class NoJobObject(Exception):
+    """Windows would not give the program a job object, so it was not run (the caller answers "read again later")."""
+
+
 class Tree:
     """A running program and everything it starts. `proc` is the `subprocess.Popen`."""
 
@@ -83,12 +88,6 @@ class Tree:
         if sys.platform == "win32":
             if self._job:
                 _k32.TerminateJobObject(self._job, 1)
-            else:
-                taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
-                with contextlib.suppress(OSError, subprocess.SubprocessError):
-                    subprocess.run([taskkill, "/T", "/F", "/PID", str(self.proc.pid)],  # nosec B603 - a fixed system tool, an exact pid
-                                   stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         else:
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                 os.killpg(self.proc.pid, signal.SIGKILL)
@@ -107,5 +106,12 @@ def start(argv, env, stdout):
     kwargs = {"shell": False, "stdin": subprocess.DEVNULL, "stdout": stdout, "stderr": subprocess.DEVNULL, "env": env}
     if sys.platform == "win32":
         proc = subprocess.Popen(argv, **kwargs)  # nosec B603 - no shell; the operator's own configured command
-        return Tree(proc, _make_job(proc))
+        job = _make_job(proc)
+        if job is None:
+            with contextlib.suppress(OSError):
+                proc.kill()                         # this process, by its handle: it must not run without a job
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                proc.wait(timeout=5)
+            raise NoJobObject()
+        return Tree(proc, job)
     return Tree(subprocess.Popen(argv, start_new_session=True, **kwargs), None)  # nosec B603 - as above

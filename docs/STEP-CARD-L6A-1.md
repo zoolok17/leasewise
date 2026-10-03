@@ -83,6 +83,14 @@ fixes each finding; the numbers are Codex's.
 | F8 exactly 200 | `201` counted as done | a settle succeeds only on `200`; any other 2xx is retried with the same bytes and shows `MALFORMED_RESPONSE` | `test_card7l6a1_delivery` |
 | F9 words | README and status text were wrong in six places | `gateway` not `ovh-gateway`; the 7c-2 state paragraph is marked historical; `receipt_cursor` is not immutable; an omitted `admission_store` setting versus a missing file; `RECEIPT_CONFLICT` has its own action ("look at the parked account"); "keeps its hold" says an advisory lease holds nothing | `StoreTrouble.test_a_receipt_conflict_...` |
 
+**Scanner gate (fix round 2, part A).** The semgrep gate rated the Windows fallback of `proctree.py` an error: it found
+`taskkill.exe` through the `SystemRoot` environment variable, so whoever controls that variable could make the reporter run
+another program. The fallback is removed (option a): if Windows will not give the program a job object, the program is not
+run, the process that was just started is ended by its handle, and the read is "read again later" with the new closed word
+`no_job_object` (shown in `status` with the other read-later words). Killing stays by exact process id or job only. Test:
+`test_card7l6a1_adapter.Command.test_when_windows_gives_no_job_object_the_command_is_not_run_and_the_read_is_later`. The
+ruff findings of the gate set that this card added were fixed in the previous commit (E741 names, `zip(strict=True)`).
+
 Honest note: F1 and F2 were designed against Codex's description; the new F2 process tests hang on the old reader (the
 orphan test was started against it and did not return within 100 seconds) and pass on the new one. The F1 design changed
 once while writing its tests: the first version labelled only 500 new captures a cycle, which made a late record for a

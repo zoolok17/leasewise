@@ -42,7 +42,7 @@ READ_LATER = "read_later"
 REFUSED = "refused"
 
 # The closed reasons, per status. These words (and counts of them) are all the status ever shows.
-LATER_REASONS = ("source_missing", "cannot_run", "timeout", "exit_code", "not_json")
+LATER_REASONS = ("source_missing", "cannot_run", "no_job_object", "timeout", "exit_code", "not_json")
 REFUSED_REASONS = ("not_an_object", "bad_version", "bad_envelope", "wrong_after", "too_many", "too_large",
                    "duplicate_key", "bad_row", "bad_order")
 
@@ -245,6 +245,8 @@ def _read_command(source, after_seq):
     deadline = time.monotonic() + source.timeout_seconds
     try:
         tree = proctree.start(argv, _environment(source.env), subprocess.PIPE)
+    except proctree.NoJobObject:
+        raise _Later("no_job_object") from None      # Windows would not give it a job: it was not run at all
     except (OSError, ValueError):
         raise _Later("cannot_run") from None
     chunks, seen = [], [0]
