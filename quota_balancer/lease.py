@@ -1194,6 +1194,49 @@ def settle(path, receipt, now_ms):
         conn.close()
 
 
+def _unknown_counts_allowed(receipt, lease):
+    """Card L6a-0: may this receipt leave a token count unknown (null) for a
+    lease that is not shadow? Only when ALL of these hold, and in no other
+    case: it is final; it names the lease's OWN gateway (a null gateway, or
+    a lease without one, is not enough); the money is known
+    (actual_micro_eur); the cached count is a whole number; and the lease is
+    metered or metered_advisory. The gateway knows what it charged but not
+    how many tokens it used after a "charge the reserve" reconciliation."""
+    return bool(
+        receipt["final"]
+        and receipt["gateway_id"] is not None
+        and receipt["gateway_id"] == lease["gateway_id"]
+        and receipt["actual_micro_eur"] is not None
+        and receipt["cached_input_tokens"] is not None
+        and lease["enforcement"] in ("metered", "metered_advisory"))
+
+
+def _settled_details(receipt, lease):
+    """The redacted details of the settle audit row. A final receipt of a
+    lease that is not shadow with an unknown input or output count adds
+    "usage_unknown": 1 (card L6a-0)."""
+    details = {"final": 1}
+    if lease["enforcement"] != "shadow" and (
+            receipt["input_tokens"] is None
+            or receipt["output_tokens"] is None):
+        details["usage_unknown"] = 1
+    return details
+
+
+def usage_unknown(conn, lease_id):
+    """True when the lease's final receipt left the input or output token
+    count unknown (null). Derived from the stored receipt: no column. Only
+    for a lease that is not shadow (a shadow lease's unknown counts are its
+    normal, observe-only state). Any later report must treat such a count
+    as UNKNOWN, never as 0."""
+    row = conn.execute(
+        "SELECT 1 FROM receipts r JOIN leases l ON l.id=r.lease_id "
+        "WHERE r.lease_id=? AND r.final=1 AND l.enforcement <> 'shadow' "
+        "AND (r.input_tokens IS NULL OR r.output_tokens IS NULL)",
+        (lease_id,)).fetchone()
+    return row is not None
+
+
 def _receipt_conflict_park(conn, lease, event_id, now_ms):
     # A conflicting FINAL receipt blocks further work on the account
     # (section 4, card row "receipt conflict blocks"): recorded like
@@ -1223,13 +1266,6 @@ def _settle(conn, receipt, now_ms):
         lease = _lease_row(conn, receipt["lease_id"])
         if lease is None:
             _not_found()
-        # Unknown token counts are for shadow leases only: every other
-        # enforcement reports whole numbers, since its usage feeds limits
-        # and liability (card L1c). Decided here, in the transaction that
-        # read the lease; a table CHECK cannot see the lease.
-        if lease["enforcement"] != "shadow" and any(
-                receipt[key] is None for key in _TOKEN_FIELDS):
-            _invalid()
         # The receipt must be attributed to the lease's own gateway
         # (a NULL names no other): a report naming a foreign gateway
         # is a conflicting account of this lease (static
@@ -1244,6 +1280,19 @@ def _settle(conn, receipt, now_ms):
                                        now_ms)
             raise QuotaError(errors.CODE_RECEIPT_CONFLICT,
                              errors.MSG_RECEIPT_CONFLICT)
+        # Unknown token counts are for shadow leases only, with ONE
+        # exception (card L6a-0): a FINAL receipt from the lease's own
+        # gateway that carries the money may leave the input and/or output
+        # count unknown (see _unknown_counts_allowed). Every other
+        # enforcement reports whole numbers, since its usage feeds limits
+        # and liability (card L1c). Decided here, after the gateway
+        # comparison above (so another gateway stays a conflict) and in
+        # the transaction that read the lease; a table CHECK cannot see
+        # the lease.
+        if lease["enforcement"] != "shadow" and any(
+                receipt[key] is None for key in _TOKEN_FIELDS) \
+                and not _unknown_counts_allowed(receipt, lease):
+            _invalid()
         stored = conn.execute(
             "SELECT event_id," + ",".join(_RECEIPT_FIELDS) +
             " FROM receipts WHERE event_id=?",
@@ -1335,6 +1384,16 @@ def _settle(conn, receipt, now_ms):
             for _lease_id, limit_id, period_start, reserved, _actual in \
                     hold_rows:
                 metric = _hold_metric(conn, limit_id)
+                if metric != "money_micro_eur" \
+                        and receipt["input_tokens"] is None:
+                    # Unknown input usage (card L6a-0): a null is never a
+                    # zero. The whole token hold is kept (no refund) and no
+                    # token overrun can be computed.
+                    conn.execute(
+                        "UPDATE holds SET settled_actual=? WHERE lease_id=? "
+                        "AND limit_id=?",
+                        (reserved, receipt["lease_id"], limit_id))
+                    continue
                 actual = (receipt["actual_micro_eur"]
                           if metric == "money_micro_eur"
                           else receipt["input_tokens"])
@@ -1415,7 +1474,7 @@ def _settle(conn, receipt, now_ms):
                 "INSERT INTO audit(actor_alias, action, object_id, at, "
                 "redacted_details) VALUES(?,?,?,?,?)",
                 ("coordinator", "lease_settled", receipt["lease_id"],
-                 now_ms, json.dumps({"final": 1})))
+                 now_ms, json.dumps(_settled_details(receipt, lease))))
         if lease["money_hold"] is None:
             released = retained = None   # nothing reserved (see the replay)
         conn.execute("COMMIT")

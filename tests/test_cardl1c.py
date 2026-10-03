@@ -7,11 +7,9 @@ Stores are built through config-import v2 (the migration rows excepted: a
 version-8 store has to be built by hand). Synthetic data only.
 """
 
-import copy
 import json
 import os
 import sqlite3
-import time
 import unittest
 import uuid
 from unittest import mock
@@ -196,6 +194,11 @@ class NonShadowRequiresTokens(_L1c):
         for kind, (made, now) in self.leases().items():
             for field in TOKENS:
                 for final in (False, True):
+                    if kind in ("advisory", "metered") and final and field != "cached_input_tokens":
+                        # Card L6a-0: the ONE exception. A final receipt from the lease's own gateway with
+                        # the money may leave the input or output count unknown; it is covered, with its
+                        # refusals, by tests/test_cardl6a0_null_counts.py.
+                        continue
                     receipt = self.receipt(
                         made["lease_id"], final, actual=5 if final else None,
                         gateway=gateway if kind in ("advisory", "metered") else None)
