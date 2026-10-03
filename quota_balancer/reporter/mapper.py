@@ -5,6 +5,7 @@ only, so a restart or a lost answer yields the same bytes (DESIGN-7A.md
 4.4 and 4.6). No clock, no I/O, no randomness except what the caller passes.
 """
 
+import hashlib
 import json
 import re
 import uuid
@@ -228,3 +229,69 @@ def final_body(event_id, disposition, totals):
     body.update({"actual_micro_eur": None, "gateway_id": None, "seq": None,
                  "final": True})
     return body
+
+
+# Card L6a-1: a gateway's final receipt becomes ONE final `/settle` body. These are the only fields
+# the body may carry (Leasewise's own wire keys for a settle), and the only outcome words.
+RECEIPT_BODY_KEYS = frozenset({"event_id", "outcome", "calls", "input_tokens", "cached_input_tokens",
+                               "output_tokens", "actual_micro_eur", "gateway_id", "seq", "final"})
+RECEIPT_OUTCOMES = ("completed", "cancelled", "failed", "provider_limit")
+# Decision O2: the gateway records no cached input, so the body says 0. 0 means "the gateway
+# records none", never "none was used".
+CACHED_INPUT_TOKENS = 0
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def lease_ref_hash(lease_id):
+    """The reference the gateway keeps for a quota lease: the sha256 of the lease id's own text
+    (lower-case hex). The reference handed to the gateway IS the lease id; the gateway stores only
+    this hash, and so does the reporter, to find the lease again."""
+    return hashlib.sha256(lease_id.encode("ascii")).hexdigest()
+
+
+def receipt_event_id(ref_sha256, generation):
+    """The settle's `event_id`: derived from the reference hash and the ledger's own generation,
+    never from a position, a time or a counter, so reading the same receipt twice, or after a
+    restart, always gives the same id (and Leasewise answers a replay with the first answer)."""
+    return str(uuid.uuid5(NAMESPACE, "receipt|%s|%s" % (ref_sha256, generation)))
+
+
+def receipt_body(gateway_id, generation, receipt):
+    """The final settle body for one captured receipt (any object with the fields of receipts.Receipt). A token
+    count the gateway did not know stays None: Leasewise accepts that for a final receipt from the lease's own
+    gateway that carries the money (card L6a-0), and an unknown count is never turned into 0."""
+    return {
+        "event_id": receipt_event_id(receipt.ref_sha256, generation),
+        "outcome": receipt.outcome,
+        "calls": receipt.calls,
+        "input_tokens": receipt.input_tokens,
+        "cached_input_tokens": CACHED_INPUT_TOKENS,
+        "output_tokens": receipt.output_tokens,
+        "actual_micro_eur": receipt.actual_micro_eur,
+        "gateway_id": gateway_id,
+        "seq": receipt.seq,
+        "final": True,
+    }
+
+
+def receipt_body_text(body):
+    """The canonical text of a receipt body, or ValueError if it is not exactly the allow-listed
+    shape. The same canonical form the client sends."""
+    if type(body) is not dict or frozenset(body) != RECEIPT_BODY_KEYS:
+        raise ValueError("shape")
+    for key in ("event_id", "gateway_id"):
+        if type(body[key]) is not str or _LIMIT_UUID.fullmatch(body[key]) is None:
+            raise ValueError("id")
+    if type(body["outcome"]) is not str or body["outcome"] not in RECEIPT_OUTCOMES:
+        raise ValueError("outcome")
+    for key in ("calls", "actual_micro_eur", "seq"):
+        if not _plain_int(body[key], 0, INT64_MAX):
+            raise ValueError(key)
+    for key in ("input_tokens", "output_tokens"):
+        if body[key] is not None and not _plain_int(body[key], 0, INT64_MAX):
+            raise ValueError(key)
+    if body["cached_input_tokens"] != CACHED_INPUT_TOKENS or type(body["cached_input_tokens"]) is not int:
+        raise ValueError("cached_input_tokens")
+    if body["final"] is not True:
+        raise ValueError("final")
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))

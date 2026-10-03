@@ -29,7 +29,7 @@ _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 TOP_REQUIRED = ("version", "base_url", "identity", "machine", "journal_root",
                 "state_path", "policy_ids")
-TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events")
+TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "gateway_receipts")
 AGENT_REQUIRED = ("seat", "model", "task_class", "effort", "expected_calls",
                   "max_calls", "output_cap", "per_call_output_cap", "ttl_ms")
 AGENT_OPTIONAL = ("account", "team")
@@ -41,6 +41,16 @@ _CEILINGS = ("expected_calls", "max_calls", "output_cap",
 LIMIT_PROVIDERS = ("claude",)
 MAX_LIMIT_SOURCES = 8
 _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
+
+# Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
+# or `command` (an argument list, run without a shell).
+_RECEIPT_KEYS = ("gateway", "admission_store", "fixture")
+_RECEIPT_OPTIONAL = ("max_bytes", "page_limit")
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 1000
+
+# A command source (a program the reporter runs) is not part of this version (card L6a-1b).
+MSG_NO_COMMAND_SOURCE = "Command receipt sources are not available in this version; use a fixture file."
 
 CONFIG_INVALID = "CONFIG_INVALID"
 CONFIG_PERMISSIONS = "CONFIG_PERMISSIONS"
@@ -65,7 +75,7 @@ class Config:
     __slots__ = ("scheme", "host", "port", "identity", "machine",
                  "journal_root", "state_path", "policy_ids_path",
                  "poll_seconds", "silent_after_seconds", "agents",
-                 "limit_sources")
+                 "limit_sources", "gateway_receipts")
 
     def __repr__(self):
         return "Config(<hidden>)"
@@ -175,6 +185,39 @@ def _limit_sources(table, state_path):
     return tuple(found)
 
 
+class GatewayReceipts:
+    """The receipt source of card L6a-1. `gateway_id` is None until `resolve_gateway_receipts`
+    fills it from the policy-ids snapshot. The repr hides everything (a path can name a deployment)."""
+
+    __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "max_bytes", "page_limit")
+
+    def __repr__(self):
+        return "GatewayReceipts(<hidden>)"
+
+    __str__ = __repr__
+
+
+def _gateway_receipts(table):
+    where = "gateway_receipts"
+    if not isinstance(table, dict):
+        _invalid("%s: must be a table" % where)
+    if "command" in table:
+        _invalid(MSG_NO_COMMAND_SOURCE)
+    _closed_keys(table, _RECEIPT_KEYS, _RECEIPT_OPTIONAL, where)
+    row = GatewayReceipts()
+    row.gateway = _alias(table["gateway"], where)
+    row.gateway_id = None
+    row.admission_store = _path(table["admission_store"], where)
+    row.fixture = _path(table["fixture"], where)
+    row.max_bytes = table.get("max_bytes", 1024 * 1024)
+    if type(row.max_bytes) is not int or not 1024 <= row.max_bytes <= 4 * 1024 * 1024:
+        _invalid("%s: max_bytes must be a whole number from 1024 to 4194304" % where)
+    row.page_limit = table.get("page_limit", DEFAULT_PAGE_LIMIT)
+    if type(row.page_limit) is not int or not 1 <= row.page_limit <= MAX_PAGE_LIMIT:
+        _invalid("%s: page_limit must be a whole number from 1 to %d" % (where, MAX_PAGE_LIMIT))
+    return row
+
+
 def _parse_url(value):
     """-> (scheme, host, port). Plain http is for loopback only: the identity
     travels in a header, so anything else must be https."""
@@ -242,6 +285,9 @@ def parse_config(text):
     config.limit_sources = ()
     if "limit_events" in data:
         config.limit_sources = _limit_sources(data["limit_events"], config.state_path)
+    config.gateway_receipts = None
+    if "gateway_receipts" in data:
+        config.gateway_receipts = _gateway_receipts(data["gateway_receipts"])
     agents = data.get("agents", {})
     if not isinstance(agents, dict):
         _invalid("agents: must be a table of agent tables")
@@ -461,7 +507,12 @@ def load_snapshot(path):
                     if set(r) == {"alias", "id"}]
         if len(accounts) != len(data.get("accounts", [])):
             raise TypeError
-        if not all(isinstance(v, str) for row in seats + models + accounts
+        # Card L6a-1: so is the gateway list (alias and id, nothing else).
+        gateways = [(r["alias"], r["id"]) for r in data.get("gateways", [])
+                    if set(r) == {"alias", "id"}]
+        if len(gateways) != len(data.get("gateways", [])):
+            raise TypeError
+        if not all(isinstance(v, str) for row in seats + models + accounts + gateways
                    for v in row) \
                 or not all(isinstance(t, str) for t in task_classes):
             raise TypeError
@@ -470,7 +521,7 @@ def load_snapshot(path):
                           "the policy-ids snapshot has an unexpected shape"
                           ) from None
     return {"seats": seats, "models": models, "task_classes": task_classes,
-            "accounts": accounts}
+            "accounts": accounts, "gateways": gateways}
 
 
 class ResolvedLimitSource:
@@ -508,6 +559,29 @@ def resolve_limit_sources(config, snapshot):
         row.account, row.account_id = source.account, ids[0]
         resolved.append(row)
     return tuple(resolved)
+
+
+def resolve_gateway_receipts(config, snapshot):
+    """-> the GatewayReceipts with its gateway's local id filled in, or None without the block. The
+    gateway alias must be in the snapshot exactly once and its id must be a UUID: otherwise the
+    reporter refuses to start. Never the first of several, never a guess. The messages name no value."""
+    source = config.gateway_receipts
+    if source is None:
+        return None
+    ids = [gateway_id for alias, gateway_id in snapshot["gateways"] if alias == source.gateway]
+    if not ids:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_receipts: the gateway is not in the policy-ids snapshot")
+    if len(ids) > 1:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_receipts: the gateway alias is ambiguous in the "
+                          "policy-ids snapshot")
+    if _UUID_TEXT.fullmatch(ids[0]) is None:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_receipts: the gateway id in the policy-ids snapshot "
+                          "is not valid")
+    resolved = GatewayReceipts()
+    for name in GatewayReceipts.__slots__:
+        setattr(resolved, name, getattr(source, name))
+    resolved.gateway_id = ids[0]
+    return resolved
 
 
 def _unresolved(agent, what):

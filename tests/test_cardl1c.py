@@ -549,7 +549,7 @@ class PolicyIdsProjection(_L1c):
 
     def test_the_shape_is_closed_and_sorted(self):
         text, data = self.ids_json()
-        self.assertEqual(set(data), {"seats", "models", "task_classes", "accounts"})   # card 7c-2 added accounts
+        self.assertEqual(set(data), {"seats", "models", "task_classes", "accounts", "gateways"})   # 7c-2: accounts; L6a-1: gateways
         seat_ids = self.ids("seats")
         model_ids = self.ids("models")
         expected_seats = sorted(
@@ -619,7 +619,7 @@ class PolicyIdsProjection(_L1c):
         result = run_cli("--db", db, "policy-ids", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout),
-                         {"models": [], "seats": [], "task_classes": [], "accounts": []})
+                         {"models": [], "seats": [], "task_classes": [], "accounts": [], "gateways": []})
 
     def test_the_errors_are_static(self):
         missing = run_cli("--db", os.path.join(self.tmp, "SENTINEL-DIR",

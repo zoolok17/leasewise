@@ -78,11 +78,21 @@ LIMIT_PATH = "/v1/limit-events"
 
 def _allowed(kind, path):
     """The kind and the path are checked as a PAIR (card 7c-2): a limit row may be sent to exactly
-    LIMIT_PATH and to nothing else; every other kind keeps the lease rule, which never allows
-    LIMIT_PATH. Nothing else can reach it."""
+    LIMIT_PATH and to nothing else; a receipt row (card L6a-1) may be sent to exactly
+    /v1/leases/<uuid>/settle and to nothing else; every other kind keeps the lease rule, which never
+    allows LIMIT_PATH. Nothing else can reach it."""
     if kind == decisions.LIMIT:
         return path == LIMIT_PATH
+    if kind == decisions.RECEIPT:
+        # Card L6a-1: a receipt row settles one lease and can go nowhere else.
+        return _settle_path(path)
     return _safe_path(path)
+
+
+def _settle_path(path):
+    parts = path.split("/")
+    return len(parts) == 5 and parts[:3] == ["", "v1", "leases"] and parts[4] == "settle" \
+        and _UUID.fullmatch(parts[3]) is not None
 
 
 def _safe_path(path):
@@ -128,9 +138,9 @@ def _response(kind, status, raw, identity=""):
     if isinstance(error, dict):
         # Only Leasewise's own words: anything else is UNKNOWN_CODE.
         code = decisions.closed_code(error.get("code"))
-    if kind == decisions.LIMIT:
-        # A limit answer is its status and its error word, nothing else: no field of a 202 body
-        # (block, retry time, state) is read, kept or shown.
+    if kind in (decisions.LIMIT, decisions.RECEIPT):
+        # A limit or receipt answer is its status and its error word, nothing else: no field of
+        # the body (block, retry time, state, released or retained money) is read, kept or shown.
         return Response(status, code)
     value = doc.get("lease_id")
     if isinstance(value, str):

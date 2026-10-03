@@ -393,8 +393,8 @@ before. Replays work as usual: the same receipt again is a harmless `200`, and a
 same event id is `IDEMPOTENCY_CONFLICT`.
 
 **What happens to the lease.** It settles. The money is settled and any overrun recorded exactly as
-before. A **token hold is kept whole** (nothing is refunded, no token overrun is computed), because an
-unknown number is not a zero.
+before. When input is unknown, the **token hold is kept whole** (nothing is refunded, no token overrun is
+computed), because an unknown number is not a zero.
 
 **How it is marked.** There is no new column. A lease is `usage_unknown` when its final receipt has a
 null input or output count (`lease.usage_unknown(conn, lease_id)`), and the audit row written when the
@@ -770,8 +770,9 @@ dropped, and never leave the machine.
   small in practice (one per parked seat), far below 256.
 - **No backfill.** Blocks that already exist keep the `retry_at` they have; only new events get the 30
   seconds.
-- **No downgrade of the state file.** The reporter's state file is now version 2, and a version-1 file
-  is upgraded the first time the new reporter opens it. A reporter built before this card meets a
+- **No downgrade of the state file.** *(Historical: this is how it was when card 7c-2 landed. The state file is
+  version 3 since card L6a-1, and `status_version` is 3; see that card below.)* The state file became version 2, and
+  a version-1 file is upgraded the first time the new reporter opens it. A reporter built before this card meets a
   version-2 file with its existing "the state file version is not supported" refusal: it never opens
   or changes it. Keep a copy of the state file if you may need to go back.
 - **Claude only.** Codex limit events wait for agenttalk's own Codex producer.
@@ -782,9 +783,175 @@ dropped, and never leave the machine.
 
 ### Technical detail
 
-State file version 2 adds the `limit_event` table (one row per limit fact keyed by `event_id`; the
-frozen canonical body; identity and body cannot be changed or deleted). The limit pass runs before the
-lease pass and the two stay separate; `status_version` is 2 with a top-level `limit_events` object.
+State file version 2 (historical; version 3 since card L6a-1) adds the `limit_event` table (one row per limit fact
+keyed by `event_id`; the frozen canonical body; identity and body cannot be changed or deleted). The limit pass runs
+before the lease pass and the two stay separate; `status_version` was 2 with a top-level `limit_events` object.
 One limit fact is (installation, account alias, evidence kind, window, reset); with an unknown reset the
 park time joins the key. `event_id` and `turn_id` are derived from that key; the body is built field by
 field with the reset RAW. Leasewise's margin is `LIMIT_RETRY_MARGIN_MS` in `lease.py`.
+
+## Card L6a-1 - gateway receipts
+
+**Status: built, fixture-only.** A gateway keeps one final receipt for every quota lease it served: how
+many calls, how much text went in and out, what it cost, how it ended. The reporter reads those receipts
+and tells Leasewise, so the lease is settled with what really happened. Audience: the operator of a
+Leasewise store. Until agenttalk ships its receipt command, receipts can only come from a file you write
+yourself (that is what the tests do). Design: `C:\lw\records\DESIGN-6A.md` section 8; build record:
+`docs/STEP-CARD-L6A-1.md`.
+
+### What it does, in plain words
+
+The reporter never loses a receipt and never sends one to the wrong place. It does that in two steps,
+and a receipt is only released from the first to the second when the right paperwork exists.
+
+1. **Keep.** Every receipt that arrives is first written down exactly as the gateway said it, together
+   with the number of the last receipt taken, in one step. This happens even when the reporter does not
+   yet know which lease the receipt belongs to. If anything goes wrong, nothing is written and the same
+   receipts are read again.
+2. **Release.** The reporter reads, but never changes, the **admission store**: the file where the
+   admission command (card L6a-2) writes, before each turn starts, which lease it handed out and which
+   gateway that lease expects. Before anything is copied from the store, each record is checked against
+   itself: the reference must be the lease's own text and the hash must be the SHA-256 of it. One record
+   that does not match refuses the whole read (nothing is copied), so a damaged store cannot send one
+   lease's receipt to another. A kept receipt is released for sending only when the store has a record
+   for its lease **and** that record names the very gateway the receipt came from. At that moment the
+   settle message is made once and never changes; it is the only thing ever sent for that receipt.
+3. **Send.** The reporter sends the stored message to Leasewise (`POST /v1/leases/{id}/settle`), after
+   limit events and before lease messages. A restart, a lost answer or a retry sends the same bytes
+   again, so Leasewise recognises them and answers with the first answer. Only the answer `200` means
+   "done"; any other success status is treated as an unreadable answer and the same bytes are sent again,
+   with the word `MALFORMED_RESPONSE` showing.
+
+**What waits, and what is set aside.**
+
+- A receipt whose lease has no record yet is **quarantined: `unknown_reference`**. Nothing is sent.
+  New captures with bindings are considered first. Previously quarantined captures are reconsidered on every
+  cycle once their binding exists: each cycle looks up the waiting receipts whose record has appeared, wherever
+  they sit in the list, oldest first, up to 500, so no number of waiting receipts can keep another from being
+  released.
+- A receipt whose record names **another gateway** is quarantined: `wrong_gateway`. Nothing is ever sent
+  for it. This (and `duplicate_reference`) is permanent: a record never changes, so it is never looked at again
+  and stays visible in `status`. The same holds if a source's name is later pointed at a different gateway: the receipts already
+  kept stay tied to the gateway they came from, and the new mapping starts a separate source with its
+  own counters.
+- A second receipt for a lease and ledger that already has one is quarantined: `duplicate_reference`.
+- A **missing or busy admission store** is never read as "this lease is unknown". The reporter reads it
+  again later; receipts are still kept.
+
+**A rebuilt ledger.** Each gateway ledger has its own identity (its *generation*). When a page arrives
+from a different generation, the reporter keeps the old counter, starts a counter at 0 for the new one
+(or takes back the kept counter of one it saw before: generation A, then B, then A again continues where
+A stopped), and never mixes the two. Message ids include the generation, so two ledgers cannot collide.
+
+**Unknown token counts.** A gateway may report that it does not know a lease's input or output tokens
+(a `null`). That is passed on as unknown and never turned into 0; Leasewise settles the lease and marks it
+`usage_unknown` (card L6a-0). Cached input is always reported as 0 (see the limits).
+
+### What Leasewise answers, and what the reporter does
+
+| Leasewise answers | The reporter does |
+| --- | --- |
+| `200` (a first settle, or the same message again) | done |
+| `RECEIPT_CONFLICT` (a different final for a settled lease, or a lease of another gateway; the account is parked) | that receipt fails for good; `status` shows it and asks you to look at the parked account |
+| `IDEMPOTENCY_CONFLICT`, `INVALID_REQUEST`, `NOT_FOUND`, `FORBIDDEN` | that receipt fails for good, with its word |
+| `LEASE_CLOSED` | not a "done" word: a settle never answers it, so it is a permanent failure of that receipt |
+| no answer, `401`, `429`, `5xx`, an unreadable `2xx` | wait and send the same bytes again |
+
+A failed receipt never erases what was kept, and never stops the other receipts or the other passes.
+
+### What `status` shows
+
+The `gateway_receipts` object (closed words and counts only; never a lease id, a reference, a gateway
+id, an amount or a path):
+
+- `rows`: waiting (`pending`), delivered (`sent`), `failed_permanent` and `quarantined`; `failed` counts
+  the permanent failures by closed word;
+- `quarantine`: how many are set aside for each reason, and `quarantine_action`: one fixed sentence per
+  reason saying what to check (the sentences also appear in `operator_actions`);
+- `generation_changes`: for each source, how many new ledger generations were seen and when the latest
+  first appeared;
+- `awaiting_receipt`: leases whose record the reporter has copied but for which no receipt has come, as a
+  count and the age in seconds of the oldest; `overdue`: those among them whose own expiry has passed
+  (`operator_actions` says so);
+- `admission_store`: the current state of the admission store as the reporter last read it (`ok`, `missing`,
+  `busy`, `unreadable` or `history_limit`; empty before the first read) and how many times each trouble
+  happened before. The state goes back to `ok` after a good read. `operator_actions` has a sentence for the
+  ones that need you (a wait, `busy`, does not);
+- `refused` and `read_later`: how often a read was refused or had to wait, by closed reason;
+- `last_seq`, `stored`, `last_read`, `last_ok` and the note about cached input.
+
+### How to set it up
+
+1. **Save the ids again.** `policy-ids` also lists `gateways` (alias and local id). Save its output
+   again; an older snapshot has none, and the reporter then refuses to start if `gateway_receipts` is set.
+2. **Add the block** to the reporter configuration. Name `admission_store` and a `fixture` file. **A `command`
+   source (a program the reporter would run) is not available in this version**: the reporter refuses to start with
+   "Command receipt sources are not available in this version; use a fixture file." Live use needs card L6a-1b (see
+   the limits):
+
+```toml
+[gateway_receipts]
+gateway = "g1"                                  # a Leasewise gateway alias
+admission_store = "C:/path/to/admission.db"     # the admission store, an absolute path (read only here)
+fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
+# max_bytes = 1048576                           # 1024 to 4194304: the largest fixture read
+# page_limit = 100                              # receipts in one page, 1 to 1000
+```
+
+   The fixture holds `{"generation": "<32 hex>", "receipts": [...]}` (the reporter makes the page after the
+   last number it took, of at most `page_limit` receipts), or one finished page (version 1: `generation`,
+   `after_seq`, `next_seq`, `has_more`, `receipts`), which is refused if it is longer than `page_limit`.
+3. **Start the reporter** as before. It refuses to start, with a fixed sentence, when the gateway alias
+   is missing from the snapshot, appears twice, has an id that is not a UUID, or when the `admission_store`
+   setting is left out or is not an absolute path. A file that the setting names but that is not there yet
+   is different: the reporter starts, keeps every receipt, shows `admission store: missing`, and reads it
+   again each cycle. Without the block nothing changes.
+
+### Limits
+
+- **A history limit (this card).** The reporter reads the granted rows of the admission store whole, up to
+  **100,000**. If the store holds more, nothing is copied: no new binding can be taken, later receipts stay
+  unknown (quarantined), and `status` shows `admission store: history_limit` with a sentence. Reading only what
+  is new is a prerequisite for live use; it comes with card L6a-2, through a durable grant order value. Never
+  delete admissions to get below the limit.
+- **Command sources are not available yet (card L6a-1b).** This version reads receipts from a fixture file only.
+  A source that is a program the reporter runs needs its own card, because the program must be started already
+  contained. Its starting requirements: the program is created suspended, put into its job, then resumed (on POSIX
+  its own session, with the limit that a descendant can leave it); it fails closed when it cannot be contained; one
+  deadline covers reading, exit and cleanup, with no blocking close after a timed wait; and the reserved options
+  (`--after`, `--limit`) are refused in every spelling.
+- **Fixture-only.** agenttalk does not have the receipt command yet (its card 6a-1), so the page format
+  is our reading of the design and lives in one file (`quota_balancer/reporter/receipts.py`).
+- **Nothing is compacted.** Kept receipts and their messages are never edited or deleted. A page with a
+  gap or a repeated number is refused whole.
+- **A replaced ledger cannot rebuild old receipts that were never received.** The record of a lease does
+  not say which generation it was in; a receipt missing from a replaced ledger stays missing.
+- **A missing receipt is never a guessed zero.** The lease keeps its liability (an advisory lease holds no
+  money, so there is nothing to release). Waiting work stays visible
+  in `status` (`awaiting_receipt`, then `overdue`); nothing else settles that lease.
+- **Cached input is reported as 0.** The gateway records none, so every settle says `0`. Zero is a gap in
+  what is recorded, not a measurement. `status` says so too.
+- **Journal reports for gateway leases are not suppressed yet.** That, and the list of gateway agents,
+  come with card L6a-2 (the admission command).
+- **Live gateways need the X3 upgrade** (the gateway program with the receipt API) before this can reach
+  one. Nothing here touches a live gateway.
+- **A refused source stays stuck** until it is fixed: no receipt after the last kept one is taken. `status`
+  asks for attention in that case; a wait ("read later") is not a fault.
+- **No downgrade of the state file.** It is now version 3 (1 and 2 are upgraded in one step). A reporter
+  built before this card refuses a version-3 file with its existing "the state file version is not
+  supported" sentence and never opens or changes it. Keep a copy if you may go back.
+- **Advisory until R1.** Metered leases stay advisory in Leasewise until card R1.
+
+### Technical detail
+
+State version 3: `receipt_source` (a name and the gateway it was bound to, immutable), `receipt_cursor`
+(one per source and generation; its `last_seq` and `page_ord` are updated as pages are taken and as the
+generation read last changes; `first_seen_ms` is when it first appeared), `receipt_binding` (copied from the admission store, immutable), `receipt_capture` (stage 1,
+immutable evidence, the source's gateway frozen on the row), `receipt_delivery` (stage 2, immutable, the
+settle text), and `receipt_state` (the mutable delivery-status table: `captured`, `quarantined`, `pending`, `sent`,
+`failed_permanent`, with a closed reason). Stage 1 and stage 2 are each one `BEGIN IMMEDIATE`. Stage 2 labels
+all new captures without a record in one statement, then works on the captures whose reference has a record, oldest
+first, at most 500 per cycle, found by a direct join on the reference hash (`receipt_capture_ref` indexes it).
+`event_id` is a UUIDv5 of the reference hash and the ledger generation. The pass order is limit, receipt,
+lease; `status_version` is 3. The admission store is opened with `mode=ro` and `query_only`; its layout is
+in `quota_balancer/reporter/admission_store.py`, the one module the admission command will reuse.
