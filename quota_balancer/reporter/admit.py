@@ -19,6 +19,17 @@ How it stays safe (the order of the steps is the point):
 7. Any other refusal or outage is `held` with one closed word and a back-off kept in the store, so a wrapper that asks
    again every few seconds does not hit Leasewise every time.
 
+The other three questions the wrapper asks are answered here too, on the same store:
+
+* `recall`: the stored admission, or "unknown". Read-only: it takes no lock and can never create anything.
+* `pending`: the admissions not yet acknowledged as closed, least recently returned first by a durable return number
+  (never by the clock); the same short transaction gives every returned entry the next number, so an entry that cannot
+  be closed yet goes to the back of the line.
+* `closed`: records the acknowledgement once, waiting for the message's key lock for at most the bounded wait.
+
+Only `admit` can answer `held`. When another operation cannot complete (the store is busy or unusable, the lock is not
+free in time) it exits non-zero with NO answer, and the caller keeps its work and asks again.
+
 Nothing from Leasewise's answer or from a fault is ever printed: only the closed words of `admit_wire`.
 """
 
@@ -47,6 +58,7 @@ ERR_STALE = "ESTIMATE_STALE"
 ERR_CONFLICT = "IDEMPOTENCY_CONFLICT"
 ERR_PARKED = "ACCOUNT_PARKED"
 ERR_DENIED = "POLICY_DENIED"
+ERR_BODY_CAP = "BODY_CAP"                # the message used up its request bodies (admission_store.MAX_BODIES)
 PAID = ("metered_advisory", "metered")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -65,18 +77,60 @@ class Environment:
         self.fault = fault or (lambda _stage: None)
 
 
+class Incomplete(Exception):
+    """An operation other than `admit` could not complete now: no answer is printed and the exit is non-zero."""
+
+
 def run(raw, env):
-    """The request bytes -> (exit code, bytes to print). Exit 0 prints an answer (`admitted` or `held`); exit 2 is a
-    request that is not allowed (the closed word is returned as text, nothing is printed on standard output)."""
+    """The request bytes -> (exit code, bytes to print). Exit 0 prints an answer; exit 2 is a request that is not
+    allowed (the closed word is returned as text, nothing is printed on standard output); exit 3 is an operation
+    other than `admit` that could not complete (no answer, the caller keeps its work)."""
     deadline = env.monotonic() + TOTAL_SECONDS
     try:
         request = wire.parse_request(raw)
     except wire.WireFailure as exc:
         return EXIT_BAD_REQUEST, exc.word.encode("ascii")
+    if request.op != wire.OP_ADMIT:
+        try:
+            return EXIT_OK, _other(request, env, deadline)
+        except (Incomplete, store.StoreBusy, store.StoreUnusable, wire.WireFailure):
+            return EXIT_FAILED, b""
     try:
         return EXIT_OK, _admit(request, env, deadline)
     except wire.WireFailure:
         return EXIT_OK, wire.held("refused")            # an answer that cannot be written within its bounds
+
+
+def _other(request, env, deadline):
+    """`recall`, `pending` and `closed`. None of them creates a store file: with no file there is nothing to find,
+    nothing pending and nothing to close."""
+    path = env.admission.store
+    if request.op == wire.OP_RECALL:
+        status, row = store.read_admission(path, request.agent, request.message_id)
+        if status == store.LATER and row == store.STORE_MISSING:
+            return wire.unknown()                       # no file: nothing was ever admitted
+        if status != store.OK:
+            raise Incomplete()
+        if row is None or row["state"] != "granted":
+            return wire.unknown()
+        # a grant whose time is used up is still the admission of that message: its reference is what the close needs
+        return wire.admitted(row["reference"], row["max_calls"], row["max_micro_eur"], max(row["ttl_seconds"], wire.MIN_TTL))
+    if not os.path.isfile(path):
+        return wire.pending_answer([], request.limit) if request.op == wire.OP_PENDING else wire.closed_ok()
+    writer = _open(env, deadline)
+    try:
+        if request.op == wire.OP_PENDING:
+            return wire.pending_answer(writer.pending(request.agent, request.limit, env.now_ms()), request.limit)
+        lock = admission_lock.KeyLock(path, request.agent, request.message_id, env.monotonic, env.sleep)
+        if not lock.acquire(min(deadline, env.monotonic() + LOCK_WAIT_SECONDS)):
+            raise Incomplete()
+        try:
+            writer.close_message(request.agent, request.message_id, env.now_ms())
+        finally:
+            lock.release()
+        return wire.closed_ok()
+    finally:
+        writer.close()
 
 
 # --- the answer ---------------------------------------------------------------------------------------------------
@@ -259,6 +313,10 @@ def _locked(request, agent, env, writer, deadline):
         if code == ERR_STALE and status is not None:
             if row["rebuilds"] >= MAX_REBUILDS:
                 return _hold(env, writer, row, ERR_STALE)
+            if writer.attempt_count(row["id"]) >= store.MAX_BODIES:
+                # Over a long outage the saved bodies must not grow without bound. At the cap the message is held as
+                # refused, shown in the status, and nothing is deleted.
+                return _hold(env, writer, row, ERR_BODY_CAP, restart_recovery=False)
             writer.rebuild(row["id"], _rebuilt_text(body_text, env.now_ms()), env.now_ms())
             row = writer.lookup(request.agent, request.message_id)    # the new body is saved before it is sent
             continue

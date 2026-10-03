@@ -10,7 +10,7 @@ import datetime
 import json
 import os
 
-from . import admission_store, capture, decisions, receipts, rounds
+from . import capture, decisions, receipts, rounds
 from . import state as state_mod
 
 STATUS_VERSION = 3          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`
@@ -128,20 +128,25 @@ def _agent(state, agent, configured, now_ms, silent_after_ms):
     row = one("SELECT COUNT(*), SUM(complete=1), SUM(disposition IS NULL),"
               " SUM(disposition='outcome_unknown') FROM message_status "
               "WHERE agent=?", (agent,))
-    acq = _counts(state, "SELECT state, COUNT(*) FROM acquisition WHERE "
-                  "agent=? GROUP BY state", agent)
+    # Journal rows of a message that was set aside because it is bound to a paid lease (`superseded`) are not counted.
+    acq = _counts(state, "SELECT state, COUNT(*) FROM acquisition WHERE agent=? AND NOT EXISTS (SELECT 1 FROM"
+                  " superseded x WHERE x.agent=acquisition.agent AND x.message_id=acquisition.message_id)"
+                  " GROUP BY state", agent)
     failed_codes = {}
     for code, count in _counts(
             state, "SELECT COALESCE(last_error_code, 'UNKNOWN_CODE'), COUNT(*)"
-            " FROM acquisition WHERE agent=? AND state='failed_permanent' "
-            "GROUP BY 1", agent).items():
+            " FROM acquisition WHERE agent=? AND state='failed_permanent' AND NOT EXISTS (SELECT 1 FROM"
+            " superseded x WHERE x.agent=acquisition.agent AND x.message_id=acquisition.message_id)"
+            " GROUP BY 1", agent).items():
         word = decisions.closed_code(code)
         failed_codes[word] = failed_codes.get(word, 0) + count
     failures = _failures(state, agent)
-    reports = _counts(state, "SELECT state, COUNT(*) FROM report WHERE "
-                      "agent=? GROUP BY state", agent)
-    finals = _counts(state, "SELECT state, COUNT(*) FROM final WHERE agent=? "
-                     "GROUP BY state", agent)
+    reports = _counts(state, "SELECT state, COUNT(*) FROM report WHERE agent=? AND NOT EXISTS (SELECT 1 FROM"
+                      " superseded x WHERE x.agent=report.agent AND x.message_id=report.message_id)"
+                      " GROUP BY state", agent)
+    finals = _counts(state, "SELECT state, COUNT(*) FROM final WHERE agent=? AND NOT EXISTS (SELECT 1 FROM"
+                     " superseded x WHERE x.agent=final.agent AND x.message_id=final.message_id)"
+                     " GROUP BY state", agent)
     last = one("SELECT MAX(at_ms), COUNT(*) FROM event WHERE agent=?",
                (agent,))
     stopped = one("SELECT failed_code FROM agent_state WHERE agent=?",
@@ -258,17 +263,16 @@ def _generation_changes(state):
     return out
 
 
-STORE_STATES = {"ok": "ok", "store_missing": "missing", "store_busy": "busy", "store_unreadable": "unreadable",
-                "history_limit": "history_limit"}
+STORE_STATES = {"ok": "ok", "store_missing": "missing", "store_busy": "busy", "store_unreadable": "unreadable"}
 STORE_ACTIONS = {
     "missing": "The admission store file is not there: check that the admission command writes to the file the "
                "configuration names. Receipts are kept and are read against it again each cycle.",
     "unreadable": "The admission store cannot be used (damaged, another version, or a row that does not match its "
                   "lease): nothing is copied from it. Check it before more receipts arrive.",
-    "history_limit": "The admission store holds more granted rows than the reporter reads at once (%d): no new binding "
-                     "can be copied and later receipts stay unknown. Reading only what is new is needed before live "
-                     "use; never delete admissions." % admission_store.MAX_BINDINGS,
 }
+BODY_CAP_ACTION = ("Some messages used up their request bodies in the admission store (%d): `admit` holds them as "
+                   "refused and nothing is deleted. Look at why their grants never arrived (see the admission "
+                   "command's own state).")
 
 
 def _admission_store(state):
@@ -278,10 +282,22 @@ def _admission_store(state):
     current = None if note is None else STORE_STATES.get(note[0], "unreadable")
     agent = state_mod.RECEIPT_AGENT
     failures = {word: state.counter(agent, "store:" + name) for name, word in STORE_STATES.items() if name != "ok"}
-    return {"state": current, "failures": failures}
+    cap = state.note(state_mod.BODY_CAP_NOTE)
+    return {"state": current, "failures": failures, "at_body_cap": int(cap[0]) if cap is not None and cap[0].isdigit()
+            else 0}
 
 
-def _gateway_receipts(state, source, now_ms):
+def _journal_suppression(state, gateway_agents):
+    """What the one-authority rule did (DESIGN-6A 8.5), as counts: journal events skipped because the gateway admits
+    the agent or the message is bound, messages whose queued journal rows were set aside, and those whose acquisition
+    had already been sent."""
+    def total(name):
+        return state.one("SELECT COALESCE(SUM(value), 0) FROM counter WHERE name=?", (name,))[0]
+    return {"gateway_agents": len(gateway_agents), "suppressed": total("suppressed"),
+            "superseded": total("superseded"), "superseded_after_send": total("superseded_after_send")}
+
+
+def _gateway_receipts(state, source, now_ms, gateway_agents=()):
     """The `gateway_receipts` object (card L6a-1): closed words and counts only. Never a path, a
     command, a lease id, a reference, a figure from a receipt or the text of a fault. `gateway` is the
     alias the OPERATOR wrote."""
@@ -317,6 +333,7 @@ def _gateway_receipts(state, source, now_ms):
         "failed": failed,
         "quarantine": quarantine,
         "admission_store": _admission_store(state),
+        "journal_suppression": _journal_suppression(state, gateway_agents),
         "quarantine_action": dict(QUARANTINE_ACTIONS),
         "generation_changes": _generation_changes(state),
         "awaiting_receipt": awaiting,
@@ -329,7 +346,8 @@ def _gateway_receipts(state, source, now_ms):
     }
 
 
-def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=(), gateway_receipts=None):
+def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=(), gateway_receipts=None,
+                 gateway_agents=()):
     """The whole report as plain data. `configured` is the set of agent
     names that have a table in the configuration file; `limit_sources` is the
     account map of card 7c-2 (empty: limit events are off); `gateway_receipts` is the receipt
@@ -356,14 +374,14 @@ def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=
         "code": decisions.closed_code(refused[0]), "at": iso(refused[1]),
         "active": state.note(_NOTE_CREDENTIAL) is not None}
     report["limit_events"] = _limit_events(state, limit_sources)
-    report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts, now_ms)
+    report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts, now_ms, gateway_agents)
     report["silent_configured_seats"] = sorted(
         n for n, a in report["agents"].items() if a["silent"])
-    report["operator_actions"] = _actions(report)
+    report["operator_actions"] = _actions(report, gateway_agents)
     return report
 
 
-def _actions(report):
+def _actions(report, gateway_agents=()):
     actions = []
     if report["journal_refused"]:
         actions.append("the journal is refused: see journal_refused")
@@ -371,14 +389,14 @@ def _actions(report):
         actions.append("Leasewise refused the identity: check the identity "
                        "value in the configuration")
     agents = report["agents"].values()
+    open_agents = [one for name, one in report["agents"].items() if name not in gateway_agents]
     failed = sum(a["permanent_failures_total"] for a in agents)
     if failed:
         actions.append("%d item(s) failed for good and will not be retried "
                        "(see permanent_failures: acquisitions, reports and "
                        "finals, each with its code)" % failed)
-    if any(a["messages"]["open"] or a["messages"]["incomplete"]
-           or a["messages"]["outcome_unknown"]
-           or a["acquisitions"]["pending"] for a in agents):
+    if any(a["messages"]["open"] or a["messages"]["incomplete"] or a["messages"]["outcome_unknown"]
+           or a["acquisitions"]["pending"] for a in open_agents):
         actions.append("open or incomplete messages: after an outage run "
                        "`expire-sweep` on the Leasewise store (explicit, "
                        "never a timer)")
@@ -409,6 +427,8 @@ def _actions(report):
         sentence = STORE_ACTIONS.get(receipt["admission_store"]["state"])
         if sentence:
             actions.append(sentence)
+        if receipt["admission_store"]["at_body_cap"]:
+            actions.append(BODY_CAP_ACTION % receipt["admission_store"]["at_body_cap"])
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")

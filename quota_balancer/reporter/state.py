@@ -22,6 +22,8 @@ LIMIT_AGENT = "_limit_events"
 RECEIPT_AGENT = "_gateway_receipts"
 RELEASE_BATCH = 500             # captures stage 2 works on in one cycle
 PERMANENT_REASONS = ("wrong_gateway", "duplicate_reference")
+BODY_CAP_NOTE = "receipt_store_body_cap"      # how many messages are held at the body cap (a count)
+GRANT_CURSOR_NOTE = "receipt_grant_cursor"       # the number of the last admission grant copied (card L6a-2)
 # Why a captured receipt is held back (never sent): no binding for its reference yet, a binding for another gateway
 # than its source's own, or a second receipt for one reference and generation.
 QUARANTINE_REASONS = ("unknown_reference", "wrong_gateway", "duplicate_reference")
@@ -141,6 +143,9 @@ _LIMIT_DDL = (
 #                    was read most recently, so a generation seen again (A, B, A) takes its kept cursor back;
 #                    `first_seen_ms` says when it first appeared.
 #   receipt_binding  copied from the admission store's granted rows: reference hash -> lease, gateway.
+#   superseded       (card L6a-2) a message whose journal rows were set aside because it is bound to a paid lease: the
+#                    gateway's receipt is its only authority. A record, never a deletion; `after_send` says whether the
+#                    journal acquisition had already been sent.
 #   receipt_capture  stage 1: the evidence exactly as received, even when no binding is known. The gateway of its
 #                    source is frozen on the row.
 #   receipt_delivery stage 2: the frozen canonical settle body, created in one transaction only when a binding for
@@ -148,6 +153,8 @@ _LIMIT_DDL = (
 #   receipt_state    the ONLY mutable table: captured, quarantined (with a closed reason), pending, sent, failed.
 # Source, binding, capture and delivery rows cannot be changed or deleted; the state row cannot be deleted.
 _RECEIPT_DDL = (
+    "CREATE TABLE superseded(agent TEXT NOT NULL, message_id TEXT NOT NULL, at_ms INTEGER NOT NULL,"
+    " after_send INTEGER NOT NULL, PRIMARY KEY(agent, message_id)) STRICT",
     "CREATE TABLE receipt_source(id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL,"
     " gateway_id TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(alias, gateway_id)) STRICT",
     "CREATE TABLE receipt_cursor(source_id INTEGER NOT NULL REFERENCES receipt_source(id),"
@@ -156,6 +163,7 @@ _RECEIPT_DDL = (
     " PRIMARY KEY(source_id, generation)) STRICT",
     "CREATE TABLE receipt_binding(ref_sha256 TEXT PRIMARY KEY, lease_id TEXT NOT NULL, gateway_id TEXT NOT NULL,"
     " agent TEXT NOT NULL, message_id TEXT NOT NULL, expires_ms INTEGER NOT NULL, copied_ms INTEGER NOT NULL) STRICT",
+    "CREATE INDEX receipt_binding_message ON receipt_binding(agent, message_id)",
     "CREATE TABLE receipt_capture(id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " source_id INTEGER NOT NULL REFERENCES receipt_source(id), gateway_id TEXT NOT NULL,"
     " generation TEXT NOT NULL, seq INTEGER NOT NULL, ref_sha256 TEXT NOT NULL, outcome TEXT NOT NULL,"
@@ -172,6 +180,7 @@ _RECEIPT_DDL = (
 ) + tuple(
     statement
     for table, what in (("receipt_source", "a receipt source"), ("receipt_binding", "a receipt binding"),
+                        ("superseded", "a superseded record"),
                         ("receipt_capture", "a receipt capture"), ("receipt_delivery", "a receipt delivery"))
     for statement in (
         "CREATE TRIGGER %s_immutable BEFORE UPDATE ON %s BEGIN SELECT RAISE(ABORT, '%s is immutable'); END"
@@ -448,11 +457,20 @@ class State:
             self.bump(RECEIPT_AGENT, "%s:%s" % (status, reason))
             self.set_note("receipt_last_read", status, now_ms)
 
-    def copy_bindings(self, bindings, now_ms):
+    def grant_cursor(self):
+        """The number of the last admission grant copied (0 before the first)."""
+        note = self.note(GRANT_CURSOR_NOTE)
+        return int(note[0]) if note is not None and note[0].isdigit() else 0
+
+    def copy_bindings(self, bindings, now_ms, cursor=None):
         """Copy the admission store's granted rows into this state (immutable). A reference already copied is left
-        exactly as it is; one that now names another lease or gateway is counted and never replaces it. -> new rows."""
+        exactly as it is; one that now names another lease or gateway is counted and never replaces it. With a
+        `cursor` (the number of the last grant of this batch) the progress is saved in the SAME transaction, so a
+        restart neither skips a grant nor needs to take one twice. -> new rows."""
         added = 0
         with self.txn():
+            if cursor is not None:
+                self.set_note(GRANT_CURSOR_NOTE, str(cursor), now_ms)
             for one in bindings:
                 row = self.conn.execute(
                     "INSERT OR IGNORE INTO receipt_binding(ref_sha256, lease_id, gateway_id, agent, message_id,"
@@ -465,6 +483,30 @@ class State:
                               (one.ref_sha256,)) != (one.lease_id, one.gateway_id):
                     self.bump(RECEIPT_AGENT, "binding_changed")
         return added
+
+    def supersede_bound(self, now_ms):
+        """Journal rows of a message that is now bound to a paid lease are set aside (DESIGN-6A 8.5): the gateway's
+        receipt is its only authority. For each such message that still has a pending or acquired journal
+        acquisition, ONE record is written and its queued rows are never sent (the sending query skips it). Nothing is
+        deleted. An acquisition that had already been sent is counted as `superseded_after_send`; the lease it made is
+        observe-only and holds nothing. -> the number of messages set aside."""
+        with self.txn():
+            rows = self.all(
+                "SELECT a.agent, a.message_id, a.state FROM acquisition a JOIN receipt_binding b"
+                " ON b.agent=a.agent AND b.message_id=a.message_id WHERE a.state IN ('pending','acquired')"
+                " AND NOT EXISTS (SELECT 1 FROM superseded x WHERE x.agent=a.agent AND x.message_id=a.message_id)"
+                " ORDER BY a.id LIMIT 1000")
+            for agent, message_id, state in rows:
+                self.conn.execute("INSERT INTO superseded(agent, message_id, at_ms, after_send) VALUES(?,?,?,?)",
+                                  (agent, message_id, now_ms, 1 if state == "acquired" else 0))
+                self.bump(agent, "superseded_after_send" if state == "acquired" else "superseded")
+        return len(rows)
+
+    def message_is_bound(self, agent, message_id):
+        """True when the message has a paid lease (a copied binding) or was set aside for one."""
+        return self.one("SELECT 1 FROM receipt_binding WHERE agent=? AND message_id=?", (agent, message_id)) \
+            is not None or self.one("SELECT 1 FROM superseded WHERE agent=? AND message_id=?",
+                                    (agent, message_id)) is not None
 
     def _insert_delivery(self, capture_id, body, text, now_ms):
         """The delivery row of stage 2. -> True if it is new, False if its event id already has a delivery."""
@@ -562,6 +604,7 @@ class State:
             " a.request_id, a.lease_id, a.not_before_ms FROM acquisition a"
             " LEFT JOIN agent_state s ON s.agent=a.agent"
             " WHERE s.failed_code IS NULL AND a.state<>'failed_permanent'"
+            " AND NOT EXISTS (SELECT 1 FROM superseded x WHERE x.agent=a.agent AND x.message_id=a.message_id)"
             " ORDER BY a.id")
         for (aid, agent, message_id, state, body, request_id, lease_id,
              not_before) in rows:

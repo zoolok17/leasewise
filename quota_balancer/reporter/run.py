@@ -27,6 +27,7 @@ MAX_SLEEP_SECONDS = 900
 # for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
 LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
 MAX_PAGES_PER_CYCLE = 6          # card L6a-1: pages (and generation switches) taken from a receipt source per cycle
+MAX_GRANT_BATCHES = 20          # card L6a-2: batches of admission grants (500 each) copied per cycle
 
 
 def _worse(current, new):
@@ -65,6 +66,10 @@ class Reporter:
         self.config = config
         self.limit_sources = tuple(limit_sources)   # card 7c-2: resolved account map (may be empty)
         self.gateway_receipts = gateway_receipts    # card L6a-1: the resolved receipt source, or None
+        # Card L6a-2 (DESIGN-6A 8.5): the agents whose turns the gateway admits. The journal pipeline never acquires
+        # or reports for them (their journal observations are still kept).
+        admission = getattr(config, "admission", None)
+        self.gateway_agents = frozenset(admission.gateway_agents) if admission is not None else frozenset()
         self.agents = agents            # {agent: mapper.AgentConfig}
         self.state = state
         self.client = client
@@ -103,13 +108,14 @@ class Reporter:
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
                                    self.config.silent_after_seconds,
-                                   self.limit_sources, self.gateway_receipts)
+                                   self.limit_sources, self.gateway_receipts, self.gateway_agents)
 
     def _read(self, result):
         try:
+            journal_agents = {name: one for name, one in self.agents.items() if name not in self.gateway_agents}
             outcome = rounds.run_round(self.state, self.config.journal_root,
-                                       self.agents, self.clock(),
-                                       fault=self.fault)
+                                       journal_agents, self.clock(),
+                                       fault=self.fault, suppressed=self.gateway_agents)
         except events.UnsupportedVersion:
             reason = "schema_version"
         except events.JournalError:
@@ -166,15 +172,30 @@ class Reporter:
                 pass
 
     def _copy_bindings(self, source, now):
-        status, found = admission_store.read_bindings(source.admission_store)
-        if status == admission_store.OK:
+        """Copy new grants in bounded batches, after the number of the last one taken (kept in the state, saved
+        with each batch), so no history size can stop the reader and nothing is read twice. A batch with a damaged
+        row or a row whose reference or hash does not belong to its lease copies nothing and the store shows as
+        unreadable. Then journal rows of newly bound messages are set aside, and the number of messages held at the
+        body cap is noted (a count only)."""
+        for _ in range(MAX_GRANT_BATCHES):
+            status, found = admission_store.read_bindings(source.admission_store, self.state.grant_cursor(),
+                                                          admission_store.BATCH)
+            if status != admission_store.OK:
+                with self.state.txn():
+                    self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
+                    self.state.set_note("receipt_store_read", found, now)
+                return
             with self.state.txn():
                 self.state.set_note("receipt_store_read", admission_store.OK, now)      # trouble is over: say so
-            self.state.copy_bindings(found, now)
-        else:
+            if found:
+                self.state.copy_bindings(found, now, cursor=found[-1].grant_seq)
+            if len(found) < admission_store.BATCH:
+                break
+        self.state.supersede_bound(now)
+        status, summary = admission_store.read_summary(source.admission_store)
+        if status == admission_store.OK:
             with self.state.txn():
-                self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
-                self.state.set_note("receipt_store_read", found, now)
+                self.state.set_note(state_mod.BODY_CAP_NOTE, str(summary["at_body_cap"]), now)
 
     def _take_pages(self, source, source_id):
         """Pages of this source, up to a few per cycle. A page from a generation other than the current one was

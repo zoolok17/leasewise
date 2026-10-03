@@ -137,6 +137,9 @@ def _admit(config, transport, seams):
     except Exception:                  # nothing from the fault is printed
         _error("ADMIT_FAILED", MSG_ADMIT_FAILED)
         return admit_mod.EXIT_FAILED
+    if code == admit_mod.EXIT_FAILED:
+        _error("ADMIT_FAILED", MSG_ADMIT_FAILED)         # an operation that could not complete: no answer, exit 3
+        return admit_mod.EXIT_FAILED
     if code != admit_mod.EXIT_OK:
         _error("ADMIT_REQUEST", "%s: %s" % (MSG_ADMIT_BAD, out.decode("ascii")))
         return EXIT_REFUSED
@@ -198,7 +201,8 @@ def _status(config, args):
         try:
             report = status_mod.build_status(
                 state, set(config.agents), now, config.silent_after_seconds,
-                config.limit_sources, config.gateway_receipts)
+                config.limit_sources, config.gateway_receipts,
+                config.admission.gateway_agents if config.admission is not None else ())
         finally:
             state.close()
     except StateOwned:

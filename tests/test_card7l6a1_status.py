@@ -16,7 +16,7 @@ from quota_balancer.reporter import admission_store, receipts, status
 
 from quota_balancer.reporter import mapper
 
-from tests.l6a1_env import (GATEWAY_ALIAS, GATEWAY_ID, GENERATION_B, OTHER_GATEWAY_ID, configure, grant, ledger, lease,
+from tests.l6a1_env import (GATEWAY_ALIAS, GATEWAY_ID, GENERATION_B, OTHER_GATEWAY_ID, add_binding, configure, grant, ledger, lease,
                             make_store, receipt, write_json)
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
@@ -24,7 +24,7 @@ from tests.test_card7l6a1_delivery import Net, error
 
 NOTE = ("Cached input is reported as 0: the gateway records none, so 0 is not proof that none was used.")
 OBJECT_KEYS = {"configured", "gateway", "last_seq", "last_read", "last_read_result", "stored", "rows", "failed",
-               "quarantine", "quarantine_action", "admission_store", "generation_changes", "awaiting_receipt", "overdue", "read_later",
+               "quarantine", "quarantine_action", "admission_store", "journal_suppression", "generation_changes", "awaiting_receipt", "overdue", "read_later",
                "refused", "read_fault", "last_ok", "cached_input"}
 
 
@@ -310,8 +310,8 @@ class StoreTrouble(_Status):
         self.assertIn("admission store: not read yet", text)
         self.reporter.cycle()
         state, text, report = self.shown()
-        self.assertEqual(state, {"state": "ok", "failures": {"missing": 0, "busy": 0, "unreadable": 0,
-                                                              "history_limit": 0}})
+        self.assertEqual(state, {"state": "ok", "failures": {"missing": 0, "busy": 0, "unreadable": 0},
+                                 "at_body_cap": 0})
         self.assertIn("admission store: ok", text)
         self.assertEqual(report["operator_actions"], [])
 
@@ -370,18 +370,23 @@ class StoreTrouble(_Status):
         self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_binding")[0], 0)
         self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_delivery")[0], 0)
 
-    def test_more_granted_rows_than_can_be_read_is_its_own_state_with_its_own_sentence(self):
-        with mock.patch.object(admission_store, "MAX_BINDINGS", 0):
-            self.reporter.cycle()
-        state, text, report = self.shown()
-        self.assertEqual((state["state"], state["failures"]["history_limit"]), ("history_limit", 1))
-        self.assertIn("admission store: history_limit", text)
-        action = [line for line in report["operator_actions"] if "more granted rows" in line]
-        self.assertTrue(action)
-        self.assertIn("never delete admissions", action[0])
-        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_binding")[0], 0)   # no new binding is copied
-        self.reporter.cycle()                                                                # the limit is gone: ok
+    def test_no_history_size_stops_the_reporter_grants_are_copied_in_batches_across_cycles_and_a_restart(self):
+        """D-127 F7: the receipt reader copies new grants a few at a time; there is no lifetime limit."""
+        extra = [lease() for _ in range(10)]
+        for number, one in enumerate(extra):
+            add_binding(self.store, {"lease_id": one, "message_id": "bulk-%d" % number})
+        from quota_balancer.reporter import run as run_mod
+        with mock.patch.object(admission_store, "BATCH", 3), mock.patch.object(run_mod, "MAX_GRANT_BATCHES", 1):
+            seen = []
+            for _ in range(5):
+                self.reporter.cycle()
+                seen.append(self.rig.state.one("SELECT COUNT(*) FROM receipt_binding")[0])
+                self.rig.close()                                                           # a restart between cycles
+                self.reporter = self.rig.open(transport=Net())
+        self.assertEqual(seen, [3, 6, 9, 11, 11])                                           # 3 a cycle, then the last 2
         self.assertEqual(self.shown()[0]["state"], "ok")
+        self.assertEqual(self.rig.state.grant_cursor(), 11)
+        self.assertEqual(self.rig.state.one("SELECT COUNT(DISTINCT ref_sha256) FROM receipt_binding")[0], 11)
 
     def test_nothing_in_the_state_names_a_path_or_a_fault(self):
         os.rename(self.store, self.store + ".away")
@@ -390,7 +395,7 @@ class StoreTrouble(_Status):
         shown = json.dumps(report, sort_keys=True) + text
         for private in (self.rig.ws.dir, "admission.db", "sqlite", "Traceback"):
             self.assertNotIn(private, shown)
-        self.assertEqual(set(report["gateway_receipts"]["admission_store"]), {"state", "failures"})
+        self.assertEqual(set(report["gateway_receipts"]["admission_store"]), {"state", "failures", "at_body_cap"})
 
     def test_the_command_shows_it_too(self):
         os.rename(self.store, self.store + ".away")

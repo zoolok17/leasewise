@@ -10,16 +10,21 @@ out, strict on both sides.
   carries no text from the input.
 * **Closed `held` reasons**: only the six words of `HELD_REASONS`.
 
-Only `admit` exists in step 1 of the card; the other three operations arrive in step 2 and reuse these helpers.
+The four operations: `admit` (the only one that can answer `held`), `recall`, `pending` and `closed`. Every operation
+reads one JSON object with exactly its own keys and writes one answer of its own shape; another operation's shape is a
+failure.
 """
 
 import json
 import re
 
 VERSION = 1
-OP_ADMIT = "admit"
+OP_ADMIT, OP_RECALL, OP_PENDING, OP_CLOSED = "admit", "recall", "pending", "closed"
+OPERATIONS = (OP_ADMIT, OP_RECALL, OP_PENDING, OP_CLOSED)
 MAX_REQUEST_BYTES = 512
 MAX_ANSWER_BYTES = 512
+MAX_PENDING_ANSWER_BYTES = 9216          # 35 bytes of frame, 64 entries of at most 128 bytes, 63 commas (8,290)
+MAX_LIMIT = 64
 
 HELD_REASONS = ("coordinator_unreachable", "refused", "parked", "context_unprovable", "store_busy", "not_configured")
 
@@ -41,6 +46,9 @@ MIN_TTL, MAX_TTL = 1, 86_400
 CONTEXT_MODES = ("fresh", "resume")
 
 REQUEST_KEYS = frozenset({"v", "op", "agent", "message_id", "parent_request_id", "profile", "context"})
+KEYED_KEYS = frozenset({"v", "op", "agent", "message_id"})            # recall and closed
+PENDING_KEYS = frozenset({"v", "op", "agent", "limit"})
+ENTRY_KEYS = frozenset({"message_id", "reference"})
 CONTEXT_KEYS = frozenset({"mode", "dispatch_bytes"})
 ADMITTED_KEYS = frozenset({"max_calls", "max_micro_eur", "reference", "status", "ttl_seconds", "v"})
 HELD_KEYS = frozenset({"reason", "status", "v"})
@@ -110,27 +118,51 @@ def _closed(doc, keys):
         raise WireFailure(BAD_SHAPE)
 
 
-class AdmitRequest:
-    __slots__ = ("agent", "message_id", "parent_request_id", "profile", "mode", "dispatch_bytes")
+class Request:
+    """One checked request. Only the fields of its operation are set."""
+
+    __slots__ = ("op", "agent", "message_id", "parent_request_id", "profile", "mode", "dispatch_bytes", "limit")
 
     def __repr__(self):
-        return "AdmitRequest(<hidden>)"
+        return "Request(<hidden>)"
 
     __str__ = __repr__
 
 
-def parse_request(raw):
-    """The bytes read from standard input -> AdmitRequest, or WireFailure."""
-    doc = loads(raw, MAX_REQUEST_BYTES)
-    if doc.get("op") != OP_ADMIT:
-        raise WireFailure(BAD_SHAPE)             # another operation's shape (or none): not this program's here
-    _closed(doc, REQUEST_KEYS)
-    _int(doc["v"], VERSION, VERSION)
-    request = AdmitRequest()
-    agent = _text(doc["agent"], AGENT)
+AdmitRequest = Request          # the name step 1 used
+
+
+def _agent(value):
+    agent = _text(value, AGENT)
     if agent.casefold() in RESERVED_AGENTS:
         raise WireFailure(OUT_OF_BOUNDS)
-    request.agent = agent
+    return agent
+
+
+def parse_request(raw):
+    """The bytes read from standard input -> Request, or WireFailure. The operation is named by `op`; the keys are
+    closed and must be exactly that operation's."""
+    doc = loads(raw, MAX_REQUEST_BYTES)
+    op = doc.get("op")
+    if type(op) is not str or op not in OPERATIONS:
+        raise WireFailure(BAD_SHAPE)
+    request = Request()
+    request.op = op
+    if op == OP_PENDING:
+        _closed(doc, PENDING_KEYS)
+        _int(doc["v"], VERSION, VERSION)
+        request.agent = _agent(doc["agent"])
+        request.limit = _int(doc["limit"], 1, MAX_LIMIT)
+        return request
+    if op in (OP_RECALL, OP_CLOSED):
+        _closed(doc, KEYED_KEYS)
+        _int(doc["v"], VERSION, VERSION)
+        request.agent = _agent(doc["agent"])
+        request.message_id = _text(doc["message_id"], MESSAGE_ID)
+        return request
+    _closed(doc, REQUEST_KEYS)
+    _int(doc["v"], VERSION, VERSION)
+    request.agent = _agent(doc["agent"])
     request.message_id = _text(doc["message_id"], MESSAGE_ID)
     parent = doc["parent_request_id"]
     if type(parent) is not str:
@@ -151,12 +183,17 @@ def parse_request(raw):
     return request
 
 
-def encode(doc):
+def encode(doc, cap=MAX_ANSWER_BYTES):
     """One answer as compact, sorted, ASCII JSON. Over the cap is a failure, never a cut message."""
     raw = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    if len(raw) > MAX_ANSWER_BYTES:
+    if len(raw) > cap:
         raise WireFailure(TOO_LARGE)
     return raw
+
+
+def encode_op(op, **fields):
+    """A request of any operation exactly as the caller writes it (used by the tests and by the other side)."""
+    return json.dumps(dict({"v": VERSION, "op": op}, **fields), sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
 def encode_request(agent, message_id, parent_request_id, profile, mode, dispatch_bytes):
@@ -206,4 +243,63 @@ def parse_answer(raw):
         if doc["reason"] not in HELD_REASONS:
             raise WireFailure(OUT_OF_BOUNDS)
         return doc
+    raise WireFailure(BAD_SHAPE)
+
+
+def unknown():
+    return encode({"v": VERSION, "status": "unknown"})
+
+
+def closed_ok():
+    return encode({"v": VERSION, "status": "ok"})
+
+
+def pending_answer(entries, limit):
+    """The `pending` answer: 0 to `limit` entries of (message_id, reference), each within its bounds, at most 9,216
+    bytes. More entries than the limit is a failure of the program, never a long answer."""
+    if len(entries) > limit:
+        raise WireFailure(OUT_OF_BOUNDS)
+    messages = []
+    for message_id, reference in entries:
+        messages.append({"message_id": _text(message_id, MESSAGE_ID), "reference": _text(reference, REFERENCE)})
+    return encode({"v": VERSION, "status": "ok", "messages": messages}, MAX_PENDING_ANSWER_BYTES)
+
+
+def parse_op_answer(op, raw, limit=None):
+    """The other side's strict reading of an answer to operation `op`: `admit` (admitted or held), `recall`
+    (admitted or unknown), `pending` (ok with its entries) and `closed` (ok). Another operation's shape, an extra or
+    missing key, a boolean or a float for a whole number, or a `held` anywhere but `admit` is a failure."""
+    if op == OP_PENDING:
+        doc = loads(raw, MAX_PENDING_ANSWER_BYTES)
+        _closed(doc, frozenset({"v", "status", "messages"}))
+        _int(doc["v"], VERSION, VERSION)
+        if doc["status"] != "ok" or type(doc["messages"]) is not list:
+            raise WireFailure(BAD_SHAPE)
+        if len(doc["messages"]) > (MAX_LIMIT if limit is None else limit):
+            raise WireFailure(OUT_OF_BOUNDS)
+        for entry in doc["messages"]:
+            if type(entry) is not dict:
+                raise WireFailure(BAD_SHAPE)
+            _closed(entry, ENTRY_KEYS)
+            _text(entry["message_id"], MESSAGE_ID)
+            _text(entry["reference"], REFERENCE)
+        return doc
+    if op == OP_CLOSED:
+        doc = loads(raw, MAX_ANSWER_BYTES)
+        _closed(doc, frozenset({"v", "status"}))
+        _int(doc["v"], VERSION, VERSION)
+        if doc["status"] != "ok":
+            raise WireFailure(BAD_SHAPE)
+        return doc
+    if op == OP_RECALL:
+        doc = loads(raw, MAX_ANSWER_BYTES)
+        if doc.get("status") == "unknown":
+            _closed(doc, frozenset({"v", "status"}))
+            _int(doc["v"], VERSION, VERSION)
+            return doc
+        if doc.get("status") != "admitted":
+            raise WireFailure(BAD_SHAPE)             # `held` belongs to `admit` alone
+        return parse_answer(raw)
+    if op == OP_ADMIT:
+        return parse_answer(raw)
     raise WireFailure(BAD_SHAPE)

@@ -874,7 +874,7 @@ id, an amount or a path):
   count and the age in seconds of the oldest; `overdue`: those among them whose own expiry has passed
   (`operator_actions` says so);
 - `admission_store`: the current state of the admission store as the reporter last read it (`ok`, `missing`,
-  `busy`, `unreadable` or `history_limit`; empty before the first read) and how many times each trouble
+  `busy` or `unreadable`; empty before the first read) and how many times each trouble
   happened before. The state goes back to `ok` after a good read. `operator_actions` has a sentence for the
   ones that need you (a wait, `busy`, does not);
 - `refused` and `read_later`: how often a read was refused or had to wait, by closed reason;
@@ -909,11 +909,9 @@ fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
 
 ### Limits
 
-- **A history limit (this card).** The reporter reads the granted rows of the admission store whole, up to
-  **100,000**. If the store holds more, nothing is copied: no new binding can be taken, later receipts stay
-  unknown (quarantined), and `status` shows `admission store: history_limit` with a sentence. Reading only what
-  is new is a prerequisite for live use; it comes with card L6a-2, through a durable grant order value. Never
-  delete admissions to get below the limit.
+- **No history limit any more (card L6a-2).** Card L6a-1 read the granted rows of the admission store whole, up to
+  100,000. The reporter now copies new grants in batches after a durable grant number (see card L6a-2 below), so no
+  history size can stop it. Never delete admissions.
 - **Command sources are not available yet (card L6a-1b).** This version reads receipts from a fixture file only.
   A source that is a program the reporter runs needs its own card, because the program must be started already
   contained. Its starting requirements: the program is created suspended, put into its job, then resumed (on POSIX
@@ -955,3 +953,131 @@ first, at most 500 per cycle, found by a direct join on the reference hash (`rec
 `event_id` is a UUIDv5 of the reference hash and the ledger generation. The pass order is limit, receipt,
 lease; `status_version` is 3. The admission store is opened with `mode=ro` and `query_only`; its layout is
 in `quota_balancer/reporter/admission_store.py`, the one module the admission command will reuse.
+
+## Card L6a-2 - the turn admission program (`reporter admit`)
+
+**Status: built, fixture-only.** Before a paid turn starts, the agent wrapper asks one question: *may this turn run,
+and under what limits?* `reporter admit` is the local program that answers it. It asks Leasewise for a lease, keeps the
+answer in a small database file (the **admission store**), and gives the **same answer** every time it is asked about
+the same message, however often it is run, killed or run at the same time as itself. Audience: the operator who sets up
+the wrapper's turn admission hook. Design: `C:\lw\records\DESIGN-6A.md` sections 8.5 to 8.7; the wire format is the
+neutral hook specification, section 4. Build records: `docs/STEP-CARD-L6A-2.md`.
+
+### What it does, in plain words
+
+The hook runs the program once per question. One JSON request goes in on standard input; one JSON answer comes out on
+standard output; nothing else is printed. There are four questions:
+
+| Question | What the wrapper wants to know | Answer |
+| --- | --- | --- |
+| `admit` | May this message's turn run? | `admitted` with a **reference** (the lease id), the caps and the time left; or `held` with one of six words |
+| `recall` | What was the answer for this message? | the stored admission, or `unknown`. It never creates anything |
+| `pending` | Which admitted messages are not closed yet? | up to the limit asked for (1 to 64), each with its reference |
+| `closed` | This message is closed | `ok`. A repeat changes nothing |
+
+Only `admit` ever answers `held`. If another question cannot be answered now (the store is busy, or the message's lock is
+not free in time), the program prints **nothing**, writes a fixed sentence on standard error and exits with code 3; the
+wrapper keeps its work and asks again. A request that is not allowed (wrong key, wrong type, over a bound or over 512
+bytes) exits with code 2. The reasons for `held` are only `coordinator_unreachable`, `refused`, `parked`,
+`context_unprovable`, `store_busy` and `not_configured`.
+
+**Why the same answer every time.**
+
+1. A message that already has a saved grant is answered from the file: no lock, no call to Leasewise.
+2. Otherwise one of 64 small lock files, chosen from the message's key, lets only one run work on that message at a time.
+   The operating system frees the lock if the run dies, so nothing is ever left locked and nothing is cleaned up by hand.
+3. The request, and every later body, is **written down before it is sent**. If an answer is lost, the same bytes go
+   again and Leasewise recognises them and returns the lease it already made. A stale estimate is rebuilt (at most 3 times
+   per recovery episode); if Leasewise then says "same request, different body", an earlier body was granted after all, and
+   the saved bodies are replayed, newest first (at most 4), to find that grant.
+4. The grant is saved **before** anything is printed.
+5. The whole run has one 20-second deadline (below the hook's 25 s). If it runs out it answers `held` with `store_busy`
+   and keeps what it learned, so the next run continues where it stopped.
+6. Any other refusal or outage is `held` with a back-off kept in the file (10 s after an outage, 30 s when the account is
+   parked, 60 s after a refusal), so a wrapper that asks again every few seconds does not call Leasewise every time.
+
+A message may keep at most **16** saved bodies. At that point `admit` holds it as `refused`, `reporter status` shows how
+many messages are at the cap, and nothing is ever deleted.
+
+### How to set it up
+
+1. **Save the ids again.** `policy-ids` lists `gateways`; the reporter configuration names the gateway by alias.
+2. **Add the `[admission]` block** to the reporter configuration, and the same store to `[gateway_receipts]`:
+
+```toml
+[admission]
+store = "C:/path/to/admission.db"    # an absolute path; the reporter's receipt reader must name the SAME file
+gateway = "g1"                       # a Leasewise gateway alias
+gateway_agents = ["alpha"]           # the agents whose turns the gateway admits (each needs its own [agents.alpha])
+fresh_overhead_bound_tokens = 4000   # the operator's bounds: what a fresh turn adds before the message
+resume_history_bound_tokens = 60000  # what a resumed turn carries
+growth_bound_tokens = 2000           # growth per call
+context_ceiling_tokens = 180000      # optional: the model's context ceiling, to refuse a sum that cannot fit
+```
+
+   The seat, model, task class and call limits come from the agent's own `[agents.alpha]` table, as for the journal
+   pipeline. The reporter **refuses to start** (a fixed sentence) if `[admission]` and `[gateway_receipts]` name different
+   store files, if a `gateway_agents` entry has no agent table, or if a value is not valid.
+3. **Point the wrapper's hook at the program:** `python -m quota_balancer reporter admit --config <file>`. The
+   configuration file is a secret (it holds the identity): keep it readable by its owner only.
+
+Nothing is invented. A bound that is not written is simply missing, and a turn that needs it is `held` as
+`context_unprovable`. An agent that is not in `gateway_agents` is `held` as `not_configured`. The `profile` field of a
+request is checked against its bound and not otherwise used.
+
+### One authority per paid message
+
+For a message bound to a paid lease, the **gateway's final receipt is the only thing that settles it.** The journal
+pipeline (card 7a) never acquires a lease for it, never sends a non-final report and never sends a final. Its
+observations are still read and kept, for diagnosis.
+
+- An agent in `gateway_agents` is never acquired or reported for by the journal pipeline at all.
+- A message that has a binding in the admission store creates no journal acquisition, report or final. `status` counts
+  the events skipped (`suppressed`).
+- Journal rows queued **before** the binding appeared are set aside with a `superseded` record: they are never sent and
+  never deleted. If the journal acquisition had already been sent, it is counted as `superseded_after_send`; the
+  observe-only lease it made holds nothing.
+- A missing or busy admission store is never taken to mean "this message is unbound".
+
+**Transition limit.** An agent that is not yet in `gateway_agents` can still be journalled before a binding is seen. List
+an agent in `gateway_agents` **before** its first gateway admission to close that route. The observe-only acquisition that
+may exist before then is not a second authority: it holds nothing, and the bound lease is settled only by the receipt.
+
+### The receipt reader reads only what is new
+
+The admission store numbers every grant in the order it was saved (`grant_seq`). The reporter copies grants in batches of
+500 after the last number it took, keeps that number in its state, and never reads old grants again, so there is **no
+lifetime limit** (the 100,000-grant limit of card L6a-1 is gone). Each batch is checked: a row whose reference is not its
+lease id, or whose hash is not the SHA-256 of it, refuses the whole batch.
+
+### What `status` adds
+
+Under `gateway_receipts`: `admission_store` (the current state, counts of past failures, and `at_body_cap`, the number of
+messages held at the body cap) and `journal_suppression` (`gateway_agents`, `suppressed`, `superseded`,
+`superseded_after_send`). Counts and closed words only.
+
+### Limits
+
+- **Replaying a stored admission is not a per-attempt authority check**, and leases stay **advisory**: the program grants
+  `metered_advisory` leases with null caps (the gateway uses its own ledger ceiling). Enforcement comes later.
+- **The lock bounds waiting; it does not promise fairness.** Under heavy contention a run may answer `store_busy`.
+- **A missing receipt is never a guessed zero.** The lease keeps its liability and the wait stays visible in `status`
+  (`awaiting_receipt`, then `overdue`).
+- **After a restart with no evidence** of how a turn ended, the wrapper's close may say `cancelled` although the work
+  finished. `closed` is only an acknowledgement: it never proves that a receipt exists or that its cost is zero.
+- **No compaction.** Admissions, attempts and captures are never deleted. A replaced gateway ledger cannot rebuild old
+  missing receipts from a binding alone.
+- **Fixture-only.** No live gateway is touched; a live one needs the gateway-side upgrade first.
+- **A message at the body cap stays held** until an operator looks at why its grant never arrived.
+
+### Technical detail
+
+The store layout is one module, `quota_balancer/reporter/admission_store.py` (version 1): `admission` (one row per
+message; the key, the request, the saved bodies' count, the grant written once, `grant_seq`, `return_seq`,
+`replay_tried`, `closed_ms`), `admission_attempt` (every body, saved before it is sent, never changed), and
+`admission_meta` (two counters that only grow: `grant_seq` and `return_seq`). Triggers keep the key, the grant and the
+close acknowledgement fixed and forbid deletes. `pending` orders by never-returned first, then `return_seq`, then row,
+and gives every returned entry the next `return_seq` in the same transaction, so a standing or backward clock changes
+nothing. The wire format is `reporter/admit_wire.py`, the flow `reporter/admit.py`, the lock
+`reporter/admission_lock.py` (`fcntl.flock` on POSIX; `msvcrt.locking` on one byte at offset 0 on Windows). The
+journal side is `rounds.py` (`suppressed`) and `state.py` (`superseded`, `message_is_bound`, `supersede_bound`).

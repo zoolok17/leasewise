@@ -460,5 +460,50 @@ class Deadline(_Case):
         self.assertEqual(wire.parse_answer(self.answer(script))["status"], "admitted")
 
 
+class BodyCap(_Case):
+    """Over a long outage the saved bodies of one message must not grow without bound: at the cap it is held as refused,
+    shown in the status, and nothing is ever deleted."""
+
+    def test_a_message_never_keeps_more_than_16_bodies_and_is_held_as_refused_at_the_cap(self):
+        script = self.script(STALE)
+        for _ in range(9):                                                             # many episodes, each after its back-off
+            out = self.answer(script)
+            self.assertEqual(self.held(out), "refused")
+            self.clock.advance(61)
+        attempts = self.rg.sql("SELECT COUNT(*) FROM admission_attempt")[0][0]
+        self.assertEqual(attempts, store.MAX_BODIES)                                   # 16 and never more
+        self.assertEqual(self.rg.row()[3], "BODY_CAP")                                 # the visible reason
+        self.assertEqual(self.rg.sql("SELECT state FROM admission"), [("requested",)])
+        calls = len(script.calls)
+        self.answer(script)
+        self.clock.advance(61)
+        self.answer(script)
+        self.assertEqual(self.rg.sql("SELECT COUNT(*) FROM admission_attempt")[0][0], store.MAX_BODIES)
+        self.assertGreater(len(script.calls), calls)                                   # it still asks with the stored body
+
+    def test_nothing_is_deleted_at_the_cap_and_a_late_landing_body_can_still_be_replayed(self):
+        script = self.script(STALE)
+        for _ in range(7):
+            self.answer(script)
+            self.clock.advance(61)
+        bodies = [row[0] for row in self.rg.sql("SELECT body FROM admission_attempt ORDER BY id")]
+        self.assertEqual(len(bodies), store.MAX_BODIES)
+        key = script.calls[0][0]
+        script.granted[key] = ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", bodies[-1].encode("utf-8"))      # the newest landed
+        script.answers[:] = ["GRANT"]
+        out = self.answer(script)
+        self.assertEqual(wire.parse_answer(out)["reference"], "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        self.assertEqual(self.rg.sql("SELECT COUNT(*) FROM admission_attempt")[0][0], store.MAX_BODIES)
+
+    def test_the_cap_is_counted_by_the_read_only_summary_the_status_uses(self):
+        script = self.script(STALE)
+        for _ in range(9):
+            self.answer(script)
+            self.clock.advance(61)
+        self.assertEqual(store.read_summary(self.rg.store), (store.OK, {"at_body_cap": 1}))
+        self.setUp()
+        self.assertEqual(store.read_summary(self.rg.store), (store.LATER, store.STORE_MISSING))
+
+
 if __name__ == "__main__":
     unittest.main()

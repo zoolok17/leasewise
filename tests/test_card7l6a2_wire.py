@@ -98,12 +98,17 @@ class Requests(unittest.TestCase):
         more["context"]["extra"] = 1
         self.refuses(json.dumps(more), wire.BAD_SHAPE)
 
-    def test_another_operations_shape_is_refused(self):
-        for doc in ({"v": 1, "op": "recall", "agent": "alpha", "message_id": "m1"},
-                    {"v": 1, "op": "pending", "agent": "alpha", "limit": 5},
-                    {"v": 1, "op": "closed", "agent": "alpha", "message_id": "m1"},
-                    dict(json.loads(request_bytes()), op="recall")):
-            with self.subTest(op=doc["op"]):
+    def test_another_operations_keys_are_refused_for_each_operation(self):
+        """Each operation takes exactly its own keys: the other operations' shapes are failures."""
+        admit = json.loads(request_bytes())
+        for doc in (dict(admit, op="recall"), dict(admit, op="pending"), dict(admit, op="closed"),
+                    {"v": 1, "op": "admit", "agent": "alpha", "message_id": "m1"},
+                    {"v": 1, "op": "recall", "agent": "alpha", "limit": 5},
+                    {"v": 1, "op": "pending", "agent": "alpha", "message_id": "m1"},
+                    {"v": 1, "op": "closed", "agent": "alpha", "limit": 5},
+                    {"v": 1, "op": "nonsense", "agent": "alpha", "message_id": "m1"},
+                    {"v": 1, "agent": "alpha", "message_id": "m1"}, {"v": 1, "op": 7, "agent": "alpha"}):
+            with self.subTest(doc=str(doc)[:60]):
                 self.refuses(json.dumps(doc), wire.BAD_SHAPE)
 
     def test_a_value_of_the_wrong_type_is_refused(self):
