@@ -13,7 +13,7 @@ import random
 import threading
 import time
 
-from . import capture, decisions, events, receipts, rounds, status
+from . import admission_store, capture, decisions, events, receipts, rounds, status
 from . import state as state_mod
 
 # What a cycle ended with.
@@ -26,6 +26,7 @@ MAX_SLEEP_SECONDS = 900
 # is not answering: the wrapper refreshes a park file about once a minute and a file counts as fresh
 # for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
 LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
+MAX_PAGES_PER_CYCLE = 6          # card L6a-1: pages (and generation switches) taken from a receipt source per cycle
 
 
 def _worse(current, new):
@@ -140,28 +141,58 @@ class Reporter:
                 pass
 
     def _receive(self, result):
-        """Read the gateway's new receipts and store them (card L6a-1). One read per cycle, from the
-        source in the configuration. What comes back is stored in ONE transaction together with the
-        new last `seq`; a source that cannot be read, or whose answer is refused, stores nothing and
-        moves nothing, and only a closed word and a count are kept. A fault anywhere in here is
-        caught whole: counted, no text kept, and it never stops sending."""
+        """The receipt custody chain's intake (card L6a-1, DESIGN-6A 8.3), once per cycle: copy the new bindings
+        from the admission store (read-only; a missing or busy store means "read again later"), take pages from
+        the source into immutable evidence (stage 1, even when no binding is known), then release every capture
+        whose binding is now known (stage 2). A page that cannot be read or is refused stores nothing and moves
+        nothing; only a closed word and a count are kept. A fault anywhere in here is caught whole: counted, no
+        text kept, and it never stops sending."""
         source = self.gateway_receipts
         if source is None:
             return
         try:
             now = self.clock()
-            read = receipts.read_receipts(source, self.state.receipt_cursor(source.gateway))
-            if read.status == receipts.OK:
-                result.new_receipts = self.state.record_receipts(
-                    source.gateway, source.gateway_id, read.receipts, now)
-            else:
-                self.state.note_receipt_read(read.status, read.reason, now)
+            self._copy_bindings(source, now)
+            source_id = self.state.ensure_source(source.gateway, source.gateway_id, now)
+            result.new_receipts = self._take_pages(source, source_id)
+            self.state.release_waiting(self.clock())
         except Exception:               # noqa: BLE001 - nothing from the fault is kept
             try:
                 with self.state.txn():
                     self.state.bump(state_mod.RECEIPT_AGENT, "read_fault")
             except Exception:           # noqa: BLE001 - even the count may fail; sending goes on
                 pass
+
+    def _copy_bindings(self, source, now):
+        status, found = admission_store.read_bindings(source.admission_store)
+        if status == admission_store.OK:
+            self.state.copy_bindings(found, now)
+        else:
+            with self.state.txn():
+                self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
+                self.state.set_note("receipt_store_read", found, now)
+
+    def _take_pages(self, source, source_id):
+        """Pages of this source, up to a few per cycle. A page from a generation other than the current one was
+        asked for with another ledger's cursor: the generation is switched (a new one starts at 0, one seen
+        before takes its kept cursor back) and the page is used only if it happens to start there, else read again."""
+        added = 0
+        for _ in range(MAX_PAGES_PER_CYCLE):
+            generation, after = self.state.current_cursor(source_id)
+            read = receipts.read_page(source, after)
+            now = self.clock()
+            if read.status != receipts.OK:
+                self.state.note_receipt_read(read.status, read.reason, now)
+                break
+            page = read.page
+            if generation is not None and page.generation != generation:
+                after = self.state.switch_generation(source_id, page.generation)
+                if page.after_seq != after:
+                    continue                      # asked with the wrong cursor: nothing of it is taken
+            added += self.state.capture_page(source_id, source.gateway_id, page, now)
+            if not page.has_more:
+                break
+        return added
 
     def _send(self, result):
         """Three passes, in this order and SEPARATE: limit events (card 7c-2), then gateway receipts

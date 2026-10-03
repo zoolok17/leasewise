@@ -12,7 +12,7 @@ import sqlite3
 
 from . import decisions, mapper
 
-SCHEMA_VERSION = 3       # 2: card 7c-2 added limit_event; 3: card L6a-1 added gateway_receipt and lease_ref
+SCHEMA_VERSION = 3       # 2: card 7c-2 added limit_event; 3: card L6a-1 added the receipt custody tables
                          # (older files are migrated; a reporter that knows less refuses a newer file)
 
 # The agent word on a limit item. Real agent names start with a letter or a digit, so this can
@@ -20,6 +20,9 @@ SCHEMA_VERSION = 3       # 2: card 7c-2 added limit_event; 3: card L6a-1 added g
 LIMIT_AGENT = "_limit_events"
 # The same for a gateway receipt (card L6a-1): it belongs to one lease and to no seat and no message.
 RECEIPT_AGENT = "_gateway_receipts"
+# Why a captured receipt is held back (never sent): no binding for its reference yet, a binding for another gateway
+# than its source's own, or a second receipt for one reference and generation.
+QUARANTINE_REASONS = ("unknown_reference", "wrong_gateway", "duplicate_reference")
 _ALIAS = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 
@@ -129,29 +132,67 @@ _LIMIT_DDL = (
     " SELECT RAISE(ABORT, 'a limit event is immutable'); END",
 )
 
-# Version 3 (card L6a-1): the gateway-receipt outbox and the lease references. One receipt row per
-# (gateway, ledger generation, seq), keyed by `event_id`; the body is the frozen canonical settle
-# text and is never recomputed. A receipt whose reference matches no lease of ours is stored as
-# failed for good (so its `seq` is still passed) and has no lease id. `lease_ref` maps the sha256
-# of a lease id (what the gateway keeps) back to the lease id.
+# Version 3 (card L6a-1, DESIGN-6A 8.3): the receipt custody chain, in two durable stages.
+#   receipt_source   who the receipts come from: a configured name AND the gateway it was bound to. A source mapped to
+#                    another gateway is another source (another identity, its own cursors); nothing is rebound.
+#   receipt_cursor   one per (source, generation): the last receipt number taken. `page_ord` says which generation
+#                    was read most recently, so a generation seen again (A, B, A) takes its kept cursor back.
+#   receipt_binding  copied from the admission store's granted rows: reference hash -> lease, gateway.
+#   receipt_capture  stage 1: the evidence exactly as received, even when no binding is known. The gateway of its
+#                    source is frozen on the row.
+#   receipt_delivery stage 2: the frozen canonical settle body, created in one transaction only when a binding for
+#                    the frozen gateway matches.
+#   receipt_state    the ONLY mutable table: captured, quarantined (with a closed reason), pending, sent, failed.
+# Source, binding, capture and delivery rows cannot be changed or deleted; the state row cannot be deleted.
 _RECEIPT_DDL = (
-    "CREATE TABLE gateway_receipt(id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    " event_id TEXT NOT NULL UNIQUE, gateway_alias TEXT NOT NULL, generation TEXT NOT NULL,"
-    " seq INTEGER NOT NULL, ref_sha256 TEXT NOT NULL, lease_id TEXT, body TEXT NOT NULL,"
-    " state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','sent','failed_permanent')),"
-    " tries INTEGER NOT NULL DEFAULT 0, not_before_ms INTEGER NOT NULL DEFAULT 0,"
-    " last_error_code TEXT, stored_ms INTEGER NOT NULL,"
-    " CHECK(lease_id IS NOT NULL OR state='failed_permanent'),"
-    " UNIQUE(gateway_alias, generation, seq)) STRICT",
-    "CREATE TRIGGER gateway_receipt_immutable BEFORE UPDATE OF event_id, gateway_alias, generation,"
-    " seq, ref_sha256, lease_id, body, stored_ms ON gateway_receipt BEGIN"
-    " SELECT RAISE(ABORT, 'a gateway receipt is immutable'); END",
-    "CREATE TRIGGER gateway_receipt_keep BEFORE DELETE ON gateway_receipt BEGIN"
-    " SELECT RAISE(ABORT, 'a gateway receipt is immutable'); END",
-    "CREATE TABLE lease_ref(ref_sha256 TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE) STRICT",
+    "CREATE TABLE receipt_source(id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL,"
+    " gateway_id TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(alias, gateway_id)) STRICT",
+    "CREATE TABLE receipt_cursor(source_id INTEGER NOT NULL REFERENCES receipt_source(id),"
+    " generation TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0, page_ord INTEGER NOT NULL,"
+    " PRIMARY KEY(source_id, generation)) STRICT",
+    "CREATE TABLE receipt_binding(ref_sha256 TEXT PRIMARY KEY, lease_id TEXT NOT NULL, gateway_id TEXT NOT NULL,"
+    " agent TEXT NOT NULL, message_id TEXT NOT NULL, expires_ms INTEGER NOT NULL, copied_ms INTEGER NOT NULL) STRICT",
+    "CREATE TABLE receipt_capture(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " source_id INTEGER NOT NULL REFERENCES receipt_source(id), gateway_id TEXT NOT NULL,"
+    " generation TEXT NOT NULL, seq INTEGER NOT NULL, ref_sha256 TEXT NOT NULL, outcome TEXT NOT NULL,"
+    " calls INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER, actual_micro_eur INTEGER NOT NULL,"
+    " closed_at TEXT NOT NULL, captured_ms INTEGER NOT NULL, UNIQUE(source_id, generation, seq)) STRICT",
+    "CREATE TABLE receipt_delivery(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " capture_id INTEGER NOT NULL UNIQUE REFERENCES receipt_capture(id), event_id TEXT NOT NULL UNIQUE,"
+    " lease_id TEXT NOT NULL, gateway_id TEXT NOT NULL, body TEXT NOT NULL, created_ms INTEGER NOT NULL) STRICT",
+    "CREATE TABLE receipt_state(capture_id INTEGER PRIMARY KEY REFERENCES receipt_capture(id),"
+    " state TEXT NOT NULL DEFAULT 'captured' CHECK(state IN"
+    " ('captured','quarantined','pending','sent','failed_permanent')), reason TEXT,"
+    " tries INTEGER NOT NULL DEFAULT 0, not_before_ms INTEGER NOT NULL DEFAULT 0, last_error_code TEXT) STRICT",
+) + tuple(
+    statement
+    for table, what in (("receipt_source", "a receipt source"), ("receipt_binding", "a receipt binding"),
+                        ("receipt_capture", "a receipt capture"), ("receipt_delivery", "a receipt delivery"))
+    for statement in (
+        "CREATE TRIGGER %s_immutable BEFORE UPDATE ON %s BEGIN SELECT RAISE(ABORT, '%s is immutable'); END"
+        % (table, table, what),
+        "CREATE TRIGGER %s_keep BEFORE DELETE ON %s BEGIN SELECT RAISE(ABORT, '%s is immutable'); END"
+        % (table, table, what))
+) + (
+    "CREATE TRIGGER receipt_state_keep BEFORE DELETE ON receipt_state BEGIN"
+    " SELECT RAISE(ABORT, 'a receipt state is never deleted'); END",
 )
 
 _DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL
+
+
+# The column that names a row in each outbox table (every table but the receipt state is keyed by `id`).
+_KEY_COLUMN = {"receipt_state": "capture_id"}
+
+
+class _Evidence:
+    """The fields of a captured receipt that make a settle body (the shape receipts.Receipt has)."""
+
+    __slots__ = ("seq", "ref_sha256", "outcome", "calls", "input_tokens", "output_tokens", "actual_micro_eur")
+
+    def __init__(self, seq, ref_sha256, outcome, calls, input_tokens, output_tokens, actual_micro_eur):
+        self.seq, self.ref_sha256, self.outcome, self.calls = seq, ref_sha256, outcome, calls
+        self.input_tokens, self.output_tokens, self.actual_micro_eur = input_tokens, output_tokens, actual_micro_eur
 
 
 class State:
@@ -193,17 +234,14 @@ class State:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version in (1, 2) and SCHEMA_VERSION >= 3:
-            # Version 1 -> 3 or 2 -> 3, inside the caller's transaction: all or nothing.
+            # Version 1 -> 3 or 2 -> 3, inside the caller's transaction: all or nothing. (An earlier version 3
+            # with another layout never shipped, so there is nothing to carry over.)
             if version == 1:
                 self.conn.execute(_NOTE_DDL)        # a file made before card 7a-3
                 for statement in _LIMIT_DDL:
                     self.conn.execute(statement)
             for statement in _RECEIPT_DDL:
                 self.conn.execute(statement)
-            # Every lease already acquired can be named by a receipt, so its reference is kept.
-            for (lease_id,) in self.conn.execute(
-                    "SELECT lease_id FROM acquisition WHERE lease_id IS NOT NULL").fetchall():
-                self.remember_lease(lease_id)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
             raise StateError("the state file version is not supported")
@@ -330,70 +368,165 @@ class State:
         return Item(decisions.LIMIT, LIMIT_AGENT, "", "/v1/limit-events", json.loads(row[2]),
                     row[1], ("limit_event", row[0]), None)
 
-    # --- the gateway-receipt outbox (card L6a-1) ------------------------------
+    # --- the receipt custody chain (card L6a-1, DESIGN-6A 8.3) ---------------------------------------
 
-    def remember_lease(self, lease_id):
-        """Keep the reference of one lease (the sha256 of its id) so that a gateway receipt naming
-        that reference can be sent to the lease. Inside the caller's transaction."""
-        self.conn.execute("INSERT OR IGNORE INTO lease_ref(ref_sha256, lease_id) VALUES(?,?)",
-                          (mapper.lease_ref_hash(lease_id), lease_id))
+    def ensure_source(self, alias, gateway_id, now_ms):
+        """The id of the source (alias, gateway). A source is bound to ONE gateway for good: the same name mapped
+        to another gateway is another source."""
+        with self.txn():
+            self.conn.execute("INSERT OR IGNORE INTO receipt_source(alias, gateway_id, created_ms) VALUES(?,?,?)",
+                              (alias, gateway_id, now_ms))
+            return self.one("SELECT id FROM receipt_source WHERE alias=? AND gateway_id=?", (alias, gateway_id))[0]
 
-    def receipt_cursor(self, gateway_alias):
-        """The last receipt `seq` stored for this gateway (0 if none)."""
-        row = self.one("SELECT value FROM meta WHERE key=?", ("receipt_seq:" + gateway_alias,))
-        return row[0] if row else 0
+    def current_cursor(self, source_id):
+        """(generation, last_seq) of the generation read most recently for this source, or (None, 0)."""
+        row = self.one("SELECT generation, last_seq FROM receipt_cursor WHERE source_id=?"
+                       " ORDER BY page_ord DESC LIMIT 1", (source_id,))
+        return (None, 0) if row is None else (row[0], row[1])
 
-    def record_receipts(self, gateway_alias, gateway_id, receipts, now_ms):
-        """One read's result, in ONE transaction: each new receipt as a frozen outbox row (a row that
-        already exists is left exactly as it is), and the last `seq` moved to the last receipt of the
-        read. A failure anywhere stores nothing and moves nothing. -> the number of new rows."""
+    def cursor_for(self, source_id, generation):
+        """The kept cursor of one generation, or None if that generation was never seen."""
+        row = self.one("SELECT last_seq FROM receipt_cursor WHERE source_id=? AND generation=?",
+                       (source_id, generation))
+        return None if row is None else row[0]
+
+    def _next_page_ord(self):
+        return self.one("SELECT COALESCE(MAX(page_ord), 0) + 1 FROM receipt_cursor")[0]
+
+    def switch_generation(self, source_id, generation):
+        """Make `generation` the current one for this source: a generation never seen starts its own cursor at 0,
+        and one seen before takes its KEPT cursor back (A, B, A). Old cursors stay. -> its last_seq."""
+        with self.txn():
+            order = self._next_page_ord()
+            self.conn.execute("INSERT OR IGNORE INTO receipt_cursor(source_id, generation, last_seq, page_ord)"
+                              " VALUES(?,?,0,?)", (source_id, generation, order))
+            self.conn.execute("UPDATE receipt_cursor SET page_ord=? WHERE source_id=? AND generation=?",
+                              (order, source_id, generation))
+            self.bump(RECEIPT_AGENT, "generation_change")
+            return self.cursor_for(source_id, generation)
+
+    def capture_page(self, source_id, gateway_id, page, now_ms):
+        """Stage 1, ONE transaction: every receipt of an accepted page as immutable evidence (a row that already
+        exists is left exactly as it is), its state row, and the cursor moved to the page's last number. This
+        happens even when no binding is known. A page that was not asked for at the cursor stores nothing
+        (StateError). -> the number of new captures."""
         added = 0
         with self.txn():
-            last = self.receipt_cursor(gateway_alias)
-            for receipt in receipts:
-                try:
-                    body = mapper.receipt_body(gateway_id, receipt)
-                    text = mapper.receipt_body_text(body)
-                except ValueError:
-                    raise StateError("a receipt body is not valid") from None
-                found = self.one("SELECT lease_id FROM lease_ref WHERE ref_sha256=?", (receipt.ref_sha256,))
-                lease_id = None if found is None else found[0]
-                state = "pending" if lease_id is not None else "failed_permanent"
-                code = None if lease_id is not None else decisions.UNKNOWN_LEASE
+            if self.cursor_for(source_id, page.generation) is None:
+                self.conn.execute("INSERT INTO receipt_cursor(source_id, generation, last_seq, page_ord)"
+                                  " VALUES(?,?,0,?)", (source_id, page.generation, self._next_page_ord()))
+            if self.cursor_for(source_id, page.generation) != page.after_seq:
+                raise StateError("a receipt page does not start at the stored cursor")
+            for receipt in page.receipts:
                 row = self.conn.execute(
-                    "INSERT OR IGNORE INTO gateway_receipt(event_id, gateway_alias, generation, seq,"
-                    " ref_sha256, lease_id, body, state, last_error_code, stored_ms)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (body["event_id"], gateway_alias, receipt.generation, receipt.seq,
-                     receipt.ref_sha256, lease_id, text, state, code, now_ms))
-                added += row.rowcount
-                last = max(last, receipt.seq)
-            if receipts:
-                self.conn.execute(
-                    "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET"
-                    " value=excluded.value", ("receipt_seq:" + gateway_alias, last))
+                    "INSERT OR IGNORE INTO receipt_capture(source_id, gateway_id, generation, seq, ref_sha256,"
+                    " outcome, calls, input_tokens, output_tokens, actual_micro_eur, closed_at, captured_ms)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (source_id, gateway_id, page.generation, receipt.seq, receipt.ref_sha256, receipt.outcome,
+                     receipt.calls, receipt.input_tokens, receipt.output_tokens, receipt.actual_micro_eur,
+                     receipt.closed_at, now_ms))
+                if row.rowcount == 1:
+                    added += 1
+                    self.conn.execute("INSERT INTO receipt_state(capture_id) VALUES(?)", (row.lastrowid,))
+            if page.receipts:
+                self.conn.execute("UPDATE receipt_cursor SET last_seq=? WHERE source_id=? AND generation=?",
+                                  (page.next_seq, source_id, page.generation))
             if added:
                 self.bump(RECEIPT_AGENT, "stored", added)
             self.set_note("receipt_last_read", "ok", now_ms)
         return added
 
     def note_receipt_read(self, status, reason, now_ms):
-        """A read that stored nothing (`read_later` or `refused`): count it by its closed reason and
-        say when. Never any text from the source."""
+        """A read that stored nothing (`read_later` or `refused`): count it by its closed reason and say when. Never
+        any text from the source."""
         with self.txn():
             self.bump(RECEIPT_AGENT, "%s:%s" % (status, reason))
             self.set_note("receipt_last_read", status, now_ms)
 
+    def copy_bindings(self, bindings, now_ms):
+        """Copy the admission store's granted rows into this state (immutable). A reference already copied is left
+        exactly as it is; one that now names another lease or gateway is counted and never replaces it. -> new rows."""
+        added = 0
+        with self.txn():
+            for one in bindings:
+                row = self.conn.execute(
+                    "INSERT OR IGNORE INTO receipt_binding(ref_sha256, lease_id, gateway_id, agent, message_id,"
+                    " expires_ms, copied_ms) VALUES(?,?,?,?,?,?,?)",
+                    (one.ref_sha256, one.lease_id, one.gateway_id, one.agent, one.message_id, one.expires_ms,
+                     now_ms))
+                if row.rowcount == 1:
+                    added += 1
+                elif self.one("SELECT lease_id, gateway_id FROM receipt_binding WHERE ref_sha256=?",
+                              (one.ref_sha256,)) != (one.lease_id, one.gateway_id):
+                    self.bump(RECEIPT_AGENT, "binding_changed")
+        return added
+
+    def _insert_delivery(self, capture_id, body, text, now_ms):
+        """The delivery row of stage 2. -> True if it is new, False if its event id already has a delivery."""
+        return self.conn.execute(
+            "INSERT OR IGNORE INTO receipt_delivery(capture_id, event_id, lease_id, gateway_id, body, created_ms)"
+            " VALUES(?,?,?,?,?,?)", (capture_id, body["event_id"], body["_lease_id"], body["gateway_id"], text,
+                                     now_ms)).rowcount == 1
+
+    def _mark_pending(self, capture_id):
+        self.conn.execute("UPDATE receipt_state SET state='pending', reason=NULL, last_error_code=NULL"
+                          " WHERE capture_id=?", (capture_id,))
+
+    def release_waiting(self, now_ms, limit=500):
+        """Stage 2: look again at every capture that is not yet released (`captured` or `quarantined`). Each one is
+        its own `BEGIN IMMEDIATE`. A binding that matches the capture's FROZEN gateway creates the immutable
+        delivery body and sets `pending` together or not at all; no binding is `unknown_reference`; a binding for
+        another gateway is `wrong_gateway`; a second capture of one reference and generation is
+        `duplicate_reference`. None of these ever creates a sendable body. -> the number released."""
+        ids = [row[0] for row in self.all(
+            "SELECT capture_id FROM receipt_state WHERE state IN ('captured','quarantined') ORDER BY capture_id"
+            " LIMIT ?", (limit,))]
+        released = 0
+        for capture_id in ids:
+            with self.txn():
+                row = self.one(
+                    "SELECT s.state, c.gateway_id, c.generation, c.seq, c.ref_sha256, c.outcome, c.calls,"
+                    " c.input_tokens, c.output_tokens, c.actual_micro_eur FROM receipt_capture c"
+                    " JOIN receipt_state s ON s.capture_id=c.id WHERE c.id=?", (capture_id,))
+                if row[0] not in ("captured", "quarantined"):
+                    continue
+                (_state, frozen, generation, seq, ref, outcome, calls, tokens_in, tokens_out, money) = row
+                binding = self.one("SELECT lease_id, gateway_id FROM receipt_binding WHERE ref_sha256=?", (ref,))
+                reason = None
+                if binding is None:
+                    reason = "unknown_reference"
+                elif binding[1] != frozen:
+                    reason = "wrong_gateway"
+                else:
+                    capture = _Evidence(seq, ref, outcome, calls, tokens_in, tokens_out, money)
+                    body = mapper.receipt_body(frozen, generation, capture)
+                    try:
+                        text = mapper.receipt_body_text(body)
+                    except ValueError:
+                        raise StateError("a receipt body is not valid") from None
+                    body["_lease_id"] = binding[0]
+                    if self._insert_delivery(capture_id, body, text, now_ms):
+                        self._mark_pending(capture_id)
+                        released += 1
+                    else:
+                        reason = "duplicate_reference"
+                if reason is not None:
+                    self.conn.execute("UPDATE receipt_state SET state='quarantined', reason=? WHERE capture_id=?",
+                                      (reason, capture_id))
+        return released
+
     def next_receipt_item(self, now_ms):
-        """The oldest receipt row that is pending and due, as an Item, or None. A receipt belongs to
-        one lease and to no seat and no message: nothing about an agent or another lease holds it back."""
+        """The oldest pending delivery that is due, as an Item, or None. A receipt belongs to one lease and to no
+        seat and no message: nothing about an agent or another lease holds it back. The body sent is the stored
+        delivery body, unchanged."""
         row = self.one(
-            "SELECT id, event_id, body, lease_id FROM gateway_receipt WHERE state='pending'"
-            " AND not_before_ms<=? ORDER BY id LIMIT 1", (now_ms,))
+            "SELECT d.event_id, d.body, d.lease_id, d.capture_id FROM receipt_delivery d"
+            " JOIN receipt_state s ON s.capture_id=d.capture_id WHERE s.state='pending' AND s.not_before_ms<=?"
+            " ORDER BY d.id LIMIT 1", (now_ms,))
         if row is None:
             return None
-        return Item(decisions.RECEIPT, RECEIPT_AGENT, "", "/v1/leases/%s/settle" % row[3],
-                    json.loads(row[2]), row[1], ("gateway_receipt", row[0]), row[3])
+        return Item(decisions.RECEIPT, RECEIPT_AGENT, "", "/v1/leases/%s/settle" % row[2], json.loads(row[1]),
+                    row[0], ("receipt_state", row[3]), row[2])
 
     # --- the outbox -------------------------------------------------------
 
@@ -443,6 +576,7 @@ class State:
         """Carry out `decisions.decide` for one answer. Returns the
         decision. Everything is one transaction."""
         table, row_id = item.ref
+        key = _KEY_COLUMN.get(table, "id")
         with self.txn():
             rebuilds = 0
             if table == "acquisition":
@@ -465,17 +599,16 @@ class State:
                         "UPDATE acquisition SET state='acquired', lease_id=?,"
                         " last_error_code=NULL WHERE id=?",
                         (response.lease_id, row_id))
-                    self.remember_lease(response.lease_id)
                 else:
                     self.conn.execute(
                         "UPDATE %s SET state='sent', last_error_code=NULL "
-                        "WHERE id=?" % table, (row_id,))
+                        "WHERE %s=?" % (table, key), (row_id,))
             elif decision.action == decisions.RETRY:
-                tries = self.one("SELECT tries FROM %s WHERE id=?" % table,
+                tries = self.one("SELECT tries FROM %s WHERE %s=?" % (table, key),
                                  (row_id,))[0] + 1
                 self.conn.execute(
                     "UPDATE %s SET tries=?, not_before_ms=?, "
-                    "last_error_code=? WHERE id=?" % table,
+                    "last_error_code=? WHERE %s=?" % (table, key),
                     (tries, now_ms + decisions.backoff_ms(tries, jitter),
                      code, row_id))
             elif decision.action == decisions.REBUILD:
@@ -514,7 +647,7 @@ class State:
                 if table != "report" or decision.action == decisions.FAIL:
                     self.conn.execute(
                         "UPDATE %s SET state='failed_permanent', "
-                        "last_error_code=? WHERE id=?" % table,
+                        "last_error_code=? WHERE %s=?" % (table, key),
                         (code or decisions.UNKNOWN_CODE, row_id))
         return decision
 

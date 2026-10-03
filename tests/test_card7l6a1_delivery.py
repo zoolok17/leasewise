@@ -1,7 +1,7 @@
 """Card L6a-1, step 4: gateway receipts are delivered by their own pass, between the limit pass and the
 lease pass, to `/v1/leases/{id}/settle` and nowhere else.
 
-Answers: 200 is done; LEASE_CLOSED is done; RECEIPT_CONFLICT and every other refusal fail THAT row for
+Answers: 200 is done; LEASE_CLOSED is NOT done (a settle never answers it); RECEIPT_CONFLICT and every other refusal fail THAT row for
 good with a closed word (never an agent stop, never a rebuild or a drop); 401, 429, 5xx and no answer
 leave the row as it is and retry the same bytes. The cycle summary keeps the worse of the passes.
 Everything is synthetic: a fake transport and generated ids; no server, no real gateway.
@@ -67,16 +67,12 @@ class _Rig(unittest.TestCase):
         if rows is None:
             self.leases = [lease() for _ in range(count)]
             rows = [receipt(l, n + 1) for n, l in enumerate(self.leases)]
-        configure(self.rig, rows)
-        reporter = self.rig.open(transport=net)
-        with self.rig.state.txn():
-            for lease_id in self.leases:
-                self.rig.state.remember_lease(lease_id)
-        return reporter
+        configure(self.rig, rows, bindings=self.leases)
+        return self.rig.open(transport=net)
 
     def row(self, n=1):
-        return self.rig.state.one("SELECT state, tries, last_error_code, not_before_ms FROM gateway_receipt "
-                                  "WHERE seq=?", (n,))
+        return self.rig.state.one("SELECT s.state, s.tries, s.last_error_code, s.not_before_ms FROM receipt_state s"
+                                  " JOIN receipt_capture c ON c.id=s.capture_id WHERE c.seq=?", (n,))
 
     def agent_stops(self):
         return self.rig.state.one("SELECT COUNT(*) FROM agent_state")[0]
@@ -91,7 +87,7 @@ class Answers(_Rig):
         self.assertEqual(self.row()[0], "sent")
         (path, key, raw), = self.net.settles()
         self.assertEqual(path, "/v1/leases/%s/settle" % self.leases[0])
-        stored = self.rig.state.one("SELECT event_id, body FROM gateway_receipt")
+        stored = self.rig.state.one("SELECT event_id, body FROM receipt_delivery")
         self.assertEqual(key, stored[0])                                       # Idempotency-Key = event_id
         self.assertEqual(raw.decode(), stored[1])                              # the stored bytes, canonical
         sent = json.loads(raw)
@@ -99,11 +95,16 @@ class Answers(_Rig):
         self.assertEqual((sent["gateway_id"], sent["cached_input_tokens"], sent["final"], sent["seq"]),
                          (GATEWAY_ID, 0, True, 1))
 
-    def test_lease_closed_is_done(self):
-        reporter = self.start(Net(receipt=[error("LEASE_CLOSED", 410)]))
+    def test_lease_closed_fails_that_row_for_good_and_the_next_row_still_sends(self):
+        reporter = self.start(Net(receipt=[error("LEASE_CLOSED", 410), OK]), count=2)
         result = reporter.cycle()
-        self.assertEqual((self.row()[0], self.row()[2], result.blocked), ("sent", None, None))
-        self.assertEqual(result.sent, 1)
+        self.assertEqual(self.row(1)[::2], ("failed_permanent", "LEASE_CLOSED"))
+        self.assertEqual((self.row(2)[0], result.sent, result.blocked), ("sent", 1, None))
+        self.assertEqual(self.agent_stops(), 0)
+        calls = len(self.net.calls)
+        reporter.cycle()
+        self.assertEqual(len(self.net.calls), calls)                           # nothing is sent again
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_delivery")[0], 2)    # custody is kept
 
     def test_a_receipt_conflict_fails_that_row_for_good_with_its_word_and_is_never_resent(self):
         reporter = self.start(Net(receipt=[error("RECEIPT_CONFLICT", 409)]), count=2)
@@ -138,7 +139,7 @@ class Answers(_Rig):
         reporter = self.start(Net(receipt=[error(LOUD, 400)]))
         reporter.cycle()
         self.assertEqual(self.row()[::2], ("failed_permanent", decisions.UNKNOWN_CODE))
-        self.assertNotIn(LOUD, json.dumps(self.rig.state.all("SELECT * FROM gateway_receipt")))
+        self.assertNotIn(LOUD, json.dumps(self.rig.state.all("SELECT * FROM receipt_state")))
 
     def test_no_answer_5xx_and_429_keep_the_row_and_retry_the_same_bytes(self):
         for answer in (ConnectionRefusedError("down"), (503, {}), (500, b"not json"), error("CONCURRENCY_LIMIT", 429)):
@@ -245,7 +246,7 @@ class Table(unittest.TestCase):
     def test_the_table(self):
         self.assertEqual(self.decide(200), decisions.Decision(decisions.DONE))
         self.assertEqual(self.decide(201), decisions.Decision(decisions.DONE))
-        self.assertEqual(self.decide(410, "LEASE_CLOSED"), decisions.Decision(decisions.DONE))
+        self.assertEqual(self.decide(410, "LEASE_CLOSED"), decisions.Decision(decisions.FAIL, "LEASE_CLOSED"))
         self.assertEqual(self.decide(409, "RECEIPT_CONFLICT"), decisions.Decision(decisions.FAIL, "RECEIPT_CONFLICT"))
         self.assertEqual(self.decide(400, "INVALID_REQUEST"), decisions.Decision(decisions.FAIL, "INVALID_REQUEST"))
         self.assertEqual(self.decide(404, None), decisions.Decision(decisions.FAIL, decisions.UNKNOWN_CODE))
@@ -285,7 +286,7 @@ class Pair(unittest.TestCase):
     def test_a_refused_pair_sends_nothing(self):
         called = []
         http = client.HttpClient("http", "127.0.0.1", 9, "FAKE-IDENTITY-pair", transport=lambda *a: called.append(a))
-        item = state_mod.Item(decisions.RECEIPT, state_mod.RECEIPT_AGENT, "", LIMIT_PATH, {}, "k", ("gateway_receipt", 1), None)
+        item = state_mod.Item(decisions.RECEIPT, state_mod.RECEIPT_AGENT, "", LIMIT_PATH, {}, "k", ("receipt_state", 1), None)
         answer = http.send(item)
         self.assertEqual((answer.status, answer.code, called), (None, decisions.BAD_ANSWER, []))
 

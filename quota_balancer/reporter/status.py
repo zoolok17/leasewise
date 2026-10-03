@@ -228,26 +228,35 @@ def _gateway_receipts(state, source):
     command, a lease id, a reference, a figure from a receipt or the text of a fault. `gateway` is the
     alias the OPERATOR wrote."""
     agent = state_mod.RECEIPT_AGENT
-    rows = {"pending": 0, "sent": 0, "failed_permanent": 0}
-    for name, count in state.all("SELECT state, COUNT(*) FROM gateway_receipt GROUP BY state"):
-        rows[name] = count
+    rows = {"pending": 0, "sent": 0, "failed_permanent": 0, "quarantined": 0}
+    for name, count in state.all("SELECT state, COUNT(*) FROM receipt_state GROUP BY state"):
+        rows["pending" if name == "captured" else name] += count        # captured = waiting for its release
     failed = {}
-    for code, count in state.all("SELECT last_error_code, COUNT(*) FROM gateway_receipt "
+    for code, count in state.all("SELECT last_error_code, COUNT(*) FROM receipt_state "
                                  "WHERE state='failed_permanent' GROUP BY last_error_code"):
         word = decisions.closed_code(code) or decisions.UNKNOWN_CODE
         failed[word] = failed.get(word, 0) + count
+    quarantine = {name: 0 for name in state_mod.QUARANTINE_REASONS}
+    for reason, count in state.all("SELECT reason, COUNT(*) FROM receipt_state WHERE state='quarantined'"
+                                   " GROUP BY reason"):
+        if reason in quarantine:
+            quarantine[reason] = count
+    cursor = state.one("SELECT c.last_seq FROM receipt_cursor c JOIN receipt_source s ON s.id=c.source_id"
+                       " WHERE s.alias=? ORDER BY c.page_ord DESC LIMIT 1",
+                       (source.gateway if source is not None else "",))
     read = state.note("receipt_last_read")
     ok = state.note(state_mod.last_ok_note(agent))
     configured = source is not None
     return {
         "configured": configured,
         "gateway": source.gateway if configured else None,
-        "last_seq": state.receipt_cursor(source.gateway) if configured else 0,
+        "last_seq": cursor[0] if cursor else 0,
         "last_read": None if read is None else iso(read[1]),
         "last_read_result": None if read is None else read[0],
         "stored": state.counter(agent, "stored"),
         "rows": rows,
         "failed": failed,
+        "quarantine": quarantine,
         "read_later": {name: state.counter(agent, "read_later:" + name) for name in receipts.LATER_REASONS},
         "refused": {name: state.counter(agent, "refused:" + name) for name in receipts.REFUSED_REASONS},
         "read_fault": state.counter(agent, "read_fault"),
@@ -320,6 +329,10 @@ def _actions(report):
     if receipt["rows"]["failed_permanent"]:
         actions.append("%d gateway receipt(s) failed for good and will not be retried (see "
                        "gateway_receipts: failed, with each closed code)" % receipt["rows"]["failed_permanent"])
+    quarantined = sum(receipt["quarantine"].values())
+    if quarantined:
+        actions.append("%d gateway receipt(s) are quarantined and not sent: no matching lease binding or the "
+                       "wrong gateway (see gateway_receipts: quarantine)" % quarantined)
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")

@@ -19,7 +19,7 @@ from quota_balancer import lease as lease_mod
 from quota_balancer import store
 from quota_balancer.reporter.run import UNREACHABLE
 
-from tests.l6a1_env import configure, receipt, write_json
+from tests.l6a1_env import GENERATION_B, add_binding, configure, ledger, receipt, write_json
 from tests.reporter_env import Rig
 from tests.test_cardl1a import _grant_request, _sized_snapshot
 
@@ -58,17 +58,17 @@ class EndToEnd(unittest.TestCase):
             return lease_mod.grant(self.rig.lw.db, body, self.rig.clock.ms)
 
     def start(self, rows):
-        write_json(self.fixture, rows)
-        configure(self.rig, rows, fixture=self.fixture, gateway=GATEWAY, add_gateway=False)
+        self.store = os.path.join(self.rig.ws.dir, "admission.db")
+        configure(self.rig, rows, fixture=self.fixture, gateway=GATEWAY, add_gateway=False, store=self.store)
         reporter = self.rig.open()
         return reporter
 
-    def know(self, *lease_ids):
-        """What the admission step of card L6a-2 will do when it acquires a gateway-bound lease: the
-        reporter keeps the reference of the lease it hands out."""
-        with self.rig.state.txn():
-            for lease_id in lease_ids:
-                self.rig.state.remember_lease(lease_id)
+    def know(self, *lease_ids, gateway=GATEWAY):
+        """What the admission command of card L6a-2 will do when it acquires a gateway-bound lease: it writes the
+        binding (the lease, the gateway it expects) into the admission store before the turn starts. The reporter
+        only reads it."""
+        for lease_id in lease_ids:
+            add_binding(self.store, {"lease_id": lease_id, "gateway_id": self.ids["gateways"][gateway]})
 
     def lease_row(self, lease_id):
         return self.rig.lw.rows("SELECT state, outcome FROM leases WHERE id=?", (lease_id,))[0]
@@ -82,18 +82,18 @@ class EndToEnd(unittest.TestCase):
         made = self.grant()
         lease_id = made["lease_id"]
         self.assertEqual(self.lease_row(lease_id), ("active", None))
-        reporter = self.start([receipt(lease_id, 4, calls=2, input_tokens=1200, output_tokens=300,
+        reporter = self.start([receipt(lease_id, 1, calls=2, input_tokens=1200, output_tokens=300,
                                        actual_micro_eur=450)])
         self.know(lease_id)
         result = reporter.cycle()
         self.assertEqual((result.new_receipts, result.sent, result.blocked), (1, 1, None))
         self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))
-        self.assertEqual(self.receipts(lease_id), [(self.ids["gateways"][GATEWAY], 4, 2, 1200, 0, 300, 450,
+        self.assertEqual(self.receipts(lease_id), [(self.ids["gateways"][GATEWAY], 1, 2, 1200, 0, 300, 450,
                                                     "completed", 1)])
-        self.assertEqual(self.rig.state.all("SELECT state, tries, last_error_code FROM gateway_receipt"),
+        self.assertEqual(self.rig.state.all("SELECT state, tries, last_error_code FROM receipt_state"),
                          [("sent", 0, None)])
         self.assertEqual(self.rig.net.calls[0][0], "/v1/leases/%s/settle" % lease_id)
-        self.assertEqual(self.rig.state.receipt_cursor(GATEWAY), 4)
+        self.assertEqual(self.rig.state.current_cursor(1)[1], 1)
 
     def test_zero_spend_with_a_failed_outcome_settles_the_lease_too(self):
         lease_id = self.grant()["lease_id"]
@@ -133,15 +133,15 @@ class EndToEnd(unittest.TestCase):
         self.rig.net.down = True                                       # Leasewise unreachable
         result = reporter.cycle()
         self.assertEqual(result.blocked, UNREACHABLE)
-        self.assertEqual(self.rig.state.all("SELECT state, tries FROM gateway_receipt"), [("pending", 1)])
-        self.assertEqual(self.rig.state.receipt_cursor(GATEWAY), 1)    # stored, so never asked for again
+        self.assertEqual(self.rig.state.all("SELECT state, tries FROM receipt_state"), [("pending", 1)])
+        self.assertEqual(self.rig.state.current_cursor(1)[1], 1)    # captured, so never asked for again
         self.assertEqual(self.lease_row(lease_id)[0], "active")
         self.rig.close()                                               # restart
         self.rig.net.down = False
         reporter = self.rig.open()
         self.rig.clock.advance(3600)
         reporter.cycle()
-        self.assertEqual(self.rig.state.all("SELECT state FROM gateway_receipt"), [("sent",)])
+        self.assertEqual(self.rig.state.all("SELECT state FROM receipt_state"), [("sent",)])
         self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))
         self.assertEqual(len(self.receipts(lease_id)), 1)
 
@@ -153,12 +153,12 @@ class EndToEnd(unittest.TestCase):
         reporter.cycle()
         self.assertEqual(self.lease_row(lease_id)[0], "settled")
         # a NEW final receipt (another ledger generation) for the same lease, then one for another lease
-        write_json(self.fixture, [receipt(lease_id, 1), receipt(lease_id, 2, generation="f" * 32),
-                                  receipt(other, 3)])
+        write_json(self.fixture, ledger([receipt(lease_id, 1), receipt(other, 2)], generation=GENERATION_B))
         result = reporter.cycle()
         self.assertEqual(result.new_receipts, 2)
-        states = self.rig.state.all("SELECT seq, state, last_error_code FROM gateway_receipt ORDER BY seq")
-        self.assertEqual(states, [(1, "sent", None), (2, "failed_permanent", "RECEIPT_CONFLICT"), (3, "sent", None)])
+        states = self.rig.state.all("SELECT c.seq, s.state, s.last_error_code FROM receipt_capture c"
+                                    " JOIN receipt_state s ON s.capture_id=c.id ORDER BY c.id")
+        self.assertEqual(states, [(1, "sent", None), (1, "failed_permanent", "RECEIPT_CONFLICT"), (2, "sent", None)])
         self.assertEqual(self.lease_row(other)[0], "settled")            # the next row still flowed
         self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM agent_state")[0], 0)
         # a conflicting FINAL receipt parks the account on the Leasewise side (the design's own rule)
@@ -169,19 +169,34 @@ class EndToEnd(unittest.TestCase):
         reporter = self.start([receipt(lease_id, 1)])
         self.know(lease_id)
         reporter.cycle()
-        self.assertEqual(self.rig.state.all("SELECT state, last_error_code FROM gateway_receipt"),
+        self.assertEqual(self.rig.state.all("SELECT state, last_error_code FROM receipt_state"),
                          [("failed_permanent", "RECEIPT_CONFLICT")])
         self.assertEqual(self.lease_row(lease_id)[0], "active")
 
-    def test_a_receipt_whose_reference_is_not_ours_is_never_sent(self):
+    def test_a_receipt_with_no_binding_is_captured_quarantined_never_sent_and_sent_once_it_is_bound(self):
         lease_id = self.grant()["lease_id"]
-        reporter = self.start([receipt(lease_id, 1)])                    # the lease is NOT known to the reporter
+        reporter = self.start([receipt(lease_id, 1)])                    # the admission store knows nothing of it yet
         result = reporter.cycle()
         self.assertEqual((result.new_receipts, result.sent), (1, 0))
         self.assertEqual(self.rig.net.calls, [])
-        self.assertEqual(self.rig.state.all("SELECT state, last_error_code, lease_id FROM gateway_receipt"),
-                         [("failed_permanent", "UNKNOWN_LEASE", None)])
-        self.assertEqual(self.rig.state.receipt_cursor(GATEWAY), 1)
+        self.assertEqual(self.rig.state.all("SELECT state, reason FROM receipt_state"),
+                         [("quarantined", "unknown_reference")])
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_delivery")[0], 0)
+        self.assertEqual(self.rig.state.current_cursor(1)[1], 1)         # captured: its number is passed
+        self.assertEqual(self.lease_row(lease_id)[0], "active")
+        self.know(lease_id)                                              # the binding appears later
+        self.assertEqual(reporter.cycle().sent, 1)
+        self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))
+        self.assertEqual(self.rig.state.all("SELECT state, reason FROM receipt_state"), [("sent", None)])
+
+    def test_a_receipt_for_a_binding_that_names_another_gateway_is_never_sent(self):
+        lease_id = self.grant()["lease_id"]
+        reporter = self.start([receipt(lease_id, 1)])
+        add_binding(self.store, {"lease_id": lease_id, "gateway_id": "c4a2e9f0-3b7d-4c1e-8a55-0d9b2f6e7a12"})
+        reporter.cycle()
+        self.assertEqual(self.rig.net.calls, [])
+        self.assertEqual(self.rig.state.all("SELECT state, reason FROM receipt_state"),
+                         [("quarantined", "wrong_gateway")])
         self.assertEqual(self.lease_row(lease_id)[0], "active")
 
     def test_spend_over_the_hold_settles_and_leasewise_records_the_overrun(self):
@@ -209,12 +224,12 @@ class EndToEnd(unittest.TestCase):
 
     def test_the_status_says_what_happened(self):
         lease_id = self.grant()["lease_id"]
-        reporter = self.start([receipt(lease_id, 6)])
+        reporter = self.start([receipt(lease_id, 1)])
         self.know(lease_id)
         reporter.cycle()
         report = reporter.report()["gateway_receipts"]
-        self.assertEqual((report["configured"], report["gateway"], report["last_seq"]), (True, GATEWAY, 6))
-        self.assertEqual(report["rows"], {"pending": 0, "sent": 1, "failed_permanent": 0})
+        self.assertEqual((report["configured"], report["gateway"], report["last_seq"]), (True, GATEWAY, 1))
+        self.assertEqual(report["rows"], {"pending": 0, "sent": 1, "failed_permanent": 0, "quarantined": 0})
         self.assertEqual(report["last_read_result"], "ok")
 
 

@@ -20,7 +20,7 @@ from unittest import mock
 
 from quota_balancer.reporter import mapper, receipts, status
 
-from tests.l6a1_env import GATEWAY_ID, command_source, configure, lease, receipt, write_json
+from tests.l6a1_env import GATEWAY_ID, add_binding, command_source, configure, ledger, lease, receipt, write_json
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
 from tests.test_card7l6a1_delivery import Net, error
@@ -74,7 +74,8 @@ class Privacy(unittest.TestCase):
                 self.assertNotIn(loud, text, name)
 
     def start(self, rows, net):
-        configure(self.rig, rows, fixture=self.fixture)
+        self.store = os.path.join(self.rig.ws.dir, "admission.db")
+        configure(self.rig, rows, fixture=self.fixture, store=self.store)
         reporter = self.rig.open(transport=net)
         return reporter
 
@@ -93,16 +94,15 @@ class Privacy(unittest.TestCase):
         wires = []
         results = []
         for row in loud_rows:
-            write_json(self.fixture, [row])
+            write_json(self.fixture, ledger([row]))
             results.append(reporter.cycle())
             self.assertEqual(reporter.report()["gateway_receipts"]["last_read_result"], "refused")
         self.assertEqual(net.calls, [])                                     # nothing refused was ever sent
-        self.assertEqual(self.rig.state.all("SELECT * FROM gateway_receipt"), [])
+        self.assertEqual(self.rig.state.all("SELECT * FROM receipt_capture"), [])
         self.assertEqual(reporter.report()["gateway_receipts"]["refused"]["bad_row"], len(loud_rows))
         # now the one good receipt goes through the same path
-        with self.rig.state.txn():
-            self.rig.state.remember_lease(good)
-        write_json(self.fixture, [receipt(good, 1)])
+        add_binding(self.store, good)
+        write_json(self.fixture, ledger([receipt(good, 1)]))
         result = reporter.cycle()
         self.assertEqual(len(net.settles()), 1)
         wire = net.settles()[0][2].decode("utf-8")
@@ -125,21 +125,23 @@ class Privacy(unittest.TestCase):
         good = lease()
         net = Net(receipt=[error(LOUD["server"], 400)])
         reporter = self.start([receipt(good, 1)], net)
-        with self.rig.state.txn():
-            self.rig.state.remember_lease(good)
+        add_binding(self.store, good)
         result = reporter.cycle()
-        self.assertEqual(self.rig.state.all("SELECT state, last_error_code FROM gateway_receipt"),
+        self.assertEqual(self.rig.state.all("SELECT state, last_error_code FROM receipt_state"),
                          [("failed_permanent", "UNKNOWN_CODE")])
-        with mock.patch.object(receipts, "read_receipts", side_effect=RuntimeError(LOUD["fault"])):
+        with mock.patch.object(receipts, "read_page", side_effect=RuntimeError(LOUD["fault"])):
             result = reporter.cycle()
-        with mock.patch.object(self.rig.state, "record_receipts", side_effect=RuntimeError(LOUD["fault"])):
+        with mock.patch.object(self.rig.state, "capture_page", side_effect=RuntimeError(LOUD["fault"])):
             reporter.cycle()
         self.no_loud(self.everything(reporter, result))
 
     def test_a_command_with_loud_error_output_and_loud_environment_leaks_nothing(self):
         script = os.path.join(self.folder, "fake.py")
         with open(script, "w", encoding="utf-8") as handle:
-            handle.write("import os, sys\nsys.stderr.write(%r)\nprint('[]')\nsys.exit(7 if any(k.startswith('LOUD_ENV') for k in os.environ) else 0)\n"
+            handle.write("import json, os, sys\nsys.stderr.write(%r)\n"
+                         "print(json.dumps({'envelope_version': 1, 'generation': '0' * 32, 'after_seq': int(sys.argv[2]),"
+                         " 'next_seq': int(sys.argv[2]), 'has_more': False, 'receipts': []}))\n"
+                         "sys.exit(7 if any(k.startswith('LOUD_ENV') for k in os.environ) else 0)\n"
                          % LOUD["stderr"])
         os.environ["LOUD_ENV_L6A1"] = LOUD["env"]
         self.addCleanup(os.environ.pop, "LOUD_ENV_L6A1", None)
@@ -186,18 +188,22 @@ class Privacy(unittest.TestCase):
     def test_the_stored_rows_hold_only_the_allow_listed_fields(self):
         good = lease()
         reporter = self.start([receipt(good, 1)], Net())
-        with self.rig.state.txn():
-            self.rig.state.remember_lease(good)
+        add_binding(self.store, good)
         reporter.cycle()
-        columns = [r[1] for r in self.rig.state.all("PRAGMA table_info(gateway_receipt)")]
-        self.assertEqual(columns, ["id", "event_id", "gateway_alias", "generation", "seq", "ref_sha256", "lease_id",
-                                   "body", "state", "tries", "not_before_ms", "last_error_code", "stored_ms"])
-        stored = json.loads(self.rig.state.one("SELECT body FROM gateway_receipt")[0])
+        for table, expected in (
+                ("receipt_capture", ["id", "source_id", "gateway_id", "generation", "seq", "ref_sha256", "outcome",
+                                     "calls", "input_tokens", "output_tokens", "actual_micro_eur", "closed_at",
+                                     "captured_ms"]),
+                ("receipt_delivery", ["id", "capture_id", "event_id", "lease_id", "gateway_id", "body", "created_ms"]),
+                ("receipt_state", ["capture_id", "state", "reason", "tries", "not_before_ms", "last_error_code"])):
+            columns = [r[1] for r in self.rig.state.all("PRAGMA table_info(%s)" % table)]
+            self.assertEqual(columns, expected, table)
+        stored = json.loads(self.rig.state.one("SELECT body FROM receipt_delivery")[0])
         self.assertEqual(set(stored), set(mapper.RECEIPT_BODY_KEYS))
         counters = self.rig.state.all("SELECT agent, name FROM counter WHERE agent='_gateway_receipts'")
         for _agent, name in counters:
-            self.assertRegex(name, r"^(stored|read_fault|read_later:[a-z_]+|refused:[a-z_]+)$")    # closed words only
-        for (code,) in self.rig.state.all("SELECT last_error_code FROM gateway_receipt"):
+            self.assertRegex(name, r"^(stored|read_fault|generation_change|binding_changed|store:[a-z_]+|read_later:[a-z_]+|refused:[a-z_]+)$")    # closed words only
+        for (code,) in self.rig.state.all("SELECT last_error_code FROM receipt_state"):
             self.assertIsNone(code)
 
 

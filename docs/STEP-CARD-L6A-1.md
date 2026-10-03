@@ -5,6 +5,47 @@ Work item `card-l6a-1`. Branch `card-l6a-1`, from `ac4aab6` (card 7c-2, step 4).
 Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only. Audience: the lead and the reviewers.
 Status: **built, fixture-only.**
 
+## Step 1 (revised): the custody chain on fixtures
+
+Status: **step 1 of 2 built, fixture-only.** The full record and the README come with step 2. Contract:
+`DESIGN-6A.md` sections 5.4, 8.3, 8.4, 8.6, 8.8 and 19.
+
+### In plain words
+
+The first build of this card kept a receipt only if the reporter already knew its lease, and it could not
+say what to do when the gateway rebuilt its list. This step replaces that with a chain of custody, so a
+receipt is never lost and never sent to the wrong place:
+
+1. **Capture.** Every receipt that arrives is first written down exactly as received, together with the
+   number of the last receipt taken, in one step. Even a receipt we cannot place yet is kept.
+2. **Release.** A kept receipt is released for sending only when a record in the admission store says
+   which lease it belongs to and that the lease expects this very gateway. The text to send is made once, at
+   that moment, and never changes. A receipt with no such record waits ("unknown reference"); one whose
+   record names another gateway is set aside for good ("wrong gateway"). Both are checked again at each cycle
+   and nothing is sent for them.
+3. **Send.** Only the stored text is sent, byte for byte, in the existing order of passes.
+
+The reporter only reads the admission store (opened read-only; a missing or busy file means "look again
+later"). Changing which gateway an alias points to starts a new source with its own counters, so a receipt
+captured under the old mapping can never be released under the new one. A rebuilt ledger (a new generation)
+starts again from zero, and going back to an earlier generation takes its kept counter back.
+A settle answer "lease closed" is now a permanent failure of that one row, not a success; other rows go on.
+
+### Technical detail
+
+- `reporter/receipts.py`: the page adapter (envelope version 1, nullable token counts, ISO close time) and
+  its whole-page refusals. `reporter/admission_store.py`: the one module that holds the `admission` layout
+  (`create`) and the read-only reader `read_bindings`.
+- `reporter/state.py`: state version 3 from 1 or 2 (`receipt_source`, `receipt_cursor`, `receipt_binding`,
+  `receipt_capture`, `receipt_delivery`, and the only mutable table `receipt_state`); stage 1 `capture_page`
+  and stage 2 `release_waiting`, each one `BEGIN IMMEDIATE`. `decisions.py`: `LEASE_CLOSED` is `FAIL`.
+  `config.py`: `admission_store` key. `status.py`: counts of the new states, `quarantined` among them.
+- Tests (all new or rewritten, 1566 in the whole suite, equal to the `discover` count): adapter 37,
+  admission store 15, state 34, delivery 21, config 22, status 15, end to end 12, privacy 6.
+- Gates: free memory 9.0 GB; chunks `test_card[1-4]*` 454, `test_card5*` 122, `test_cardl1*` 215,
+  `test_cardl6*` 40, `test_billing*` 46, `test_card7*` 689 (2 skipped) = 1566; the 63 test files match the six
+  patterns exactly once. `ruff --select F` clean.
+
 ## In plain words
 
 A gateway keeps one final receipt for each quota lease it served: calls made, text in and out, cost,

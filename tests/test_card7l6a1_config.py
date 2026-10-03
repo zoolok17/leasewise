@@ -37,6 +37,7 @@ class _Tmp(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.dir = self._tmp.name
         self.fixture = os.path.join(self.dir, "receipts.json")
+        self.store = os.path.join(self.dir, "admission.db")
 
     def text(self, raw):
         return config_text("http://127.0.0.1:8443", os.path.join(self.dir, "journal"),
@@ -53,10 +54,12 @@ class _Tmp(unittest.TestCase):
         return caught.exception
 
     def fixture_block(self, extra=""):
-        return "[gateway_receipts]\ngateway = %s\nfixture = %s\n%s" % (_q(GATEWAY_ALIAS), _q(self.fixture), extra)
+        return "[gateway_receipts]\ngateway = %s\nadmission_store = %s\nfixture = %s\n%s" % (
+            _q(GATEWAY_ALIAS), _q(self.store), _q(self.fixture), extra)
 
     def command_block(self, command, extra=""):
-        return "[gateway_receipts]\ngateway = %s\ncommand = %s\n%s" % (_q(GATEWAY_ALIAS), _q(command), extra)
+        return "[gateway_receipts]\ngateway = %s\nadmission_store = %s\ncommand = %s\n%s" % (
+            _q(GATEWAY_ALIAS), _q(self.store), _q(command), extra)
 
 
 class Block(_Tmp):
@@ -79,21 +82,32 @@ class Block(_Tmp):
         self.assertEqual((source.timeout_seconds, source.max_bytes, source.env), (5, 4096, (("AGENTTALK_ROOT", "x"),)))
 
     def test_exactly_one_source_is_named(self):
-        self.refused("[gateway_receipts]\ngateway = %s\n" % _q(GATEWAY_ALIAS))
+        self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\n" % (_q(GATEWAY_ALIAS), _q(self.store)))
         self.refused(self.fixture_block("command = %s\n" % _q([EXE])))
 
     def test_the_keys_are_closed(self):
         self.refused(self.fixture_block("agent = %s\n" % _q(LOUD)))
-        self.refused("[gateway_receipts]\nfixture = %s\n" % _q(self.fixture))          # no gateway
+        self.refused("[gateway_receipts]\nadmission_store = %s\nfixture = %s\n" % (_q(self.store), _q(self.fixture)))   # no gateway
         self.refused("gateway_receipts = 5\n")
         self.refused("gateway_receipts = [%s]\n" % _q(GATEWAY_ALIAS))
 
     def test_the_gateway_must_be_a_valid_alias(self):
         for bad in ("", "Has Space", "A" * 80, "../x", 5):
-            self.refused("[gateway_receipts]\ngateway = %s\nfixture = %s\n" % (_q(bad), _q(self.fixture)))
+            self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\nfixture = %s\n"
+                         % (_q(bad), _q(self.store), _q(self.fixture)))
 
     def test_the_fixture_must_be_an_absolute_path(self):
-        self.refused("[gateway_receipts]\ngateway = %s\nfixture = \"receipts.json\"\n" % _q(GATEWAY_ALIAS))
+        self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\nfixture = \"receipts.json\"\n"
+                     % (_q(GATEWAY_ALIAS), _q(self.store)))
+
+    def test_the_admission_store_is_required_and_must_be_an_absolute_path(self):
+        self.refused("[gateway_receipts]\ngateway = %s\nfixture = %s\n" % (_q(GATEWAY_ALIAS), _q(self.fixture)))
+        for bad in ("admission.db", "", 5, "a\x00b"):
+            self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\nfixture = %s\n"
+                         % (_q(GATEWAY_ALIAS), _q(bad), _q(self.fixture)))
+        source = self.parse(self.fixture_block()).gateway_receipts
+        self.assertEqual(source.admission_store, self.store)
+        self.assertNotIn(self.store, repr(source))
 
     def test_the_command_rules(self):
         for bad in ([], ["relative-program"], [EXE, ""], [EXE, 5], [EXE] + ["x"] * 16, [EXE, "--after", "3"],

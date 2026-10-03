@@ -256,10 +256,12 @@ def receipt_event_id(ref_sha256, generation):
     return str(uuid.uuid5(NAMESPACE, "receipt|%s|%s" % (ref_sha256, generation)))
 
 
-def receipt_body(gateway_id, receipt):
-    """The final settle body for one validated receipt (see receipts.Receipt)."""
+def receipt_body(gateway_id, generation, receipt):
+    """The final settle body for one captured receipt (any object with the fields of receipts.Receipt). A token
+    count the gateway did not know stays None: Leasewise accepts that for a final receipt from the lease's own
+    gateway that carries the money (card L6a-0), and an unknown count is never turned into 0."""
     return {
-        "event_id": receipt_event_id(receipt.ref_sha256, receipt.generation),
+        "event_id": receipt_event_id(receipt.ref_sha256, generation),
         "outcome": receipt.outcome,
         "calls": receipt.calls,
         "input_tokens": receipt.input_tokens,
@@ -282,8 +284,11 @@ def receipt_body_text(body):
             raise ValueError("id")
     if type(body["outcome"]) is not str or body["outcome"] not in RECEIPT_OUTCOMES:
         raise ValueError("outcome")
-    for key in ("calls", "input_tokens", "output_tokens", "actual_micro_eur", "seq"):
+    for key in ("calls", "actual_micro_eur", "seq"):
         if not _plain_int(body[key], 0, INT64_MAX):
+            raise ValueError(key)
+    for key in ("input_tokens", "output_tokens"):
+        if body[key] is not None and not _plain_int(body[key], 0, INT64_MAX):
             raise ValueError(key)
     if body["cached_input_tokens"] != CACHED_INPUT_TOKENS or type(body["cached_input_tokens"]) is not int:
         raise ValueError("cached_input_tokens")

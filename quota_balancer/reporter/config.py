@@ -44,7 +44,7 @@ _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
 # Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
 # or `command` (an argument list, run without a shell).
-_RECEIPT_KEYS = ("gateway",)
+_RECEIPT_KEYS = ("gateway", "admission_store")
 _RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "max_bytes", "env")
 MAX_COMMAND_ARGS = 16
 MAX_RECEIPT_ENV = 8
@@ -188,7 +188,8 @@ class GatewayReceipts:
     fills it from the policy-ids snapshot. The repr hides everything (a command line and an
     environment can name a deployment)."""
 
-    __slots__ = ("gateway", "gateway_id", "fixture", "command", "timeout_seconds", "max_bytes", "env")
+    __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "command", "timeout_seconds", "max_bytes",
+                 "env")
 
     def __repr__(self):
         return "GatewayReceipts(<hidden>)"
@@ -232,6 +233,7 @@ def _gateway_receipts(table):
     row = GatewayReceipts()
     row.gateway = _alias(table["gateway"], where)
     row.gateway_id = None
+    row.admission_store = _path(table["admission_store"], where)
     row.fixture = _path(table["fixture"], where) if "fixture" in table else None
     row.command = _text_list(table["command"], where) if "command" in table else None
     row.timeout_seconds = table.get("timeout_seconds", 20)
