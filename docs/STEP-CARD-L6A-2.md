@@ -219,12 +219,14 @@ sent twice by the journal side just because a bookkeeping step crashed half-way.
 
 - **F1, one real deadline.** One absolute deadline now runs through the whole exchange: connecting, sending, the answer
   read in pieces (the time left is checked between pieces and caps each wait; a watchdog also shuts a blocked read), every
-  wait for the store file, and the open retry, which does not start an attempt it cannot finish. At the deadline the
+  wait for the store file, and the open retry, which does not start an attempt it cannot finish. (Fix round 2 adds the
+  connection step itself and removes the name lookup from the admission path.) At the deadline the
   connection is closed and the answer is `held` with `store_busy`, progress saved. A grant that Leasewise made but we
   could not save is recovered by the next run, which resends the same stored bytes and gets the same lease.
 - **F2, the owner comes from the saved request.** The binding's gateway is read from the exact saved body that won (also
   an older body found by the replay search), never from today's configuration. A saved request is recovered before any
-  check that reads today's settings; those checks apply to a new message only.
+  check that reads today's settings; those checks apply to a new message only. (Fix round 2 completes this for an agent
+  that was removed from the settings: the lease is still recovered and saved, and the turn is held.)
 - **F3, custody is not permission.** A replayed paid grant whose lease is now `uncertain` (expired) or `settled` is still
   saved as the binding, so `recall`, `pending`, `closed` and receipts can use it; its time is stored as none and `admit`
   answers `held` (`refused`), so the turn does not run.
@@ -266,3 +268,70 @@ request timed out; the old code saved no expired grant) and pass now.
 Chunks, each under 8 minutes: cards 1-4: 454; card 5: 122; L1: 215; L6: 40; R1: 69; billing: 46; card 7: 915 (2 skipped).
 Total **1861**, equal to the `discover` collection; the 78 test files match the seven patterns exactly once. ruff (gate
 set): 74 (the baseline, none in a file this card changed). bandit: 26 (Low 5, Medium 20, High 1, the accepted OVH SHA-1).
+
+## Fix round 2 (the last): the connection and the removed agent
+
+### In plain words
+
+Codex's second read closed six of the eight findings and found two only half closed. Both are now closed.
+
+- **D1, the connection obeys the 20-second limit.** Before, looking up Leasewise's address could take longer than the limit,
+  and the program would then still send. Now, with `[admission]`, Leasewise's address must be an IP address or `localhost`
+  (any other name is refused at start-up with one fixed sentence), so `admit` never waits on a name lookup; the
+  connection is made with the time that is left, the watchdog owns its socket from the moment it exists, and nothing is
+  sent after the deadline.
+- **D2, a half-saved lease is recovered even if its agent was removed.** Before, removing the agent from the settings
+  while its request was saved made `admit` refuse to recover, so Leasewise held a lease that our side never recorded. Now
+  the saved request is resent, the binding is saved, and the turn is held as `not_configured`.
+
+### What changed
+
+- `config.py`: with `[admission]`, `base_url`'s host must be an IP address or `localhost`; otherwise the fixed sentence
+  `base_url: with [admission], the host must be an IP address or localhost`. Without `[admission]` nothing changes.
+- `client.py`: `_http` makes its own connection through the standard library's connection hook. `localhost` and IP addresses
+  are connected as numbers (no resolver); the connect timeout is the time left; the socket is handed to the watchdog
+  at once; the time left is checked before sending, before reading the headers and between pieces; an error that
+  arrives after the deadline is reported as `TimeoutError`; the watchdog thread is always ended (joined for at most 1 s).
+  Any other host name (the `run` path) still goes through the resolver, and that lookup is not bounded.
+- `admit.py`: `admit` no longer refuses an existing `requested` row because its agent is gone. The stored bytes are
+  resent, a conflict replays the saved bodies as before, a grant is saved (owner from the winning saved body, custody kept)
+  and answered `held` as `not_configured`. A stale estimate that would need a rebuild with the agent gone is `held` as
+  `not_configured`, the row stays `requested` (reason `NOT_CONFIGURED`, no back-off), nothing is rebuilt or deleted. A
+  stored grant of a removed agent is also answered `held` as `not_configured` on every later `admit` (custody stays;
+  permission follows today's settings). A message with no saved request of an agent that is not configured is
+  `not_configured` as before.
+
+### The bound, as measured
+
+With a connection that uses up the whole budget, or a peer that answers a few bytes at a time, the exchange ends within a
+few milliseconds of the deadline (measured, worst of ten runs: 2 ms). The one thing allowed past the deadline is a save that
+is already in hand (a grant Leasewise made), which may wait at most 0.5 s (`SAVE_RESERVE_MS`) for the store file. The
+tests allow the deadline plus 1 s: `test_card7l6a2_fix2.Connect` and `test_card7l6a2_fix1.Deadline`.
+
+### Tests (new, in `test_card7l6a2_fix2.py`)
+
+| What | Where |
+|---|---|
+| a host name is refused at start-up with the exact sentence; an IP address, `localhost` and an IPv6 literal are accepted; without `[admission]` a host name still works | `Address` |
+| a patched resolver that sleeps 2.4 s for any non-numeric host: `admit` with an IP-literal or a `localhost` base URL is not delayed and the resolver is never asked; a host name on the `run` path still uses it | `NoLookup` |
+| a patched connection step that uses up the whole budget, then connects to a local peer: it ends within the budget plus the bound and the peer sees no request (with a literal, with `localhost`, and through the whole `admit` run, where Leasewise creates no lease) | `Connect` |
+| the watchdog thread has ended after a good answer, a refused connection, an expiry during connect and a blocked answer | `Watchdog` |
+| the real handler: grant, crash before the local save, alpha replaced by beta, retry: the binding for alpha is saved (`read_bindings`, `recall`), `admit` is `held` as `not_configured`, `pending` and `closed` work, the same afterwards, one lease | `Removed` |
+| the replay variant (an earlier body won), the rebuild-needed variant (held, row stays `requested`, no back-off, nothing rebuilt; putting the agent back lets the same message go on), and a new message of a removed agent | `Removed` |
+
+Red first: against the previous head, 8 of the 17 new tests fail (14 failures counting sub-cases) and pass now.
+
+### Limits (new)
+
+- With `[admission]`, Leasewise's address must be an IP address or `localhost`.
+- The `run` path without `[admission]` may still use a host name; its lookup is not bounded and it has no hook promise.
+- For an `https` base URL the handshake steps are each bounded by the time left, not jointly; the watchdog ends the
+  exchange once it is connected.
+
+
+### Gates (fix round 2)
+
+Chunks, each under 8 minutes: cards 1-4: 454; card 5: 122; L1: 215; L6: 40; R1: 69; billing: 46; card 7: 932 (2 skipped).
+Total **1878**, equal to the `discover` collection; the 79 test files match the seven patterns exactly once. ruff (gate
+set): 74 (the baseline). bandit: 26 (Low 5, Medium 20, High 1, the accepted OVH SHA-1). The only `nosec` notes are still
+`admission_store.py:266` and `:328`, both `B608 - fixed column names, values bound`.

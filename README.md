@@ -997,8 +997,17 @@ bytes) exits with code 2. The reasons for `held` are only `coordinator_unreachab
    an attempt it cannot finish. If the deadline comes first the connection is closed and the answer is `held` with
    `store_busy`; what was learned is kept, so the next run continues where it stopped. A grant that Leasewise made
    but that could not be saved in time is recovered by the next run, which sends the very same saved bytes and gets the
-   same lease back. Cleaning up after the deadline takes a fraction of a second, so the run ends within about a second
-   of 20 s, not at the end of the slowest step.
+   same lease back. Cleaning up the exchange after the deadline measured at most a few milliseconds
+   (`test_card7l6a2_fix2`: a connection that uses up the whole budget, a peer that answers a few bytes at a time); the
+   one thing allowed past the deadline is a save that is already in hand, which may wait at most 0.5 s for the store
+   file. So the run ends within the deadline plus well under a second, and the tests allow one second.
+   **The connection obeys the deadline too:** it is made with the time that is left, its socket belongs to the watchdog from
+   the moment it exists, and nothing is sent or waited for after the deadline. For that reason, **with `[admission]`
+   the address of Leasewise (`base_url`) must be an IP address or `localhost`**: a host name is refused at start-up
+   ("base_url: with [admission], the host must be an IP address or localhost"), because looking a name up cannot be
+   stopped by a deadline. `localhost` is connected as `127.0.0.1` without asking the resolver (Leasewise serves on IPv4
+   loopback only). Without `[admission]`, the `run` path may still use a host name; its lookup is not bounded, and it
+   has no hook promise.
 6. Any other refusal or outage is `held` with a back-off kept in the file (10 s after an outage, 30 s when the account is
    parked, 60 s after a refusal), so a wrapper that asks again every few seconds does not call Leasewise every time.
 
@@ -1028,7 +1037,12 @@ context_ceiling_tokens = 180000      # optional: the model's context ceiling, to
    configuration file is a secret (it holds the identity): keep it readable by its owner only.
 
 Nothing is invented. A bound that is not written is simply missing, and a turn that needs it is `held` as
-`context_unprovable`. An agent that is not in `gateway_agents` is `held` as `not_configured`. The `profile` field of a
+`context_unprovable`. An agent that is not in `gateway_agents` is `held` as `not_configured`. A request that was already
+saved is the exception in one direction only: if the operator removes the agent while its request is saved, the next
+`admit` still recovers the lease (it resends the same stored bytes), saves the binding so that nothing is lost, and then
+answers `held` as `not_configured`, because today's settings no longer allow that agent's turn. Only a rebuild of a stale
+estimate needs the agent's settings: in that case the answer is `held` as `not_configured` and the row stays
+`requested`, with nothing deleted. The `profile` field of a
 request is checked against its bound and not otherwise used.
 
 ### One authority per paid message

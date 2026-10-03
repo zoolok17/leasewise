@@ -11,6 +11,7 @@ resolved to ids at start-up from a saved snapshot of that command's output.
 A bare alias that matches more than one row is refused.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -283,6 +284,17 @@ def _parse_url(value):
     return parts.scheme, host, port or (443 if parts.scheme == "https" else 80)
 
 
+def _admission_host(host):
+    """With `[admission]` the address of Leasewise must be an IP address or `localhost`, so that a run of `admit` never
+    waits on a name lookup that its deadline cannot stop."""
+    if host == "localhost":
+        return
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        _invalid("base_url: with [admission], the host must be an IP address or localhost")
+
+
 def _identity(value):
     text = _text(value, "identity", 512)
     if any(ord(c) < 33 or ord(c) > 126 for c in text):
@@ -338,6 +350,7 @@ def parse_config(text):
     config.admission = None
     if "admission" in data:
         config.admission = _admission(data["admission"])
+        _admission_host(config.host)
         receipts = config.gateway_receipts
         if receipts is not None and os.path.normcase(os.path.abspath(receipts.admission_store))                 != os.path.normcase(os.path.abspath(config.admission.store)):
             _invalid("admission: the store must be the same file as gateway_receipts names")

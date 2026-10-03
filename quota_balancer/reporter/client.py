@@ -10,6 +10,7 @@ just "no answer". The identity travels only in the request header.
 
 import contextlib
 import http.client
+import ipaddress
 import json
 import re
 import socket
@@ -60,24 +61,50 @@ class HttpClient:
         def stop():
             with contextlib.suppress(OSError, AttributeError):
                 held["sock"].shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError, AttributeError):
+                held["sock"].close()
             with contextlib.suppress(OSError):
                 conn.close()
 
+        def time_left():
+            """What is left of the deadline, handed to the socket as its timeout; the exchange stops when it is used up."""
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError()
+            with contextlib.suppress(OSError, AttributeError):
+                held["sock"].settimeout(left)
+            return left
+
+        def connect(address, _timeout, source_address=None):
+            """The connection step: with the time that is left, and the socket handed to the watchdog the moment it
+            exists. `localhost` and an IP address are connected as numbers, so the resolver is never asked (a host name
+            may still be looked up on the `run` path, where there is no promise; the lookup itself cannot be stopped)."""
+            target = _numeric(address[0])
+            if target is None:
+                held["sock"] = socket.create_connection(address, time_left(), source_address)
+                return held["sock"]
+            sock = socket.socket(socket.AF_INET6 if ":" in target else socket.AF_INET, socket.SOCK_STREAM)
+            held["sock"] = sock
+            sock.settimeout(time_left())
+            if source_address:
+                sock.bind(source_address)
+            sock.connect((target, address[1]))
+            return sock
+
+        conn._create_connection = connect               # the connection step obeys the deadline
         watchdog = threading.Timer(timeout, stop)
         watchdog.daemon = True
         watchdog.start()
         try:
             conn.connect()
-            held["sock"] = conn.sock
+            held["sock"] = conn.sock                    # the TLS socket replaces the plain one
+            time_left()                                 # nothing is sent after the deadline
             conn.request(method, path, body=body, headers=headers)
+            time_left()                                 # nor is the answer waited for beyond it
             answer = conn.getresponse()
             pieces, size = [], 0
             while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise TimeoutError()
-                with contextlib.suppress(OSError, AttributeError):
-                    held["sock"].settimeout(left)
+                time_left()
                 piece = answer.read1(8192)
                 if not piece:
                     break
@@ -86,9 +113,16 @@ class HttpClient:
                 if size > MAX_ANSWER_BYTES:
                     break
             return answer.status, b"".join(pieces)
+        except (OSError, http.client.HTTPException):
+            if time.monotonic() >= deadline:
+                raise TimeoutError() from None          # the watchdog (or the clock) ended it: the deadline came first
+            raise
         finally:
             watchdog.cancel()
             conn.close()
+            with contextlib.suppress(OSError, AttributeError):
+                held["sock"].close()                    # a socket that never reached the connection object
+            watchdog.join(1.0)                          # the watchdog thread ends in every case
 
     def send(self, item):
         """POST one outbox item; always returns a Response."""
@@ -138,6 +172,17 @@ class HttpClient:
 
 
 LIMIT_PATH = "/v1/limit-events"
+
+
+def _numeric(host):
+    """The address to connect to when the resolver need not be asked: `localhost` is IPv4 loopback (Leasewise serves
+    there only) and an IP address is itself. None for a host name."""
+    if host == "localhost":
+        return "127.0.0.1"
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
 
 
 def _allowed(kind, path):

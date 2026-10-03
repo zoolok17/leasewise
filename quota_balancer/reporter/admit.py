@@ -59,6 +59,7 @@ ERR_STALE = "ESTIMATE_STALE"
 ERR_CONFLICT = "IDEMPOTENCY_CONFLICT"
 ERR_PARKED = "ACCOUNT_PARKED"
 ERR_DENIED = "POLICY_DENIED"
+ERR_NOT_CONFIGURED = "NOT_CONFIGURED"    # recovery needs today's settings for an agent that is no longer configured
 ERR_BODY_CAP = "BODY_CAP"                # the message used up its request bodies (admission_store.MAX_BODIES)
 PAID = ("metered_advisory", "metered")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -239,15 +240,17 @@ def _post(env, row, body_text, deadline):
     return env.client.post_acquisition(row["request_id"], body_text.encode("utf-8"), min(POST_TIMEOUT_SECONDS, left))
 
 
-def _saved(env, writer, row, doc, body_text):
-    """A paid grant is saved (once) and answered from what is stored. -> bytes, or None if it is not a paid grant."""
+def _saved(env, writer, row, doc, body_text, allowed=True):
+    """A paid grant is saved (once) and answered from what is stored. -> bytes, or None if it is not a paid grant.
+    `allowed` is whether today's settings let this agent run a turn: custody does not depend on it (the binding is saved
+    either way), but a turn of an agent that is no longer configured is `held` as `not_configured`."""
     grant = _grant_of(doc, body_text, env.now_ms())
     if grant is None:
         return None
     env.fault("granted")                                # Leasewise has granted; nothing is saved yet
     stored = writer.save_grant(row["id"], grant)
     env.fault("saved")                                  # saved; nothing is printed yet
-    return _answer(stored)
+    return _answer(stored) if allowed else wire.held("not_configured")
 
 
 def _granted(status, doc):
@@ -278,6 +281,7 @@ def _open(env, deadline):
 def _admit(request, env, deadline):
     admission = env.admission
     agent = env.agents.get(request.agent)
+    allowed = agent is not None and request.agent in admission.gateway_agents
     writer = None
     try:
         row = None
@@ -285,23 +289,23 @@ def _admit(request, env, deadline):
             writer = _open(env, deadline)
             row = writer.lookup(request.agent, request.message_id)
             if row is not None and row["state"] == "granted":
-                return _answer(row)                     # grants never change: no lock, no Leasewise
+                # grants never change: no lock, no Leasewise. The binding stays; whether the turn may run follows today's
+                # settings (an agent that was removed is held).
+                return _answer(row) if allowed else wire.held("not_configured")
         if row is None:
             # Only a NEW message is judged by today's settings. A request that is already saved is recovered from what
-            # was saved, whatever the settings say now (configuration changes apply to new messages only).
-            if agent is None or request.agent not in admission.gateway_agents:
+            # was saved, whatever the settings say now: custody first (the grant is saved), permission second.
+            if not allowed:
                 return wire.held("not_configured")
             if _unprovable(request, agent, admission):
                 return wire.held("context_unprovable")
-        elif agent is None:
-            return wire.held("not_configured")           # nothing to rebuild a stale estimate from
         if writer is None:
             writer = _open(env, deadline)
         lock = admission_lock.KeyLock(admission.store, request.agent, request.message_id, env.monotonic, env.sleep)
         if not lock.acquire(min(deadline, env.monotonic() + LOCK_WAIT_SECONDS)):
             return wire.held("store_busy")
         try:
-            return _locked(request, agent, env, writer, deadline)
+            return _locked(request, allowed, env, writer, deadline)
         finally:
             lock.release()
     except (store.StoreBusy, store.StoreUnusable):
@@ -311,20 +315,20 @@ def _admit(request, env, deadline):
             writer.close()
 
 
-def _locked(request, agent, env, writer, deadline):
+def _locked(request, allowed, env, writer, deadline):
     row = writer.lookup(request.agent, request.message_id)
     if row is not None and row["state"] == "granted":
-        return _answer(row)                             # another helper saved it while this one waited
+        return _answer(row) if allowed else wire.held("not_configured")   # another helper saved it while this one waited
     now_ms = env.now_ms()
     if row is None:
         request_id, _turn = _ids(request.agent, request.message_id)
         row = writer.begin_request(request.agent, request.message_id, request_id,
-                                   _body_text(request, agent, env.admission, now_ms), now_ms)
+                                   _body_text(request, env.agents[request.agent], env.admission, now_ms), now_ms)
         env.fault("request_saved")                      # the request is durable; nothing has been sent
     elif row["not_before_ms"] > now_ms and row["last_error_code"]:
         return wire.held(_reason(row["last_error_code"]))     # still backing off: do not ask Leasewise again yet
     if row["replay_tried"] >= 1:
-        return _search(request, env, writer, row, deadline)   # an earlier run already learned the newest body conflicts
+        return _search(request, allowed, env, writer, row, deadline)   # an earlier run already learned the newest body conflicts
     while True:
         body_text = row["body_current"]
         sent = _post(env, row, body_text, deadline)
@@ -335,9 +339,14 @@ def _locked(request, agent, env, writer, deadline):
             return wire.held("store_busy")              # the deadline cut the exchange short: the progress is in the store
         env.fault("posted")                             # the answer is here; nothing is saved yet
         if _granted(status, doc):
-            answer = _saved(env, writer, row, doc, body_text)
+            answer = _saved(env, writer, row, doc, body_text, allowed)
             return answer if answer is not None else _hold(env, writer, row, ERR_DENIED)
         if code == ERR_STALE and status is not None:
+            if not allowed:
+                # Only a rebuild needs today's settings. The agent is gone: nothing is rebuilt, the row stays
+                # `requested` with the reason, and nothing is deleted.
+                writer.note_error(row["id"], ERR_NOT_CONFIGURED, env.now_ms(), False)
+                return wire.held("not_configured")
             if row["rebuilds"] >= MAX_REBUILDS:
                 return _hold(env, writer, row, ERR_STALE)
             if writer.attempt_count(row["id"]) >= store.MAX_BODIES:
@@ -348,7 +357,7 @@ def _locked(request, agent, env, writer, deadline):
             row = writer.lookup(request.agent, request.message_id)    # the new body is saved before it is sent
             continue
         if code == ERR_CONFLICT:
-            return _search(request, env, writer, row, deadline)
+            return _search(request, allowed, env, writer, row, deadline)
         return _hold(env, writer, row, _failure_word(status, code))
 
 
@@ -362,7 +371,7 @@ def _failure_word(status, code):
     return code or "UNKNOWN_CODE"
 
 
-def _search(request, env, writer, row, deadline):
+def _search(request, allowed, env, writer, row, deadline):
     """The current body was told "same request, another body": an earlier body was granted. Replay the saved bodies,
     newest first (at most 4); the one Leasewise answers with a lease is the winning grant. Each body that Leasewise
     says no to is counted in the store, so a run that runs out of time continues where it stopped."""
@@ -378,7 +387,7 @@ def _search(request, env, writer, row, deadline):
             return wire.held("store_busy")
         env.fault("posted")
         if _granted(status, doc):
-            answer = _saved(env, writer, row, doc, bodies[index])
+            answer = _saved(env, writer, row, doc, bodies[index], allowed)
             return answer if answer is not None else _hold(env, writer, row, ERR_DENIED)
         if code == ERR_CONFLICT:
             writer.mark_replayed(row["id"], index + 1)
