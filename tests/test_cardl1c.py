@@ -402,8 +402,9 @@ class MigrationV9(_Base):
         finally:
             conn.close()
 
-    def test_the_version_is_nine_and_the_script_exists(self):
-        self.assertEqual(migrate.SCHEMA_VERSION, 9)
+    def test_the_version_is_ten_and_the_scripts_exist(self):
+        self.assertEqual(migrate.SCHEMA_VERSION, 10)
+        self.assertIn(10, migrate._STEPS)
         self.assertIn(9, migrate._STEPS)
         self.assertTrue(migrate.MIGRATION_V9.endswith("PRAGMA user_version=9;\n"))
 
@@ -417,7 +418,7 @@ class MigrationV9(_Base):
         self.assertEqual(self.receipts_dump(db), before)
         conn = sqlite3.connect(db)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(),
                              [])
             self.assertEqual(conn.execute(
@@ -518,7 +519,7 @@ class MigrationV9(_Base):
         db = os.path.join(self.tmp, "future.db")
         self.assertEqual(run_cli("--db", db, "init").returncode, 0)
         conn = sqlite3.connect(db)
-        conn.execute("PRAGMA user_version=10")
+        conn.execute("PRAGMA user_version=11")
         conn.commit()
         conn.close()
         for verb in (("status", "--json"),):
@@ -533,7 +534,7 @@ class MigrationV9(_Base):
             "SELECT 1 WHERE 1"), [(1,)])
         conn = sqlite3.connect(self.db)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
         finally:
             conn.close()
 

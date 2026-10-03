@@ -157,6 +157,7 @@ def _build_store(tmp, name="lease.db", budget=10 * HOLD, gateway_sized=1,
         if not stop_at_v7:
             scripts.append(migrate.MIGRATION_V8)
             scripts.append(migrate.MIGRATION_V9)
+            scripts.append(migrate.MIGRATION_V10)
         for script in scripts:
             conn.executescript(script)
         budget_col = budget if account_kind == "metered" else None

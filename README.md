@@ -343,7 +343,7 @@ other kind of lease (metered, advisory, subscription) must still report whole
 numbers; a `null` there is `INVALID_REQUEST`, except for the one case that card
 L6a-0 adds below. Shadow reports are observe-only:
 whether known or unknown, they never count toward any token or money limit. This
-needs schema version 9 (`init` upgrades a version-8 store in one transaction,
+needs schema version 9 or later (`init` upgrades a version-8 store in one transaction,
 keeping every receipt).
 
 `policy-ids --json` is a read-only command that prints, on one line, the ids a lease
@@ -554,6 +554,36 @@ settled receipts and of open holds; money and input tokens use the same query te
 pure rule `policy.check_admission` saturated at `policy.USAGE_MAX` (2^63, one above the largest cap). `_advisory_budget_check` uses
 `money.reaches`, which stops at the first receipt that decides. `store._allocated` replaces the three `SUM(share_micro_eur)` queries.
 Tests: `tests/test_cardr1_money.py`, `tests/test_cardr1_money_store.py`. Record: `docs/STEP-CARD-R1-M.md`.
+
+## Card R1-3a - the tables that will keep a gateway's evidence
+
+In plain words: Leasewise will one day let a paid gateway's own books help decide whether a lease is allowed. Before it can trust a
+figure from the gateway it needs somewhere to keep every report, to record which report an operator adopted as the trusted baseline,
+and to write down changes that need a decision (a new ledger, a new policy fingerprint, a total that fell). **This first step only
+creates those places, empty.** Nothing reads them and nothing writes to them yet (that is cards R1-3b and R1-3c), so nothing changes
+for any seat, lease or report. Design note: `DESIGN-R1-3.md` in the team's records (sections 3 and 7).
+
+What is new:
+
+- **Store version 10.** `init` upgrades a version-9 store in one step. The six new tables are `gateway_epochs`, `gateway_totals`,
+  `gateway_approvals`, `gateway_adoptions`, `gateway_transitions` and `gateway_chain_state`. The upgrade only adds tables: it changes no
+  existing table, and it **creates no row**, not even from the reports already stored. Every gateway's evidence stays unusable until
+  an operator approves and adopts it, in a later card.
+- **An older Leasewise refuses a version-10 store** (`SCHEMA_UNSUPPORTED`) before it touches it, instead of misreading it.
+- **Moving a gateway forgets its trust.** When the configuration import re-points a kept gateway to another machine or another account,
+  its approvals are deleted, its chain state stops pointing at an adoption (the adoption rows stay, as history), and one
+  `owner_changed` transition is written. It must be approved and adopted again. Changing only its share changes none of this.
+- **A gateway that has evidence rows cannot be removed** by a configuration import, like a gateway with receipts today.
+
+Not built yet: reading document version 4, ingest into these tables, the rules that decide what is a change, the operator commands
+`gateway-approve` and `gateway-adopt`, and the reading source (cards R1-3b to R1-3f).
+
+### Technical detail (R1-3a)
+
+The table definitions are in one place, `migrate._DDL_V10` (with the list `migrate.EVIDENCE_TABLES`), as `STRICT` tables with every
+money column a whole number >= 0, a hash 64 lowercase hex characters, a generation 32, `unattributed <= settled`, and closed words for a
+transition's kind and an adoption's kind. `store._forget_evidence` is the `import_config` effect; `store.REMOVAL_GUARDS["gateways"]`
+lists the six new tables. Tests: `tests/test_cardr13a_schema.py`. Record: `docs/STEP-CARD-R1-3A.md`.
 
 ## Card 7a-2 - the reporter core
 

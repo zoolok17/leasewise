@@ -275,6 +275,7 @@ def _upsert(conn, accounts, machines, gateways, policy_doc=None):
                     (account_ids[account], machine_ids[machine], share,
                      period, GATEWAY_STATE_RECONCILE, gateway_id),
                 )
+                _forget_evidence(conn, gateway_id)
             else:
                 conn.execute(
                     "UPDATE gateways SET account_id=?, machine_id=?, "
@@ -332,8 +333,21 @@ REMOVAL_GUARDS = {
         ("billing_policies", "reporter_machine_id")),
     "gateways": (
         ("leases", "gateway_id"), ("receipts", "gateway_id"),
-        ("adjustments", "gateway_id")),
+        ("adjustments", "gateway_id"),
+        ("gateway_epochs", "gateway_id"), ("gateway_totals", "gateway_id"),
+        ("gateway_approvals", "gateway_id"), ("gateway_adoptions", "gateway_id"),
+        ("gateway_transitions", "gateway_id"), ("gateway_chain_state", "gateway_id")),
 }
+
+
+def _forget_evidence(conn, gateway_id):
+    """A gateway moved to another machine or account (card R1-3a, DESIGN-R1-3.md section 7): its approvals are deleted, its
+    chain state no longer points at an adoption (the adoption rows stay, as history), and one `owner_changed` transition is
+    written (no event id). It must be approved and adopted again. A row of chain state is never created here."""
+    conn.execute("DELETE FROM gateway_approvals WHERE gateway_id=?", (gateway_id,))
+    conn.execute("UPDATE gateway_chain_state SET current_adoption_id=NULL WHERE gateway_id=?", (gateway_id,))
+    conn.execute("INSERT INTO gateway_transitions(gateway_id, kind, event_id, adoption_id, detected_at, resolved_by_adoption) "
+                 "VALUES(?, 'owner_changed', NULL, NULL, ?, NULL)", (gateway_id, int(time.time() * 1000)))
 
 
 def _refuse_if_referenced(conn, target, entity_id):

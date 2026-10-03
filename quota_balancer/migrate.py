@@ -48,7 +48,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -527,9 +527,108 @@ _DDL_V9 = (
 # The canonical version-9 migration script, kept for comparison.
 MIGRATION_V9 = "\n".join(_DDL_V9) + "\nPRAGMA user_version=9;\n"
 
+
+# Card R1-3a (migration version 10): the six tables that keep a gateway's evidence (DESIGN-R1-3.md section 3). TABLES ONLY: no
+# ALTER, no rebuild, and no row of any kind (no approval, adoption, transition or chain state, and no backfill from old readings).
+# Nothing reads or writes them until cards R1-3b and R1-3c. Money columns are whole numbers >= 0; a hash is 64 lowercase hex
+# characters; a generation is 32. The definitions live here, in one place.
+_HEX64 = "length({c})=64 AND {c} NOT GLOB '*[^0-9a-f]*'"
+_HEX32 = "length({c})=32 AND {c} NOT GLOB '*[^0-9a-f]*'"
+
+_DDL_V10 = (
+    "CREATE TABLE gateway_epochs(\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
+    " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
+    " first_event_id TEXT NOT NULL REFERENCES readings(event_id),\n"
+    " PRIMARY KEY(gateway_id, ledger_epoch),\n"
+    " UNIQUE(gateway_id, generation)) STRICT;",
+    "CREATE TABLE gateway_totals(\n"
+    " event_id TEXT PRIMARY KEY REFERENCES readings(event_id),\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
+    " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
+    " seq INTEGER NOT NULL CHECK(seq>=0),\n"
+    " period_start INTEGER NOT NULL CHECK(period_start>=0),\n"
+    " period_end INTEGER NOT NULL CHECK(period_end>period_start),\n"
+    " settled_micro_eur INTEGER NOT NULL CHECK(settled_micro_eur>=0),\n"
+    " reserved_micro_eur INTEGER NOT NULL CHECK(reserved_micro_eur>=0),\n"
+    " uncertain_micro_eur INTEGER NOT NULL CHECK(uncertain_micro_eur>=0),\n"
+    " unattributed_micro_eur INTEGER NOT NULL CHECK(unattributed_micro_eur>=0),\n"
+    " receipts_seq INTEGER CHECK(receipts_seq IS NULL OR receipts_seq>=0),\n"
+    " quiet INTEGER NOT NULL CHECK(quiet IN (0,1)),\n"
+    " held_over_reservation INTEGER NOT NULL CHECK(held_over_reservation>=0),\n"
+    " price_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="price_hash") + "),\n"
+    " child_cap_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="child_cap_hash") + "),\n"
+    " gateway_flag INTEGER NOT NULL CHECK(gateway_flag IN (0,1)),\n"
+    " observed_at INTEGER NOT NULL CHECK(observed_at>=0),\n"
+    " received_at INTEGER NOT NULL CHECK(received_at>=0),\n"
+    " CHECK(unattributed_micro_eur<=settled_micro_eur)) STRICT;",
+    "CREATE INDEX gateway_totals_chain ON gateway_totals(gateway_id, ledger_epoch, generation, seq);",
+    "CREATE TABLE gateway_approvals(\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " price_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="price_hash") + "),\n"
+    " child_cap_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="child_cap_hash") + "),\n"
+    " approved_at INTEGER NOT NULL CHECK(approved_at>=0),\n"
+    " operator TEXT NOT NULL,\n"
+    " PRIMARY KEY(gateway_id, price_hash, child_cap_hash)) STRICT;",
+    "CREATE TABLE gateway_adoptions(\n"
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " event_id TEXT NOT NULL UNIQUE REFERENCES readings(event_id),\n"
+    " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
+    " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
+    " period_start INTEGER NOT NULL CHECK(period_start>=0),\n"
+    " seq INTEGER NOT NULL CHECK(seq>=0),\n"
+    " settled_micro_eur INTEGER NOT NULL CHECK(settled_micro_eur>=0),\n"
+    " reserved_micro_eur INTEGER NOT NULL CHECK(reserved_micro_eur>=0),\n"
+    " uncertain_micro_eur INTEGER NOT NULL CHECK(uncertain_micro_eur>=0),\n"
+    " unattributed_micro_eur INTEGER NOT NULL CHECK(unattributed_micro_eur>=0),\n"
+    " price_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="price_hash") + "),\n"
+    " child_cap_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="child_cap_hash") + "),\n"
+    " adopted_at INTEGER NOT NULL CHECK(adopted_at>=0),\n"
+    " operator TEXT,\n"
+    " kind TEXT NOT NULL CHECK(kind IN ('operator','period_roll')),\n"
+    " quiet INTEGER NOT NULL CHECK(quiet IN (0,1)),\n"
+    " prev_adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
+    " CHECK((kind='operator') = (operator IS NOT NULL))) STRICT;",
+    "CREATE INDEX gateway_adoptions_gateway ON gateway_adoptions(gateway_id, id);",
+    "CREATE TABLE gateway_transitions(\n"
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " kind TEXT NOT NULL CHECK(kind IN ('epoch_changed','epoch_generation_mismatch','price_hash_changed',"
+    "'child_cap_hash_changed','figure_fell','unattributed_rose','sequence_conflict','reported_by_gateway','owner_changed')),\n"
+    " event_id TEXT REFERENCES readings(event_id),\n"
+    " adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
+    " detected_at INTEGER NOT NULL CHECK(detected_at>=0),\n"
+    " resolved_by_adoption INTEGER REFERENCES gateway_adoptions(id),\n"
+    " CHECK((event_id IS NULL) = (kind='owner_changed')),\n"
+    " UNIQUE(gateway_id, kind, event_id)) STRICT;",
+    "CREATE INDEX gateway_transitions_open ON gateway_transitions(gateway_id, resolved_by_adoption);",
+    "CREATE TABLE gateway_chain_state(\n"
+    " gateway_id TEXT PRIMARY KEY REFERENCES gateways(id),\n"
+    " current_adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
+    " last_quiet_event_id TEXT REFERENCES readings(event_id),\n"
+    " last_quiet_unattributed INTEGER CHECK(last_quiet_unattributed IS NULL OR last_quiet_unattributed>=0),\n"
+    " quiet_baseline_event_id TEXT REFERENCES readings(event_id),\n"
+    " quiet_baseline_unattributed INTEGER CHECK(quiet_baseline_unattributed IS NULL OR quiet_baseline_unattributed>=0),\n"
+    " late_reports INTEGER NOT NULL DEFAULT 0 CHECK(late_reports>=0),\n"
+    " old_chain_reports INTEGER NOT NULL DEFAULT 0 CHECK(old_chain_reports>=0),\n"
+    " duplicate_reports INTEGER NOT NULL DEFAULT 0 CHECK(duplicate_reports>=0),\n"
+    " CHECK((last_quiet_event_id IS NULL) = (last_quiet_unattributed IS NULL)),\n"
+    " CHECK((quiet_baseline_event_id IS NULL) = (quiet_baseline_unattributed IS NULL))) STRICT;",
+)
+
+# The tables of the evidence history, in creation order (the removal guards and the tests read this list).
+EVIDENCE_TABLES = ("gateway_epochs", "gateway_totals", "gateway_approvals", "gateway_adoptions", "gateway_transitions",
+                   "gateway_chain_state")
+
+# The canonical version-10 migration script, kept for comparison (the tests build stores from the scripts).
+MIGRATION_V10 = "\n".join(_DDL_V10) + "\nPRAGMA user_version=10;\n"
+
 # Step N upgrades a store from version N-1 to version N.
 _STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
-          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8, 9: _DDL_V9}
+          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8, 9: _DDL_V9, 10: _DDL_V10}
 
 
 def schema_version(conn):
