@@ -188,3 +188,12 @@ must fail) are listed in the reply.
 - The reporter has no scheduler. Running it continuously, or `expire-sweep` on a
   timer, needs the desktop lead's approval (a task named `lw-...`).
 - Nothing here has met a real deployment or a non-loopback network.
+
+## Scope cut after fix round 2
+
+In plain words: the reporter now accepts less, on purpose, because both fix rounds are used up.
+
+1. **Only a JSON object counts as an answer.** Before, a reply such as `null`, a list, a number, `true` or `false`, or a string on a success status was taken as "delivered", so a final could be stored as sent without Leasewise ever confirming it. Now such a reply is treated like an unreadable one: on a success status, 401, 429 or a server error it is retried with the same bytes and nothing is stored; on any other 4xx it is a permanent refusal with no retry loop. No other shape rule was added: an object without the expected fields is accepted as before.
+2. **The identity may not be, or be part of, a public error word.** Before, an identity such as `CONTEXT_UNKNOWN` was accepted, and a refusal that carried that same word as its error code passed the allow-list and was stored and shown. Configuration now refuses such an identity, ignoring case. The error message does not repeat the value. Use a long generated value.
+
+Technical detail: `client._response` returns `_unreadable(status)` when the decoded body is not a dict; `config._identity` checks the lowered value as a substring of every lowered `decisions.CLOSED_CODES` word. Tests: `tests/test_card7a3_cut.py` (9 tests; 87 failures before the change, all passing after). Codex's boundary probe `VocabularyCollision` first asserts that the colliding identity is accepted, which is exactly what is now refused, so it fails at that line by design; with that line turned into "is refused" it passes, as do `ShapePolicy` and the adapted probes. Full suite 1112 tests OK (2 skipped).

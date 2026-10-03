@@ -18,7 +18,7 @@ import sys
 import tomllib
 from urllib.parse import urlsplit
 
-from . import mapper
+from . import decisions, mapper
 from .events import _NAME as _AGENT_NAME
 from ..validate import ALIAS_RE
 
@@ -130,6 +130,10 @@ def _identity(value):
     text = _text(value, "identity", 512)
     if any(ord(c) < 33 or ord(c) > 126 for c in text):
         _invalid("identity: the value has characters a header cannot carry")
+    lowered = text.lower()
+    if any(lowered in word.lower() for word in decisions.CLOSED_CODES):
+        _invalid("identity: the value must not be, or be part of, one of the "
+                 "public error words; use a long generated value")
     return text
 
 

@@ -107,20 +107,23 @@ def _response(kind, status, raw, identity=""):
         doc = json.loads(raw.decode("utf-8"))
     except Exception:                   # ValueError, UnicodeError, RecursionError...
         return _unreadable(status)
+    if not isinstance(doc, dict):
+        # Only a JSON object is an answer: null, a list, a number, true/false
+        # or a string is as unusable as bytes that do not decode.
+        return _unreadable(status)
     code, lease_id = None, None
-    if isinstance(doc, dict):
-        error = doc.get("error")
-        if isinstance(error, dict):
-            # Only Leasewise's own words: anything else is UNKNOWN_CODE.
-            code = decisions.closed_code(error.get("code"))
-        value = doc.get("lease_id")
-        if isinstance(value, str):
-            if identity and identity in value:
-                # A returned value that holds the secret is never stored or
-                # used to build a request: the whole answer is unreadable.
-                return _unreadable(status)
-            if _UUID.fullmatch(value):
-                lease_id = value
+    error = doc.get("error")
+    if isinstance(error, dict):
+        # Only Leasewise's own words: anything else is UNKNOWN_CODE.
+        code = decisions.closed_code(error.get("code"))
+    value = doc.get("lease_id")
+    if isinstance(value, str):
+        if identity and identity in value:
+            # A returned value that holds the secret is never stored or
+            # used to build a request: the whole answer is unreadable.
+            return _unreadable(status)
+        if _UUID.fullmatch(value):
+            lease_id = value
     if status in (200, 201) and kind == decisions.ACQUIRE and lease_id is None:
         # Never mark an acquisition acquired without the lease it names:
         # ask again with the same bytes (a replay answers with the same id).

@@ -412,7 +412,8 @@ Expected output: one line such as
 
 The file holds a secret (the identity value Leasewise's ingress expects), so the
 reporter refuses to start if other users can read it. Never commit it and never
-put it in an agenttalk bus root. It is TOML, with one table per agent:
+put it in an agenttalk bus root. The identity must not be, or be part of, any of
+Leasewise's public error words; use a long generated value. It is TOML, with one table per agent:
 
 ```toml
 version = 1
