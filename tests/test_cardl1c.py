@@ -430,12 +430,23 @@ class MigrationV9(_Base):
     def test_the_new_table_allows_null_and_keeps_every_other_rule(self):
         db, rows = self.build_v8("rules.db")
         self.assertEqual(run_cli("--db", db, "init").returncode, 0)
+        # The fixture's lease ids are random, so table order is random too:
+        # pick each lease by its role. rows[0] belongs to the lease that
+        # already has a final receipt; rows[2] to the one without.
+        lease_id, other = rows[0][1], rows[2][1]
         conn = sqlite3.connect(db)
+        # Closed in the finally below: an open file would make tearDown's
+        # temp-directory removal fail on Windows.
+        try:
+            self._check_receipt_rules(conn, lease_id, other)
+        finally:
+            conn.close()
+        sql = self.schema_of(db, "receipts")[0]
+        self.assertIn("STRICT", sql)
+        self.assertNotIn("input_tokens INTEGER NOT NULL", sql)
+
+    def _check_receipt_rules(self, conn, lease_id, other):
         conn.execute("PRAGMA foreign_keys=ON")
-        # the fixture gives lease1 its receipts: pick the two leases in a fixed
-        # order (an unordered query returned either one, by UUID order)
-        lease_id = conn.execute(
-            "SELECT id FROM leases ORDER BY rowid LIMIT 1").fetchone()[0]
 
         def insert(**kw):
             values = dict(event_id=str(uuid.uuid4()), lease_id=lease_id,
@@ -464,18 +475,14 @@ class MigrationV9(_Base):
             with self.assertRaises(sqlite3.IntegrityError, msg=str(bad)):
                 insert(**bad)
         # the final-receipt partial index still allows one final per lease
-        other = conn.execute(
-            "SELECT id FROM leases WHERE id<>? ORDER BY rowid LIMIT 1",
-            (lease_id,)).fetchone()[0]
         insert(lease_id=other, final=1)
         with self.assertRaises(sqlite3.IntegrityError):
             insert(lease_id=other, final=1)
         insert(lease_id=other, final=0)
+        # and the fixture's existing final still blocks a second one
+        with self.assertRaises(sqlite3.IntegrityError):
+            insert(lease_id=lease_id, final=1)
         conn.rollback()
-        conn.close()
-        sql = self.schema_of(db, "receipts")[0]
-        self.assertIn("STRICT", sql)
-        self.assertNotIn("input_tokens INTEGER NOT NULL", sql)
 
     def test_every_interruption_rolls_back_whole(self):
         statements = migrate._STEPS[9]

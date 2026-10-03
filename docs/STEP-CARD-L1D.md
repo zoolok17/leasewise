@@ -18,9 +18,16 @@ Part 9, F6). Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only.
 2. **"Your estimate is too old" has its own name.** A stale or future-dated
    `observed_at` used to be a plain `INVALID_REQUEST`. It is now `ESTIMATE_STALE`
    (HTTP 400, exit 2, a fixed message). Because that check runs after the replay
-   lookup, receiving it proves no lease exists for the request id, so the caller
-   may rebuild the request with a fresh estimate. Everything else that is wrong with a
-   request is still `INVALID_REQUEST`.
+   lookup, receiving it proves no lease exists for the request id (while the
+   seat keeps its machine, see the limit below), so the caller may rebuild the
+   request with a fresh estimate. Everything else that is wrong with a request
+   is still `INVALID_REQUEST`.
+
+**The limit of this promise.** The stored lease is looked up by the seat's
+machine and the request id. Config-import never moves a seat to another
+machine, so both guarantees (a granted request always replays; `ESTIMATE_STALE`
+proves no lease exists) hold **while a seat keeps its machine**. Editing a
+seat's machine by hand in the database is outside the guarantee (register R-008).
 
 Nothing else changes: a successful new grant, the replay answer, the token rules
 of card L1a and the behaviour of L1b and L1c are untouched. No schema change.
@@ -30,7 +37,7 @@ of card L1a and the behaviour of L1b and L1c are untouched. No schema change.
 - `quota_balancer/lease.py` - `_grant` order; the freshness failure.
 - `quota_balancer/errors.py`, `quota_balancer/http_api.py` - the new code, its
   exit code, message and HTTP status.
-- `tests/test_cardl1d.py` - 21 tests. Three older tests changed (below).
+- `tests/test_cardl1d.py` - 23 tests. Three older tests changed (below).
 - `docs/STEP-CARD-L1D.md` (this record) and a README section.
 
 ## Grant order, before and after
@@ -56,7 +63,8 @@ The relative order of every check that moved is unchanged. No check sat between
 the seat lookup and the replay lookup for a reason of its own: the team and
 project reads only feed the policy checks, and the machine the replay is keyed by
 comes from the seat row. The replay still reads no model, account or profile, so
-an operator edit cannot reach it.
+an edit of those cannot reach it. (An edit that changes the seat's own machine
+can: see the limit above.)
 
 ## Decisions
 
@@ -64,8 +72,8 @@ an operator edit cannot reach it.
    other store read (the lead's order, exactly).
 2. `ESTIMATE_STALE` covers "too old" and "too far in the future" and nothing else;
    the same rule applies to unknown-context requests.
-3. A replay never sees a policy error or `ESTIMATE_STALE`; a changed body for the
-   same request id stays `IDEMPOTENCY_CONFLICT` even after a policy edit or when
+3. A replay never sees a policy error or `ESTIMATE_STALE` (while the seat keeps
+   its machine); a changed body for the same request id stays `IDEMPOTENCY_CONFLICT` even after a policy edit or when
    the old `observed_at` is stale.
 4. Static message "the admission estimate is stale"; no request text is echoed.
 5. The edits in the tests are direct SQL on a store built by config-import v2:
