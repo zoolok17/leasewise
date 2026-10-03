@@ -4,7 +4,7 @@ The adapter is the ONE place that knows how gateway receipts reach us, so everyt
 refused page is refused WHOLE: nothing is stored from it. The unit is the versioned page of DESIGN-6A 5.4: its
 version, its closed keys, the ledger generation (even on an empty page), the asked-for number, the receipts with
 nullable token counts and an ISO close time, and numbers that rise by exactly one. A source that cannot be read is
-"read again later", never a settle. The command source is tried with fake scripts only. Synthetic data only.
+"read again later", never a settle. Synthetic data only.
 """
 
 import os

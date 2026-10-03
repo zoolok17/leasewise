@@ -1,4 +1,4 @@
-"""`python -m quota_balancer reporter run|drain|status --config FILE`.
+"""`python -m quota_balancer reporter run|drain|status|admit --config FILE`.
 
 Exit codes: 0 done; 2 refused to start (configuration, or the state is owned
 by another reporter); 3 Leasewise did not answer or refused the identity, so
@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 
+from . import admit as admit_mod
+from . import admit_wire
 from . import config as cfg
 from . import status as status_mod
 from .client import HttpClient
@@ -55,17 +57,22 @@ def _parser():
         if name == "status":
             one.add_argument("--json", action="store_true",
                              help="machine-readable output")
+    admit = sub.add_parser("admit", help="the turn admission program: read one request on standard input, "
+                                         "answer once on standard output")
+    admit.add_argument("--config", required=True, help="the reporter configuration file (a secret)")
     return parser
 
 
 def main(argv=None, *, permissions=None, transport=None, clock=None,
-         stop=None):
-    """`permissions`, `transport`, `clock` and `stop` are test seams."""
+         stop=None, admit_seams=None):
+    """`permissions`, `transport`, `clock`, `stop` and `admit_seams` are test seams."""
     args = _parser().parse_args(argv)
     try:
         config = cfg.load_config(args.config, permissions=permissions)
         if args.verb == "status":
             return _status(config, args)
+        if args.verb == "admit":
+            return _admit(config, transport, admit_seams or {})
         snapshot = cfg.load_snapshot(config.policy_ids_path)
         agents = cfg.resolve_agents(config, snapshot)
         limit_sources = cfg.resolve_limit_sources(config, snapshot)
@@ -99,6 +106,46 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
         return EXIT_INTERNAL
     finally:
         state.close()
+
+
+MSG_ADMIT_OFF = "the configuration has no admission block"
+MSG_ADMIT_BAD = "the request is not allowed"
+MSG_ADMIT_FAILED = "the admission could not be completed"
+
+
+def _admit(config, transport, seams):
+    """`reporter admit` (card L6a-2): one request in, one answer out, and nothing else. Standard output carries the
+    answer only; every failure is a fixed sentence on standard error with a non-zero exit."""
+    try:
+        snapshot = cfg.load_snapshot(config.policy_ids_path)
+        agents = cfg.resolve_agents(config, snapshot)
+        admission = cfg.resolve_admission(config, snapshot)
+    except cfg.ConfigError as exc:
+        _error(exc.code, exc.message)
+        return EXIT_REFUSED
+    if admission is None:
+        _error(cfg.CONFIG_INVALID, MSG_ADMIT_OFF)
+        return EXIT_REFUSED
+    stdin = seams.get("stdin") or sys.stdin.buffer
+    stdout = seams.get("stdout") or sys.stdout.buffer
+    try:
+        raw = stdin.read(admit_wire.MAX_REQUEST_BYTES + 1)         # one byte over the cap is enough to refuse it
+        client = HttpClient(config.scheme, config.host, config.port, config.identity, transport=transport)
+        env = admit_mod.Environment(admission, agents, client, **{k: v for k, v in seams.items()
+                                                                  if k in ("now_ms", "monotonic", "sleep", "fault")})
+        code, out = admit_mod.run(raw, env)
+    except Exception:                  # nothing from the fault is printed
+        _error("ADMIT_FAILED", MSG_ADMIT_FAILED)
+        return admit_mod.EXIT_FAILED
+    if code == admit_mod.EXIT_FAILED:
+        _error("ADMIT_FAILED", MSG_ADMIT_FAILED)         # an operation that could not complete: no answer, exit 3
+        return admit_mod.EXIT_FAILED
+    if code != admit_mod.EXIT_OK:
+        _error("ADMIT_REQUEST", "%s: %s" % (MSG_ADMIT_BAD, out.decode("ascii")))
+        return EXIT_REFUSED
+    stdout.write(out)
+    stdout.flush()
+    return EXIT_OK
 
 
 def _go(reporter, verb):
@@ -154,7 +201,8 @@ def _status(config, args):
         try:
             report = status_mod.build_status(
                 state, set(config.agents), now, config.silent_after_seconds,
-                config.limit_sources, config.gateway_receipts)
+                config.limit_sources, config.gateway_receipts,
+                config.admission.gateway_agents if config.admission is not None else ())
         finally:
             state.close()
     except StateOwned:

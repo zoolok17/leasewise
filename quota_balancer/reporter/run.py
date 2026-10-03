@@ -9,6 +9,7 @@ with the same Idempotency-Key and Leasewise answers with what it already did.
 `drain` is one cycle; `run` repeats it until told to stop.
 """
 
+import contextlib
 import random
 import threading
 import time
@@ -27,6 +28,8 @@ MAX_SLEEP_SECONDS = 900
 # for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
 LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
 MAX_PAGES_PER_CYCLE = 6          # card L6a-1: pages (and generation switches) taken from a receipt source per cycle
+MAX_GRANT_BATCHES = 20          # card L6a-2: batches of admission grants (500 each) copied per cycle
+UNKNOWN_CAP = "unknown"             # the note when the summary could not be read (never a fresh zero)
 
 
 def _worse(current, new):
@@ -65,6 +68,10 @@ class Reporter:
         self.config = config
         self.limit_sources = tuple(limit_sources)   # card 7c-2: resolved account map (may be empty)
         self.gateway_receipts = gateway_receipts    # card L6a-1: the resolved receipt source, or None
+        # Card L6a-2 (DESIGN-6A 8.5): the agents whose turns the gateway admits. The journal pipeline never acquires
+        # or reports for them (their journal observations are still kept).
+        admission = getattr(config, "admission", None)
+        self.gateway_agents = frozenset(admission.gateway_agents) if admission is not None else frozenset()
         self.agents = agents            # {agent: mapper.AgentConfig}
         self.state = state
         self.client = client
@@ -87,6 +94,8 @@ class Reporter:
         if not self.stop.is_set():
             self._receive(result)
         if not self.stop.is_set():
+            self._summarize()
+        if not self.stop.is_set():
             self._send(result)
         # The back-off grows over consecutive blocked cycles. A cycle that
         # found nothing due (an item still waiting out its own back-off) is
@@ -103,13 +112,14 @@ class Reporter:
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
                                    self.config.silent_after_seconds,
-                                   self.limit_sources, self.gateway_receipts)
+                                   self.limit_sources, self.gateway_receipts, self.gateway_agents)
 
     def _read(self, result):
         try:
+            journal_agents = {name: one for name, one in self.agents.items() if name not in self.gateway_agents}
             outcome = rounds.run_round(self.state, self.config.journal_root,
-                                       self.agents, self.clock(),
-                                       fault=self.fault)
+                                       journal_agents, self.clock(),
+                                       fault=self.fault, suppressed=self.gateway_agents)
         except events.UnsupportedVersion:
             reason = "schema_version"
         except events.JournalError:
@@ -140,6 +150,29 @@ class Reporter:
             except Exception:           # noqa: BLE001 - even the count may fail; sending goes on
                 pass
 
+    def _summarize(self):
+        """The admission summary (the store's state and how many messages are held at the body cap) is refreshed
+        whenever `[admission]` is configured, with or without receipt intake. When receipts are configured too, the
+        one checked store path in `_copy_bindings` already did it this cycle. A fault here is caught whole."""
+        admission = getattr(self.config, "admission", None)
+        if admission is None or self.gateway_receipts is not None:
+            return
+        with contextlib.suppress(Exception):    # nothing from the fault is kept
+            self._refresh_summary(admission.store, self.clock())
+
+    def _refresh_summary(self, store_path, now):
+        """Read the summary and note it. A read that fails notes the store's closed state and marks the count
+        `unknown`: a failed read never shows as a fresh zero."""
+        status, found = admission_store.read_summary(store_path)
+        with self.state.txn():
+            if status == admission_store.OK:
+                self.state.set_note("receipt_store_read", admission_store.OK, now)
+                self.state.set_note(state_mod.BODY_CAP_NOTE, str(found["at_body_cap"]), now)
+            else:
+                self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
+                self.state.set_note("receipt_store_read", found, now)
+                self.state.set_note(state_mod.BODY_CAP_NOTE, UNKNOWN_CAP, now)
+
     def _receive(self, result):
         """The receipt custody chain's intake (card L6a-1, DESIGN-6A 8.3), once per cycle: copy the new bindings
         from the admission store (read-only; a missing or busy store means "read again later"), take pages from
@@ -166,15 +199,28 @@ class Reporter:
                 pass
 
     def _copy_bindings(self, source, now):
-        status, found = admission_store.read_bindings(source.admission_store)
-        if status == admission_store.OK:
+        """Copy new grants in bounded batches, after the number of the last one taken (kept in the state, saved
+        with each batch), so no history size can stop the reader and nothing is read twice. A batch with a damaged
+        row or a row whose reference or hash does not belong to its lease copies nothing and the store shows as
+        unreadable. Then journal rows of newly bound messages are set aside, and the number of messages held at the
+        body cap is noted (a count only)."""
+        for _ in range(MAX_GRANT_BATCHES):
+            status, found = admission_store.read_bindings(source.admission_store, self.state.grant_cursor(),
+                                                          admission_store.BATCH)
+            if status != admission_store.OK:
+                with self.state.txn():
+                    self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
+                    self.state.set_note("receipt_store_read", found, now)
+                    self.state.set_note(state_mod.BODY_CAP_NOTE, UNKNOWN_CAP, now)     # not read: never a fresh zero
+                return
             with self.state.txn():
                 self.state.set_note("receipt_store_read", admission_store.OK, now)      # trouble is over: say so
-            self.state.copy_bindings(found, now)
-        else:
-            with self.state.txn():
-                self.state.bump(state_mod.RECEIPT_AGENT, "store:" + found)
-                self.state.set_note("receipt_store_read", found, now)
+            if found:
+                self.state.copy_bindings(found, now, cursor=found[-1].grant_seq)
+            if len(found) < admission_store.BATCH:
+                break
+        self.state.supersede_bound(now)
+        self._refresh_summary(source.admission_store, now)
 
     def _take_pages(self, source, source_id):
         """Pages of this source, up to a few per cycle. A page from a generation other than the current one was
@@ -212,7 +258,7 @@ class Reporter:
         shows as CREDENTIAL, above UNREACHABLE (no answer, 5xx, 429), above nothing."""
         self._send_pass(result, self.state.next_limit_item)
         self._send_pass(result, self.state.next_receipt_item)
-        self._send_pass(result, self.state.next_item)
+        self._send_pass(result, lambda now: self.state.next_item(now, self.gateway_agents))
 
     def _send_pass(self, result, pick):
         """Send what `pick` offers, one request at a time. True if the pass ran out of due items;

@@ -11,6 +11,7 @@ resolved to ids at start-up from a saved snapshot of that command's output.
 A bare alias that matches more than one row is refused.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -29,7 +30,8 @@ _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 TOP_REQUIRED = ("version", "base_url", "identity", "machine", "journal_root",
                 "state_path", "policy_ids")
-TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "gateway_receipts")
+TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "gateway_receipts",
+                "admission")
 AGENT_REQUIRED = ("seat", "model", "task_class", "effort", "expected_calls",
                   "max_calls", "output_cap", "per_call_output_cap", "ttl_ms")
 AGENT_OPTIONAL = ("account", "team")
@@ -42,8 +44,7 @@ LIMIT_PROVIDERS = ("claude",)
 MAX_LIMIT_SOURCES = 8
 _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
-# Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
-# or `command` (an argument list, run without a shell).
+# Card L6a-1: where a gateway's receipts are read from. Gateway receipts are read from a fixture file in this version.
 _RECEIPT_KEYS = ("gateway", "admission_store", "fixture")
 _RECEIPT_OPTIONAL = ("max_bytes", "page_limit")
 DEFAULT_PAGE_LIMIT = 100
@@ -75,7 +76,7 @@ class Config:
     __slots__ = ("scheme", "host", "port", "identity", "machine",
                  "journal_root", "state_path", "policy_ids_path",
                  "poll_seconds", "silent_after_seconds", "agents",
-                 "limit_sources", "gateway_receipts")
+                 "limit_sources", "gateway_receipts", "admission")
 
     def __repr__(self):
         return "Config(<hidden>)"
@@ -218,6 +219,53 @@ def _gateway_receipts(table):
     return row
 
 
+# Card L6a-2: the turn admission program (`reporter admit`). The store path, the gateway the leases are for, the agents
+# whose turns the gateway admits, and the operator's token bounds (an unproven bound is never invented).
+_ADMISSION_REQUIRED = ("store", "gateway", "gateway_agents")
+_ADMISSION_BOUNDS = ("fresh_overhead_bound_tokens", "resume_history_bound_tokens", "growth_bound_tokens",
+                     "context_ceiling_tokens")
+MAX_GATEWAY_AGENTS = 64
+_ADMISSION_BOUND_MAX = 10 ** 12
+
+
+class Admission:
+    """The `admission` block. `gateway_id` is None until `resolve_admission` fills it from the snapshot. A bound
+    that was not written is None: the request that needs it is `held` as `context_unprovable`."""
+
+    __slots__ = ("store", "gateway", "gateway_id", "gateway_agents") + _ADMISSION_BOUNDS
+
+    def __repr__(self):
+        return "Admission(<hidden>)"
+
+    __str__ = __repr__
+
+
+def _admission(table):
+    where = "admission"
+    if not isinstance(table, dict):
+        _invalid("%s: must be a table" % where)
+    _closed_keys(table, _ADMISSION_REQUIRED, _ADMISSION_BOUNDS, where)
+    row = Admission()
+    row.store = _path(table["store"], where)
+    row.gateway = _alias(table["gateway"], where)
+    row.gateway_id = None
+    names = table["gateway_agents"]
+    if not isinstance(names, list) or not 0 < len(names) <= MAX_GATEWAY_AGENTS:
+        _invalid("%s: gateway_agents must be a list of 1 to %d agent names" % (where, MAX_GATEWAY_AGENTS))
+    for name in names:
+        if not isinstance(name, str) or not _AGENT_NAME.fullmatch(name):
+            _invalid("%s: an agent name in gateway_agents is not valid" % where)
+    if len(set(names)) != len(names):
+        _invalid("%s: gateway_agents names an agent twice" % where)
+    row.gateway_agents = tuple(sorted(names))
+    for key in _ADMISSION_BOUNDS:
+        value = table.get(key)
+        if key in table and (type(value) is not int or not 0 < value <= _ADMISSION_BOUND_MAX):
+            _invalid("%s: a bound must be a positive whole number" % where)
+        setattr(row, key, value)
+    return row
+
+
 def _parse_url(value):
     """-> (scheme, host, port). Plain http is for loopback only: the identity
     travels in a header, so anything else must be https."""
@@ -234,6 +282,17 @@ def _parse_url(value):
     if parts.scheme == "http" and host not in _LOOPBACK:
         _invalid("base_url: plain http is allowed for loopback only")
     return parts.scheme, host, port or (443 if parts.scheme == "https" else 80)
+
+
+def _admission_host(host):
+    """With `[admission]` the address of Leasewise must be an IP address or `localhost`, so that a run of `admit` never
+    waits on a name lookup that its deadline cannot stop."""
+    if host == "localhost":
+        return
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        _invalid("base_url: with [admission], the host must be an IP address or localhost")
 
 
 def _identity(value):
@@ -288,6 +347,13 @@ def parse_config(text):
     config.gateway_receipts = None
     if "gateway_receipts" in data:
         config.gateway_receipts = _gateway_receipts(data["gateway_receipts"])
+    config.admission = None
+    if "admission" in data:
+        config.admission = _admission(data["admission"])
+        _admission_host(config.host)
+        receipts = config.gateway_receipts
+        if receipts is not None and os.path.normcase(os.path.abspath(receipts.admission_store))                 != os.path.normcase(os.path.abspath(config.admission.store)):
+            _invalid("admission: the store must be the same file as gateway_receipts names")
     agents = data.get("agents", {})
     if not isinstance(agents, dict):
         _invalid("agents: must be a table of agent tables")
@@ -296,6 +362,8 @@ def parse_config(text):
         if not isinstance(name, str) or not _AGENT_NAME.fullmatch(name):
             _invalid("agents: an agent name is not valid")
         config.agents[name] = _agent_table(name, table)
+    if config.admission is not None and any(name not in config.agents for name in config.admission.gateway_agents):
+        _invalid("admission: every agent in gateway_agents needs its own agent table")
     return config
 
 
@@ -579,6 +647,26 @@ def resolve_gateway_receipts(config, snapshot):
                           "is not valid")
     resolved = GatewayReceipts()
     for name in GatewayReceipts.__slots__:
+        setattr(resolved, name, getattr(source, name))
+    resolved.gateway_id = ids[0]
+    return resolved
+
+
+def resolve_admission(config, snapshot):
+    """-> the Admission with its gateway's local id filled in, or None without the block. The alias must be in the
+    snapshot exactly once with a UUID id; otherwise `reporter admit` refuses to start. The messages name no value."""
+    source = config.admission
+    if source is None:
+        return None
+    ids = [gateway_id for alias, gateway_id in snapshot["gateways"] if alias == source.gateway]
+    if not ids:
+        raise ConfigError(CONFIG_UNRESOLVED, "admission: the gateway is not in the policy-ids snapshot")
+    if len(ids) > 1:
+        raise ConfigError(CONFIG_UNRESOLVED, "admission: the gateway alias is ambiguous in the policy-ids snapshot")
+    if _UUID_TEXT.fullmatch(ids[0]) is None:
+        raise ConfigError(CONFIG_UNRESOLVED, "admission: the gateway id in the policy-ids snapshot is not valid")
+    resolved = Admission()
+    for name in Admission.__slots__:
         setattr(resolved, name, getattr(source, name))
     resolved.gateway_id = ids[0]
     return resolved

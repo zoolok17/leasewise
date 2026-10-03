@@ -40,12 +40,13 @@ class RoundResult:
 
 # --- reading and storing --------------------------------------------------
 
-def run_round(state, root, configs, now_ms, fault=None):
+def run_round(state, root, configs, now_ms, fault=None, suppressed=frozenset()):
     """One snapshot round. `configs` maps agent -> mapper.AgentConfig (an
     agent without one is read and counted, never sent). `fault(stage)` is
     a test seam called right after the data, the cursors and the finals
     are stored. An unknown schema version raises before anything is
-    written."""
+    written. `suppressed` names the agents the gateway admits (card L6a-2): they have no config here, so nothing is
+    acquired, reported or finalised for them, and the events skipped are counted."""
     # A crash between storing a round's data and deciding its finals leaves
     # that round unfinished. Finish it from what it stored BEFORE any new
     # input is read, so a final never depends on whether the reporter crashed.
@@ -70,7 +71,7 @@ def run_round(state, root, configs, now_ms, fault=None):
                 (agent, "damaged_stream_records",
                  snapshot[agent].damaged_records))
         for ref, read in reads:
-            _store_read(state, ref, read, round_no, configs, now_ms, result)
+            _store_read(state, ref, read, round_no, configs, now_ms, result, suppressed)
         torn = _confirm_torn(state, snapshot, reads)
         conn.execute("INSERT INTO meta(key, value) VALUES('round', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -156,7 +157,7 @@ def _ensure_acquisition(state, config, message_id, now_ms):
         (config.agent, message_id, turn, mapper.request_id(turn), body, body))
 
 
-def _store_read(state, ref, read, round_no, configs, now_ms, result):
+def _store_read(state, ref, read, round_no, configs, now_ms, result, suppressed=frozenset()):
     conn = state.conn
     if read.damaged:
         state.bump(ref.agent, "damaged_lines", read.damaged)
@@ -190,10 +191,10 @@ def _store_read(state, ref, read, round_no, configs, now_ms, result):
             continue
         result.new_events += 1
         _store_event(state, ref, item, round_no, configs.get(ref.agent),
-                     now_ms)
+                     now_ms, suppressed)
 
 
-def _store_event(state, ref, item, round_no, config, now_ms):
+def _store_event(state, ref, item, round_no, config, now_ms, suppressed=frozenset()):
     conn = state.conn
     agent, message_id = ref.agent, item["message_id"]
     kind = item["kind"]
@@ -227,7 +228,14 @@ def _store_event(state, ref, item, round_no, config, now_ms):
             " outcome=excluded.outcome, usage_json=excluded.usage_json",
             (agent, message_id, item["turn_id"], ref.stream, item["at_ms"],
              1 if item["launched"] else 0, item["outcome"], usage))
-    if finalized or config is None:
+    if finalized:
+        return
+    if config is None:
+        if agent in suppressed:
+            state.bump(agent, "suppressed")        # the gateway admits this agent: its receipt is the only authority
+        return
+    if state.message_is_bound(agent, message_id):
+        state.bump(agent, "suppressed")            # bound to a paid lease: no journal acquisition, report or final
         return
     _ensure_acquisition(state, config, message_id, now_ms)
     if kind == ev.KIND_DISPATCH_ENDED and item["launched"]:
@@ -546,6 +554,8 @@ def _evaluate(state, agents, configs, round_no, result):
                     "SELECT 1 FROM acquisition WHERE agent=? AND message_id=?",
                     (agent, message_id)).fetchone() is None:
                 continue                    # no observed dispatch: no lease
+            if state.message_is_bound(agent, message_id):
+                continue                    # the gateway's receipt is the only thing that settles it
             turn = mapper.turn_uuid(config.seat_id, message_id)
             totals = mapper.message_totals(msg["launched"], complete)
             body = mapper.final_body(mapper.final_event_id(turn),

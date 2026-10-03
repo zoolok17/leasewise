@@ -97,9 +97,11 @@ def grant(conn, one, number=0):
     """One granted admission row, in an open connection (an autocommit one, or inside a transaction)."""
     one = {"lease_id": one} if isinstance(one, str) else dict(one)
     lease_id = one["lease_id"]
+    conn.execute("UPDATE admission_meta SET value=value+1 WHERE name='grant_seq'")
     conn.execute(
         "INSERT INTO admission(agent, message_id, request_id, body_current, state, lease_id, gateway_id, reference,"
-        " ref_sha256, ttl_seconds, expires_ms) VALUES(?,?,?,?, 'granted', ?,?,?,?,?,?)",
+        " ref_sha256, ttl_seconds, expires_ms, grant_seq) VALUES(?,?,?,?, 'granted', ?,?,?,?,?,?,"
+        " (SELECT value FROM admission_meta WHERE name='grant_seq'))",
         (one.get("agent", "alpha"), one.get("message_id", "m%d-%s" % (number, uuid.uuid4().hex[:6])),
          str(uuid.uuid4()), "{}", lease_id, one.get("gateway_id", GATEWAY_ID), one.get("reference", lease_id),
          one.get("ref_sha256", mapper.lease_ref_hash(lease_id)), 1800, one.get("expires_ms", int(time.time() * 1000) + 86_400_000)))
