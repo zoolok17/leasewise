@@ -86,8 +86,9 @@ directly with SQL.
   says, until an operator clears it. The margin does not change that.
 - A reset that is already in the past when the event arrives still parks the account, with a
   `retry_at` in the past. Nothing un-parks it by itself.
-- Steps 2 to 4 (the reporter's outbox and client, the marker reader and account map, the wiring,
-  status and README) are not built yet.
+- Written at step 1: steps 2 and 3 (below) built the reporter's outbox and client, the marker reader
+  and the account map. Step 4 (the wait cap, `status`, the README gap statement and the end-to-end
+  test) is not built yet.
 
 ## Step 2: the reporter's outbox and client for limit events
 
@@ -98,7 +99,7 @@ decisions, state, client, scheduling.
 
 Once the reporter knows of a limit, the event must reach Leasewise even across restarts and
 outages, and nothing else in the reporter may hold it back. This step builds the safe queue (the
-outbox) for limit events and their sending. It does not read park files yet; that is step 3. The
+outbox) for limit events and their sending. It does not read park files; that is step 3 (below). The
 tests put events into the queue by hand.
 
 ### What changed
@@ -155,7 +156,7 @@ tests, 12 failures before).
 
 ### Limits (stated, not hidden)
 
-- Nothing reads the park files yet and `status` does not yet show limit events: steps 3 and 4.
+- `status` does not yet show limit events (step 4). The park files are read by step 3 (below).
 - A sent limit event is final in the outbox; if an operator later clears the block in Leasewise
   while the park file still says the same thing, nothing is sent again (the same limit fact is one
   event for ever). That is by design (DESIGN-7C2.md section 5).
@@ -333,3 +334,41 @@ worktree): 7 of 7 pass, including the four that failed.
 The comment in `run.py` that said "Stop this cycle" now says this pass stops and the other still runs,
 and the delivery-test row above no longer says the cycle stops before the lease pass. The
 `replay_domain` test needs Git history (see above).
+
+## Fix round 1 for step 3 (Codex's read, tk-6deb0398d743)
+
+### In plain words
+
+Two limits in the park-file reader were not real limits yet, and one README sentence was out of date.
+
+1. **The folder walk is now bounded before anything is collected.** The reader opened at most 256 files,
+   but it still walked, checked and remembered every entry in the folder and sorted them all first. A
+   folder with many entries could have delayed lease sending and used memory without bound. Now the
+   walk stops after 256 directory entries visited (ignored names count too); only then are the names
+   kept sorted and read. One more entry is looked at only to learn that there is more, and the scan says
+   so with a flag (`too_many_entries`, counted as 0 or 1 per folder), never a count of the folder.
+   **Consequence, stated:** in a folder with more than 256 entries, some markers may not be seen in
+   that scan (the first 256 in the folder's own order are looked at). In practice a park folder holds
+   one small file per parked seat. The README "Limits" says so.
+2. **The wake time has a near limit now.** `reset_epoch` may be at most 9 days ahead, but `wake_epoch`
+   was only checked against the year 2100. It is now checked against the same range plus the
+   wrapper's offset, named `WAKE_AFTER_RESET_SECONDS` = 30 (the wake is the reset plus 30 seconds).
+   Out of range is refused. It is still never sent.
+3. **Stale sentences.** The README said "Nothing reads the park files yet (step 3)" and "comes in the
+   next steps"; this step record said steps 2 to 4 were not built. Updated; step 4 is the one that is
+   still to come.
+
+### Tests (red first: the reader file had 3 failures and 4 errors, the capture file 1 error)
+
+- `Bounded` (5, in `test_card7c2_reader.py`): with a fake `scandir` that counts how far it was
+  advanced, 1,000 entries give at most 257 advances (256 and the one look-ahead) and at most 256 names
+  read; 1,000 ignored names also stop at 257 advances and read nothing; a mixed folder keeps only what
+  it visited; a normal folder is unchanged; the names kept are still read in sorted order.
+- Exactly 256 files give no flag; 261 give the flag and 256 markers.
+- `WakeBound` (3): the reset's range plus 30 seconds is accepted and one second more refused; `0`,
+  the year-2100 value `4102444800` and `MAX_EPOCH` refused; `null` and a wake already in the past
+  accepted; a reset at its own edge still has room for its wake; the wake is never kept.
+- Capture: the count `over_cap` is replaced by the flag `too_many_entries`.
+
+Codex's probes (`test_7c2_step3_review_probes.py`, copied into scratch, never edited): 18 of 18 pass,
+including the two that failed.

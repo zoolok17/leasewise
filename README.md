@@ -547,7 +547,7 @@ Limit events are sent by their own pass, which runs first in every cycle: a leas
 or 429 (a parked account refuses every lease request) never delays one, and a limit event that
 Leasewise refuses fails only itself, never an agent and never the reporter. Leasewise's answer `202`
 means "recorded" for a limit event; the reporter keeps nothing from it. The client sends a limit
-event to `/v1/limit-events` and to nothing else. Nothing reads the park files yet (step 3).
+event to `/v1/limit-events` and to nothing else. Reading the park files is step 3, below.
 
 **Step 3: the reporter notices a park.** agenttalk keeps one small file per parked seat
 (`state/usage-limit-park/<agent>.json`, documented in agenttalk's README as a file other programs may
@@ -582,6 +582,10 @@ stored with its body frozen and delivered even across restarts and outages.
 
 Limits:
 
+- **A folder with more than 256 entries.** The reporter looks at the first 256 entries of the
+  folder (in the folder's own order, ignored names counting too) and says so with a flag; it never
+  counts the folder. So some markers may not be seen in that scan. A folder of park files is small
+  in practice (one per parked seat).
 - **One outbox, one memory.** An event's body is frozen only while the same reporter state file is
   kept. If the state file is recreated, or two reporters run with the same `machine` alias, the same
   `event_id` can be rebuilt with a different first-seen time (`observed_at`); Leasewise then answers
@@ -592,5 +596,5 @@ Limits:
   version-2 file with its existing "the state file version is not supported" refusal: it never opens
   or changes it. Keep a copy of the state file if you may need to go back.
 
-See docs/STEP-CARD-7C-2.md. The rest of the reporter side of card 7c-2 (reading agenttalk's park
-marker and the account map, then the wiring, status and the stated gap) comes in the next steps.
+See docs/STEP-CARD-7C-2.md. The rest of the reporter side of card 7c-2 (the wait cap, `status`, the
+stated gap and the end-to-end test) is step 4 and is not built yet.
