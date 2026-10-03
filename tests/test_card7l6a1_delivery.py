@@ -95,6 +95,22 @@ class Answers(_Rig):
         self.assertEqual((sent["gateway_id"], sent["cached_input_tokens"], sent["final"], sent["seq"]),
                          (GATEWAY_ID, 0, True, 1))
 
+    def test_a_settle_succeeds_only_on_200_any_other_2xx_is_retried_visibly_with_the_same_bytes(self):
+        """F8 (DESIGN-6A 8.4)."""
+        for other in (201, 202, 204):
+            with self.subTest(status=other):
+                rig = Rig(server=False)
+                self.addCleanup(rig.cleanup)
+                self.rig = rig
+                reporter = self.start(Net(receipt=[(other, OK[1]), OK]))
+                result = reporter.cycle()
+                self.assertEqual(self.row(1)[:3], ("pending", 1, decisions.MALFORMED_RESPONSE))
+                self.assertEqual((result.sent, result.blocked), (0, UNREACHABLE))
+                self.rig.clock.advance(3600)
+                result = reporter.cycle()
+                self.assertEqual((self.row(1)[0], result.sent), ("sent", 1))
+                self.assertEqual(len({call[2] for call in self.net.settles()}), 1)         # the same bytes both times
+
     def test_lease_closed_fails_that_row_for_good_and_the_next_row_still_sends(self):
         reporter = self.start(Net(receipt=[error("LEASE_CLOSED", 410), OK]), count=2)
         result = reporter.cycle()
@@ -245,12 +261,13 @@ class Table(unittest.TestCase):
 
     def test_the_table(self):
         self.assertEqual(self.decide(200), decisions.Decision(decisions.DONE))
-        self.assertEqual(self.decide(201), decisions.Decision(decisions.DONE))
+        self.assertEqual(self.decide(201), decisions.Decision(decisions.RETRY, decisions.MALFORMED_RESPONSE))
         self.assertEqual(self.decide(410, "LEASE_CLOSED"), decisions.Decision(decisions.FAIL, "LEASE_CLOSED"))
         self.assertEqual(self.decide(409, "RECEIPT_CONFLICT"), decisions.Decision(decisions.FAIL, "RECEIPT_CONFLICT"))
         self.assertEqual(self.decide(400, "INVALID_REQUEST"), decisions.Decision(decisions.FAIL, "INVALID_REQUEST"))
         self.assertEqual(self.decide(404, None), decisions.Decision(decisions.FAIL, decisions.UNKNOWN_CODE))
-        self.assertEqual(self.decide(202), decisions.Decision(decisions.FAIL, decisions.UNKNOWN_CODE))
+        for other in (202, 204, 299):
+            self.assertEqual(self.decide(other), decisions.Decision(decisions.RETRY, decisions.MALFORMED_RESPONSE))
         self.assertEqual(self.decide(401), decisions.Decision(decisions.RETRY, "UNAUTHENTICATED"))
         self.assertEqual(self.decide(429).action, decisions.RETRY)
         self.assertEqual(self.decide(503).action, decisions.RETRY)

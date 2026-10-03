@@ -10,7 +10,7 @@ import datetime
 import json
 import os
 
-from . import capture, decisions, receipts, rounds
+from . import admission_store, capture, decisions, receipts, rounds
 from . import state as state_mod
 
 STATUS_VERSION = 3          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`
@@ -258,6 +258,29 @@ def _generation_changes(state):
     return out
 
 
+STORE_STATES = {"ok": "ok", "store_missing": "missing", "store_busy": "busy", "store_unreadable": "unreadable",
+                "history_limit": "history_limit"}
+STORE_ACTIONS = {
+    "missing": "The admission store file is not there: check that the admission command writes to the file the "
+               "configuration names. Receipts are kept and are read against it again each cycle.",
+    "unreadable": "The admission store cannot be used (damaged, another version, or a row that does not match its "
+                  "lease): nothing is copied from it. Check it before more receipts arrive.",
+    "history_limit": "The admission store holds more granted rows than the reporter reads at once (%d): no new binding "
+                     "can be copied and later receipts stay unknown. Reading only what is new is needed before live "
+                     "use; never delete admissions." % admission_store.MAX_BINDINGS,
+}
+
+
+def _admission_store(state):
+    """The current state of the admission store as the reporter last saw it, and how often it failed before. Closed
+    words and counts only: never a path and never an exception's text. `state` is None before the first read."""
+    note = state.note("receipt_store_read")
+    current = None if note is None else STORE_STATES.get(note[0], "unreadable")
+    agent = state_mod.RECEIPT_AGENT
+    failures = {word: state.counter(agent, "store:" + name) for name, word in STORE_STATES.items() if name != "ok"}
+    return {"state": current, "failures": failures}
+
+
 def _gateway_receipts(state, source, now_ms):
     """The `gateway_receipts` object (card L6a-1): closed words and counts only. Never a path, a
     command, a lease id, a reference, a figure from a receipt or the text of a fault. `gateway` is the
@@ -293,6 +316,7 @@ def _gateway_receipts(state, source, now_ms):
         "rows": rows,
         "failed": failed,
         "quarantine": quarantine,
+        "admission_store": _admission_store(state),
         "quarantine_action": dict(QUARANTINE_ACTIONS),
         "generation_changes": _generation_changes(state),
         "awaiting_receipt": awaiting,
@@ -375,7 +399,16 @@ def _actions(report):
                            % (count, reason, receipt["quarantine_action"][reason]))
     if receipt["overdue"]:
         actions.append("%d lease(s) are overdue: their expiry has passed and no gateway receipt has come (the lease "
-                       "keeps its hold; see gateway_receipts: awaiting_receipt)" % receipt["overdue"])
+                       "keeps what it holds, which is nothing for an advisory lease; see gateway_receipts: "
+                       "awaiting_receipt)" % receipt["overdue"])
+    if receipt["failed"].get("RECEIPT_CONFLICT"):
+        actions.append("%d gateway receipt(s) were refused as a conflict: Leasewise has parked the account; look at "
+                       "the parked account (its blocks) before anything else is sent"
+                       % receipt["failed"]["RECEIPT_CONFLICT"])
+    if receipt["configured"]:
+        sentence = STORE_ACTIONS.get(receipt["admission_store"]["state"])
+        if sentence:
+            actions.append(sentence)
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")
@@ -453,6 +486,9 @@ def render_text(report):
         out.append("gateway receipts: last seq %d, pending %d, delivered %d, failed %d. %s"
                    % (receipt["last_seq"], receipt["rows"]["pending"], receipt["rows"]["sent"],
                       receipt["rows"]["failed_permanent"], receipt["cached_input"]))
+        store = receipt.get("admission_store")      # a snapshot of the first build has none
+        if store is not None:
+            out.append("admission store: %s" % (store["state"] or "not read yet"))
     for line in report["operator_actions"]:
         out.append("-> " + line)
     return "\n".join(out)

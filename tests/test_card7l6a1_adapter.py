@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 from quota_balancer.reporter import receipts
@@ -21,10 +22,31 @@ from tests.l6a1_env import (GENERATION, GENERATION_B, command_source, encode, fi
 LOUD = "loud-secret-l6a1-adapter"
 
 
-def parse(doc, after=0):
+def alive(pid):
+    """Is a process with this id still running? (By its id only.)"""
+    if sys.platform == "win32":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, pid)           # query limited information
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        kernel.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel.CloseHandle(handle)
+        return code.value == 259                                   # still active
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def parse(doc, after=0, limit=receipts.MAX_ROWS):
     """The page of `doc`, or the closed (status, reason) the adapter refuses it with."""
     try:
-        return receipts.parse_page(encode(doc), after)
+        return receipts.parse_page(encode(doc), after, limit)
     except receipts._Refused as exc:
         return (receipts.REFUSED, exc.args[0])
     except receipts._Later as exc:
@@ -186,6 +208,32 @@ class Pages(unittest.TestCase):
         rows = [receipt(lease(), n) for n in range(1, receipts.MAX_ROWS + 2)]
         self.refused(page(rows), "too_many")
 
+    def test_zero_calls_means_zero_counts_and_zero_money_and_null_is_not_zero(self):
+        """F4 (spec 3.4): with no call, both token counts and the money must be the number 0."""
+        zero = dict(calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=0)
+        self.assertEqual(len(parse(page([receipt(lease(), 1, **zero)])).receipts), 1)
+        for over in (dict(input_tokens=None), dict(output_tokens=None), dict(input_tokens=None, output_tokens=None),
+                     dict(input_tokens=1), dict(output_tokens=1), dict(actual_micro_eur=1)):
+            with self.subTest(over=over):
+                self.refused(page([receipt(lease(), 1, **dict(zero, **over))]), "bad_row")
+        self.refused(page([receipt(lease(), 1), receipt(lease(), 2, **dict(zero, input_tokens=None))]), "bad_row")
+
+    def test_null_counts_stay_legal_when_there_was_at_least_one_call(self):
+        got = parse(page([receipt(lease(), 1, calls=1, input_tokens=None, output_tokens=None)]))
+        self.assertEqual((got.receipts[0].input_tokens, got.receipts[0].output_tokens), (None, None))
+
+    def test_a_page_longer_than_the_requested_limit_is_refused_before_anything_is_stored(self):
+        """F5: the limit asked for is the limit allowed, not just the 1000 ceiling."""
+        rows = [receipt(lease(), n) for n in range(1, 151)]
+        self.assertEqual(parse(page(rows), limit=150).next_seq, 150)
+        self.assertEqual(parse(page(rows), limit=100), (receipts.REFUSED, "too_many"))     # shorter than 1000, longer than asked
+        self.assertEqual(parse(page(rows[:1]), limit=1).next_seq, 1)
+        self.assertEqual(parse(page(rows[:2]), limit=1), (receipts.REFUSED, "too_many"))
+        big = [receipt(lease(), n) for n in range(1, 1001)]
+        self.assertEqual(parse(page(big), limit=1000).next_seq, 1000)
+        self.assertEqual(parse(page(big + [receipt(lease(), 1001)]), limit=1000), (receipts.REFUSED, "too_many"))
+        self.assertEqual(parse(page([]), limit=1).receipts, ())                              # an empty page is always fine
+
     def test_one_bad_receipt_refuses_the_whole_page(self):
         got = parse(page([receipt(lease(), 1), receipt(lease(), 2, outcome="nope")]))
         self.assertEqual(got, (receipts.REFUSED, "bad_row"))
@@ -205,6 +253,20 @@ class Fixture(_Dir):
     def read(self, doc, after=0, **over):
         write_json(self.fixture, doc)
         return receipts.read_page(fixture_source(self.fixture, **over), after)
+
+    def test_the_fixture_page_has_the_configured_length_and_says_there_is_more(self):
+        rows = [receipt(lease(), n) for n in range(1, 151)]
+        for limit, expected in ((1, 1), (100, 100), (150, 150), (1000, 150)):
+            with self.subTest(limit=limit):
+                result = self.read(ledger(rows), page_limit=limit)
+                self.assertEqual(len(result.page.receipts), expected)
+                self.assertEqual(result.page.has_more, expected < 150)
+
+    def test_a_ready_made_fixture_page_longer_than_the_configured_length_is_refused(self):
+        rows = [receipt(lease(), n) for n in range(1, 151)]
+        result = self.read(page(rows), page_limit=100)
+        self.assertEqual((result.status, result.reason), (receipts.REFUSED, "too_many"))
+        self.assertEqual(self.read(page(rows), page_limit=150).status, receipts.OK)
 
     def test_a_ledger_makes_the_page_after_the_asked_for_number(self):
         rows = [receipt(lease(), n) for n in (1, 2, 3, 4)]
@@ -264,6 +326,25 @@ elif mode == "exit":
     sys.stderr.write("LOUD-STDERR-TEXT")
     sys.stdout.write("{}")
     sys.exit(3)
+elif mode == "orphan_good":
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)    # a child that holds nothing open
+    with open(os.environ["PIDFILE"], "w") as handle:
+        handle.write("%d %d" % (os.getpid(), child.pid))
+    print(os.environ["FAKE_PAGE"])
+elif mode in ("orphan", "hang_tree", "flood"):
+    import subprocess, time
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])      # inherits our output
+    with open(os.environ["PIDFILE"], "w") as handle:
+        handle.write("%d %d" % (os.getpid(), child.pid))
+    if mode == "orphan":
+        sys.exit(0)                                   # the program is gone; its child still holds the output open
+    if mode == "hang_tree":
+        time.sleep(120)
+    while True:
+        sys.stdout.write("x" * 65536)
+        sys.stdout.flush()
 elif mode == "badjson":
     print("{oops")
 elif mode == "stderr":
@@ -302,7 +383,7 @@ class Command(_Dir):
         self.assertEqual((refused.status, refused.reason), (receipts.REFUSED, "bad_version"))   # it ran: not a page
         raw = receipts._read_command(source, 7)
         said = json.loads(raw.decode())
-        self.assertEqual(said["argv"], ["echo", "a b", "x;y", "$(z)", "--after", "7"])
+        self.assertEqual(said["argv"], ["echo", "a b", "x;y", "$(z)", "--after", "7", "--limit", "100"])
         self.assertNotIn("LEASEWISE_LOUD_SECRET_L6A1", said["env"])
         self.assertIn("ONE", said["env"])
         self.assertNotIn(LOUD, raw.decode())
@@ -328,6 +409,57 @@ class Command(_Dir):
         result = self.run_mode("stderr", env=[("FAKE_PAGE", json.dumps(doc))])
         self.assertEqual((result.status, result.page.receipts), (receipts.OK, ()))
         self.assertNotIn("LOUD-STDERR-TEXT", repr(result.page) + str(result.reason))
+
+    # --- fix round 1, F2: ONE deadline bounds reading, exit and cleanup, and no process is left running ---
+
+    def tree_run(self, mode, **over):
+        pidfile = os.path.join(self.dir, "pids-%s.txt" % mode)
+        started = time.monotonic()
+        result = self.run_mode(mode, env=[("PIDFILE", pidfile)], **over)
+        elapsed = time.monotonic() - started
+        with open(pidfile, "r", encoding="ascii") as handle:
+            parent, child = (int(number) for number in handle.read().split())
+        return result, elapsed, parent, child
+
+    def assertGone(self, *pids):
+        for pid in pids:
+            for _ in range(40):                                  # a killed process needs a moment to be reaped
+                if not alive(pid):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(alive(pid), "process %d is still running" % pid)
+
+    def test_a_program_that_exits_while_its_child_still_holds_the_output_is_bounded_and_leaves_nothing(self):
+        result, elapsed, parent, child = self.tree_run("orphan", timeout_seconds=2)
+        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "timeout"))
+        self.assertLess(elapsed, 2 + receipts.CLEANUP_SECONDS + 2)
+        self.assertGone(parent, child)
+
+    def test_a_program_that_never_stops_is_ended_with_its_children_at_the_deadline(self):
+        result, elapsed, parent, child = self.tree_run("hang_tree", timeout_seconds=2)
+        self.assertEqual((result.status, result.reason), (receipts.READ_LATER, "timeout"))
+        self.assertLess(elapsed, 2 + receipts.CLEANUP_SECONDS + 2)
+        self.assertGone(parent, child)
+
+    def test_a_program_that_writes_too_much_is_ended_at_once_with_its_children(self):
+        result, elapsed, parent, child = self.tree_run("flood", timeout_seconds=20, max_bytes=100_000)
+        self.assertEqual((result.status, result.reason), (receipts.REFUSED, "too_large"))
+        self.assertLess(elapsed, 10)                                 # long before the deadline: the cap ended it
+        self.assertGone(parent, child)
+
+    def test_a_good_run_leaves_no_process_behind_either(self):
+        doc = page([receipt(lease(), 1)], after=0)
+        pidfile = os.path.join(self.dir, "pids-good.txt")
+        result = self.run_mode("orphan_good", env=[("FAKE_PAGE", json.dumps(doc)), ("PIDFILE", pidfile)])
+        self.assertEqual((result.status, [r.seq for r in result.page.receipts]), (receipts.OK, [1]))
+        with open(pidfile, "r", encoding="ascii") as handle:
+            parent, child = (int(number) for number in handle.read().split())
+        self.assertGone(parent, child)
+
+    def test_the_command_is_asked_for_the_configured_page_length(self):
+        source = command_source([sys.executable, self.script, "echo"], page_limit=7)
+        said = json.loads(receipts._read_command(source, 3).decode())
+        self.assertEqual(said["argv"][-4:], ["--after", "3", "--limit", "7"])
 
     def test_a_command_that_cannot_start_is_read_later(self):
         result = receipts.read_page(command_source([os.path.join(self.dir, "no-such-program")]), 0)

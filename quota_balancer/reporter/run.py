@@ -168,6 +168,8 @@ class Reporter:
     def _copy_bindings(self, source, now):
         status, found = admission_store.read_bindings(source.admission_store)
         if status == admission_store.OK:
+            with self.state.txn():
+                self.state.set_note("receipt_store_read", admission_store.OK, now)      # trouble is over: say so
             self.state.copy_bindings(found, now)
         else:
             with self.state.txn():

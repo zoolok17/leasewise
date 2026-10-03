@@ -26,12 +26,16 @@ An answer is one of three words (`ReadResult.status`):
               repeated key, too much): nothing from it is stored, and a counter says so.
 """
 
+import contextlib
 import datetime
 import json
 import os
 import re
 import subprocess
 import threading
+import time
+
+from . import proctree
 
 OK = "ok"
 READ_LATER = "read_later"
@@ -58,6 +62,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 _GENERATION = re.compile(r"[0-9a-f]{32}")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 
+CLEANUP_SECONDS = 2.0                # after the deadline, how long ending the tree and the reader may take
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_MAX_BYTES = 1024 * 1024
 _ENV_KEPT = ("SYSTEMROOT", "SYSTEMDRIVE", "PATH")      # what a program needs to start; no secrets
@@ -131,8 +136,8 @@ def _row(doc):
     if not (type(doc["quota_lease_ref_sha256"]) is str and _HEX64.fullmatch(doc["quota_lease_ref_sha256"])
             and type(doc["outcome"]) is str and doc["outcome"] in OUTCOMES):
         raise _Refused("bad_row")
-    if doc["calls"] == 0 and (doc["input_tokens"] or doc["output_tokens"] or doc["actual_micro_eur"]):
-        raise _Refused("bad_row")        # no call, yet spend: a receipt that contradicts itself
+    if doc["calls"] == 0 and (doc["input_tokens"] != 0 or doc["output_tokens"] != 0 or doc["actual_micro_eur"] != 0):
+        raise _Refused("bad_row")        # no call: both counts and the money must be the number 0 (null is not 0)
     row = Receipt()
     row.seq, row.ref_sha256, row.outcome = doc["seq"], doc["quota_lease_ref_sha256"], doc["outcome"]
     row.calls, row.input_tokens, row.output_tokens = doc["calls"], doc["input_tokens"], doc["output_tokens"]
@@ -160,10 +165,11 @@ def _loads(raw):
         raise _Later("not_json") from None
 
 
-def parse_page(raw, after_seq):
+def parse_page(raw, after_seq, limit=MAX_ROWS):
     """The bytes a source gave -> a Page, or _Later/_Refused. Every rule of the page is checked here, so a page that
     is stored is a page that was whole: the version, the closed keys, the generation, the asked-for number, the
-    receipts, and that the numbers rise by exactly one."""
+    receipts, and that the numbers rise by exactly one. `limit` is the page length that was asked for: a longer page
+    is refused before anything is read from it."""
     doc = _loads(raw)
     if type(doc) is not dict:
         raise _Refused("not_an_object")
@@ -178,7 +184,7 @@ def parse_page(raw, after_seq):
         raise _Refused("bad_envelope")
     if doc["after_seq"] != after_seq:
         raise _Refused("wrong_after")
-    if len(doc["receipts"]) > MAX_ROWS:
+    if len(doc["receipts"]) > min(limit, MAX_ROWS):
         raise _Refused("too_many")
     rows = [_row(item) for item in doc["receipts"]]
     expected = after_seq
@@ -194,14 +200,14 @@ def parse_page(raw, after_seq):
     return page
 
 
-def _fixture_page(raw, after_seq, max_bytes):
+def _fixture_page(raw, after_seq, max_bytes, limit):
     """A fixture holds either a made page (served as it is) or a whole ledger `{"generation", "receipts"}`, from
     which the page after `after_seq` is made the way the gateway would make it."""
     doc = _loads(raw)
     if type(doc) is dict and frozenset(doc) == {"generation", "receipts"} and type(doc["receipts"]) is list:
         rows = [item for item in doc["receipts"]
                 if type(item) is not dict or type(item.get("seq")) is not int or item["seq"] > after_seq]
-        shown = rows[:100]
+        shown = rows[:limit]
         last = shown[-1]["seq"] if shown and type(shown[-1]) is dict and type(shown[-1].get("seq")) is int \
             else after_seq
         doc = {"envelope_version": ENVELOPE_VERSION, "generation": doc["generation"], "after_seq": after_seq,
@@ -209,7 +215,7 @@ def _fixture_page(raw, after_seq, max_bytes):
         raw = json.dumps(doc).encode("utf-8")
         if len(raw) > max_bytes:
             raise _Refused("too_large")
-    return parse_page(raw, after_seq)
+    return parse_page(raw, after_seq, limit)
 
 
 def _read_fixture(path, max_bytes):
@@ -230,54 +236,74 @@ def _environment(extra):
 
 
 def _read_command(source, after_seq):
-    """Run the configured command once. No shell, no standard input, no error text kept, a time limit and a size cap
-    on what it prints."""
-    argv = list(source.command) + ["--after", str(after_seq)]
+    """Run the configured command once. No shell, no standard input, no error text kept, and ONE deadline
+    (`timeout_seconds`) that covers reading the output, the exit and the cleanup, so a program that hangs, that
+    leaves a child holding its output open, or that never stops writing cannot hold the reporter. The program is
+    started in its own session or job (`proctree`); on a timeout, on too much output and after every run the whole
+    tree is ended by exact process id, and the reader is given only a short, fixed time to finish."""
+    argv = list(source.command) + ["--after", str(after_seq), "--limit", str(source.page_limit)]
+    deadline = time.monotonic() + source.timeout_seconds
     try:
-        proc = subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, env=_environment(source.env))
+        tree = proctree.start(argv, _environment(source.env), subprocess.PIPE)
     except (OSError, ValueError):
         raise _Later("cannot_run") from None
-    timed_out = threading.Event()
+    chunks, seen = [], [0]
+    finished, too_big = threading.Event(), threading.Event()
 
-    def stop():
-        timed_out.set()
+    def pump():
+        """Read until the end of the output or one byte past the cap. Never inspects what it reads."""
         try:
-            proc.kill()                  # this process, by its handle: never by name
-        except OSError:
-            pass
+            stream = tree.proc.stdout
+            while True:
+                data = stream.read1(65536)
+                if not data:
+                    return
+                seen[0] += len(data)
+                if seen[0] > source.max_bytes:
+                    too_big.set()
+                    return
+                chunks.append(data)
+        except (OSError, ValueError):
+            return
+        finally:
+            finished.set()
 
-    timer = threading.Timer(source.timeout_seconds, stop)
-    timer.start()
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    timed_out = False
     try:
-        raw = proc.stdout.read(source.max_bytes + 1)
-        too_big = len(raw) > source.max_bytes
-        if too_big:
+        if not finished.wait(max(0.0, deadline - time.monotonic())):
+            timed_out = True                             # still writing, or a child holds the output open
+        elif not too_big.is_set():
             try:
-                proc.kill()
-            except OSError:
-                pass
-        code = proc.wait()
+                code = tree.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True                         # the output ended but the program did not
     finally:
-        timer.cancel()
-        proc.stdout.close()
-        proc.wait()
-    if timed_out.is_set():
-        raise _Later("timeout")
-    if too_big:
+        tree.kill()                                      # the program and every child, by exact id
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            tree.proc.wait(timeout=CLEANUP_SECONDS)
+        reader.join(CLEANUP_SECONDS)
+        with contextlib.suppress(OSError, ValueError):
+            tree.proc.stdout.close()
+        tree.close()
+    if too_big.is_set():
         raise _Refused("too_large")
+    if timed_out:
+        raise _Later("timeout")
     if code != 0:
         raise _Later("exit_code")
-    return raw
+    return b"".join(chunks)
 
 
 def read_page(source, after_seq):
     """One page of `source` after `after_seq` -> ReadResult. Never raises on bad input."""
     try:
         if source.command is not None:
-            page = parse_page(_read_command(source, after_seq), after_seq)
+            page = parse_page(_read_command(source, after_seq), after_seq, source.page_limit)
         else:
-            page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes)
+            page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes,
+                                 source.page_limit)
     except _Later as exc:
         return ReadResult(READ_LATER, exc.args[0])
     except _Refused as exc:

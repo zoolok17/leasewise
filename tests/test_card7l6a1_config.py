@@ -85,6 +85,21 @@ class Block(_Tmp):
         self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\n" % (_q(GATEWAY_ALIAS), _q(self.store)))
         self.refused(self.fixture_block("command = %s\n" % _q([EXE])))
 
+    def test_page_limit_is_a_whole_number_from_1_to_1000_and_defaults_to_100(self):
+        """F5: the number of receipts the reporter asks for in one page."""
+        self.assertEqual(self.parse(self.fixture_block()).gateway_receipts.page_limit, 100)
+        for good in (1, 7, 100, 1000):
+            self.assertEqual(self.parse(self.fixture_block("page_limit = %d\n" % good)).gateway_receipts.page_limit,
+                             good)
+        for bad in ("0", "-1", "1001", "true", "false", "5.0", "1e2", _q("5"), "[5]", "{}"):
+            with self.subTest(bad=bad):
+                self.refused(self.fixture_block("page_limit = %s\n" % bad))
+
+    def test_a_command_that_names_limit_is_refused_because_the_reporter_adds_it(self):
+        self.refused(self.command_block([EXE, "--limit", "5"]))
+        self.refused(self.command_block([EXE, "x", "--after", "0"]))
+        self.parse(self.command_block([EXE, "x"], "page_limit = 25\n"))
+
     def test_the_keys_are_closed(self):
         self.refused(self.fixture_block("agent = %s\n" % _q(LOUD)))
         self.refused("[gateway_receipts]\nadmission_store = %s\nfixture = %s\n" % (_q(self.store), _q(self.fixture)))   # no gateway

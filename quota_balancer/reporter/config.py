@@ -45,7 +45,9 @@ _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 # Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
 # or `command` (an argument list, run without a shell).
 _RECEIPT_KEYS = ("gateway", "admission_store")
-_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "max_bytes", "env")
+_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "max_bytes", "env", "page_limit")
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 1000
 MAX_COMMAND_ARGS = 16
 MAX_RECEIPT_ENV = 8
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
@@ -189,7 +191,7 @@ class GatewayReceipts:
     environment can name a deployment)."""
 
     __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "command", "timeout_seconds", "max_bytes",
-                 "env")
+                 "env", "page_limit")
 
     def __repr__(self):
         return "GatewayReceipts(<hidden>)"
@@ -206,8 +208,8 @@ def _text_list(value, where):
             _invalid("%s: the command has a character it may not have" % where)
     if not os.path.isabs(value[0]):
         _invalid("%s: the command must start with an absolute path" % where)
-    if "--after" in value:
-        _invalid("%s: the command may not name --after; the reporter adds it" % where)
+    if "--after" in value or "--limit" in value:
+        _invalid("%s: the command may not name --after or --limit; the reporter adds them" % where)
     return tuple(value)
 
 
@@ -243,6 +245,9 @@ def _gateway_receipts(table):
     if type(row.max_bytes) is not int or not 1024 <= row.max_bytes <= 4 * 1024 * 1024:
         _invalid("%s: max_bytes must be a whole number from 1024 to 4194304" % where)
     row.env = _receipt_env(table["env"], where) if "env" in table else ()
+    row.page_limit = table.get("page_limit", DEFAULT_PAGE_LIMIT)
+    if type(row.page_limit) is not int or not 1 <= row.page_limit <= MAX_PAGE_LIMIT:
+        _invalid("%s: page_limit must be a whole number from 1 to %d" % (where, MAX_PAGE_LIMIT))
     return row
 
 

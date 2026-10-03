@@ -42,9 +42,10 @@ sets `pending`), which made all 14 of them fail before the code was restored.
 - **The admission store** (`reporter/admission_store.py`): the one module that holds the `admission` layout
   (reused later by the admission command) and the reader `read_bindings`, opened `mode=ro` with `query_only`.
   Missing, busy or unreadable means "read again later", never an error and never proof that a lease is unknown.
-- **State version 3** (`reporter/state.py`; migrates from 1 and 2 only): `receipt_source`, `receipt_cursor`,
-  `receipt_binding`, `receipt_capture`, `receipt_delivery` (all immutable), and `receipt_state` (the only mutable
-  table: `captured`, `quarantined`, `pending`, `sent`, `failed_permanent` with a closed reason). Stage 1
+- **State version 3** (`reporter/state.py`; migrates from 1 and 2 only): `receipt_source`, `receipt_binding`,
+  `receipt_capture` and `receipt_delivery` are immutable; `receipt_cursor` is updated as pages are taken (and is never
+  deleted); `receipt_state` is the table whose rows change status (`captured`, `quarantined`, `pending`, `sent`,
+  `failed_permanent`, with a closed reason). Stage 1
   (`capture_page`) and stage 2 (`release_waiting`) are each one `BEGIN IMMEDIATE`.
 - **Source ownership** (requirement 6): a source is a name plus the gateway it was bound to, for good. A capture
   freezes that gateway; release compares the binding with the frozen gateway, never with today's configuration.
@@ -63,6 +64,29 @@ sets `pending`), which made all 14 of them fail before the code was restored.
 - **Config**: `admission_store` (an absolute path) in `[gateway_receipts]`; fixed-sentence refusals as before.
 - **Fault points** (`run.py`, a test seam like the existing `answered` and `applied`): `read`, `captured`,
   `released`.
+
+## Fix round 1 (after the merge-gate read)
+
+Codex read the card at `a41b8e60` and found that the receipt intake keeps everything safely and survives crashes, but
+could stall, could misroute, was too lenient in two page checks and hid trouble with the admission store. This round
+fixes each finding; the numbers are Codex's.
+
+| Finding | What was wrong, in plain words | What it does now | Tests |
+| --- | --- | --- | --- |
+| F1 (major) fair release | the reporter looked at the oldest 500 unreleased receipts every cycle, so 500 that could never be released kept every newer one waiting for ever | new receipts are labelled in one statement; the ones with a record are released first; `wrong_gateway` and `duplicate_reference` are permanent and leave the selection (still counted in `status`); `unknown_reference` ones are re-checked through a rotating window after a cursor kept in the state, so every one is looked at again over time | `test_card7l6a1_state.FairRelease` (1,200 unknown ones then a late record; 650 wrong-gateway ones; duplicates; a window of 20 over 100 rows across restarts) |
+| F2 (major) source deadline | a slow source command, or one whose child kept its output open, could freeze every upload | ONE deadline covers reading, exit and cleanup; a reader thread; the command runs in its own process group (a job object on Windows, `reporter/proctree.py`) and on a timeout, on too much output and after every run the whole tree is ended by exact process id | `test_card7l6a1_adapter.Command` (a parent that exits while its child holds the output; a program that never stops; a writer that sends too much; a good run): each returns within the deadline plus 2 s and leaves no process |
+| F3 (major) relations | a damaged store could send one lease's receipt to another | before anything is copied, the reference must equal the lease id and the hash must be the SHA-256 of it; any mismatch refuses the whole read | `test_card7l6a1_admission_store` (the mismatching row), `test_card7l6a1_status.StoreTrouble` (through the whole reporter: nothing is copied or sent) |
+| F4 zero calls | `calls` = 0 with unknown counts was accepted | with no call, both counts and the money must be the number 0; the whole page is refused, nothing is captured, the cursor stays | `test_card7l6a1_adapter.Pages`, `test_card7l6a1_status.Report` |
+| F5 page limit | any page up to 1000 was accepted whatever was asked | a validated `page_limit` (1 to 1000, default 100); the reporter adds `--limit` itself (a command that names it is refused); a longer page is refused before anything is stored | adapter `Pages` and `Fixture`, `test_card7l6a1_config` |
+| F6 store trouble hidden | status said nothing about the admission store | `status` shows its current state (`ok`, `missing`, `busy`, `unreadable`, `history_limit`) and counts of past failures, in the JSON and the text, with a sentence for the ones that need you | `test_card7l6a1_status.StoreTrouble` |
+| F7 history limit | more than 100,000 granted rows meant "unreadable" | its own state `history_limit` with its own sentence. **The limit is exactly 100,000 granted rows: above it no new binding can be copied and later receipts stay unknown.** Reading only what is new is a prerequisite for live use and comes with card L6a-2 (a durable grant order value). Admissions are never to be deleted | `test_card7l6a1_admission_store`, `StoreTrouble` |
+| F8 exactly 200 | `201` counted as done | a settle succeeds only on `200`; any other 2xx is retried with the same bytes and shows `MALFORMED_RESPONSE` | `test_card7l6a1_delivery` |
+| F9 words | README and status text were wrong in six places | `gateway` not `ovh-gateway`; the 7c-2 state paragraph is marked historical; `receipt_cursor` is not immutable; an omitted `admission_store` setting versus a missing file; `RECEIPT_CONFLICT` has its own action ("look at the parked account"); "keeps its hold" says an advisory lease holds nothing | `StoreTrouble.test_a_receipt_conflict_...` |
+
+Honest note: F1 and F2 were designed against Codex's description; the new F2 process tests hang on the old reader (the
+orphan test was started against it and did not return within 100 seconds) and pass on the new one. The F1 design changed
+once while writing its tests: the first version labelled only 500 new captures a cycle, which made a late record for a
+capture not yet labelled wait several cycles; labelling is now one statement.
 
 ## Requirements 6 and 7 (DESIGN-6A 19.1), and the tests that prove them
 
@@ -101,13 +125,14 @@ idempotent replay.
 
 ## Tests
 
-Step 1 and 2 together, the L6a-1 files: adapter 37, admission store 15, state 34, delivery 21, config 22,
-status 26, end to end 15, privacy 6, crash 15 (191 in all). Step 2 added 11 status, 3 end to end and 15 crash tests.
+The L6a-1 files, after fix round 1: adapter 47, admission store 17, state 40, delivery 22, config 24, status 36,
+end to end 15, privacy 6, crash 15 (222 in all). Step 2 added 11 status, 3 end to end and 15 crash tests; fix round 1
+added 31 tests.
 
 ## Gates
 
-Memory free at the start: 9.5 GB. The full suite, in chunks each under 8 minutes, proven to cover every test file
-once (16 + 1 + 7 + 2 + 1 + 2 + 36 = 65 files, equal to the 65 `test_*.py` files):
+Memory free at the start of fix round 1: 8.5 GB. The full suite, in chunks each under 8 minutes, proven to cover every
+test file once (16 + 1 + 7 + 2 + 1 + 2 + 36 = 65 files, equal to the 65 `test_*.py` files):
 
 | Chunk | Tests |
 |---|---|
@@ -117,8 +142,8 @@ once (16 + 1 + 7 + 2 + 1 + 2 + 36 = 65 files, equal to the 65 `test_*.py` files)
 | `test_cardl6*.py` | 40 |
 | `test_cardr1*.py` | 16 |
 | `test_billing*.py` | 46 |
-| `test_card7*.py` | 718 (2 skipped, as before) |
-| **Total** | **1611** (equals the `discover` collection) |
+| `test_card7*.py` | 749 (2 skipped, as before) |
+| **Total** | **1642** (equals the `discover` collection) |
 
 `ruff --select F` is clean on the changed files.
 

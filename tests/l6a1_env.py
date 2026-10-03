@@ -70,7 +70,7 @@ def fixture_source(path, store=None, **over):
     row.gateway, row.gateway_id = GATEWAY_ALIAS, GATEWAY_ID
     row.admission_store = store or os.path.join(os.path.dirname(path or ".") or ".", "admission.db")
     row.fixture, row.command = path, None
-    row.timeout_seconds, row.max_bytes, row.env = 20, 1024 * 1024, ()
+    row.timeout_seconds, row.max_bytes, row.env, row.page_limit = 20, 1024 * 1024, (), 100
     for key, value in over.items():
         setattr(row, key, value)
     return row
@@ -105,8 +105,8 @@ def grant(conn, one, number=0):
         "INSERT INTO admission(agent, message_id, request_id, body_current, state, lease_id, gateway_id, reference,"
         " ref_sha256, ttl_seconds, expires_ms) VALUES(?,?,?,?, 'granted', ?,?,?,?,?,?)",
         (one.get("agent", "alpha"), one.get("message_id", "m%d-%s" % (number, uuid.uuid4().hex[:6])),
-         str(uuid.uuid4()), "{}", lease_id, one.get("gateway_id", GATEWAY_ID), lease_id,
-         mapper.lease_ref_hash(lease_id), 1800, one.get("expires_ms", int(time.time() * 1000) + 86_400_000)))
+         str(uuid.uuid4()), "{}", lease_id, one.get("gateway_id", GATEWAY_ID), one.get("reference", lease_id),
+         one.get("ref_sha256", mapper.lease_ref_hash(lease_id)), 1800, one.get("expires_ms", int(time.time() * 1000) + 86_400_000)))
 
 
 def add_binding(path, one):

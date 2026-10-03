@@ -11,6 +11,7 @@ part of the layout so that the writer has it, and is not touched by the reader.
 """
 
 import contextlib
+import hashlib
 import os
 import re
 import sqlite3
@@ -24,6 +25,7 @@ LATER = "later"
 STORE_MISSING = "store_missing"
 STORE_BUSY = "store_busy"
 STORE_UNREADABLE = "store_unreadable"
+STORE_HISTORY_LIMIT = "history_limit"      # more granted rows than one read may take (MAX_BINDINGS)
 
 # The layout (DESIGN-6A 8.6). One row per admitted message: the request (saved before anything is sent), its state
 # (`requested` until the grant is saved, then `granted`), the grant, and when the wrapper acknowledged the close.
@@ -97,7 +99,7 @@ def read_bindings(path):
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             return LATER, STORE_UNREADABLE
         rows = conn.execute(
-            "SELECT ref_sha256, lease_id, gateway_id, agent, message_id, expires_ms FROM admission"
+            "SELECT ref_sha256, lease_id, gateway_id, agent, message_id, expires_ms, reference FROM admission"
             " WHERE state='granted' ORDER BY id LIMIT ?", (MAX_BINDINGS + 1,)).fetchall()
     except sqlite3.OperationalError as exc:
         text = str(exc)
@@ -109,13 +111,18 @@ def read_bindings(path):
             with contextlib.suppress(sqlite3.Error):
                 conn.close()
     if len(rows) > MAX_BINDINGS:
-        return LATER, STORE_UNREADABLE
+        return LATER, STORE_HISTORY_LIMIT               # nothing is copied: no new binding can be taken (see README)
     found = []
-    for ref, lease_id, gateway_id, agent, message_id, expires_ms in rows:
+    for ref, lease_id, gateway_id, agent, message_id, expires_ms, reference in rows:
         if not (type(ref) is str and _HEX64.fullmatch(ref) and type(lease_id) is str and _UUID.fullmatch(lease_id)
                 and type(gateway_id) is str and _UUID.fullmatch(gateway_id) and type(agent) is str
                 and type(message_id) is str and type(expires_ms) is int):
             return LATER, STORE_UNREADABLE              # a damaged row is never half used
+        # The relations the receipt side relies on: the reference IS the lease id's own text, and the hash IS the
+        # SHA-256 of that text. A row where they disagree could send one lease's receipt to another lease, so the
+        # whole batch is refused (nothing is copied).
+        if reference != lease_id or ref != hashlib.sha256(lease_id.encode("ascii")).hexdigest():
+            return LATER, STORE_UNREADABLE
         one = Binding()
         one.ref_sha256, one.lease_id, one.gateway_id = ref, lease_id, gateway_id
         one.agent, one.message_id, one.expires_ms = agent, message_id, expires_ms

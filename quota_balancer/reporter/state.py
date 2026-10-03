@@ -20,6 +20,10 @@ SCHEMA_VERSION = 3       # 2: card 7c-2 added limit_event; 3: card L6a-1 added t
 LIMIT_AGENT = "_limit_events"
 # The same for a gateway receipt (card L6a-1): it belongs to one lease and to no seat and no message.
 RECEIPT_AGENT = "_gateway_receipts"
+RELEASE_BATCH = 500             # captures stage 2 works on in one cycle
+RELEASE_WINDOW = 5000           # unknown captures looked at (for a binding) in one cycle, after a rotating cursor
+RELEASE_CURSOR_NOTE = "receipt_release_cursor"
+PERMANENT_REASONS = ("wrong_gateway", "duplicate_reference")
 # Why a captured receipt is held back (never sent): no binding for its reference yet, a binding for another gateway
 # than its source's own, or a second receipt for one reference and generation.
 QUARANTINE_REASONS = ("unknown_reference", "wrong_gateway", "duplicate_reference")
@@ -474,25 +478,58 @@ class State:
         self.conn.execute("UPDATE receipt_state SET state='pending', reason=NULL, last_error_code=NULL"
                           " WHERE capture_id=?", (capture_id,))
 
-    def release_waiting(self, now_ms, limit=500):
-        """Stage 2: look again at every capture that is not yet released (`captured` or `quarantined`). Each one is
+    def _release_candidates(self):
+        """The captures stage 2 looks at in this cycle, fair and bounded (card L6a-1 fix round 1):
+
+        * every capture still `captured` (new, never looked at) that has a binding, at most RELEASE_BATCH of them
+          (the new ones WITHOUT a binding were just labelled `unknown_reference`, all at once, by one statement);
+        * then a rotating WINDOW of the `unknown_reference` ones: at most RELEASE_WINDOW rows after a cursor that is
+          kept in the state (so it survives a restart), of which the ones whose reference now HAS a binding come
+          first, at most RELEASE_BATCH. The cursor moves on to the end of the window and wraps to the start, so
+          every unknown capture is looked at again over time, however many there are.
+
+        `wrong_gateway` and `duplicate_reference` captures are permanent (a binding is immutable, so neither can
+        ever become releasable): they leave the selection and stay visible in the status counts."""
+        with self.txn():
+            self.conn.execute(
+                "UPDATE receipt_state SET state='quarantined', reason='unknown_reference' WHERE state='captured'"
+                " AND NOT EXISTS (SELECT 1 FROM receipt_capture c JOIN receipt_binding b ON b.ref_sha256=c.ref_sha256"
+                " WHERE c.id=receipt_state.capture_id)")
+        fresh = [row[0] for row in self.all(
+            "SELECT capture_id FROM receipt_state WHERE state='captured' ORDER BY capture_id LIMIT ?",
+            (RELEASE_BATCH,))]
+        note = self.note(RELEASE_CURSOR_NOTE)
+        cursor = int(note[0]) if note is not None and note[0].isdigit() else 0
+        window = [row[0] for row in self.all(
+            "SELECT capture_id FROM receipt_state WHERE state='quarantined' AND reason='unknown_reference'"
+            " AND capture_id>? ORDER BY capture_id LIMIT ?", (cursor, RELEASE_WINDOW))]
+        bound = []
+        for capture_id in window:
+            if len(bound) >= RELEASE_BATCH:
+                break
+            if self.one("SELECT 1 FROM receipt_capture c JOIN receipt_binding b ON b.ref_sha256=c.ref_sha256"
+                        " WHERE c.id=?", (capture_id,)):
+                bound.append(capture_id)
+        next_cursor = window[-1] if len(window) == RELEASE_WINDOW else 0       # the end of the list: start over
+        return fresh + [one for one in bound if one not in fresh], next_cursor
+
+    def release_waiting(self, now_ms):
+        """Stage 2: look at the captures that are not yet released (`_release_candidates` says which). Each one is
         its own `BEGIN IMMEDIATE`. A binding that matches the capture's FROZEN gateway creates the immutable
         delivery body and sets `pending` together or not at all; no binding is `unknown_reference`; a binding for
         another gateway is `wrong_gateway`; a second capture of one reference and generation is
         `duplicate_reference`. None of these ever creates a sendable body. -> the number released."""
-        ids = [row[0] for row in self.all(
-            "SELECT capture_id FROM receipt_state WHERE state IN ('captured','quarantined') ORDER BY capture_id"
-            " LIMIT ?", (limit,))]
+        ids, next_cursor = self._release_candidates()
         released = 0
         for capture_id in ids:
             with self.txn():
                 row = self.one(
                     "SELECT s.state, c.gateway_id, c.generation, c.seq, c.ref_sha256, c.outcome, c.calls,"
-                    " c.input_tokens, c.output_tokens, c.actual_micro_eur FROM receipt_capture c"
+                    " c.input_tokens, c.output_tokens, c.actual_micro_eur, s.reason FROM receipt_capture c"
                     " JOIN receipt_state s ON s.capture_id=c.id WHERE c.id=?", (capture_id,))
-                if row[0] not in ("captured", "quarantined"):
+                if row[0] not in ("captured", "quarantined") or row[10] in PERMANENT_REASONS:
                     continue
-                (_state, frozen, generation, seq, ref, outcome, calls, tokens_in, tokens_out, money) = row
+                (_state, frozen, generation, seq, ref, outcome, calls, tokens_in, tokens_out, money, _why) = row
                 binding = self.one("SELECT lease_id, gateway_id FROM receipt_binding WHERE ref_sha256=?", (ref,))
                 reason = None
                 if binding is None:
@@ -515,6 +552,8 @@ class State:
                 if reason is not None:
                     self.conn.execute("UPDATE receipt_state SET state='quarantined', reason=? WHERE capture_id=?",
                                       (reason, capture_id))
+        with self.txn():
+            self.set_note(RELEASE_CURSOR_NOTE, str(next_cursor), now_ms)
         return released
 
     def next_receipt_item(self, now_ms):

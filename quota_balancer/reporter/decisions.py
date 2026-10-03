@@ -91,13 +91,17 @@ def decide(kind, response, rebuilds=0):
         return Decision(FAIL, code)
     if kind == RECEIPT:
         # A gateway's final receipt belongs to one lease and to no agent: nothing it is answered
-        # can stop an agent, rebuild or drop. 200 is settled (a replay of the same event is a 200
+        # can stop an agent, rebuild or drop. Only 200 is settled (a replay of the same event is a 200
         # too). LEASE_CLOSED is NOT a "done" word: a settle never answers it (only a lease check
         # does), so seeing it is an unexpected, permanent failure of THIS row like every other
         # refusal (DESIGN-6A 8.4). A refusal never erases the stored receipt and never stops
         # another row or pass.
-        if status in (200, 201):
+        if status == 200:
             return Decision(DONE)
+        if 200 < status < 300:
+            # A settle succeeds ONLY on 200. Any other success status is not an answer this reporter knows, so it
+            # is treated like an unreadable 2xx: the same bytes are sent again, and the word stays visible.
+            return Decision(RETRY, MALFORMED_RESPONSE)
         return Decision(FAIL, code or UNKNOWN_CODE)
     if status in (200, 201):
         return Decision(DONE)

@@ -12,19 +12,19 @@ import sqlite3
 import unittest
 from unittest import mock
 
-from quota_balancer.reporter import receipts, status
+from quota_balancer.reporter import admission_store, receipts, status
 
 from quota_balancer.reporter import mapper
 
-from tests.l6a1_env import (GATEWAY_ALIAS, GATEWAY_ID, GENERATION_B, OTHER_GATEWAY_ID, configure, ledger, lease,
-                            receipt, write_json)
+from tests.l6a1_env import (GATEWAY_ALIAS, GATEWAY_ID, GENERATION_B, OTHER_GATEWAY_ID, configure, grant, ledger, lease,
+                            make_store, receipt, write_json)
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
 from tests.test_card7l6a1_delivery import Net, error
 
 NOTE = ("Cached input is reported as 0: the gateway records none, so 0 is not proof that none was used.")
 OBJECT_KEYS = {"configured", "gateway", "last_seq", "last_read", "last_read_result", "stored", "rows", "failed",
-               "quarantine", "quarantine_action", "generation_changes", "awaiting_receipt", "overdue", "read_later",
+               "quarantine", "quarantine_action", "admission_store", "generation_changes", "awaiting_receipt", "overdue", "read_later",
                "refused", "read_fault", "last_ok", "cached_input"}
 
 
@@ -108,6 +108,16 @@ class Report(_Status):
         self.assertEqual(object_["quarantine"], {"unknown_reference": 1, "wrong_gateway": 0, "duplicate_reference": 0})
         self.assertTrue(any("quarantined" in line for line in reporter.report()["operator_actions"]))
         self.assertEqual(self.rig.net.calls, [])
+
+    def test_a_zero_call_receipt_with_unknown_counts_refuses_the_whole_page_and_the_cursor_stays(self):
+        """F4: with no call, null is not zero. Nothing is captured, nothing moves, and the word is counted."""
+        reporter = self.reporter(rows=[receipt(lease(), 1), receipt(lease(), 2, calls=0, input_tokens=None,
+                                                                    output_tokens=None, actual_micro_eur=0)])
+        reporter.cycle()
+        object_ = reporter.report()["gateway_receipts"]
+        self.assertEqual((object_["last_seq"], object_["stored"], object_["refused"]["bad_row"]), (0, 0, 1))
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_capture")[0], 0)
+        self.assertEqual(self.rig.state.current_cursor(1), (None, 0))
 
     def test_a_source_that_is_not_there_is_counted_as_read_later_and_a_bad_one_as_refused(self):
         reporter = self.reporter()
@@ -276,6 +286,131 @@ class Custody(_Status):
         for key in ("quarantine_action", "generation_changes", "awaiting_receipt", "overdue"):
             del report["gateway_receipts"][key]
         self.assertIn("gateway receipts: last seq 0", status.render_text(report))
+
+
+class StoreTrouble(_Status):
+    """F6 and F7: trouble with the admission store is visible, as a closed current state and counts of past failures,
+    in the JSON and in the text. No path, no exception text. The state goes back to `ok` after a good read."""
+
+    def setUp(self):
+        super().setUp()
+        self.one = lease()
+        self.store = os.path.join(self.rig.ws.dir, "admission.db")
+        self.fixture = configure(self.rig, [receipt(self.one, 1)], store=self.store, bindings=[self.one])
+        self.reporter = self.rig.open(transport=Net())
+
+    def shown(self):
+        report = self.reporter.report()
+        text = status.render_text(report)
+        return report["gateway_receipts"]["admission_store"], text, report
+
+    def test_before_the_first_read_there_is_no_state_and_after_a_good_read_it_is_ok(self):
+        state, text, _report = self.shown()
+        self.assertEqual(state["state"], None)
+        self.assertIn("admission store: not read yet", text)
+        self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual(state, {"state": "ok", "failures": {"missing": 0, "busy": 0, "unreadable": 0,
+                                                              "history_limit": 0}})
+        self.assertIn("admission store: ok", text)
+        self.assertEqual(report["operator_actions"], [])
+
+    def test_a_missing_store_is_shown_then_recovers(self):
+        os.rename(self.store, self.store + ".away")
+        self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual((state["state"], state["failures"]["missing"]), ("missing", 1))
+        self.assertIn("admission store: missing", text)
+        self.assertTrue(any("not there" in line for line in report["operator_actions"]))
+        os.rename(self.store + ".away", self.store)
+        self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual((state["state"], state["failures"]["missing"]), ("ok", 1))        # back to ok; the past stays
+        self.assertIn("admission store: ok", text)
+        self.assertEqual(report["operator_actions"], [])
+
+    def test_a_busy_store_is_shown_as_a_wait_not_a_fault_then_recovers(self):
+        writer = sqlite3.connect(self.store, isolation_level=None)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN EXCLUSIVE")
+        self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual((state["state"], state["failures"]["busy"]), ("busy", 1))
+        self.assertIn("admission store: busy", text)
+        self.assertFalse(set(status.STORE_ACTIONS.values()) & set(report["operator_actions"]))      # a wait asks for nothing
+        writer.execute("ROLLBACK")
+        self.reporter.cycle()
+        self.assertEqual(self.shown()[0]["state"], "ok")
+
+    def test_a_malformed_store_is_shown_then_recovers(self):
+        with open(self.store, "wb") as handle:
+            handle.write(b"this is not a database")
+        self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual((state["state"], state["failures"]["unreadable"]), ("unreadable", 1))
+        self.assertIn("admission store: unreadable", text)
+        self.assertTrue(any("cannot be used" in line for line in report["operator_actions"]))
+        os.remove(self.store)
+        make_store(self.store, [self.one])
+        self.reporter.cycle()
+        self.assertEqual(self.shown()[0]["state"], "ok")
+
+    def test_a_row_that_does_not_belong_to_its_lease_makes_the_store_unreadable_and_nothing_is_ever_sent(self):
+        """F3 through the whole reporter: one lease's reference and hash on another lease's row."""
+        other = lease()
+        os.remove(self.store)
+        make_store(self.store, [])
+        conn = sqlite3.connect(self.store, isolation_level=None)
+        grant(conn, {"lease_id": other, "reference": self.one, "ref_sha256": mapper.lease_ref_hash(self.one)}, 1)
+        conn.close()
+        self.reporter.cycle()
+        self.reporter.cycle()
+        self.assertEqual(self.shown()[0]["state"], "unreadable")
+        self.assertEqual(self.rig.net.calls, [])                                          # no settle, to anyone
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_binding")[0], 0)
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_delivery")[0], 0)
+
+    def test_more_granted_rows_than_can_be_read_is_its_own_state_with_its_own_sentence(self):
+        with mock.patch.object(admission_store, "MAX_BINDINGS", 0):
+            self.reporter.cycle()
+        state, text, report = self.shown()
+        self.assertEqual((state["state"], state["failures"]["history_limit"]), ("history_limit", 1))
+        self.assertIn("admission store: history_limit", text)
+        action = [line for line in report["operator_actions"] if "more granted rows" in line]
+        self.assertTrue(action)
+        self.assertIn("never delete admissions", action[0])
+        self.assertEqual(self.rig.state.one("SELECT COUNT(*) FROM receipt_binding")[0], 0)   # no new binding is copied
+        self.reporter.cycle()                                                                # the limit is gone: ok
+        self.assertEqual(self.shown()[0]["state"], "ok")
+
+    def test_nothing_in_the_state_names_a_path_or_a_fault(self):
+        os.rename(self.store, self.store + ".away")
+        self.reporter.cycle()
+        _state, text, report = self.shown()
+        shown = json.dumps(report, sort_keys=True) + text
+        for private in (self.rig.ws.dir, "admission.db", "sqlite", "Traceback"):
+            self.assertNotIn(private, shown)
+        self.assertEqual(set(report["gateway_receipts"]["admission_store"]), {"state", "failures"})
+
+    def test_the_command_shows_it_too(self):
+        os.rename(self.store, self.store + ".away")
+        self.reporter.cycle()
+        self.rig.close()
+        code, out, err = cli(["status", "--config", self.rig.ws.config, "--json"], permissions=lambda p: None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out)["gateway_receipts"]["admission_store"]["state"], "missing")
+        code, text, _err = cli(["status", "--config", self.rig.ws.config], permissions=lambda p: None)
+        self.assertIn("admission store: missing", text)
+
+    def test_a_receipt_conflict_has_its_own_action_that_names_the_parked_account(self):
+        self.rig.close()
+        net = Net(receipt=[error("RECEIPT_CONFLICT", 409)])
+        reporter = self.rig.open(transport=net)
+        reporter.cycle()
+        report = reporter.report()
+        lines = [line for line in report["operator_actions"] if "conflict" in line]
+        self.assertTrue(lines)
+        self.assertIn("parked account", lines[0])
 
 
 class Command(_Status):

@@ -6,10 +6,12 @@ and these tests build from. The reader opens the file read-only and a missing, b
 again later": it never raises and never writes. Synthetic data only.
 """
 
+import hashlib
 import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from quota_balancer.reporter import admission_store as store
 
@@ -97,6 +99,29 @@ class Reader(_Dir):
                          [(one, GATEWAY_ID, "alpha"), (two, OTHER_GATEWAY_ID, "beta")])
         self.assertEqual(len(found[0].ref_sha256), 64)
         self.assertNotIn(one, repr(found[0]) + str(found[0]))
+
+    def test_a_row_whose_reference_or_hash_does_not_belong_to_its_lease_is_refused_as_a_whole_batch(self):
+        """F3: lease A's reference and hash on lease B's row (the case that could send A's receipt to B)."""
+        one, other, good = lease(), lease(), lease()
+        make_store(self.path, [good])
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        grant(conn, {"lease_id": other, "reference": one, "ref_sha256": hashlib.sha256(one.encode()).hexdigest()}, 5)
+        conn.close()
+        self.assertEqual(store.read_bindings(self.path), (store.LATER, store.STORE_UNREADABLE))      # copies nothing
+        for field, value in (("reference", lease()), ("ref_sha256", hashlib.sha256(b"x").hexdigest())):
+            with self.subTest(field=field):
+                path = make_store(os.path.join(self._dir.name, field + ".db"), [good])
+                conn = sqlite3.connect(path, isolation_level=None)
+                grant(conn, dict({"lease_id": lease()}, **{field: value}), 6)
+                conn.close()
+                self.assertEqual(store.read_bindings(path), (store.LATER, store.STORE_UNREADABLE))
+
+    def test_more_granted_rows_than_one_read_may_take_is_its_own_closed_state_and_copies_nothing(self):
+        make_store(self.path, [lease() for _ in range(4)])
+        with mock.patch.object(store, "MAX_BINDINGS", 3):
+            self.assertEqual(store.read_bindings(self.path), (store.LATER, store.STORE_HISTORY_LIMIT))
+        with mock.patch.object(store, "MAX_BINDINGS", 4):
+            self.assertEqual(store.read_bindings(self.path)[0], store.OK)                          # exactly the limit
 
     def test_an_empty_store_is_ok_with_no_bindings(self):
         make_store(self.path)
