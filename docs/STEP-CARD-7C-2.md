@@ -2,7 +2,7 @@
 
 Work item `card-7c-2`. Branch `card-7c-2`, from main `da91e1f`. Contract:
 `C:\lw\records\DESIGN-7C2.md` (the lead's decisions in its section 15 win). This record grows one
-step at a time; steps 1 to 3 of 4 are below.
+step at a time; all four steps and the fix rounds are below. **Card 7c-2 is built.**
 Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only. Audience: the lead and the reviewers.
 
 ## In plain words
@@ -372,3 +372,87 @@ Two limits in the park-file reader were not real limits yet, and one README sent
 
 Codex's probes (`test_7c2_step3_review_probes.py`, copied into scratch, never edited): 18 of 18 pass,
 including the two that failed.
+
+## Step 4: the wait cap, status, README, privacy and the end-to-end test
+
+Built on step 3 fix round 1 (`c1e1d93`), in small commits: wait cap, status, README, privacy and end to
+end, this record.
+
+### In plain words
+
+After this step an operator can see in `reporter status` that limit events are on and what they are
+doing, and the status says plainly, in the words claude-agenttalk-lead approved, that capture is best
+effort. The README explains the feature and its limits in one section. While limit capture is on, the
+reporter never waits more than 60 seconds between looks. One end-to-end test proves the whole path: a
+park file, the reporter, the real Leasewise handler, and the account parked until the reset plus 30
+seconds.
+
+### What changed
+
+- **The wait cap (D5, `run.py`).** While limit capture is configured the wait between cycles is at
+  most 60 seconds (`LIMIT_CAPTURE_MAX_WAIT_SECONDS`), even while Leasewise is not answering (it could
+  be 900) and even if `poll_seconds` is set higher. Without limit sources the wait is exactly as before.
+- **Status version 2 (D3, `status.py`).** A top-level `limit_events` object: `configured`; the account
+  map in use as the operator wrote it (an OS-user label, the provider, an account alias, so the map can
+  be checked: the only defence against R-011); the last scan's counts, including `too_many_entries`;
+  `captured` (cumulative); the numbers of pending, sent and failed rows; failed rows by closed code;
+  `capture_fault` as a count and a time; the time of the last good delivery; and the best-effort
+  sentence. `render_text` prints one line, `limit events (best effort): <sentence>`, when limit events
+  are configured and nothing when not. A failed limit event and a capture fault each add an operator
+  action. Closed words and counts only. The existing test that pins the status keys gained
+  `limit_events`.
+- **The gap sentence (R-012).** `status.LIMIT_GAP`, word for word as approved, is byte-identical in the
+  status and the README (a test checks it). It names what closes the gap: a permanent "parked" record in
+  agenttalk's turn journal, a later agenttalk change after pull request #300 merges, together with Codex
+  limit events.
+- **The README.** The step 1 to 3 notes are merged into one "Card 7c-2 - limit events" section: what it
+  does in plain words, how to set it up, what is read, the limits, and a short technical detail.
+- **The test rig.** `tests/reporter_env.py` `Rig.open` resolves the account map the way the command
+  does.
+
+### Tests (`tests/test_card7c2_*.py`; 35 new in this step)
+
+| File | What it proves |
+| --- | --- |
+| `test_card7c2_wait.py` (5) | the 60-second cap with limit sources, even in a long outage and with a slow poll setting; without sources the wait is as before |
+| `test_card7c2_status.py` (12) | version 2; the closed shape; not configured says so and carries no gap; the map in use; the sentence verbatim and exactly one text line; counts after a capture and a delivery; the scan counts describe the last scan only; a refused row by closed word with an operator action; a capture fault as a count and a time; pending while Leasewise is down; the command; a running reporter's snapshot |
+| `test_card7c2_readme.py` (7) | the sentence byte-identical in the README and the status; one section with every limit; plain words before technical detail; no stale sentences; the TOML example is a valid block |
+| `test_card7c2_privacy.py` (5), **privacy_7c2** | loud markers in every string field of a marker, a loud folder, torn, refused and denied files and a loud server answer: none appears in the wire, the stored rows, the status JSON and text, the notes, the counters, the logs or anything the command prints; the wire body has exactly the allow-listed keys; a canary shows the search would notice a leak |
+| `test_card7c2_e2e.py` (6) | against the real in-process Leasewise handler: the account is parked with `retry_at` = reset + 30 000 ms and the raw reset kept; a second cycle sends nothing; a second seat adds no event; a later reset moves the hold; a parked account refuses leases while the limit event still got through; a restart loses and repeats nothing |
+
+Red first: the wait, status and README tests were run before their code (wait 5 tests, 1 failure and 1
+error; status 12 tests, 3 failures and 9 errors; README 7 tests, 3 failures and 2 errors). The privacy
+and end-to-end tests describe code that already existed; to show they have teeth I ran deliberate
+faults against them and the sentence, version and wait tests (the margin set to zero, capture not wired,
+the seat in the event key, the sentence changed, the status version left at 1, the cap at 600): every
+one made tests fail.
+
+### What exists now
+
+- **Leasewise:** a limit event parks the account until the reset plus 30 seconds; the raw reset is kept;
+  replays are pure reads and keep the old domain; `policy-ids` lists accounts.
+- **The reporter:** the account map and its checks; the strict park-file reader; one frozen event per
+  account and limit; a durable queue with its own pass, sent first; capture in every cycle with a
+  60-second cap; status version 2 with the gap sentence.
+- **Evidence:** the full suite at the end of step 4 is 1,353 tests in three chunks (454 + 383 + 516,
+  all passing, 2 skipped), equal to the `discover` collection and covering all 52 test files once; the
+  end-to-end test; the privacy test; and the fix rounds' reviews by Codex.
+
+### Residual risks (stated, not hidden)
+
+- **R-011, the map is trusted.** If someone signs a different account into the same OS user, the map is
+  wrong until the operator edits it, and the reporter cannot see the switch.
+- **R-012, best effort.** A park that starts and ends while the reporter is not running, or between two
+  looks, is never reported. It closes with agenttalk's permanent "parked" record in its turn journal.
+- **One outbox, one memory.** A recreated state file, or two reporters with one `machine` alias, can
+  give a `409` that fails that event for good.
+- **256 entries.** In a folder with more than 256 entries some markers may not be seen in that scan.
+- **No recovery yet (card 7c-3).** Leasewise never un-parks an account by itself; an operator clears the
+  block. A reset already in the past still parks, with a `retry_at` in the past.
+- **Advisory until R1.** A missed event costs a missing warning, not a wrong refusal.
+- **Claude only.** Codex limit events wait for agenttalk's Codex producer (agenttalk 7c-1c).
+
+### What is next
+
+Card 7c-3 (recovery: a coordinated probe and the way a parked block ends) and card 7b (readings, after
+agenttalk issue #301). The agenttalk journal record that closes R-012 is a later agenttalk change.

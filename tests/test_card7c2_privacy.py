@@ -13,7 +13,6 @@ Synthetic data only.
 import json
 import logging
 import os
-import sqlite3
 import time
 import unittest
 from unittest import mock
@@ -84,7 +83,6 @@ class Privacy(unittest.TestCase):
         self.put(LOUD["torn"], raw=('{"agent": "%s", ' % LOUD["torn"]).encode())
         self.put(LOUD["refused"], dict(marker(agent=LOUD["refused"], now_ms=now), **{LOUD["refused"]: LOUD["refused"]}))
         self.put(LOUD["denied"], marker(agent=LOUD["denied"], now_ms=now))
-        seen = []
         net = Net(limit=[(202, {"block_id": "x", "retry_at": None, "state": "parked"})])
         reporter = self.rig.open(transport=net)
         from tests.test_card7c2_capture import source
@@ -179,7 +177,6 @@ class Privacy(unittest.TestCase):
         counters = self.rig.state.all("SELECT agent, name FROM counter WHERE agent='_limit_events'")
         for _agent, name in counters:
             self.assertRegex(name, r"^(captured|capture_fault|scan:[a-z_]+)$")                # closed words only
-        self.assertIsInstance(sqlite3.apilevel, str)
 
 
 if __name__ == "__main__":

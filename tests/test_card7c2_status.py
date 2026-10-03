@@ -8,13 +8,12 @@ agent name, a message id, a parsed value or exception text. Synthetic data only.
 import json
 import os
 import unittest
-import uuid
 
 from quota_balancer.reporter import capture, status
 
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
-from tests.test_card7c2_capture import ACCOUNT_ID, source
+from tests.test_card7c2_capture import source
 from tests.test_card7c2_delivery import Net
 from tests.test_card7c2_reader import marker
 
