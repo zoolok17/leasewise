@@ -9,7 +9,8 @@ lead and the reviewers.
 
 (Step 2, the runner, follows below; the path rules of step 1 were tightened in step 2, see there.)
 
-Status: **built**. Steps 2 (the Windows runner) and 3 (wiring into the reporter and the status) are not built.
+Status when step 1 was written (historical): steps 2 (the Windows runner) and 3 (wiring into the reporter and the status)
+were not yet built. All three steps are built and merged; see the sections below.
 
 ### In plain words
 
@@ -158,7 +159,8 @@ the old forward-slash acceptance fail the new cases).
 - Windows only; other systems refuse a `command` at start-up (step 1).
 - The deadline is cooperative (see the notes above); the receipt-reading bound per cycle is
   `max(timeout_seconds, 30) + timeout_seconds + 2 s`, about 52 s at the default (step 3 enforces and tests it).
-- A launcher that exits before the real program is `leftover_process` or `exit_code`, and the work is ended.
+- A first program that only starts the real one and exits is `leftover_process` (or `exit_code` when it failed), and the work
+  it started is ended: `command` must name the real program.
 - Helpers started through another Windows service are outside any job. A drive letter mapped to remote storage is not detected.
 - No memory or processor limits in the job, only a limit on the number of processes (32).
 
@@ -249,3 +251,21 @@ Red first: against the previous runner, 4 of the 6 fail (the three lifetime test
 the helper test, which got `ok` with 2 MB of output). The handshakes are files the programs write and handles the test keeps,
 not sleeps.
 
+## Follow-up: wording, the test tool, and one precondition
+
+In plain words: no behaviour changed. Three small things were put right after Codex's last read.
+
+- **The reporter must run as the same operating-system user as the gateway.** The receipt command reads that user's own
+  ledger and credential file. The operator's `env` table will need that user's application-data variable. The names and
+  paths of the receipt command's own settings are not written here: they are provisional until agenttalk's change for them is
+  merged. The README ("A command source") says the same.
+- **The test tool no longer guesses (N2).** In `test_card7l6a1b_runner.py` a "ready" path that is also a process marker now
+  counts as ready only once the marker has been read and its process handle is retained; plain existence counts only for paths
+  that name no process. A new test makes the opening of the marker fail on purpose and shows that neither the readiness nor its
+  callback fires until the handle is held (red against the old rule: 1 of 2 new tests fails). This may also be the cause of
+  the one flaky run seen earlier in `test_an_unrelated_inheritable_handle_does_not_reach_the_program`; that is not proven.
+- **The deadline answer (N1).** The real-clock test in `test_card7l6a1b_https.py` accepts exactly one of `store_busy` or
+  `coordinator_unreachable`, because a transport failure just before the deadline is the second one (with the normal
+  back-off); both keep the saved request. A new test with a controlled clock pins the exact deadline answer, `store_busy`.
+- **Wording (N3).** The runner, its test, `receipts.py` and the README no longer say the reporter does not call the runner, and
+  the launcher limit now says what happens and what to do.

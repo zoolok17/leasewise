@@ -1,4 +1,4 @@
-"""Card L6a-1b, step 2: the contained Windows runner (`quota_balancer/reporter/runner.py`). The reporter does not call it yet.
+"""Card L6a-1b, step 2: the contained Windows runner (`quota_balancer/reporter/runner.py`), which the reporter's receipt reading calls when a `command` source is configured.
 
 What is proven here, with real processes (small scripts that the tests write, run by the base Python; never agenttalk, never a
 gateway):
@@ -138,11 +138,14 @@ def wait_for(path, seconds=10.0):
 
 class Probe:
     """A `stop` object that also keeps handles on the processes named in marker files as soon as they appear (so liveness is
-    checked through a retained handle), and can run a check at that moment. `is_set` answers True once `ready` markers are
-    all there and `then` has run, so a read can be ended on purpose."""
+    checked through a retained handle), and can run a check at that moment. `is_set` answers True once every `ready` path
+    is ready and `then` has run, so a read can be ended on purpose. A ready path that is also a marker (it names a process)
+    is ready only once its handle is retained: the file existing is not enough, because the file may not have been read yet.
+    A ready path that names no process is ready when it exists. `opener` is the way a marker is opened (a test can make it
+    fail)."""
 
-    def __init__(self, markers=(), ready=None, then=None):
-        self.markers, self.ready, self.then = list(markers), ready, then
+    def __init__(self, markers=(), ready=None, then=None, opener=open):
+        self.markers, self.ready, self.then, self.opener = list(markers), ready, then, opener
         self.watches = {}
         self.fired = False
 
@@ -150,18 +153,23 @@ class Probe:
         for path in self.markers:
             if path not in self.watches and os.path.exists(path):
                 try:
-                    with open(path, encoding="ascii") as handle:
+                    with self.opener(path, encoding="ascii") as handle:
                         text = handle.read()
                 except OSError:
                     continue                                    # the program is replacing the file right now: look again
                 if text:
                     self.watches[path] = Watch(int(text))
-        if self.ready and all(path in self.watches or os.path.exists(path) for path in self.ready) and not self.fired:
+        if self.ready and not self.fired and all(self._is_ready(path) for path in self.ready):
             self.fired = True
             if self.then:
                 self.then()
             return True
         return False
+
+    def _is_ready(self, path):
+        if path in self.markers:
+            return path in self.watches
+        return os.path.exists(path)
 
     def close(self):
         for watch in self.watches.values():
@@ -786,6 +794,41 @@ print(json.dumps({"assigned": assigned, "word": result.word, "confirmed": result
         if not answer["assigned"]:
             self.skipTest("this machine does not allow the helper to join a job of its own")
         self.assertEqual((answer["word"], answer["confirmed"], answer["data"]), (runner.OK, True, PAGE))
+
+
+@unittest.skipUnless(WINDOWS, "the runner is for Windows only")
+class ProbeReadiness(unittest.TestCase):
+    """The test tool itself: a marker that names a process is ready only once it has been read and its handle retained."""
+
+    def test_a_marker_that_could_not_be_opened_is_not_ready_and_its_callback_does_not_run(self):
+        with tempfile.TemporaryDirectory(prefix="quota-l6a1b-probe-") as folder:
+            marker = os.path.join(folder, "up.pid")
+            with open(marker, "w", encoding="ascii") as handle:
+                handle.write(str(os.getpid()))
+            failures, ran = [2], []
+
+            def opener(path, **kwargs):
+                if failures[0]:
+                    failures[0] -= 1
+                    raise PermissionError("the program is replacing the file right now")
+                return open(path, **kwargs)
+            probe = Probe(markers=[marker], ready=[marker], then=lambda: ran.append(sorted(probe.watches)), opener=opener)
+            self.addCleanup(probe.close)
+            self.assertFalse(probe.is_set())                          # the file exists, but it could not be read
+            self.assertFalse(probe.is_set())
+            self.assertEqual((probe.watches, ran, probe.fired), ({}, [], False))
+            self.assertTrue(probe.is_set())                           # read at last: handle retained, then ready
+            self.assertEqual(ran, [[marker]])                         # and the callback saw the retained handle
+            self.assertFalse(probe.is_set())                          # it fires once
+
+    def test_a_ready_path_that_names_no_process_is_ready_when_it_exists(self):
+        with tempfile.TemporaryDirectory(prefix="quota-l6a1b-probe-") as folder:
+            plain = os.path.join(folder, "go")
+            probe = Probe(ready=[plain])
+            self.assertFalse(probe.is_set())
+            with open(plain, "w", encoding="ascii") as handle:
+                handle.write("x")
+            self.assertTrue(probe.is_set())
 
 
 class Environment(unittest.TestCase):

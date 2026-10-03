@@ -19,7 +19,7 @@ from quota_balancer.reporter import admit
 from quota_balancer.reporter import admit_wire as wire
 from quota_balancer.reporter.client import HttpClient
 
-from tests.l6a2_env import Rigged, admission_block, request_bytes
+from tests.l6a2_env import FakeClock, Rigged, Script, admission_block, request_bytes
 
 BOUND = 1.0                      # the measured overrun is a few milliseconds; the test allows this much cleanup
 
@@ -159,10 +159,25 @@ class Handshake(unittest.TestCase):
             code, out, err = rg.run(request_bytes(), None)
             elapsed = time.monotonic() - started
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual(wire.parse_answer(out), {"reason": "store_busy", "status": "held", "v": 1})
+        # A transport failure just before the deadline is `coordinator_unreachable` (with the normal back-off); one just
+        # after it is `store_busy`. Real time decides which, so exactly one of the two is accepted here; the exact
+        # deadline answer is pinned with a controlled clock below.
+        self.assertIn(wire.parse_answer(out), [{"reason": "store_busy", "status": "held", "v": 1},
+                                               {"reason": "coordinator_unreachable", "status": "held", "v": 1}])
         self.assertLess(elapsed, 2.0 + BOUND)
         self.assertEqual(rg.sql("SELECT state FROM admission"), [("requested",)])   # saved before it was sent; recoverable
         self.assertNotIn(b"POST", peer.received)
+
+    def test_a_deadline_used_up_during_the_exchange_is_exactly_store_busy_and_keeps_the_request(self):
+        rg = Rigged()
+        self.addCleanup(rg.cleanup)
+        clock = FakeClock()
+        script = Script(Exception("no answer"), on_call=lambda index, key, body: clock.advance(admit.TOTAL_SECONDS + 1))
+        code, out, err = rg.run(request_bytes(), script, **clock.seams())
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(wire.parse_answer(out), {"reason": "store_busy", "status": "held", "v": 1})
+        self.assertEqual(len(script.calls), 1)
+        self.assertEqual(rg.sql("SELECT state FROM admission"), [("requested",)])
 
 
 if __name__ == "__main__":

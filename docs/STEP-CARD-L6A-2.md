@@ -358,6 +358,9 @@ and with a peer that answers it a byte at a time, the call ends at the deadline 
 fix the first of these took 3.61 s. The whole `admit` route answers `held` with `store_busy` and the row stays `requested`.
 Not covered, and local: building the certificate settings (about 50 ms) and checking the certificate.
 
+**Which answer at the deadline.** A transport failure just before the deadline can be answered `coordinator_unreachable` (with the normal back-off) instead of `store_busy`; which one it is depends on which side of the deadline the failure lands. Both answers keep the saved request. The real-clock test for the whole route therefore accepts exactly one of
+the two answers, and a separate test with a controlled clock pins the exact deadline answer (`store_busy`).
+
 **Tests** (`test_card7l6a1b_https.py`, 5; no certificate is needed because the peers speak no real TLS). Red first: against
 the previous client, 2 of the 5 fail (3.61 s and 3.63 s against a 2 s budget) and pass now. They cover the late connection, a
 peer that accepts late and stays silent, a peer that answers a byte at a time, a deadline that passes during the connection (the
