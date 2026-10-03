@@ -14,6 +14,15 @@ from . import decisions, mapper
 SCHEMA_VERSION = 1
 
 
+# Facts about the reporter itself, kept in the `note` table (see _NOTE_DDL).
+NOTE_LAST_401 = "last_401"                  # history: the last 401, kept
+NOTE_CREDENTIAL_ACTIVE = "credential_active"  # present only while unresolved
+
+
+def last_ok_note(agent):
+    return "last_ok:" + agent
+
+
 class StateError(Exception):
     """A static, content-free state failure."""
 
@@ -21,6 +30,11 @@ class StateError(Exception):
 class StateOwned(StateError):
     """Another reporter owns the state file."""
 
+
+# Facts about the reporter itself, for `status`: the last credential refusal,
+# a journal it refuses, the last good call of each agent. Never a secret.
+_NOTE_DDL = ("CREATE TABLE IF NOT EXISTS note(name TEXT PRIMARY KEY, code TEXT,"
+             " at_ms INTEGER NOT NULL) STRICT")
 
 _DDL = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT",
@@ -86,6 +100,7 @@ _DDL = (
     " STRICT",
     "CREATE TABLE counter(agent TEXT NOT NULL, name TEXT NOT NULL,"
     " value INTEGER NOT NULL, PRIMARY KEY(agent, name)) STRICT",
+    _NOTE_DDL,
 )
 
 
@@ -129,6 +144,8 @@ class State:
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
             raise StateError("the state file version is not supported")
+        else:
+            self.conn.execute(_NOTE_DDL)    # a file made before card 7a-3
 
     def close(self):
         with contextlib.suppress(sqlite3.Error):
@@ -172,6 +189,25 @@ class State:
         row = self.one("SELECT value FROM counter WHERE agent=? AND name=?",
                        (agent, name))
         return row[0] if row else 0
+
+    def set_note(self, name, code, at_ms):
+        self.conn.execute(
+            "INSERT INTO note(name, code, at_ms) VALUES(?,?,?) ON CONFLICT"
+            "(name) DO UPDATE SET code=excluded.code, at_ms=excluded.at_ms",
+            (name, code, at_ms))
+
+    def clear_note(self, name):
+        self.conn.execute("DELETE FROM note WHERE name=?", (name,))
+
+    def note(self, name):
+        """(code, at_ms) or None."""
+        return self.one("SELECT code, at_ms FROM note WHERE name=?", (name,))
+
+    def clear_agent_stops(self):
+        """A start-up forgives every configuration stop, so an operator who
+        fixed the cause only has to restart. Items that already failed for
+        good stay failed; a still-broken agent stops again on its next answer."""
+        return self.conn.execute("DELETE FROM agent_state").rowcount
 
     # --- the outbox -------------------------------------------------------
 
@@ -228,6 +264,15 @@ class State:
                                     "id=?", (row_id,))[0]
             decision = decisions.decide(item.kind, response, rebuilds)
             code = decision.code
+            # The credential history moves in THIS transaction, with the answer
+            # that causes it: an accepted request ends a credential fault, a 401
+            # starts one. A crash can never leave the two out of step.
+            if decision.action == decisions.DONE:
+                self.set_note(last_ok_note(item.agent), None, now_ms)
+                self.clear_note(NOTE_CREDENTIAL_ACTIVE)
+            elif response.status == 401:
+                self.set_note(NOTE_LAST_401, code, now_ms)
+                self.set_note(NOTE_CREDENTIAL_ACTIVE, code, now_ms)
             if decision.action == decisions.DONE:
                 if table == "acquisition":
                     self.conn.execute(
@@ -283,7 +328,7 @@ class State:
                     self.conn.execute(
                         "UPDATE %s SET state='failed_permanent', "
                         "last_error_code=? WHERE id=?" % table,
-                        (code or "UNKNOWN", row_id))
+                        (code or decisions.UNKNOWN_CODE, row_id))
         return decision
 
 

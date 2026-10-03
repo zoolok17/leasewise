@@ -5,7 +5,28 @@ says what the reporter does next. It never touches the network or the
 state; `state.State.apply` carries the decision out.
 """
 
+from .. import errors as _errors
+
 MAX_REBUILDS = 3
+
+# The only error words the reporter ever stores or shows: the codes Leasewise itself
+# can send (quota_balancer/errors.py) plus three words of its own. Whatever else an
+# answer says (it could echo anything, even the identity) becomes UNKNOWN_CODE.
+UNKNOWN_CODE = "UNKNOWN_CODE"
+BAD_ANSWER = "BAD_ANSWER"                  # a success that lacked the lease id
+MALFORMED_RESPONSE = "MALFORMED_RESPONSE"  # an answer that could not be decoded
+LEASEWISE_CODES = frozenset(
+    value for name, value in vars(_errors).items()
+    if name.startswith("CODE_") and isinstance(value, str))
+CLOSED_CODES = LEASEWISE_CODES | {UNKNOWN_CODE, BAD_ANSWER, MALFORMED_RESPONSE}
+
+
+def closed_code(code):
+    """`code` if it is one of the closed words, UNKNOWN_CODE if it is any other
+    text, None if there is no code."""
+    if code is None:
+        return None
+    return code if isinstance(code, str) and code in CLOSED_CODES         else UNKNOWN_CODE
 
 ACQUIRE = "acquire"
 REPORT = "report"
@@ -52,7 +73,7 @@ class Decision:
 def decide(kind, response, rebuilds=0):
     """`kind` is ACQUIRE, REPORT or FINAL; `rebuilds` is how many rebuilds
     this acquisition already used (it survives restarts in the state)."""
-    status, code = response.status, response.code
+    status, code = response.status, closed_code(response.code)
     if status == 401:
         # A credential problem is reporter-wide and fixed by an operator, so
         # nothing is lost or failed for good: retry, and keep the code visible.

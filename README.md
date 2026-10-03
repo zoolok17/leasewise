@@ -380,3 +380,151 @@ receipt, and says honestly when its view may be incomplete (then the final's tok
 numbers are "unknown", never 0). A message whose result is not known gets no
 final. It sends nothing itself: the HTTP client, the `run` / `drain` / `status`
 commands and the configuration are card 7a-3. See docs/STEP-CARD-7A-2.md.
+
+
+## Card 7a-3 - the reporter program
+
+**Status: built.** The reporter is now a program you can run. It reads the
+turn journal that agenttalk writes, and tells Leasewise over its private HTTP
+interface what each agent did: one observe-only lease per message, one report
+per launched run, one final receipt. It never reserves money and never decides
+anything; Leasewise does not use its numbers for admission. Audience: the
+operator of a Leasewise store. See docs/STEP-CARD-7A-3.md.
+
+### Quick start
+
+1. Save the ids once: `python -m quota_balancer --db inventory.db policy-ids --json > policy-ids.json`.
+2. Write the configuration file (a TOML file, see below) and make it private.
+   On Windows: `icacls reporter.toml /reset && icacls reporter.toml /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:F"`
+   (the first part drops any grant to someone else, the second removes what the
+   folder passes down and gives the file to you alone).
+   On Linux or macOS: `chmod 600 reporter.toml`.
+3. Read the journal once and send what is due:
+
+```
+python -m quota_balancer reporter drain --config reporter.toml
+```
+
+Expected output: one line such as
+`{"blocked": null, "journal": "ok", "new_events": 3, "sent": 3}`.
+
+### The configuration file
+
+The file holds a secret (the identity value Leasewise's ingress expects), so the
+reporter refuses to start if other users can read it. Never commit it and never
+put it in an agenttalk bus root. The identity must not be, or be part of, any of
+Leasewise's public error words; use a long generated value. It is TOML, with one table per agent:
+
+```toml
+version = 1
+base_url = "http://127.0.0.1:8443"   # plain http only for loopback; else https
+identity = "the-identity-value"       # SECRET
+machine = "desktop"                   # this machine's alias
+journal_root = "C:/Users/me/AppData/Local/agenttalk/turn-events/<project>"
+state_path = "C:/Users/me/AppData/Local/leasewise/reporter/state.db"
+policy_ids = "C:/Users/me/leasewise/policy-ids.json"
+# poll_seconds = 5               # `run` only
+# silent_after_seconds = 86400   # a configured agent quiet this long is "silent"
+
+[agents.alpha]            # the agenttalk agent name
+seat = "s6"               # with `machine`, the seat key
+account = "meter"         # with `model`, the model key
+model = "opus"
+task_class = "observed"   # must exist in the snapshot
+effort = "opus"
+expected_calls = 1        # the ceilings to request, within the profile
+max_calls = 2
+output_cap = 1000
+per_call_output_cap = 500
+ttl_ms = 1800000
+# team = "dev"            # only to tell apart two seats with one alias
+```
+
+Keys are compound, as `policy-ids --json` returns them: a seat is
+(this machine, seat alias), a model is (account, model alias). A bare alias that
+matches more than one row is refused at start-up. An agent that appears in the
+journal but has no table is "unconfigured": its events are read and counted and
+never sent. **Who may read the file.** On Windows the reporter reads the file's
+access list as security identifiers (not names, which depend on the language of
+the system) and allows only three: you (the current user), SYSTEM (`S-1-5-18`)
+and the Administrators group (`S-1-5-32-544`). Any other identity, an entry it
+cannot classify, an entry inherited from the folder, or a list it cannot read
+stops the start with a fixed message. On other systems no group or other
+permission bit may be set.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `reporter drain` | One pass: read the journal, send what is due, exit. The default operator action. |
+| `reporter run` | Repeat until stopped (Ctrl-C or SIGTERM); safe to stop at any moment. |
+| `reporter status [--json]` | What the reporter knows, per agent. |
+
+`run` and `drain` cannot overlap: the second one stops at once with the fixed
+message "the state is owned by another reporter" (exit 2). While `run` is
+active, `status` shows a copy that `run` refreshes every cycle.
+
+Exit codes: 0 done; 1 internal fault; 2 refused to start (configuration, or the
+state is owned); 3 Leasewise did not answer or refused the identity, so items are
+still waiting; 4 the journal is refused (see below).
+
+### Runbook
+
+- **Leasewise is down.** Nothing is lost: everything is stored first and sent
+  later with the same bytes and the same `Idempotency-Key`. One request is in
+  flight at a time, with 5-second timeouts on each network step (connecting,
+  sending, reading), which is not a total limit on one request; failures back off
+  from 5 seconds to 15 minutes with jitter. An answer that cannot be used (garbled, too
+  deeply nested, not text, empty, larger than the size limit, or a lease id that
+  repeats the secret identity) is handled by its status. On a success (2xx), a
+  401, a 429 or a 5xx it counts as no answer: it is retried with the same bytes and
+  nothing from it is stored. On any other 4xx it is a permanent refusal with
+  no retry loop (the item is listed under `permanent_failures`). A `401` is retried too. `status` keeps the last one as history
+  (`last_401`: code, time, and `active`). While it is active the advice is to
+  check the identity value in the file; the first request Leasewise accepts
+  afterwards makes it history and the advice goes away.
+- **Error words.** Only Leasewise's own error codes (the ones in
+  `quota_balancer/errors.py`) are ever saved or shown. Any other text an answer
+  carries becomes `UNKNOWN_CODE`; the reporter adds `BAD_ANSWER` (a success
+  without the lease) and `MALFORMED_RESPONSE` (an unreadable answer).
+- **Items that failed for good** (acquisitions, reports and finals) are listed in
+  `status` under `permanent_failures`, each with its code, and one warning line
+  appears. A final also says whether the observation behind it was complete: a
+  complete observation whose final was never delivered is shown as that.
+- **After an outage, or when `status` shows open or incomplete messages,** run
+  Leasewise's `expire-sweep` yourself:
+  `python -m quota_balancer --db inventory.db expire-sweep`. It moves leases
+  whose time has passed to `uncertain`; a shadow lease holds no money. It is an
+  explicit step, never a timer. Scheduling it, or the reporter, needs the
+  desktop lead's approval (a task named `lw-...`).
+- **`journal_refused` in status, exit 4.** The journal has a schema version this
+  reporter does not know (or a file is shorter than the position already read).
+  The reporter reads no new input until you fix it; what it already stored is
+  still sent. Upgrade the reporter, then run it again.
+- **An agent "stopped by a configuration fault".** Leasewise answered
+  `POLICY_DENIED`, `NOT_FOUND`, `FORBIDDEN` or `CONTEXT_UNKNOWN` for it. The code
+  is in `status`. Fix the cause (seat, model, profile ceilings, identity) and
+  start the reporter again: a start forgives the stop. The message that got the
+  refusal stays failed.
+- **Never delete the state file** while Leasewise still holds its leases: the
+  state remembers the exact bytes of each request, and a rebuilt one would be
+  refused as a changed replay. Leave old leases to `expire-sweep`.
+- **The observed task class.** Import a profile whose ceilings match the
+  `[agents.*]` tables, with a TTL long enough for your outages: a report that
+  arrives after its lease expired is dropped (counted), and the final is still
+  accepted.
+
+### What `status --json` shows
+
+At the top: `rounds_completed`, `journal_refused`, `last_401`,
+`silent_configured_seats`, `operator_actions` (plain sentences); `last_401`
+carries `active`. Per agent, also `permanent_failures` and
+`permanent_failures_total`:
+`configured`, `silent`, `stopped_by_configuration_fault`, `streams` (seen,
+missing, with gaps, with torn tails), `events_read`, `dropped_total`,
+`damaged_lines`, `messages` (known, open, complete, incomplete with a reason,
+`outcome_unknown`), `finals` (pending, sent, failed), `late_observations`,
+`acquisitions` (pending, acquired, failed with codes), `reports` (pending, sent,
+dropped, failed, over the cap), `last_successful_call`. "Complete" means "no loss
+the journal can see"; it is not a guarantee. `status` never shows the URL, the
+identity or any message text.
