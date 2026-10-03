@@ -11,12 +11,13 @@ import json
 import os
 
 from . import decisions, rounds
+from . import state as state_mod
 
 STATUS_VERSION = 1
 
 # Stored finals, reports and acquisitions are counted by their state.
-_NOTE_401 = "last_401"                  # history: the last 401, kept
-_NOTE_CREDENTIAL = "credential_active"  # present only while it is unresolved
+_NOTE_401 = state_mod.NOTE_LAST_401
+_NOTE_CREDENTIAL = state_mod.NOTE_CREDENTIAL_ACTIVE
 MAX_LISTED_FAILURES = 50
 _NOTE_JOURNAL = "journal_stopped"
 
@@ -34,7 +35,7 @@ def iso(ms):
 
 
 def last_ok_note(agent):
-    return "last_ok:" + agent
+    return state_mod.last_ok_note(agent)
 
 
 def last_401_note():

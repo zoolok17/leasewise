@@ -155,6 +155,27 @@ Files: `A` = `tests/test_card7a3.py`, `B` = `tests/test_card7a3_commands.py`,
 - The README now says that the 5-second timeout applies to each network step,
   not to the whole request (also item 8 above).
 
+## Fix round 2 (codex tk-216278947bad; the last round)
+
+- **F2, an answer that echoes the secret.** A returned lease id that equals or
+  contains the configured identity value makes the whole answer unreadable: it is
+  retried with the original bytes and nothing from it is stored or used to build a
+  request. No other answer field is stored: the error code is mapped to the closed
+  words, and the status line, reason phrase and headers are not kept. Tests:
+  `test_card7a3_fix2.EchoF2`.
+- **F3, empty and over-limit bodies.** They are unreadable like a decoding
+  failure, by status: 2xx, 401, 429 and 5xx are retried (reports and finals stay
+  pending); any other 4xx keeps the permanent handling. The README sentence now
+  says so. Tests: `BodiesF3`.
+- **F5, atomic recovery.** The credential notes (last 401, active flag, last good
+  call) are now written inside `State.apply`, in the same transaction as the
+  answer that causes them, so a crash can never leave the delivery recorded and
+  the flag still raised (or the reverse). A test seam `applied` marks the moment
+  after that commit. Tests: `CredentialAtomicF5` (crash after the commit, crash
+  inside the transaction, a new 401).
+- **F6, the fallback word.** The stored word for a failure with no code is
+  `UNKNOWN_CODE`, a member of `CLOSED_CODES`. Tests: `FallbackWordF6`.
+
 ## Results
 
 See the reply for counts. Mutation checks (one small break each, the named tests

@@ -473,8 +473,12 @@ still waiting; 4 the journal is refused (see below).
   later with the same bytes and the same `Idempotency-Key`. One request is in
   flight at a time, with 5-second timeouts on each network step (connecting,
   sending, reading), which is not a total limit on one request; failures back off
-  from 5 seconds to 15 minutes with jitter. An answer that cannot be read at all
-  (garbled, too deeply nested, not text) counts as no answer and is retried. A `401` is retried too. `status` keeps the last one as history
+  from 5 seconds to 15 minutes with jitter. An answer that cannot be used (garbled, too
+  deeply nested, not text, empty, larger than the size limit, or a lease id that
+  repeats the secret identity) is handled by its status. On a success (2xx), a
+  401, a 429 or a 5xx it counts as no answer: it is retried with the same bytes and
+  nothing from it is stored. On any other 4xx it is a permanent refusal with
+  no retry loop (the item is listed under `permanent_failures`). A `401` is retried too. `status` keeps the last one as history
   (`last_401`: code, time, and `active`). While it is active the advice is to
   check the identity value in the file; the first request Leasewise accepts
   afterwards makes it history and the advice goes away.

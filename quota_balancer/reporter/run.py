@@ -113,17 +113,8 @@ class Reporter:
                 self.fault("answered")
             now = self.clock()          # a rebuild is stamped after the wait
             decision = self.state.apply(item, answer, now, self.rng())
-            with self.state.txn():
-                if decision.action == decisions.DONE:
-                    self.state.set_note(status.last_ok_note(item.agent), None,
-                                        now)
-                    # An accepted request: any credential fault is history now.
-                    self.state.clear_note(status.credential_active_note())
-                elif answer.status == 401:
-                    self.state.set_note(status.last_401_note(), decision.code,
-                                        now)
-                    self.state.set_note(status.credential_active_note(),
-                                        decision.code, now)
+            if self.fault:
+                self.fault("applied")   # the answer and its notes are durable
             if decision.action == decisions.DONE:
                 result.sent += 1
             elif decision.action == decisions.RETRY:

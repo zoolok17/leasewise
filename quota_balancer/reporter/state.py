@@ -14,6 +14,15 @@ from . import decisions, mapper
 SCHEMA_VERSION = 1
 
 
+# Facts about the reporter itself, kept in the `note` table (see _NOTE_DDL).
+NOTE_LAST_401 = "last_401"                  # history: the last 401, kept
+NOTE_CREDENTIAL_ACTIVE = "credential_active"  # present only while unresolved
+
+
+def last_ok_note(agent):
+    return "last_ok:" + agent
+
+
 class StateError(Exception):
     """A static, content-free state failure."""
 
@@ -255,6 +264,15 @@ class State:
                                     "id=?", (row_id,))[0]
             decision = decisions.decide(item.kind, response, rebuilds)
             code = decision.code
+            # The credential history moves in THIS transaction, with the answer
+            # that causes it: an accepted request ends a credential fault, a 401
+            # starts one. A crash can never leave the two out of step.
+            if decision.action == decisions.DONE:
+                self.set_note(last_ok_note(item.agent), None, now_ms)
+                self.clear_note(NOTE_CREDENTIAL_ACTIVE)
+            elif response.status == 401:
+                self.set_note(NOTE_LAST_401, code, now_ms)
+                self.set_note(NOTE_CREDENTIAL_ACTIVE, code, now_ms)
             if decision.action == decisions.DONE:
                 if table == "acquisition":
                     self.conn.execute(
@@ -310,7 +328,7 @@ class State:
                     self.conn.execute(
                         "UPDATE %s SET state='failed_permanent', "
                         "last_error_code=? WHERE id=?" % table,
-                        (code or "UNKNOWN", row_id))
+                        (code or decisions.UNKNOWN_CODE, row_id))
         return decision
 
 
