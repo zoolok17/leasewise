@@ -210,7 +210,7 @@ class Writer:
     def lookup(self, agent, message_id):
         """The row of this message as a dict, or None."""
         try:
-            row = self.conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE agent=? AND message_id=?",
+            row = self.conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE agent=? AND message_id=?",  # nosec B608 - fixed column names
                                     (agent, message_id)).fetchone()
         except sqlite3.OperationalError as exc:
             raise (StoreBusy() if _busy(exc) else StoreUnusable()) from None
@@ -268,5 +268,6 @@ class Writer:
                 " WHERE id=? AND state='requested'",
                 (grant["lease_id"], grant["gateway_id"], grant["lease_id"], grant["ref_sha256"], grant["max_calls"],
                  grant["max_micro_eur"], grant["ttl_seconds"], grant["expires_ms"], admission_id))
-            row = conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE id=?", (admission_id,)).fetchone()
+            row = conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE id=?",  # nosec B608 - fixed column names
+                               (admission_id,)).fetchone()
             return dict(zip(COLUMNS, row))
