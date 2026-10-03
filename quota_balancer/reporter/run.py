@@ -28,6 +28,7 @@ MAX_SLEEP_SECONDS = 900
 # for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
 LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
 MAX_PAGES_PER_CYCLE = 6          # card L6a-1: pages (and generation switches) taken from a receipt source per cycle
+RECEIPT_BUDGET_FLOOR = 30       # card L6a-1b: seconds of command reading per cycle, at least (checked before a read starts)
 MAX_GRANT_BATCHES = 20          # card L6a-2: batches of admission grants (500 each) copied per cycle
 UNKNOWN_CAP = "unknown"             # the note when the summary could not be read (never a fresh zero)
 
@@ -80,6 +81,7 @@ class Reporter:
         self.stop = stop or threading.Event()
         self.fault = fault              # test seam: fault(stage)
         self.failures = 0               # consecutive blocked cycles
+        self.monotonic = time.monotonic     # the cycle's receipt budget (a test replaces it with a virtual clock)
         # An operator who fixed a configuration fault only has to restart.
         with state.txn():
             state.clear_agent_stops()
@@ -225,12 +227,24 @@ class Reporter:
     def _take_pages(self, source, source_id):
         """Pages of this source, up to a few per cycle. A page from a generation other than the current one was
         asked for with another ledger's cursor: the generation is switched (a new one starts at 0, one seen
-        before takes its kept cursor back) and the page is used only if it happens to start there, else read again."""
+        before takes its kept cursor back) and the page is used only if it happens to start there, else read again.
+
+        A command source has a time budget for the whole cycle, `max(timeout_seconds, 30)` seconds, checked only BEFORE a
+        read starts: once it is spent the cycle takes no more pages (the next cycle goes on from the cursor), and the send
+        passes run. A read that starts just before the budget ends runs for its own deadline, so receipt reading can take
+        about `max(t, 30) + t + 2` seconds (52 at the default) with normally returning Windows calls."""
         added = 0
+        budget_end = None
+        if source.command is not None:
+            budget_end = self.monotonic() + max(source.timeout_seconds, RECEIPT_BUDGET_FLOOR)
         for _ in range(MAX_PAGES_PER_CYCLE):
+            if budget_end is not None and self.monotonic() >= budget_end:
+                break
             generation, after = self.state.current_cursor(source_id)
-            read = receipts.read_page(source, after)
+            read = receipts.read_page(source, after, self.stop)
             now = self.clock()
+            if source.command is not None:
+                self.state.note_receipt_cleanup(read.cleanup_confirmed, now)
             if read.status != receipts.OK:
                 self.state.note_receipt_read(read.status, read.reason, now)
                 break

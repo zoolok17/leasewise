@@ -27,12 +27,15 @@ import datetime
 import json
 import re
 
+from . import runner
+
 OK = "ok"
 READ_LATER = "read_later"
 REFUSED = "refused"
 
 # The closed reasons, per status. These words (and counts of them) are all the status ever shows.
-LATER_REASONS = ("source_missing", "not_json")
+LATER_REASONS = ("source_missing", "not_json", "cannot_run", "cannot_contain", "timeout", "interrupted", "exit_code",
+                 "leftover_process", "read_failed")       # the last seven come from a command source (runner.py)
 REFUSED_REASONS = ("not_an_object", "bad_version", "bad_envelope", "wrong_after", "too_many", "too_large",
                    "duplicate_key", "bad_row", "bad_order")
 
@@ -77,12 +80,15 @@ class Page:
 
 
 class ReadResult:
-    __slots__ = ("status", "reason", "page")
+    """`cleanup_confirmed` is False only for a command read whose job end was not confirmed (its output is never used)."""
 
-    def __init__(self, status, reason=None, page=None):
+    __slots__ = ("status", "reason", "page", "cleanup_confirmed")
+
+    def __init__(self, status, reason=None, page=None, cleanup_confirmed=True):
         self.status = status
         self.reason = reason
         self.page = page
+        self.cleanup_confirmed = cleanup_confirmed
 
 
 class _Later(Exception):
@@ -216,8 +222,32 @@ def _read_fixture(path, max_bytes):
     return raw
 
 
-def read_page(source, after_seq):
-    """One page of `source` after `after_seq` -> ReadResult. Never raises on bad input."""
+def _read_command(source, after_seq, stop):
+    """One page from a command source: the contained runner answers a closed word, and only `ok` carries bytes, which go
+    STRAIGHT to the page rules (never through the fixture-only whole-ledger format). Any other word is read later with that
+    word; too much output is a refused page. Nothing the program printed is kept."""
+    done = runner.run(list(source.command), after_seq, source.page_limit, timeout_seconds=source.timeout_seconds,
+                      max_bytes=source.max_bytes, env=source.env, stop=stop)
+    try:
+        if done.word == runner.OK:
+            result = ReadResult(OK, None, parse_page(done.data, after_seq, source.page_limit))
+        elif done.word == runner.TOO_LARGE:
+            result = ReadResult(REFUSED, "too_large")
+        else:
+            result = ReadResult(READ_LATER, done.word)
+    except _Later as exc:
+        result = ReadResult(READ_LATER, exc.args[0])
+    except _Refused as exc:
+        result = ReadResult(REFUSED, exc.args[0])
+    result.cleanup_confirmed = done.cleanup_confirmed
+    return result
+
+
+def read_page(source, after_seq, stop=None):
+    """One page of `source` after `after_seq` -> ReadResult. Never raises on bad input. `stop` (anything with
+    `is_set()`) ends a command read in progress."""
+    if source.command is not None:
+        return _read_command(source, after_seq, stop)
     try:
         page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes,
                              source.page_limit)

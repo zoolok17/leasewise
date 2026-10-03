@@ -71,6 +71,7 @@ def fixture_source(path, store=None, **over):
     row.admission_store = store or os.path.join(os.path.dirname(path or ".") or ".", "admission.db")
     row.fixture = path
     row.max_bytes, row.page_limit = 1024 * 1024, 100
+    row.command, row.timeout_seconds, row.env = None, None, ()
     for key, value in over.items():
         setattr(row, key, value)
     return row

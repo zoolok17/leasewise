@@ -263,6 +263,13 @@ def _generation_changes(state):
     return out
 
 
+CONTAIN_WORDS = ("cannot_run", "cannot_contain")
+NOT_FINISHING_WORDS = ("timeout", "leftover_process", "exit_code", "read_failed", "interrupted")
+CONTAIN_ACTION = ("The receipt command could not be started inside its protective job: nothing was run. Check the command "
+                  "path and the Windows rules for jobs.")
+NOT_FINISHING_ACTION = "The receipt command is not finishing: it was stopped. Look at the command itself."
+CLEANUP_ACTION = ("The last receipt command read ended with termination requested but not confirmed: its output was not "
+                  "used. Check that nothing it started is still running.")
 STORE_STATES = {"ok": "ok", "store_missing": "missing", "store_busy": "busy", "store_unreadable": "unreadable"}
 STORE_ACTIONS = {
     "missing": "The admission store file is not there: check that the admission command writes to the file the "
@@ -320,6 +327,8 @@ def _gateway_receipts(state, source, now_ms, gateway_agents=()):
                        " WHERE s.alias=? ORDER BY c.page_ord DESC LIMIT 1",
                        (source.gateway if source is not None else "",))
     read = state.note("receipt_last_read")
+    reason = state.note("receipt_last_reason")
+    cleanup = state.note("receipt_cleanup")
     ok = state.note(state_mod.last_ok_note(agent))
     configured = source is not None
     awaiting, overdue = _awaiting(state, source, now_ms)
@@ -329,6 +338,10 @@ def _gateway_receipts(state, source, now_ms, gateway_agents=()):
         "last_seq": cursor[0] if cursor else 0,
         "last_read": None if read is None else iso(read[1]),
         "last_read_result": None if read is None else read[0],
+        "last_read_reason": None if reason is None else reason[0],
+        "source_kind": None if source is None else ("command" if source.command is not None else "fixture"),
+        "cleanup_incomplete": {"count": state.counter(agent, "cleanup_incomplete"),
+                               "current": cleanup is not None and cleanup[0] == "unconfirmed"},
         "stored": state.counter(agent, "stored"),
         "rows": rows,
         "failed": failed,
@@ -430,6 +443,13 @@ def _actions(report, gateway_agents=()):
         actions.append(sentence)
     if store["at_body_cap"]:
         actions.append(BODY_CAP_ACTION % store["at_body_cap"])
+    word = receipt.get("last_read_reason") if receipt["last_read_result"] == receipts.READ_LATER else None
+    if word in CONTAIN_WORDS:
+        actions.append(CONTAIN_ACTION)
+    elif word in NOT_FINISHING_WORDS:
+        actions.append(NOT_FINISHING_ACTION)
+    if receipt.get("cleanup_incomplete", {}).get("current"):
+        actions.append(CLEANUP_ACTION)
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")
@@ -507,6 +527,14 @@ def render_text(report):
         out.append("gateway receipts: last seq %d, pending %d, delivered %d, failed %d. %s"
                    % (receipt["last_seq"], receipt["rows"]["pending"], receipt["rows"]["sent"],
                       receipt["rows"]["failed_permanent"], receipt["cached_input"]))
+    if receipt is not None and receipt["configured"]:
+        # a snapshot of an older reporter has none of these keys: read them with defaults
+        out.append("gateway receipt source: %s; last read: %s" % (receipt.get("source_kind") or "fixture",
+                                                                  receipt.get("last_read_reason") or "not read yet"))
+        cleanup = receipt.get("cleanup_incomplete") or {"count": 0}
+        if cleanup["count"]:
+            out.append("gateway receipt command: termination requested but not confirmed %d time(s)%s"
+                       % (cleanup["count"], " (not confirmed now)" if cleanup.get("current") else ""))
     store = None if receipt is None else receipt.get("admission_store")      # a snapshot of the first build has none
     if store is not None and (receipt["configured"] or store["state"] is not None):
         out.append("admission store: %s%s" % (store["state"] or "not read yet",

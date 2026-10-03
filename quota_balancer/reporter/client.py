@@ -91,7 +91,29 @@ class HttpClient:
             sock.connect((target, address[1]))
             return sock
 
+        class Staged:
+            """The context's `wrap_socket` in two steps, so that the watchdog owns the socket DURING the handshake: the
+            wrap that does not touch the network, the socket handed to the watchdog (the wrapped one now owns the
+            descriptor), the timeout set again to the time left, then the handshake. Certificate checking is the real
+            context's, unchanged."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def wrap_socket(self, sock, **kwargs):
+                time_left()
+                wrapped = self._real.wrap_socket(sock, do_handshake_on_connect=False, **kwargs)
+                held["sock"] = wrapped
+                wrapped.settimeout(time_left())
+                wrapped.do_handshake()
+                return wrapped
+
         conn._create_connection = connect               # the connection step obeys the deadline
+        if self._scheme == "https":
+            conn._context = Staged(conn._context)       # and so does the TLS handshake
         watchdog = threading.Timer(timeout, stop)
         watchdog.daemon = True
         watchdog.start()

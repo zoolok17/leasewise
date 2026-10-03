@@ -460,14 +460,25 @@ class State:
             if added:
                 self.bump(RECEIPT_AGENT, "stored", added)
             self.set_note("receipt_last_read", "ok", now_ms)
+            self.set_note("receipt_last_reason", "ok", now_ms)
         return added
 
     def note_receipt_read(self, status, reason, now_ms):
         """A read that stored nothing (`read_later` or `refused`): count it by its closed reason and say when. Never
         any text from the source."""
         with self.txn():
-            self.bump(RECEIPT_AGENT, "%s:%s" % (status, reason))
+            if reason != "cleanup_incomplete":          # that one has its own counter (`note_receipt_cleanup`)
+                self.bump(RECEIPT_AGENT, "%s:%s" % (status, reason))
             self.set_note("receipt_last_read", status, now_ms)
+            self.set_note("receipt_last_reason", reason, now_ms)         # the CURRENT failure, replaced by the next read
+
+    def note_receipt_cleanup(self, confirmed, now_ms):
+        """After a command read: was the end of its job confirmed? A count of the ones that were not, and the current state
+        (so the advice follows what is true now, not a count that never goes down)."""
+        with self.txn():
+            if not confirmed:
+                self.bump(RECEIPT_AGENT, "cleanup_incomplete")
+            self.set_note("receipt_cleanup", "confirmed" if confirmed else "unconfirmed", now_ms)
 
     def grant_cursor(self):
         """The number of the last admission grant copied (0 before the first)."""
