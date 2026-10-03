@@ -265,7 +265,9 @@ class State:
                 if decision.action == decisions.FAIL_AGENT:
                     # The agent stops: its queued reports (observations only)
                     # are dropped and counted here, in this transaction.
-                    # Finals are never dropped; they wait, unsent.
+                    # Its OTHER finals are never dropped; they wait, unsent.
+                    # The item that got the fault fails for good below,
+                    # even when it is a final (DESIGN-7A 4.5).
                     dropped = self.conn.execute(
                         "UPDATE report SET state='dropped', "
                         "last_error_code=? WHERE agent=? AND "

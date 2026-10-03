@@ -400,7 +400,9 @@ def _clock_regions(ordered, streams):
 
 def _message_time(rows):
     """(arrival_ms | None, inconsistent) from every copy of `message_at`.
-    Copies of one message's time may differ by the clock-skew allowance."""
+    Every copy is the same stored value (the message record's ts), so copies
+    must agree exactly: the clock-skew margin is only for comparing that value
+    with this machine's clock, never one copy with another."""
     parsed, missing = set(), False
     for raw in rows:
         value = ev.parse_time(raw) if raw is not None else None
@@ -410,7 +412,7 @@ def _message_time(rows):
             parsed.add(value)
     if missing or not parsed:
         return None, False
-    return min(parsed), max(parsed) - min(parsed) > _MARGIN_MS
+    return min(parsed), len(parsed) > 1
 
 
 def _assess(message, streams, ordered, clock_regions, gaps_by_stream):
