@@ -347,9 +347,11 @@ Two limits in the park-file reader were not real limits yet, and one README sent
    walk stops after 256 directory entries visited (ignored names count too); only then are the names
    kept sorted and read. One more entry is looked at only to learn that there is more, and the scan says
    so with a flag (`too_many_entries`, counted as 0 or 1 per folder), never a count of the folder.
-   **Consequence, stated:** in a folder with more than 256 entries, some markers may not be seen in
-   that scan (the first 256 in the folder's own order are looked at). In practice a park folder holds
-   one small file per parked seat. The README "Limits" says so.
+   **Consequence, stated:** the walk reads the folder's FIRST 256 entries in the order the system lists
+   them, and that order is usually the same every time. So in a folder with more than 256 entries a
+   marker outside those 256 can stay unseen on EVERY scan, until earlier entries go away; a later scan
+   does not necessarily catch up. This is a best-effort limit, not a delay. In practice a park folder
+   holds one small file per parked seat, far below 256. The README "Limits" says the same.
 2. **The wake time has a near limit now.** `reset_epoch` may be at most 9 days ahead, but `wake_epoch`
    was only checked against the year 2100. It is now checked against the same range plus the
    wrapper's offset, named `WAKE_AFTER_RESET_SECONDS` = 30 (the wake is the reset plus 30 seconds).
@@ -446,7 +448,10 @@ one made tests fail.
   looks, is never reported. It closes with agenttalk's permanent "parked" record in its turn journal.
 - **One outbox, one memory.** A recreated state file, or two reporters with one `machine` alias, can
   give a `409` that fails that event for good.
-- **256 entries.** In a folder with more than 256 entries some markers may not be seen in that scan.
+- **256 entries.** The scan reads the folder's first 256 entries in the order the system lists them
+  (usually the same every time). In a folder with more than 256 entries a marker outside those 256
+  can stay unseen on every scan until earlier entries go away; a later scan does not necessarily catch
+  up.
 - **No recovery yet (card 7c-3).** Leasewise never un-parks an account by itself; an operator clears the
   block. A reset already in the past still parks, with a `retry_at` in the past.
 - **Advisory until R1.** A missed event costs a missing warning, not a wrong refusal.

@@ -608,10 +608,12 @@ dropped, and never leave the machine.
   `event_id` can be rebuilt with a different first-seen time (`observed_at`); Leasewise then answers
   `409` and that event fails for good, and `status` shows it. There is no deduplication across state
   files.
-- **A folder with more than 256 entries.** The reporter looks at the first 256 entries of the folder
-  (in the folder's own order, ignored names counting too) and says so with a flag; it never counts the
-  folder. So some markers may not be seen in that scan. A folder of park files is small in practice
-  (one per parked seat).
+- **A folder with more than 256 entries.** The reporter reads the folder's FIRST 256 entries, in the
+  order the system lists them (ignored names count too), and says so with a flag; it never counts the
+  folder. That order is usually the same every time. So in a folder with more than 256 entries, a
+  marker outside those first 256 can stay unseen on EVERY look, until earlier entries go away: a later
+  look does not necessarily catch up. This is a stated best-effort limit. A folder of park files is
+  small in practice (one per parked seat), far below 256.
 - **No backfill.** Blocks that already exist keep the `retry_at` they have; only new events get the 30
   seconds.
 - **No downgrade of the state file.** The reporter's state file is now version 2, and a version-1 file
