@@ -66,7 +66,13 @@ class Reporter:
         self._read(result)
         if not self.stop.is_set():
             self._send(result)
-        self.failures = 0 if result.blocked is None else self.failures + 1
+        # The back-off grows over consecutive blocked cycles. A cycle that
+        # found nothing due (an item still waiting out its own back-off) is
+        # neither: only a request that got through ends the streak.
+        if result.blocked is not None:
+            self.failures += 1
+        elif result.sent:
+            self.failures = 0
         status.write_snapshot(status.snapshot_path(self.state.path),
                               self.report())
         return result

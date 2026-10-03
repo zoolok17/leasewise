@@ -9,6 +9,7 @@ bound to loopback, and nothing leaves this machine.
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,17 @@ def leasewise_doc():
     return doc
 
 
+def build_store(db, tmp, doc=None):
+    """A fresh store: init, config-import v2, the enrolled fake identity."""
+    assert run_cli("--db", db, "init").returncode == 0
+    path = os.path.join(tmp, "leasewise-config.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc or leasewise_doc(), handle)
+    done = run_cli("--db", db, "config-import", "--file", path)
+    assert done.returncode == 0, done.stderr
+    store.set_machine_identity(db, MACHINE, FAKE_IDENTITY, True)
+
+
 class Clock:
     """Milliseconds the test controls. `install` makes the in-process server
     read the same clock (the way the card-L1d tests move it)."""
@@ -57,18 +69,16 @@ class Clock:
 class Leasewise:
     """A store plus a server on 127.0.0.1 (ephemeral port)."""
 
-    def __init__(self, tmp, clock=None, doc=None):
+    def __init__(self, tmp, clock=None, doc=None, template=None):
         self.tmp = tmp
         self.db = os.path.join(tmp, "inventory.db")
         self.clock = clock
         self._patch = None
-        assert run_cli("--db", self.db, "init").returncode == 0
-        path = os.path.join(tmp, "leasewise-config.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(doc or leasewise_doc(), handle)
-        done = run_cli("--db", self.db, "config-import", "--file", path)
-        assert done.returncode == 0, done.stderr
-        store.set_machine_identity(self.db, MACHINE, FAKE_IDENTITY, True)
+        self.template = template
+        if template:                      # a store made once, copied per test
+            shutil.copyfile(template, self.db)
+        else:
+            build_store(self.db, tmp, doc)
         if clock is not None:
             self._patch = mock.patch.object(http_api, "time", clock)
             self._patch.start()
@@ -87,10 +97,17 @@ class Leasewise:
             self._patch.stop()
 
     def snapshot(self, path):
-        done = run_cli("--db", self.db, "policy-ids", "--json")
-        assert done.returncode == 0, done.stderr
+        """The saved `policy-ids --json` output (the command itself, unless
+        the store is a copy: then the same function in this process)."""
+        if self.template:
+            text = json.dumps(store.policy_ids(self.db), sort_keys=True,
+                              separators=(",", ":"))
+        else:
+            done = run_cli("--db", self.db, "policy-ids", "--json")
+            assert done.returncode == 0, done.stderr
+            text = done.stdout
         with open(path, "w", encoding="utf-8") as handle:
-            handle.write(done.stdout)
+            handle.write(text)
 
     def rows(self, sql, params=()):
         import sqlite3
@@ -174,8 +191,10 @@ def deep(value):
     return copy.deepcopy(value)
 
 
-class Crash(Exception):
-    """A simulated crash: the reporter is simply dropped where this lands."""
+class Crash(BaseException):
+    """A simulated crash: the reporter is simply dropped where this lands. A
+    BaseException so that no `except Exception` in the code under test can
+    swallow it (a real crash is not catchable either)."""
 
 
 class Net:
@@ -212,13 +231,14 @@ class Rig:
     can be closed and opened again (a restart)."""
 
     def __init__(self, agents=None, journal_agent="alpha", server=True,
-                 patch_clock=True):
+                 patch_clock=True, template=None):
         from tests.journal_fixture import MODEL, SEAT, Journal
         self.ws = Workspace()
         self.clock = Clock()
         if server:
             self.lw = Leasewise(self.ws.dir,
-                                self.clock if patch_clock else None)
+                                self.clock if patch_clock else None,
+                                template=template)
             self.lw.snapshot(self.ws.snapshot)
             url = self.lw.url
         else:
