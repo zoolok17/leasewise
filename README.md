@@ -692,3 +692,81 @@ lease pass and the two stay separate; `status_version` is 2 with a top-level `li
 One limit fact is (installation, account alias, evidence kind, window, reset); with an unknown reset the
 park time joins the key. `event_id` and `turn_id` are derived from that key; the body is built field by
 field with the reset RAW. Leasewise's margin is `LIMIT_RETRY_MARGIN_MS` in `lease.py`.
+
+## Card L6a-1 - gateway receipts
+
+**Status: built, fixture-only.** A gateway keeps one final receipt for every quota lease it served: how
+many calls, how much text went in and out, what it cost, how it ended. The reporter can now read those
+receipts and tell Leasewise, so the lease is settled with what really happened. Audience: the operator
+of a Leasewise store. Until agenttalk ships its receipt command, the receipts can only come from a file
+you write yourself (that is what the tests do). See docs/STEP-CARD-L6A-1.md.
+
+### What it does, in plain words
+
+1. **The reporter reads** the gateway's receipts after the last one it has stored, once per cycle, from
+   the source you configure: a file (tests) or a local command (later).
+2. **It checks every receipt strictly.** One wrong key, type, number or order refuses the whole read:
+   nothing is stored, a counter goes up, and the same read is tried again next cycle. A file that is
+   missing, a command that fails or is too slow, or text that is not JSON means "read again later".
+3. **It stores each new receipt first**, with its settle message frozen, and moves the "last receipt
+   number" in the same step. A restart loses nothing and sends nothing twice.
+4. **It sends the final settle** to Leasewise (`POST /v1/leases/{id}/settle`), after limit events and
+   before lease messages. Done: `200`, or `LEASE_CLOSED`. A refusal, for example `RECEIPT_CONFLICT`,
+   fails only that receipt, for good, with its word in `status`. No answer, `429`, `5xx` or `401` leave
+   the receipt waiting; the same bytes are sent again.
+5. **`reporter status`** shows a `gateway_receipts` object: the last receipt number, receipts waiting,
+   delivered and failed (by closed word), and how often a read had to wait or was refused.
+
+### How to set it up
+
+1. **Save the ids again.** `policy-ids` now also lists `gateways` (alias and local id). Save its output
+   again; an older snapshot has none, and the reporter then refuses to start if `gateway_receipts` is set.
+2. **Add the block** to the reporter configuration. Name exactly one of `fixture` or `command`:
+
+```toml
+[gateway_receipts]
+gateway = "g1"                                  # a Leasewise gateway alias
+fixture = "C:/path/to/receipts.json"            # a JSON list of receipts (tests); or:
+# command = ["C:/path/to/program", "ovh-gateway", "receipts", "--json"]   # run without a shell
+# timeout_seconds = 20                          # 1 to 60
+# max_bytes = 1048576                           # 1024 to 4194304
+# [gateway_receipts.env]                        # the only environment the command gets, besides
+# SOME_NAME = "value"                           # what a program needs to start
+```
+
+   The reporter adds `--after <number>` to a command itself. A receipt names its lease by a hash of the
+   lease id, so the reporter can only settle a lease whose id it has itself recorded as acquired.
+3. **Start the reporter** as before. It refuses to start, with a fixed sentence, when the gateway alias
+   is missing from the snapshot, appears twice, or has an id that is not a UUID. Without the block
+   nothing changes.
+
+### Limits
+
+- **Fixture-only.** agenttalk does not have the receipt command yet (its card 6a-1), so the receipt
+  format here is our reading of the design and lives in one file (`quota_balancer/reporter/receipts.py`).
+  If agenttalk's format differs, that file changes and nothing else.
+- **Cached input is reported as 0.** The gateway records none, so every settle says `0`. Zero is a gap
+  in what is recorded, not a measurement: it is not proof that none was used. `status` says so too.
+- **Journal reports for gateway leases are not suppressed yet.** That comes with card L6a-2 (the
+  admission command that creates gateway-bound leases).
+- **Live gateways need the X3 upgrade** (the gateway program with the receipt API and its schema
+  migration) before this can reach one. Nothing here touches a live gateway.
+- **A lease Leasewise already settled** answers a new final receipt `RECEIPT_CONFLICT` (and parks the
+  account); the same receipt again is a harmless replay. `LEASE_CLOSED` is accepted as done as well.
+- **A refused source stays stuck** until it is fixed: no receipt after the last stored one is taken.
+  `status` asks for attention in that case, and only a wait ("read later") does not.
+- **A rebuilt gateway ledger** (a new generation) restarts its numbers; the reporter keeps one
+  "last receipt number" per gateway alias and does not handle that yet.
+- **No downgrade of the state file.** It is now version 3 (1 and 2 are upgraded in one step). A reporter
+  built before this card refuses a version-3 file with its existing "the state file version is not
+  supported" sentence and never opens or changes it. Keep a copy if you may go back.
+- **Advisory until R1.** Metered leases stay advisory in Leasewise until card R1.
+
+### Technical detail
+
+State version 3 adds `gateway_receipt` (one row per gateway alias, ledger generation and `seq`, keyed
+by `event_id`; identity and body cannot be changed or deleted) and `lease_ref` (the hash of each
+acquired lease id and the id). `event_id` is a UUIDv5 of the reference hash and the ledger generation.
+The body keys are Leasewise's settle keys; `final` is true and `cached_input_tokens` is 0. The pass
+order is limit, receipt, lease; `status_version` is 3. Unmatched references are stored as failed with
+the word `UNKNOWN_LEASE` so their number is still passed.
