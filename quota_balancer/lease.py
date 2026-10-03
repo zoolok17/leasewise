@@ -82,7 +82,7 @@ import json
 import sqlite3
 import uuid as _uuid
 
-from . import errors, policy, reduce
+from . import errors, money, policy, reduce
 from .errors import QuotaError
 from .migrate import rollback_quietly
 from .store import _connect
@@ -562,18 +562,41 @@ def _advisory_budget_check(conn, account_id, budget, now_ms):
     Only final receipts with a known `actual_micro_eur` count; holds are not added; a shadow lease never counts.
     This stops work on known spend only and claims no complete accounting.
 
-    The amounts are added here, as whole Python numbers, and the adding stops the moment the total reaches the
-    cap. The database's own SUM is not used: each amount may be as large as the largest number it keeps, and a
-    total that overflows would answer "the store failed" instead of "the budget is used up"."""
-    spent = 0
-    for (amount,) in conn.execute(
-            "SELECT r.actual_micro_eur FROM receipts r JOIN leases l ON l.id=r.lease_id "
-            "WHERE r.final=1 AND r.actual_micro_eur IS NOT NULL AND l.enforcement <> 'shadow' "
-            "AND l.period_start=? AND l.account_id=?",
-            (_month_start_ms(now_ms), account_id)):
-        spent += amount
-        if spent >= budget:
-            raise QuotaError(errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT)
+    The amounts are added by `money.reaches`, as whole Python numbers, and the adding stops the moment the total
+    reaches the cap. The database's own SUM is not used: each amount may be as large as the largest number it keeps,
+    and a total that overflows would answer "the store failed" instead of "the budget is used up"."""
+    amounts = (amount for (amount,) in conn.execute(
+        "SELECT r.actual_micro_eur FROM receipts r JOIN leases l ON l.id=r.lease_id "
+        "WHERE r.final=1 AND r.actual_micro_eur IS NOT NULL AND l.enforcement <> 'shadow' "
+        "AND l.period_start=? AND l.account_id=?",
+        (_month_start_ms(now_ms), account_id)))
+    try:
+        reached = money.reaches(amounts, budget)
+    except money.MoneyError:
+        raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED) from None
+    if reached is True:
+        raise QuotaError(errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT)
+
+
+def _money_sums(conn, tail, params, columns, guards=()):
+    """Exact totals for the admission queries (card R1-M): see `money.exact_sums`. A store that breaks its own rules (a
+    negative amount, more rows than a split sum can add, a hold settled above what it reserved) is a real store fault and
+    answers STORE_ERROR; a total that is merely HUGE is never a fault: it is above every cap and is refused as such."""
+    try:
+        sums = money.exact_sums(conn, tail, params, columns, guards)
+    except money.MoneyError:
+        raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED) from None
+    if any(sums.guards):
+        raise QuotaError(errors.CODE_STORE_ERROR, errors.MSG_STORE_FAILED)
+    return sums.totals
+
+
+def _hold_exposure(conn, tail, params):
+    """The unresolved exposure of the holds in `tail`: reserved minus settled, each added exactly, subtracted in Python
+    (never inside the database, where a subtraction inside a SUM could overflow). Saturated for the admission rule."""
+    reserved, settled = _money_sums(conn, tail, params, ["h.reserved", "COALESCE(h.settled_actual,0)"],
+                                    guards=["COALESCE(h.settled_actual,0) > h.reserved"])
+    return money.saturate(reserved - settled)
 
 
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
@@ -617,14 +640,15 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         else:
             settled_bucket = "l.period_start"
         for scope, scope_id in scope_ids:
-            settled = conn.execute(
-                "SELECT COALESCE(SUM(" + column + "),0) FROM receipts r "
+            settled = money.saturate(_money_sums(
+                conn,
+                "receipts r "
                 "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
                 # A shadow lease is observe-only: its report (a known or an
                 # unknown count) never counts toward any limit (card L1c).
                 "l.enforcement <> 'shadow' AND "
                 + settled_bucket + "=? AND " + _chain_pred(scope),
-                (ps,) + _chain_bind(scope, scope_id)).fetchone()[0]
+                (ps,) + _chain_bind(scope, scope_id), [column])[0])
             # The platform singleton matches every platform row loaded
             # for this group (the query only selects the singleton).
             limit_ids = [r["id"] for r in limit_rows
@@ -662,15 +686,14 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                 # Only unresolved exposure: a settled lease's spend is
                 # counted through its receipt, its released headroom is
                 # gone (the hold no longer reserves anything).
-                holds = conn.execute(
-                    "SELECT COALESCE(SUM(h.reserved - "
-                    "COALESCE(h.settled_actual,0)),0) FROM holds h JOIN "
+                holds = _hold_exposure(
+                    conn,
+                    "holds h JOIN "
                     "leases l ON l.id=h.lease_id WHERE h.period_start=? "
                     "AND h.limit_id IN (" + placeholders + ") AND "
                     "l.state IN ('active','uncertain') AND "
                     + _chain_pred(scope),
-                    (ps, *limit_ids) + _chain_bind(scope,
-                                                   scope_id)).fetchone()[0]
+                    (ps, *limit_ids) + _chain_bind(scope, scope_id))
             usage[(scope, scope_id)] = (settled, holds)
     # The account budget: the one mandatory (money, month) cap, enforced
     # against the account's own settled charges and synthetic holds.
@@ -678,19 +701,19 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                     and budget is not None)
     if with_account:
         month = _month_start_ms(now_ms)
-        acct_settled = conn.execute(
-            "SELECT COALESCE(SUM(r.actual_micro_eur),0) FROM receipts r "
+        acct_settled = money.saturate(_money_sums(
+            conn,
+            "receipts r "
             "JOIN leases l ON l.id=r.lease_id WHERE r.final=1 AND "
             "l.enforcement <> 'shadow' AND "
             "l.period_start=? AND l.account_id=?",
-            (month, account_id)).fetchone()[0]
-        acct_holds = conn.execute(
-            "SELECT COALESCE(SUM(h.reserved - COALESCE(h.settled_actual,0)),0) "
-            "FROM holds h JOIN leases l ON l.id=h.lease_id WHERE "
+            (month, account_id), ["r.actual_micro_eur"])[0])
+        acct_holds = _hold_exposure(
+            conn,
+            "holds h JOIN leases l ON l.id=h.lease_id WHERE "
             "h.period_start=? AND h.limit_id=? AND l.account_id=? AND "
             "l.state IN ('active','uncertain')",
-            (month, _account_limit_id(account_id),
-             account_id)).fetchone()[0]
+            (month, _account_limit_id(account_id), account_id))
         usage[("account", account_id)] = (acct_settled, acct_holds)
     # check_admission validates closed shapes: its rows carry exactly the
     # limit columns (the store's limit id stays out of the arithmetic).

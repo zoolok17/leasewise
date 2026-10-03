@@ -520,6 +520,41 @@ refused (m4).
 runs right before the admission groups, only for `metered_advisory` on an account with a budget. Tests:
 `tests/test_cardr1_expiry.py`.
 
+### R1-M: money is added exactly (steps R1-M1 to R1-M3)
+
+In plain words: before one account's spending can decide anything, every amount that is added or compared has to mean the same
+thing, and the adding must never go wrong silently. Reading the code found two problems that this part fixes, and one that a later
+part will:
+
+- **Fixed now: an absurd total is "budget used up", not "store failed".** The database's own `SUM` stops with an error when the
+  amounts together pass the largest number it keeps, and that error came out as `STORE_ERROR` (residual risk R-013). Admission
+  and the gateway shares now add the amounts exactly, outside the database: each number is split into a high and a low half, the
+  database adds the halves (which cannot overflow), and Python puts them together. A total larger than any cap is refused as the
+  limit it is (`MONEY_LIMIT`, `INPUT_LIMIT`); a gateway allocation that is too large is `INVALID_CONFIG` with the existing sentence
+  **when the account's tax basis is known**; when the ledger basis is `unknown` that check is postponed, as it always was (accepting
+  the evidence is not approving the allocation), so such an allocation is accepted;
+  `status` shows such an allocation exactly, with `allocated_above_int64: true` (the key is absent for every ordinary account).
+  A store that breaks its own rules (a negative amount, more than 2^31 - 1 rows in one sum, a hold settled above what it
+  reserved) is still `STORE_ERROR`: that is a real fault.
+- **Fixed now: one place for money arithmetic.** `quota_balancer/money.py` holds the rules: whole micro-EUR, a range check where an
+  amount enters or is stored (2^63 - 1 in storage; on the reporter's wires, money in a receipt accepts up to 10^12 and money in an admission answer stops at 10^12 - 1), a sum compared with a limit stops as soon as it
+  decides, and an **unknown amount is never 0**: a sum with an unknown term is unknown, though a known part that already passes
+  the limit still refuses.
+- **Not yet (a later step, R1-M4):** conversions between the declared tax bases (`ex_vat`, `invoice_total`) on the lease side. Both
+  bases are `ex_vat` today, so nothing is compared across bases yet. The conversion helper exists and is tested (an amount that is
+  *spent* rounds up, a *limit* rounds down) but no admission code calls it. The model rates that size a hold are meant in the
+  ledger basis; that sentence becomes a rule with R1-M4.
+
+Normal-size results are identical before and after.
+
+### Technical detail (R1-M)
+
+`lease._money_sums` and `lease._hold_exposure` replace the four `SUM` queries of `_admit_group` (the scope and account totals of
+settled receipts and of open holds; money and input tokens use the same query text, so both are fixed). The usage numbers reach the
+pure rule `policy.check_admission` saturated at `policy.USAGE_MAX` (2^63, one above the largest cap). `_advisory_budget_check` uses
+`money.reaches`, which stops at the first receipt that decides. `store._allocated` replaces the three `SUM(share_micro_eur)` queries.
+Tests: `tests/test_cardr1_money.py`, `tests/test_cardr1_money_store.py`. Record: `docs/STEP-CARD-R1-M.md`.
+
 ## Card 7a-2 - the reporter core
 
 `quota_balancer/reporter/` is the part of the observe-only reporter that decides

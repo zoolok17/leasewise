@@ -42,6 +42,7 @@ from .reduce import (
     reduce_window,
     window_freshness,
 )
+from . import money
 from .policy_config import apply_policy
 from .validate import validate
 from .validate_config_v2 import VERSION as CONFIG_V2, validate_v2
@@ -350,6 +351,16 @@ def _references(conn, table, column, entity_id):
     return row is not None
 
 
+def _allocated(conn, account_id):
+    """The account's gateway shares, added exactly (card R1-M, S5 to S7). The database's own SUM stops with an error when the
+    shares together pass the largest number it keeps; the shares are added by `money.exact_sum` instead, so a total that is
+    merely huge is an ordinary number (and the allocation check then refuses it as too large), never a store fault."""
+    try:
+        return money.exact_sum(conn, "gateways WHERE account_id = ?", (account_id,), "share_micro_eur")
+    except money.MoneyError:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from None
+
+
 def billing_policy_import(path, file):
     """Validate a billing-policy document and apply it atomically.
 
@@ -404,10 +415,8 @@ def _apply_billing_policies(conn, policies):
         accounts[alias] = (account_id, kind, budget)
     machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
     shares = {}
-    for (account_id, total) in conn.execute(
-            "SELECT account_id, SUM(share_micro_eur) FROM gateways "
-            "GROUP BY account_id"):
-        shares[account_id] = total
+    for (account_id,) in conn.execute("SELECT DISTINCT account_id FROM gateways").fetchall():
+        shares[account_id] = _allocated(conn, account_id)
 
     for policy in policies:
         account = accounts.get(policy["account"])
@@ -663,9 +672,7 @@ def _reduce_provider_billing(conn, reading, account_id, machine_id):
     # reading is accepted only while the CURRENT config still holds
     # shares + non-AI allowance <= cap on the cap basis; an unknown tax
     # basis defers the check (the reading is recorded, never approved).
-    shares = conn.execute(
-        "SELECT COALESCE(SUM(share_micro_eur), 0) FROM gateways "
-        "WHERE account_id = ?", (account_id,)).fetchone()[0]
+    shares = _allocated(conn, account_id)
     allocation_within_cap(
         account[1], shares, policy[3], policy[4], policy[5], policy[6])
 
@@ -1083,20 +1090,24 @@ def status(path):
         try:
             require_supported(conn)
             accounts = []
-            for account_id, alias, kind, budget, allocated, coverage in conn.execute(
-                "SELECT a.id, a.alias, a.kind, a.budget_micro_eur, "
-                "COALESCE((SELECT SUM(g.share_micro_eur) FROM gateways g "
-                "WHERE g.account_id = a.id), 0), a.coverage_complete "
+            for account_id, alias, kind, budget, coverage in conn.execute(
+                "SELECT a.id, a.alias, a.kind, a.budget_micro_eur, a.coverage_complete "
                 "FROM accounts a ORDER BY a.alias"
-            ):
-                accounts.append({
+            ).fetchall():
+                allocated = _allocated(conn, account_id)
+                entry = {
                     "alias": alias,
                     "kind": kind,
                     "budget_micro_eur": budget,
                     "allocated_micro_eur": allocated,
                     "coverage_complete": bool(coverage),
                     "windows": _project_windows(conn, account_id, now_ms),
-                })
+                }
+                if allocated > money.INT64_MAX:
+                    # The shares together are above the largest number the store keeps: the figure is exact, and this says so.
+                    # (Absent otherwise, so the inventory of every ordinary account is unchanged.)
+                    entry["allocated_above_int64"] = True
+                accounts.append(entry)
             machines = [
                 row[0]
                 for row in conn.execute("SELECT alias FROM machines ORDER BY alias")
