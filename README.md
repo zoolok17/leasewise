@@ -539,8 +539,10 @@ store. See docs/STEP-CARD-7C-2.md.
 
 ### What it does, in plain words
 
-1. **The reporter looks** at the park files in the agenttalk folders you name, about every 5 seconds
-   (never longer than 60 seconds apart while this is on).
+1. **The reporter looks** at the park files in the agenttalk folders you name, about every 5 seconds.
+   While this is on, the wait between two finished cycles is at most 60 seconds; reading and sending
+   can make the time between two looks longer than that, so 60 seconds is a cap on the wait, not a
+   promise about the gap between looks.
 2. **It reads each file strictly.** Anything unexpected gives no event, and a file that may only be
    half written is looked at again on the next look.
 3. **It builds one event** for the account you declare and the limit that was hit. Two seats on one
@@ -582,10 +584,12 @@ account  = "claude-main"                       # a Leasewise account alias
    - the reporter never writes into the folder.
 3. **Start the reporter** as before (`reporter run` or `reporter drain`). It refuses to start, with a
    fixed sentence, when a configured account is missing from the snapshot or appears twice.
-4. **Look at `reporter status`.** With limit events on it shows the account map in use (so you can
+4. **Look at `reporter status --json`.** With limit events on it shows the account map in use (so you can
    check it), the counts of the last look, how many events were captured, are waiting, were delivered
-   or failed, and any capture fault. A configuration without the `limit_events` block behaves
-   exactly as before.
+   or failed, and any capture fault. The plain text view shows only the gap sentence and the lines that
+   ask for action. A configuration without the `limit_events` block behaves exactly as before. While an
+   older reporter (from before this card) is still running during an upgrade, `status` shows its
+   snapshot and says that it has no limit-event section; it never says that limit capture is off.
 
 ### What is read, and what is not
 

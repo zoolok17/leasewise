@@ -385,7 +385,8 @@ end, this record.
 After this step an operator can see in `reporter status` that limit events are on and what they are
 doing, and the status says plainly, in the words claude-agenttalk-lead approved, that capture is best
 effort. The README explains the feature and its limits in one section. While limit capture is on, the
-reporter never waits more than 60 seconds between looks. One end-to-end test proves the whole path: a
+wait between two finished cycles is at most 60 seconds (reading and sending can make the time between
+two looks longer; see fix round 1 below). One end-to-end test proves the whole path: a
 park file, the reporter, the real Leasewise handler, and the account parked until the reset plus 30
 seconds.
 
@@ -461,3 +462,45 @@ one made tests fail.
 
 Card 7c-3 (recovery: a coordinated probe and the way a parked block ends) and card 7b (readings, after
 agenttalk issue #301). The agenttalk journal record that closes R-012 is a later agenttalk change.
+
+## Fix round 1 for step 4 (Codex's final read, tk-0d8e363b4129)
+
+### In plain words
+
+Codex found one real fault and two README sentences that promised too much. The fault: during an
+upgrade, while the OLD reporter is still running, `reporter status` shows that reporter's snapshot, and
+the new text view crashed on it because the old snapshot has no limit-event part. Now the text view
+shows the old status and says plainly that the old reporter has no limit-event section, so nothing is
+said about limit events. It never says that limit capture is off. A snapshot with a version this
+program does not know is refused with a fixed sentence.
+
+The README said scans are never more than 60 seconds apart. The code caps the WAIT between finished
+cycles at 60 seconds (decision D5, which still holds), but reading and sending take time too: Codex
+measured scans 95 seconds apart with waits of only 5 seconds. The README now says exactly that. The README
+also sent the operator to plain `reporter status` for the account map and the counts; those are only in
+`reporter status --json`, and the README now says so.
+
+### What changed
+
+- `status.py`: `render_text` reads `limit_events` with `get`. Without it, it prints one fixed line
+  (`OLDER_REPORTER`) and nothing about capture. With it, it behaves as before.
+- `cli.py`: where `status` falls back to the snapshot of a reporter that owns the state, the snapshot's
+  `status_version` must be a plain whole number from 1 up to this program's own version. A version 1
+  snapshot is shown as it is (text with the fixed line, `--json` unchanged, nothing invented). Anything
+  else (newer, missing, zero, not a whole number) is refused with code `STATUS_VERSION` and a fixed
+  sentence, exit 2, and no value from the snapshot.
+- `README.md` and this record: the wait wording and the `--json` pointer.
+
+### Tests (red first: 6 errors in the new upgrade file and 3 failures in the README file before the change)
+
+- `test_card7c2_upgrade.py` (9 new): the snapshot is written by the REAL old code, loaded from git at
+  `da91e1f` (the same method as `test_card7c2_replay_domain.py`); text and `--json` through the owned-state
+  fallback; no claim that capture is off; the current version still shown without the sentence; newer,
+  missing and malformed versions refused with a fixed sentence and no value.
+- `test_card7c2_readme.py`: the pinned "never longer than 60 seconds" now pins the true wording; 2 new
+  tests (no promise about the gap between scans; the `--json` pointer).
+
+Codex's three probes: the old-snapshot probe now passes as written. The other two assert the old README
+claims (plain text shows the account map; scans at most 60 seconds apart). Those claims are removed rather
+than made true, so their truthful parts are covered by the README tests above and the existing wait tests
+(`max(waits) <= 60` still holds).
