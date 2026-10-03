@@ -529,31 +529,41 @@ dropped, failed, over the cap), `last_successful_call`. "Complete" means "no los
 the journal can see"; it is not a guarantee. `status` never shows the URL, the
 identity or any message text.
 
-## Card 7c-2 - limit events (steps 1 to 3 of 4)
+## Card 7c-2 - limit events
 
-**Status: steps 1 to 3 built.** When a reporter tells Leasewise that an account is out until a given
-time (`POST /v1/limit-events`), Leasewise now holds the account until **30 seconds after** that
-time, so the provider has really reopened. Leasewise adds the 30 seconds itself, once, to the new
-event's time only; the time the reporter sent is kept as sent. A repeated delivery of an event is
-still a pure read.
+**Status: built.** When a Claude seat runs out of its allowance, agenttalk stops retrying and keeps a
+small "parked" file for that seat. The reporter now notices that file and tells Leasewise: "this
+account is out until about this time". Leasewise marks the account parked and holds it until **30
+seconds after** that time, so the provider has really reopened. Audience: the operator of a Leasewise
+store. See docs/STEP-CARD-7C-2.md.
 
-Blocks that already exist keep the `retry_at` they have: nothing is backfilled. Leasewise still does
-not un-park an account by itself; an operator clears the block (card 7c-3 will add recovery).
-**Step 2: the reporter's outbox for limit events.** Once the reporter knows of a limit, the event
-must reach Leasewise across restarts and outages, and nothing else may hold it back. The reporter's
-state file now has a table for limit events: each is stored once, with its body frozen, before
-anything is sent, and every retry resends exactly the stored bytes under the same `Idempotency-Key`.
-Limit events are sent by their own pass, which runs first in every cycle: a lease answer of "retry"
-or 429 (a parked account refuses every lease request) never delays one, and a limit event that
-Leasewise refuses fails only itself, never an agent and never the reporter. Leasewise's answer `202`
-means "recorded" for a limit event; the reporter keeps nothing from it. The client sends a limit
-event to `/v1/limit-events` and to nothing else. Reading the park files is step 3, below.
+### What it does, in plain words
 
-**Step 3: the reporter notices a park.** agenttalk keeps one small file per parked seat
-(`state/usage-limit-park/<agent>.json`, documented in agenttalk's README as a file other programs may
-read). The reporter looks at those files in the folders you name, and turns each fresh one into one
-limit event for the account you declare. Add this to the reporter configuration (every key is
-required, `provider` is `claude` for now, at most 8 sources):
+1. **The reporter looks** at the park files in the agenttalk folders you name, about every 5 seconds
+   (never longer than 60 seconds apart while this is on).
+2. **It reads each file strictly.** Anything unexpected gives no event, and a file that may only be
+   half written is looked at again on the next look.
+3. **It builds one event** for the account you declare and the limit that was hit. Two seats on one
+   account that hit the same limit make one event; a later reset time makes a new one. The event is
+   stored with its body frozen before anything is sent, so a restart or an outage loses nothing, and
+   every retry resends exactly the stored bytes.
+4. **It sends the event first** in every cycle, to Leasewise only (`POST /v1/limit-events`), before any
+   lease message: a lease answer of "retry" or 429 (a parked account refuses every lease request)
+   never delays it, and a limit event that Leasewise refuses fails only itself, never an agent and
+   never the reporter.
+5. **Leasewise** holds the account until the reset plus 30 seconds. It adds the 30 seconds itself,
+   once, to the new event's time only; the time the reporter sent is kept as sent, and a repeated
+   delivery of an event is still a pure read.
+6. **`reporter status`** shows what limit events are doing, including the sentence under "Limits".
+
+### How to set it up
+
+1. **Save the ids again.** The reporter needs each account's id. `policy-ids` now lists
+   `accounts` (alias and local id), so save its output again after upgrading:
+   `python -m quota_balancer --db inventory.db policy-ids --json > policy-ids.json`. An older
+   snapshot has no accounts, and the reporter then refuses to start if limit sources are configured.
+2. **Add the account map** to the reporter configuration (every key is required, `provider` is
+   `claude` for now, at most 8 sources):
 
 ```toml
 [[limit_events.sources]]
@@ -563,38 +573,62 @@ provider = "claude"
 account  = "claude-main"                       # a Leasewise account alias
 ```
 
-This map is a setting you are responsible for: the park files prove nothing about which account a
-seat uses, and a seat's name never decides it. If someone signs a different account into the same OS
-user, the map is wrong until you edit it, and the reporter cannot see the switch. Two sources may not
-name the same folder with the same provider (the folder is compared as it really is, so two spellings
-of one folder count as one), one OS user and provider must name one account, and the folder may not
-contain the reporter's state file or this configuration file. The reporter needs each account's id:
-`policy-ids` now lists `accounts` (alias and local id), so save its output again after upgrading; the
-reporter refuses to start if a configured account is missing or ambiguous in that file.
+   The park files prove nothing about which account a seat uses, and a seat's name never decides it:
+   **this map is a setting you are responsible for.** The folder rules:
+   - two sources may not name the same folder with the same provider (the folder is compared as it
+     really is, so two spellings of one folder count as one);
+   - one OS user and provider must name one account;
+   - the folder may not contain the reporter's state file or this configuration file;
+   - the reporter never writes into the folder.
+3. **Start the reporter** as before (`reporter run` or `reporter drain`). It refuses to start, with a
+   fixed sentence, when a configured account is missing from the snapshot or appears twice.
+4. **Look at `reporter status`.** With limit events on it shows the account map in use (so you can
+   check it), the counts of the last look, how many events were captured, are waiting, were delivered
+   or failed, and any capture fault. A configuration without the `limit_events` block behaves
+   exactly as before.
 
-A file is read strictly. A missing file, one that cannot be opened for a moment (on Windows), half a
-file, or one with a documented field missing is read again on the next look. A file with a field
-that is not documented, a wrong type, a value out of range or another version, and any provider other
-than `claude`, gives no event. A stale file (not refreshed for 300 seconds), a file without a window
-or a park time, and a reset that has already passed give no event either. Two seats on one account
-that hit the same limit make one event; a later reset makes a new one. Once captured, an event is
-stored with its body frozen and delivered even across restarts and outages.
+### What is read, and what is not
 
-Limits:
+The reporter reads the documented contract in agenttalk's README ("Reading the park marker from
+another program") and nothing more. A missing file, one that cannot be opened for a moment (on
+Windows), half a file, or one with a documented field missing is read again on the next look. A file
+with a field that is not documented, a wrong type, a value out of range or another version, and any
+provider other than `claude`, gives no event. A stale file (not refreshed for 300 seconds), a file
+without a window or a park time, and a reset that has already passed give no event either. Only five
+values are kept from a file; the seat's name, the message id and the wrapper generation are checked and
+dropped, and never leave the machine.
 
-- **A folder with more than 256 entries.** The reporter looks at the first 256 entries of the
-  folder (in the folder's own order, ignored names counting too) and says so with a flag; it never
-  counts the folder. So some markers may not be seen in that scan. A folder of park files is small
-  in practice (one per parked seat).
+### Limits
+
+- **The gap (best effort).** A park that starts and ends while the reporter is not running, or between two checks, is never reported. The seat still parks on its own, and the next refusal after the reporter is back is reported. This closes when agenttalk keeps a permanent "parked" record in its turn journal (a later agenttalk change, after the turn-journal pull request #300 is merged, together with Codex limit events). Until then, limit events are best effort.
+- **The map is trusted (R-011).** If someone signs a different account into the same OS user, the map
+  is wrong until you edit it, and the reporter cannot see the switch.
 - **One outbox, one memory.** An event's body is frozen only while the same reporter state file is
   kept. If the state file is recreated, or two reporters run with the same `machine` alias, the same
   `event_id` can be rebuilt with a different first-seen time (`observed_at`); Leasewise then answers
   `409` and that event fails for good, and `status` shows it. There is no deduplication across state
   files.
-- **No downgrade of the state file.** The reporter's state file is now version 2 and a version-1 file
+- **A folder with more than 256 entries.** The reporter looks at the first 256 entries of the folder
+  (in the folder's own order, ignored names counting too) and says so with a flag; it never counts the
+  folder. So some markers may not be seen in that scan. A folder of park files is small in practice
+  (one per parked seat).
+- **No backfill.** Blocks that already exist keep the `retry_at` they have; only new events get the 30
+  seconds.
+- **No downgrade of the state file.** The reporter's state file is now version 2, and a version-1 file
   is upgraded the first time the new reporter opens it. A reporter built before this card meets a
   version-2 file with its existing "the state file version is not supported" refusal: it never opens
   or changes it. Keep a copy of the state file if you may need to go back.
+- **Claude only.** Codex limit events wait for agenttalk's own Codex producer.
+- **Leasewise does not un-park an account by itself.** An operator clears the block until card 7c-3
+  adds recovery.
+- **Advisory until R1.** Leasewise's refusals are advisory until card R1, so a missed event costs a
+  missing warning, not a wrong refusal.
 
-See docs/STEP-CARD-7C-2.md. The rest of the reporter side of card 7c-2 (the wait cap, `status`, the
-stated gap and the end-to-end test) is step 4 and is not built yet.
+### Technical detail
+
+State file version 2 adds the `limit_event` table (one row per limit fact keyed by `event_id`; the
+frozen canonical body; identity and body cannot be changed or deleted). The limit pass runs before the
+lease pass and the two stay separate; `status_version` is 2 with a top-level `limit_events` object.
+One limit fact is (installation, account alias, evidence kind, window, reset); with an unknown reset the
+park time joins the key. `event_id` and `turn_id` are derived from that key; the body is built field by
+field with the reset RAW. Leasewise's margin is `LIMIT_RETRY_MARGIN_MS` in `lease.py`.
