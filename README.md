@@ -369,3 +369,14 @@ last among the policy checks and never for a replay, so receiving it proves that
 lease exists for that request id: the caller may rebuild the request with a
 fresh estimate. Every other bad request is still `INVALID_REQUEST`. See
 docs/STEP-CARD-L1D.md.
+
+## Card 7a-2 - the reporter core
+
+`quota_balancer/reporter/` is the part of the observe-only reporter that decides
+what to tell Leasewise about the turn journal agenttalk writes. It reads the
+journal in snapshot rounds, keeps its own database (one owner at a time), opens a
+shadow lease per message, prepares one report per launched run and one final
+receipt, and says honestly when its view may be incomplete (then the final's token
+numbers are "unknown", never 0). A message whose result is not known gets no
+final. It sends nothing itself: the HTTP client, the `run` / `drain` / `status`
+commands and the configuration are card 7a-3. See docs/STEP-CARD-7A-2.md.

@@ -620,9 +620,12 @@ def _grant(conn, request, now_ms, wire_identity=None):
         # check (team, project, model, effort, account, project link, the
         # profile, the ceilings, the parked block, freshness). Only the
         # closed shape check and the seat lookup (which names the machine)
-        # precede it. A request that was granted always replays, whatever
-        # the operator edited since, and an error such as ESTIMATE_STALE
-        # therefore proves that no lease exists for this request id.
+        # precede it. The lookup is by (machine, request id), and
+        # config-import never moves a seat to another machine, so while a
+        # seat keeps its machine a granted request replays whatever policy
+        # was edited since, and ESTIMATE_STALE proves that no lease exists
+        # for this request id. Editing a seat's machine by hand in the
+        # database is outside that guarantee (register R-008).
         content_hash = _content_hash(request)
         existing = conn.execute(
             "SELECT id, request_hash, policy_snapshot FROM leases WHERE "
