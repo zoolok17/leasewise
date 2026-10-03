@@ -135,6 +135,16 @@ class Report(_Status):
         reporter.cycle()                                                      # and the next cycle reads and sends
         self.assertEqual(reporter.report()["gateway_receipts"]["rows"]["sent"], 1)
 
+    def test_the_text_of_an_older_snapshot_without_the_object_still_renders(self):
+        """A reporter of card 7c-2 (status version 2) that still owns the state leaves a snapshot with no
+        `gateway_receipts`; the new text view shows it and says nothing about receipts."""
+        report = self.reporter().report()
+        del report["gateway_receipts"]
+        report["status_version"] = 2
+        text = status.render_text(report)
+        self.assertNotIn("gateway receipts", text)
+        self.assertNotIn("Cached input", text)
+
     def test_the_counts_survive_a_restart(self):
         reporter = self.reporter(count=2)
         reporter.cycle()

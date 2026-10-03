@@ -20,6 +20,13 @@ the 6a design.
 What is not here, on purpose: suppressing the journal's own reports for gateway-bound leases (decision
 O4; it needs the binding of card L6a-2), and any contact with a live gateway.
 
+## Rebase
+
+After card 7c-2's step 4 fix round 1 (`status` shows an older reporter's snapshot, `ca41629`), this branch
+was rebased onto it. One conflict, in `status.py` (both cards changed the text view); resolved by keeping
+both: a snapshot without `limit_events` (version 1) gets the fixed "older reporter" line, and a snapshot
+without `gateway_receipts` (version 1 or 2) simply shows no receipts line.
+
 ## Decisions taken in this card
 
 - **O2, cached input.** Every settle says `cached_input_tokens = 0`. Meaning, written in the README,
