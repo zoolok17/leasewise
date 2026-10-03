@@ -546,7 +546,7 @@ class PolicyIdsProjection(_L1c):
 
     def test_the_shape_is_closed_and_sorted(self):
         text, data = self.ids_json()
-        self.assertEqual(set(data), {"seats", "models", "task_classes"})
+        self.assertEqual(set(data), {"seats", "models", "task_classes", "accounts"})   # card 7c-2 added accounts
         seat_ids = self.ids("seats")
         model_ids = self.ids("models")
         expected_seats = sorted(
@@ -566,6 +566,13 @@ class PolicyIdsProjection(_L1c):
                 ("other", "sub-model"))),
             key=lambda e: (e["account"], e["model"])))
         self.assertEqual(data["task_classes"], ["bounded_read"])
+        # Card 7c-2: the accounts, by alias, with their local ids.
+        self.assertEqual(data["accounts"], sorted(
+            ({"alias": alias, "id": account_id}
+             for alias, account_id in self.rows("SELECT alias, id FROM accounts")),
+            key=lambda e: e["alias"]))
+        for entry in data["accounts"]:
+            self.assertEqual(set(entry), {"alias", "id"})
         for entry in data["seats"]:
             self.assertEqual(set(entry), {"machine", "team", "project",
                                           "seat", "id"})
@@ -609,7 +616,7 @@ class PolicyIdsProjection(_L1c):
         result = run_cli("--db", db, "policy-ids", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout),
-                         {"models": [], "seats": [], "task_classes": []})
+                         {"models": [], "seats": [], "task_classes": [], "accounts": []})
 
     def test_the_errors_are_static(self):
         missing = run_cli("--db", os.path.join(self.tmp, "SENTINEL-DIR",

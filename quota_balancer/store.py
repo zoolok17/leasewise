@@ -1043,6 +1043,12 @@ def policy_ids(path):
                     "ORDER BY a.alias, mo.alias")]
             task_classes = [row[0] for row in conn.execute(
                 "SELECT task_class FROM profiles ORDER BY task_class")]
+            # Card 7c-2: a limit event names its account by id, so the account ids are listed too
+            # (the alias and the local id, nothing else).
+            accounts = [
+                {"alias": alias, "id": account_id}
+                for alias, account_id in conn.execute(
+                    "SELECT alias, id FROM accounts ORDER BY alias")]
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -1051,7 +1057,8 @@ def policy_ids(path):
         raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
     finally:
         conn.close()
-    return {"seats": seats, "models": models, "task_classes": task_classes}
+    return {"seats": seats, "models": models, "task_classes": task_classes,
+            "accounts": accounts}
 
 
 def status(path):

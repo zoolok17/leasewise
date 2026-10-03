@@ -456,15 +456,58 @@ def load_snapshot(path):
                  for r in data["seats"]]
         models = [(r["account"], r["model"], r["id"]) for r in data["models"]]
         task_classes = list(data["task_classes"])
-        if not all(isinstance(v, str) for row in seats + models
+        # Card 7c-2: the account list is OPTIONAL (an older snapshot has none).
+        accounts = [(r["alias"], r["id"]) for r in data.get("accounts", [])
+                    if set(r) == {"alias", "id"}]
+        if len(accounts) != len(data.get("accounts", [])):
+            raise TypeError
+        if not all(isinstance(v, str) for row in seats + models + accounts
                    for v in row) \
                 or not all(isinstance(t, str) for t in task_classes):
             raise TypeError
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, AttributeError):
         raise ConfigError(CONFIG_UNRESOLVED,
                           "the policy-ids snapshot has an unexpected shape"
                           ) from None
-    return {"seats": seats, "models": models, "task_classes": task_classes}
+    return {"seats": seats, "models": models, "task_classes": task_classes,
+            "accounts": accounts}
+
+
+class ResolvedLimitSource:
+    """A source whose account alias is resolved to the account's local id."""
+
+    __slots__ = ("bus_root", "folder", "os_user", "provider", "account", "account_id")
+
+    def __repr__(self):
+        return "ResolvedLimitSource(<hidden>)"
+
+    __str__ = __repr__
+
+
+_UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def resolve_limit_sources(config, snapshot):
+    """-> a tuple of ResolvedLimitSource. Every source's account alias must be in the snapshot,
+    exactly once, with a local id: otherwise the reporter refuses to start. Never the first of
+    several, never a guess. The messages name no value."""
+    resolved = []
+    for source in config.limit_sources:
+        ids = [account_id for alias, account_id in snapshot["accounts"] if alias == source.account]
+        if not ids:
+            raise ConfigError(CONFIG_UNRESOLVED, "limit_events: an account is not in the policy-ids snapshot")
+        if len(ids) > 1:
+            raise ConfigError(CONFIG_UNRESOLVED, "limit_events: an account alias is ambiguous in the "
+                              "policy-ids snapshot")
+        if _UUID_TEXT.fullmatch(ids[0]) is None:
+            raise ConfigError(CONFIG_UNRESOLVED, "limit_events: an account id in the policy-ids snapshot "
+                              "is not valid")
+        row = ResolvedLimitSource()
+        row.bus_root, row.folder = source.bus_root, source.folder
+        row.os_user, row.provider = source.os_user, source.provider
+        row.account, row.account_id = source.account, ids[0]
+        resolved.append(row)
+    return tuple(resolved)
 
 
 def _unresolved(agent, what):
