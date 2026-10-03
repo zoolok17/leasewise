@@ -10,7 +10,8 @@ No I/O, clock reads, input mutation, receipts or reconcile-state writes.
 A HOLD is a recommendation and always makes request_fits false.
 """
 
-from .reduce import convert_basis, reduce_billing_total
+from . import money
+from .reduce import ROLE_DOWN, convert_basis, reduce_billing_total
 
 from .errors import (
     CODE_INVALID_CONFIG,
@@ -377,13 +378,22 @@ def _validate_request(request, ctx):
 # ---------------------------------------------------------------------------
 
 def _checked(value):
-    if not 0 <= value <= INT64_MAX:
+    """`value` when it is an amount the store could keep. An UNKNOWN passes through: it is never turned into a number."""
+    if value is money.UNKNOWN:
+        return value
+    if type(value) is not int or not 0 <= value <= INT64_MAX:
         _invalid()
     return value
 
 
 def _sum(values):
-    return _checked(sum(values))
+    """The exact total of `values`, or UNKNOWN when any term is unknown (never the known part, never 0), refused as
+    INVALID_CONFIG above the largest number the store keeps (card R1-M: the one place that adds is `money`)."""
+    try:
+        total = money.add(*values)
+    except money.MoneyError:
+        _invalid()
+    return _checked(total)
 
 
 def _normalize_money(ctx):
@@ -396,8 +406,10 @@ def _normalize_money(ctx):
     if any(source != target for source in sources) and policy["vat_bps"] is None:
         return False
 
-    def convert(value, source):
-        return convert_basis(value, source, target, policy["vat_bps"])
+    def convert(value, source, role=None):
+        if role is None:
+            return convert_basis(value, source, target, policy["vat_bps"])
+        return convert_basis(value, source, target, policy["vat_bps"], role)
 
     for event in ctx["provider_events"]:
         event["payload"]["total_micro_eur"] = convert(
@@ -407,6 +419,9 @@ def _normalize_money(ctx):
             (seq, obs, *(convert(v, policy["ledger_basis"]) for v in (l, r, u)), ev)
             for seq, obs, l, r, u, ev in chain]
     for gateway in ctx["gateways"]:
+        # A share is used two ways. As an allocation (shares + allowance against the cap) it is an exposure and rounds UP, as
+        # it always did. As the ceiling of its own gateway (`share_g`) it is a limit and rounds DOWN: never more than it is.
+        gateway["share_limit_micro_eur"] = convert(gateway["share_micro_eur"], policy["ledger_basis"], ROLE_DOWN)
         gateway["share_micro_eur"] = convert(gateway["share_micro_eur"], policy["ledger_basis"])
     if ctx["boundary_exposure_micro_eur"] is not None:
         ctx["boundary_exposure_micro_eur"] = convert(
@@ -676,12 +691,13 @@ def evaluate_billing(context, request):
                       and all(_fresh(e, ctx["policy"], req["now_ms"]) for e in ctx["provider_events"]))
         state, reason, action, quality = _decision(ctx, req, ledger, reserves, comparable)
         if comparable:
-            available = ctx["cap_micro_eur"] - _sum([estimate, reserves])
+            used = _sum([money.UNKNOWN if estimate is None else estimate, reserves])
             admission = "billing_estimate"
         else:
-            available = ctx["cap_micro_eur"] - _sum([ctx["policy"]["non_ai_allowance_micro_eur"], ledger, reserves])
+            used = _sum([ctx["policy"]["non_ai_allowance_micro_eur"], ledger, reserves])
             admission = "ledger_fallback"
-        if available >= 0:
+        available = money.headroom(ctx["cap_micro_eur"], [used])      # UNKNOWN when any term was: never a manufactured room
+        if available is not money.UNKNOWN and available >= 0:
             headroom = available
         else:
             admission = "unavailable"

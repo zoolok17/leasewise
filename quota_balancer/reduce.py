@@ -275,12 +275,18 @@ INT64_MAX = 2 ** 63 - 1
 VAT_BPS_MAX = 10_000  # basis points; 10000 == 100%
 
 
-def convert_basis(amount, source_basis, target_basis, vat_bps):
+ROLE_UP = "up"        # an exposure: money that counts against a limit (never counts less than it is)
+ROLE_DOWN = "down"    # a limit: the figure compared against (never allows more than it is)
+
+
+def convert_basis(amount, source_basis, target_basis, vat_bps, role=ROLE_UP):
     """Pure tax-basis conversion, shared by the later 2b cards.
 
     Convert a non-negative integer micro-EUR amount between two
-    operator-declared bases. Both directions round UP (a half-micro
-    fraction is never dropped), in checked integer arithmetic:
+    operator-declared bases. By default (role "up", an exposure) both
+    directions round UP (a half-micro fraction is never dropped); role
+    "down" (a limit, such as a gateway share read as a ceiling) rounds
+    DOWN. Checked integer arithmetic:
       ex_vat -> invoice_total: ceil(x * (10000 + vat_bps) / 10000)
       invoice_total -> ex_vat: ceil(x * 10000 / (10000 + vat_bps))
       equal KNOWN bases: unchanged (no rate is needed, so vat_bps may be
@@ -292,6 +298,8 @@ def convert_basis(amount, source_basis, target_basis, vat_bps):
     amount, or an overflowing result is INVALID_CONFIG.
     """
     if type(amount) is not int or amount < 0 or amount > INT64_MAX:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if role not in (ROLE_UP, ROLE_DOWN):
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
     if source_basis not in CLOSED_BASES or target_basis not in CLOSED_BASES:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
@@ -307,7 +315,7 @@ def convert_basis(amount, source_basis, target_basis, vat_bps):
         numerator, denominator = amount * (10_000 + vat_bps), 10_000
     else:
         numerator, denominator = amount * 10_000, 10_000 + vat_bps
-    result = (numerator + denominator - 1) // denominator  # ceil
+    result = (numerator + denominator - 1) // denominator if role == ROLE_UP else numerator // denominator
     if result > INT64_MAX:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
     return result
