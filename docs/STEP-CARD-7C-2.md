@@ -31,8 +31,11 @@ waits for; an operator still clears the block.
   - The reset as sent stays **raw** in `limit_events.resets_at`, and stays part of the replay
     comparison. A replay of a known event is still a pure read: it returns the block as it is and
     writes nothing.
-  - `_validate_limit_event`: `resets_at` may be at most `INT64_MAX - 30 000`, so the sum always fits
-    the store. One more is refused as `INVALID_REQUEST`.
+  - A reset a NEW event states may be at most `INT64_MAX - 30 000` (`LIMIT_RESETS_AT_MAX`), so the
+    sum always fits the store; one more is refused as `INVALID_REQUEST`. **Fix round 1 moved this
+    check:** it applies once an event is known to be new (an insert or a join), after the lookup. A
+    replay keeps the old checks (shape, type, a reset up to `INT64_MAX`, and the authorization). See
+    "Fix round 1" below.
   - A comment where `turn_id` is validated: for a limit event it is only a checked id kept for the
     replay comparison, not linked to a lease (decision D8).
 - `quota_balancer/http_api.py`: no change. The `202` answer carries the block's `retry_at`, so it is
@@ -121,9 +124,11 @@ tests put events into the queue by hand.
   field of a `202` body is kept.
 - **Scheduling (`run.py`, commit 4).** `_send` runs two passes, the limit pass first. A lease answer
   of retry or `429` (a parked account refuses every lease request) never delays a limit row, and a
-  denied lease that stops its agent never holds one. If the limit pass itself meets the wall (no
-  answer, `5xx`, `429`, `401`), the lease pass would meet the same wall, so the cycle stops. A row
-  waiting out its own back-off is skipped, and the lease pass still runs.
+  denied lease that stops its agent never holds one. **The two passes stay separate** (fix round 1,
+  16.6): a limit retry (no answer, `5xx`, `429`, `401`) does not stop the lease pass either, because
+  the limit route can fail on its own while leases work. Each pass stops on its own wall and
+  `blocked` says if either met one. A row waiting out its own back-off is skipped, and the lease
+  pass still runs.
 
 ### Decisions applied
 
@@ -140,9 +145,9 @@ tests put events into the queue by hand.
 | File | What it proves |
 | --- | --- |
 | `test_card7c2_decisions.py` (9) | the answer table above, including `202` not success for lease kinds, 4xx never an agent stop, an echoed unknown word becomes `UNKNOWN_CODE` |
-| `test_card7c2_state.py` (22) | fresh file is version 2; v1 migrates with lease rows untouched; second open is a no-op; a failed upgrade stays v1; the old code path refuses v2 and changes nothing; a newer unknown version is refused; one row per `event_id` with the first bytes; immutability; body allow-list with a fixed sentence; scheduling order and back-off; `apply` for every answer |
+| `test_card7c2_state.py` (24) | fresh file is version 2; v1 migrates with lease rows untouched; second open is a no-op; a failed upgrade stays v1; the old code path refuses v2 and changes nothing; a newer unknown version is refused; one row per `event_id` with the first bytes; immutability; body allow-list with a fixed sentence; scheduling order and back-off; `apply` for every answer |
 | `test_card7c2_client.py` (11) | the path pair (limit rows only to the limit path; no lease kind can reach it; 14 refused paths); the wire bytes equal the stored bytes on every try; answer reading; no exception text kept |
-| `test_card7c2_delivery.py` (13) | a parked account refusing every lease never delays a limit row (same cycle, limit path first); a denied acquisition that stops its agent does not either; oldest first; a refused row fails alone; no answer stops the cycle before the lease pass; a back-off row is skipped; `401`; every try resends the same bytes across a restart; a sent row is never resent; no body value or exception text in errors, notes, counters or status |
+| `test_card7c2_delivery.py` (15) | a parked account refusing every lease never delays a limit row (same cycle, limit path first); a denied acquisition that stops its agent does not either; oldest first; a refused row fails alone; no answer stops the cycle before the lease pass; a back-off row is skipped; `401`; every try resends the same bytes across a restart; a sent row is never resent; no body value or exception text in errors, notes, counters or status |
 
 Each file was run red against the code before its commit (decisions: 9 tests, 24 errors before;
 state: 22 tests, 1 failure and 44 errors before; client: 11 tests, 14 failures before; delivery: 13
@@ -157,3 +162,54 @@ tests, 12 failures before).
 - If Leasewise keeps answering `429` or `5xx` for a limit event, it is retried with the usual
   5-second to 15-minute back-off, for ever; nothing drops it.
 
+## Fix round 1 (Codex's first read, tk-e7f12e878cee; spec section 16)
+
+### In plain words
+
+Codex found one upgrade edge that broke a promise. A limit event that Leasewise accepted *before* this
+card, with an extreme reset time (within 30 seconds of the largest number the store can hold), was
+refused when the reporter sent it again, because step 1 checked the new, smaller ceiling before it
+looked the event up. A repeated delivery must behave exactly as before. It does now. Codex also asked
+for delivery tests that belong to step 2.
+
+### 16.1: a replay keeps the old reset domain (`lease.py`)
+
+- `_validate_limit_event` checks the reset in the OLD domain only, up to `INT64_MAX`.
+- `record_limit_event` checks the smaller ceiling, `LIMIT_RESETS_AT_MAX = INT64_MAX - 30 000`, only
+  after the lookup says the event is new (an insert or a join). A replay (including a legacy record)
+  returns the block as it is: no conflict, no margin, nothing written. The legacy branch is reachable
+  for those values.
+- A new event at those values is still refused with `400`, as a new block and as a join; the block is
+  left unchanged.
+- This does not change section 7.2's rule in effect: it is the same rule, now true at the edges. The
+  step 1 text above is updated; the README needed no change.
+
+Tests, `tests/test_card7c2_replay_domain.py` (8): each event is recorded **the old way** by running
+the limit-event code from the repository's own history (`da91e1f`), at `INT64_MAX`,
+`INT64_MAX - 1` and `INT64_MAX - 29 999`; the same body is then replayed through the new code and
+over HTTP: the same answer, no conflict, no margin (raw `retry_at`), and every table unchanged. The
+same for a legacy record. A changed reset under an old id is still a conflict; a replay above
+`INT64_MAX` is still invalid; a new event at those values is refused as an insert and as a join; a
+new event joining an old block at the edge gets `max(old raw, new + margin)`. Run against step 1
+(`437acb6`) the new file gave 8 tests, 4 failures and 6 errors; against the fix, all pass. Codex's own
+reproduction (`test_7c2_review_edges.py`, copied, never edited) passes: 2 of 2.
+
+### 16.6: delivery (step 2)
+
+- **The two passes stay separate even after a limit row gets a retry.** Not true before: a limit
+  retry stopped the cycle before the lease pass. Fixed in `run.py` (see step 2 above). Tests:
+  `test_the_two_passes_stay_separate_even_after_a_limit_row_gets_a_retry` (red before: 1 failure) and
+  `test_a_row_waiting_out_its_own_back_off_is_not_resent_but_the_lease_pass_runs`, which now has a
+  lease message arriving while a limit row backs off.
+- **Credential notes are written in the same transaction as the delivery state.** Already true:
+  `State.apply` does everything inside one `txn()`. Now proven: a temporary trigger makes the row
+  update fail; the credential note is not cleared by a success and not started by a `401`, and no
+  `last_ok` note or try is recorded (`Atomic` in `test_card7c2_state.py`, 2 tests, they passed
+  already).
+- **A 202 completion, then a lease 401, then recovery by a later successful limit request.** Already
+  worked; now a test: `Credential` in `test_card7c2_delivery.py`.
+
+### Not in this round
+
+Sections 16.2 to 16.5 (sample clocks, the stated one-outbox limit, folder identity, the reader table)
+are for step 3.
