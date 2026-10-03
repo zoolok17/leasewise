@@ -30,6 +30,7 @@ from tests.journal_fixture import (MODEL, RAW_NULLS, SEAT, T0, USAGE, Journal,
 CFG = AgentConfig("alpha", SEAT, MODEL, "bounded_read", "opus", 1, 2, 1000,
                   500, 1_800_000)
 NOW = T0 + 1_000_000
+MARGIN = rounds.CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -517,14 +518,16 @@ class CompletenessD3(_Base):
 
     def test_a_message_time_after_its_only_event_is_inconsistent(self):
         s = self.journal.add_stream("g1", T0)
-        s.disposed("m1", "outcome_unknown", T0 + 3000, message_at=T0 + 9000)
+        s.disposed("m1", "outcome_unknown", T0 + 3000,
+                   message_at=T0 + 3000 + MARGIN + 1)
         self.round()
         self.assertEqual(self.status("m1")[1], "clock_inconsistent")
 
     def test_two_different_message_times_are_inconsistent(self):
         s = self.journal.add_stream("g1", T0)
-        s.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
-        s.disposed("m1", "completed", T0 + 3000, message_at=T0 + 1500)
+        s.dispatch("m1", "t1", T0 + 2000 + MARGIN, message_at=T0 + 1000)
+        s.disposed("m1", "completed", T0 + 3000 + MARGIN,
+                   message_at=T0 + 1001 + MARGIN)
         self.round()
         self.assertIn("clock_inconsistent", self.status("m1")[2].split(","))
 
@@ -548,7 +551,7 @@ class CompletenessD3(_Base):
     def test_a_missing_predecessor_makes_an_old_message_incomplete(self):
         s = self.journal.add_stream("g2", T0 + 100_000, previous="g1")
         message(s, "old", T0 + 50_000, T0 + 110_000, T0 + 120_000)
-        message(s, "new", T0 + 105_000, T0 + 130_000, T0 + 140_000)
+        message(s, "new", T0 + 100_000 + MARGIN, T0 + 130_000, T0 + 140_000)
         self.round()
         self.assertIn("missing_stream", self.status("old")[2].split(","))
         self.assertEqual(self.status("new")[:2], (1, "ok"))
@@ -588,7 +591,7 @@ class ContinuityD4(_Base):
         s.dispatch("b", "t-b", T0 + 2100, message_at=T0 + 2050)
         s.rotate(T0 + 3000)
         message(s, "m1", T0 + 1500, T0 + 3100, T0 + 3200)
-        message(s, "late", T0 + 3300, T0 + 3400, T0 + 3500)
+        message(s, "late", T0 + 3100 + MARGIN + 1, T0 + 3400, T0 + 3500)
         os.remove(s.path(2))
         self.round()
         self.assertIn("seq_gap", self.status("m1")[2].split(","))
@@ -1188,9 +1191,6 @@ class PrivacyCore(_Base):
 
 # --- fix round 1 (tk-15619ce77471): F1-F5 and L1-L2 -------------------------------
 
-MARGIN = rounds.CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
-
-
 class FixRound1Completeness(_Base):
     def test_f1_a_rotation_header_is_a_watermark_not_an_observed_event(self):
         s = self.journal.add_stream("g1", T0)
@@ -1215,11 +1215,8 @@ class FixRound1Completeness(_Base):
     def test_f1_a_watermark_beyond_every_read_event_is_a_lost_tail(self):
         s = self.journal.add_stream("g1", T0)
         s.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
-        s.seq = s.written_seq = 9                            # events 3..9 vanished
-        s.rotate(T0 + 3000)
-        s.disposed("m1", "completed", T0 + 3500, message_at=T0 + 1000)
-        s.seq = s.written_seq = 12
-        s.rotate(T0 + 9000)                                  # a header, no events
+        s.seq = s.written_seq = 9                  # events 3..9 never read
+        s.rotate(T0 + 3000)                        # a header, no events after it
         self.round()
         self.assertIn("seq_gap", self.status("m1")[2].split(","))
 
@@ -1252,6 +1249,11 @@ class FixRound1Completeness(_Base):
         self.round()
         self.assertEqual(self.final("m1")["complete"], 0)
         self.assertIn("seq_gap", self.status("m1")[2].split(","))
+
+    def test_f4_the_parser_itself_refuses_a_kind_that_is_not_a_string(self):
+        for kind in ([], {"a": 1}, 7, None, ["x"]):
+            with self.assertRaises(events.JournalError):
+                events.parse_event(line(_event_obj(kind=kind)).rstrip(b"\n"))
 
     def test_f4_a_kind_that_is_a_list_or_an_object_is_a_damaged_line(self):
         s = self.journal.add_stream("g1", T0)
@@ -1462,13 +1464,15 @@ class FixRound1Unauthenticated(_Base):
         s = self.journal.add_stream("g1", T0)
         message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
         self.round()
-        for kind in (decisions.ACQUIRE, decisions.REPORT, decisions.FINAL):
-            item = self.state.next_item(NOW)
+        for number, kind in enumerate((decisions.ACQUIRE, decisions.REPORT,
+                                       decisions.FINAL)):
+            now = NOW + number * 10 ** 9           # every retry is due again
+            item = self.state.next_item(now)
             while item.kind != kind:
-                self.state.apply(item, accept(item), NOW)
-                item = self.state.next_item(NOW)
+                self.state.apply(item, accept(item), now)
+                item = self.state.next_item(now)
             decision = self.state.apply(item, Response(401, "UNAUTHENTICATED"),
-                                        NOW)
+                                        now)
             self.assertEqual(decision.action, decisions.RETRY)
             table = {"acquire": "acquisition", "report": "report",
                      "final": "final"}[kind]
@@ -1477,7 +1481,7 @@ class FixRound1Unauthenticated(_Base):
             self.assertEqual(row[0], "pending", kind)
             self.assertEqual(row[1], "UNAUTHENTICATED")
             self.assertEqual(row[2], 1)
-            later = self.state.next_item(NOW + 10 ** 9)
+            later = self.state.next_item(now + 10 ** 9)
             self.assertEqual(later.kind, kind)         # still the same request
         self.assertEqual(self.count("acquisition", "state='failed_permanent'"), 0)
         self.assertEqual(self.count("report", "state='failed_permanent'"), 0)

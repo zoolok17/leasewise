@@ -53,6 +53,10 @@ def decide(kind, response, rebuilds=0):
     """`kind` is ACQUIRE, REPORT or FINAL; `rebuilds` is how many rebuilds
     this acquisition already used (it survives restarts in the state)."""
     status, code = response.status, response.code
+    if status == 401:
+        # A credential problem is reporter-wide and fixed by an operator, so
+        # nothing is lost or failed for good: retry, and keep the code visible.
+        return Decision(RETRY, code or "UNAUTHENTICATED")
     if status is None or status >= 500 or status == 429:
         return Decision(RETRY, code)
     if status in (200, 201):

@@ -22,6 +22,7 @@ INF = float("inf")
 # the successor's start plus this allowance may have reached the dead stream.
 CLOCK_SKEW_ALLOWANCE_SECONDS = 600
 MAX_REPORTS_PER_MESSAGE = 50
+_MARGIN_MS = CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
 
 REASON_OK = "ok"
 # In the order the primary reason is chosen.
@@ -45,6 +46,11 @@ def run_round(state, root, configs, now_ms, fault=None):
     a test seam called right after the data, the cursors and the finals
     are stored. An unknown schema version raises before anything is
     written."""
+    # A crash between storing a round's data and deciding its finals leaves
+    # that round unfinished. Finish it from what it stored BEFORE any new
+    # input is read, so a final never depends on whether the reporter crashed.
+    result = RoundResult(state.round_number() + 1)
+    _finish_unfinished_round(state, configs, result)
     snapshot = ev.take_snapshot(root)
     reads = []
     for agent in sorted(snapshot):
@@ -53,7 +59,6 @@ def run_round(state, root, configs, now_ms, fault=None):
             reads.append((ref, ev.read_segment(
                 ref, state.cursor(ref.stream, ref.segment))))
     round_no = state.round_number() + 1
-    result = RoundResult(round_no)
 
     with state.txn() as conn:
         for agent in sorted(snapshot):
@@ -86,9 +91,28 @@ def run_round(state, root, configs, now_ms, fault=None):
 
     with state.txn():
         _evaluate(state, sorted(snapshot), configs, round_no, result)
+        _mark_evaluated(state, round_no)
     if fault:
         fault("final")
     return result
+
+
+def _mark_evaluated(state, round_no):
+    state.conn.execute(
+        "INSERT INTO meta(key, value) VALUES('evaluated', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (round_no,))
+
+
+def _finish_unfinished_round(state, configs, result):
+    stored = state.round_number()
+    done = state.one("SELECT value FROM meta WHERE key='evaluated'")
+    if stored == 0 or (done is not None and done[0] >= stored):
+        return
+    agents = [row[0] for row in state.all(
+        "SELECT DISTINCT agent FROM stream ORDER BY agent")]
+    with state.txn():
+        _evaluate(state, agents, configs, stored, result)
+        _mark_evaluated(state, stored)
 
 
 def _store_record(conn, agent, record):
@@ -217,10 +241,18 @@ def _store_event(state, ref, item, round_no, config, now_ms):
         event_id = mapper.dispatch_event_id(turn, item["turn_id"])
         body = json.dumps(mapper.dispatch_report_body(
             event_id, item["outcome"], item["usage"]), sort_keys=True)
-        conn.execute(
+        # An agent stopped by a configuration fault sends no reports: a new
+        # one is dropped and counted at once (finals are never dropped).
+        stopped = conn.execute(
+            "SELECT 1 FROM agent_state WHERE agent=? AND failed_code IS NOT "
+            "NULL", (agent,)).fetchone() is not None
+        added = conn.execute(
             "INSERT OR IGNORE INTO report(event_id, agent, message_id,"
-            " turn_id, body) VALUES(?,?,?,?,?)",
-            (event_id, agent, message_id, item["turn_id"], body))
+            " turn_id, body, state) VALUES(?,?,?,?,?,?)",
+            (event_id, agent, message_id, item["turn_id"], body,
+             "dropped" if stopped else "pending")).rowcount
+        if stopped and added:
+            state.bump(agent, "reports_dropped")
 
 
 def _confirm_torn(state, snapshot, reads):
@@ -314,37 +346,41 @@ def _load_streams(state, agent):
 
 
 def _gaps(stream):
-    """[(lo, hi, reason)]: the places this stream is known to have lost
-    something, as time spans."""
+    """[(lo, hi, reason, first_seq, last_seq)]: the places this stream is
+    known to have lost something. `lo` and `hi` are the times of the read
+    events around the loss (or the stream's start, a header or its closing
+    record); `first_seq` and `last_seq` are the lost numbers, or None for a
+    torn tail whose numbers are unknown.
+
+    A segment header's `after_seq` is a WATERMARK: the writer had written up
+    to that number before the segment began. It is never an observed event,
+    so a number below it that was not read is a loss like any other."""
     gaps = []
-    seen = {seq for seq, _a, _d in stream.events}
-    observed = [(seq, at, drop) for seq, at, drop in stream.events]
-    for _seg, after_seq, header_ms, _torn, _tm in stream.segments:
-        # The header says events up to after_seq were written before it.
-        if after_seq and after_seq not in seen:
-            observed.append((after_seq, header_ms, None))
-            seen.add(after_seq)
-    observed.sort()
     prev_seq, prev_at, prev_drop = 0, stream.start, 0
-    for seq, at, drop in observed:
+    for seq, at, drop in sorted(stream.events):
         if seq > prev_seq + 1:
-            gaps.append((prev_at, at, "seq_gap"))
-        elif drop is not None and drop > prev_drop:
-            gaps.append((prev_at, at, "dropped"))
-        prev_seq, prev_at = seq, at
-        if drop is not None:
-            prev_drop = drop
-    if stream.closed:
-        if stream.last_seq > prev_seq:
-            gaps.append((prev_at, stream.closed_ms, "seq_gap"))
-        elif stream.closed_dropped > prev_drop:
-            gaps.append((prev_at, stream.closed_ms, "dropped"))
+            gaps.append((prev_at, at, "seq_gap", prev_seq + 1, seq - 1))
+        elif drop > prev_drop:
+            gaps.append((prev_at, at, "dropped", seq, seq))
+        prev_seq, prev_at, prev_drop = seq, at, max(prev_drop, drop)
+    watermark, mark_ms = 0, None
+    for _seg, after_seq, header_ms, _torn, _tm in stream.segments:
+        if after_seq is not None and after_seq > watermark:
+            watermark, mark_ms = after_seq, header_ms
+    if stream.closed and stream.last_seq > prev_seq:
+        gaps.append((prev_at, stream.closed_ms, "seq_gap", prev_seq + 1,
+                     stream.last_seq))
+    elif watermark > prev_seq:
+        gaps.append((prev_at, mark_ms, "seq_gap", prev_seq + 1, watermark))
+    elif stream.closed and stream.closed_dropped > prev_drop:
+        gaps.append((prev_at, stream.closed_ms, "dropped", prev_seq + 1,
+                     prev_seq + 1))
     for index, (_seg, _a, _h, torn, torn_ms) in enumerate(stream.segments):
         if torn:
             following = [s[2] for s in stream.segments[index + 1:]
                          if s[2] is not None]
             gaps.append((torn_ms, following[0] if following
-                         else stream.succ_start, "torn_tail"))
+                         else stream.succ_start, "torn_tail", None, None))
     return gaps
 
 
@@ -363,7 +399,8 @@ def _clock_regions(ordered, streams):
 
 
 def _message_time(rows):
-    """(arrival_ms | None, inconsistent) from every copy of `message_at`."""
+    """(arrival_ms | None, inconsistent) from every copy of `message_at`.
+    Copies of one message's time may differ by the clock-skew allowance."""
     parsed, missing = set(), False
     for raw in rows:
         value = ev.parse_time(raw) if raw is not None else None
@@ -373,7 +410,7 @@ def _message_time(rows):
             parsed.add(value)
     if missing or not parsed:
         return None, False
-    return min(parsed), len(parsed) > 1
+    return min(parsed), max(parsed) - min(parsed) > _MARGIN_MS
 
 
 def _assess(message, streams, ordered, clock_regions, gaps_by_stream):
@@ -386,12 +423,14 @@ def _assess(message, streams, ordered, clock_regions, gaps_by_stream):
         reasons.add("clock_inconsistent")
     disposed = message["disposal_at"]
     if arr is not None and (
-            (disposed is not None and arr > disposed)
-            or any(arr > start for start in message["start_ms"])):
+            (disposed is not None and arr > disposed + _MARGIN_MS)
+            or any(arr > start + _MARGIN_MS for start in message["start_ms"])):
         reasons.add("clock_inconsistent")
     # An open message may still lose events: its window has no end yet.
     end = INF if disposed is None else disposed
-    low = -INF if arr is None else arr
+    # `message_at` is the sender's clock: widen every overlap test with a
+    # local time by the allowance (D3c), always toward "possibly overlapping".
+    low = -INF if arr is None else arr - _MARGIN_MS
     if any(lo <= end and hi >= low for lo, hi in clock_regions):
         reasons.add("clock_inconsistent")
     if message["unmatched"]:
@@ -403,16 +442,26 @@ def _assess(message, streams, ordered, clock_regions, gaps_by_stream):
         if stream.previous and stream.previous not in streams \
                 and (low == -INF or low < stream.start):
             reasons.add("missing_stream")
-        for lo, hi, why in gaps_by_stream[stream.name]:
-            if lo < end and hi >= low:
+        for lo, hi, why, first, _last in gaps_by_stream[stream.name]:
+            if hi < low:
+                continue
+            if disposed is None:
+                relevant = True
+            elif stream.name == message["disposal_stream"] \
+                    and first is not None:
+                # Within one stream the order is the sequence number, not a
+                # rounded timestamp: a loss before the disposition counts.
+                relevant = first <= message["disposal_seq"]
+            else:
+                relevant = lo <= end      # only times order it: a tie overlaps
+            if relevant:
                 reasons.add(why)
     if disposed is not None:
         for stream in ordered:
             if stream.closed or stream.name == message["disposal_stream"] \
                     or stream.start >= disposed:
                 continue
-            if stream.succ_start != INF and low < (
-                    stream.succ_start + CLOCK_SKEW_ALLOWANCE_SECONDS * 1000):
+            if stream.succ_start != INF and low < stream.succ_start:
                 reasons.add("unclean_predecessor")
     return [r for r in REASONS if r in reasons]
 
@@ -423,7 +472,8 @@ def _load_messages(state, agent):
     def get(message_id):
         return messages.setdefault(message_id, {
             "message_at": [], "start_ms": [], "end_ms": 0, "unmatched": False,
-            "disposal_at": None, "disposal_stream": None, "disposition": None,
+            "disposal_at": None, "disposal_stream": None,
+            "disposal_seq": None, "disposition": None,
             "launched": [], "dispatches": 0})
 
     for (message_id, started, ended, start_ms, end_ms, message_at,
@@ -458,6 +508,7 @@ def _load_messages(state, agent):
             ordering[message_id] = True
             msg["disposal_at"] = at_ms
             msg["disposal_stream"] = stream
+            msg["disposal_seq"] = seq
             msg["disposition"] = disposition
             msg["end_ms"] = max(msg["end_ms"], at_ms)
     return messages

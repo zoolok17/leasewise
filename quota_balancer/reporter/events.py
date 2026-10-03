@@ -116,7 +116,7 @@ def parse_event(raw):
         _bad()
     try:
         obj = json.loads(raw.decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         _bad()
     if not isinstance(obj, dict):
         _bad()
@@ -125,7 +125,9 @@ def parse_event(raw):
             raise UnsupportedVersion("the journal schema version is not supported")
         _bad()
     kind = obj.get("kind")
-    if kind not in _SHAPES:
+    # A kind that is not even a string (a list, an object) is a damaged line,
+    # not a lookup error: look it up only once its type is known.
+    if not isinstance(kind, str) or kind not in _SHAPES:
         _bad()
     required, optional = _SHAPES[kind]
     keys = set(obj)
@@ -208,7 +210,7 @@ def parse_stream_record(raw):
         _bad()
     try:
         obj = json.loads(raw.decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         _bad()
     if not isinstance(obj, dict) or set(obj) != {
             "stream", "previous_stream", "started_at"}:
@@ -349,7 +351,7 @@ def read_segment(ref, offset):
             event = parse_event(line)
         except UnsupportedVersion:
             raise
-        except JournalError:
+        except Exception:  # any unreadable line is damage, never a stall
             result.damaged += 1
             continue
         if event["stream"] != ref.stream:

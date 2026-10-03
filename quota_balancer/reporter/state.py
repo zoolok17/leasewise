@@ -262,16 +262,26 @@ class State:
                     "WHERE id=?", (code, row_id))
                 self.bump(item.agent, "reports_dropped")
             else:  # FAIL, FAIL_AGENT
-                self.conn.execute(
-                    "UPDATE %s SET state='failed_permanent', "
-                    "last_error_code=? WHERE id=?" % table,
-                    (code or "UNKNOWN", row_id))
                 if decision.action == decisions.FAIL_AGENT:
+                    # The agent stops: its queued reports (observations only)
+                    # are dropped and counted here, in this transaction.
+                    # Finals are never dropped; they wait, unsent.
+                    dropped = self.conn.execute(
+                        "UPDATE report SET state='dropped', "
+                        "last_error_code=? WHERE agent=? AND "
+                        "state='pending'", (code, item.agent)).rowcount
+                    if dropped:
+                        self.bump(item.agent, "reports_dropped", dropped)
                     self.conn.execute(
                         "INSERT INTO agent_state(agent, failed_code) "
                         "VALUES(?,?) ON CONFLICT(agent) DO UPDATE SET "
                         "failed_code=excluded.failed_code",
                         (item.agent, code))
+                if table != "report" or decision.action == decisions.FAIL:
+                    self.conn.execute(
+                        "UPDATE %s SET state='failed_permanent', "
+                        "last_error_code=? WHERE id=?" % table,
+                        (code or "UNKNOWN", row_id))
         return decision
 
 
