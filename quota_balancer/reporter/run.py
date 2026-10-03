@@ -117,9 +117,13 @@ class Reporter:
                 if decision.action == decisions.DONE:
                     self.state.set_note(status.last_ok_note(item.agent), None,
                                         now)
+                    # An accepted request: any credential fault is history now.
+                    self.state.clear_note(status.credential_active_note())
                 elif answer.status == 401:
                     self.state.set_note(status.last_401_note(), decision.code,
                                         now)
+                    self.state.set_note(status.credential_active_note(),
+                                        decision.code, now)
             if decision.action == decisions.DONE:
                 result.sent += 1
             elif decision.action == decisions.RETRY:

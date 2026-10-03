@@ -214,37 +214,73 @@ class ConfigPermissions(_Tmp):
                         self.assertEqual(caught.exception.code,
                                          cfg.CONFIG_PERMISSIONS)
 
-    def listing(self, *aces):
-        head = "C:\\conf\\reporter.toml " + aces[0]
-        rest = "".join("\n                      " + a for a in aces[1:])
-        return head + rest + "\n\nSuccessfully processed 1 files; Failed ...\n"
+    ME = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+    OTHER = "S-1-5-21-1111111111-2222222222-3333333333-1002"
 
-    def test_windows_accepts_a_private_access_list(self):
-        for aces in ((r"PC\me:(F)",),
-                     (r"PC\me:(F)", r"NT AUTHORITY\SYSTEM:(F)"),
-                     (r"PC\me:(F)", r"BUILTIN\Users:(DENY)(R)")):
-            with self.subTest(aces=aces):
-                cfg._check_windows("x", lambda p: self.listing(*aces))
+    def acl(self, *entries, user=None):
+        """A canned reading: [(sid, kind, inherited)] and the current user's SID."""
+        return lambda path: (list(entries), user or self.ME)
 
-    def test_windows_refuses_broad_groups_and_inherited_entries(self):
-        for aces in ((r"Everyone:(R)",), (r"PC\me:(F)", r"BUILTIN\Users:(R)"),
-                     (r"PC\me:(F)", r"NT AUTHORITY\Authenticated Users:(M)"),
-                     (r"PC\me:(I)(F)",),
-                     (r"PC\me:(F)", r"BUILTIN\Administrators:(I)(F)")):
-            with self.subTest(aces=aces):
+    def test_windows_accepts_only_you_system_and_administrators(self):
+        for entries in (
+                [(self.ME, "allow", False)],
+                [(self.ME, "allow", False), (cfg.SID_SYSTEM, "allow", False)],
+                [(self.ME, "allow", False), (cfg.SID_SYSTEM, "allow", False),
+                 (cfg.SID_ADMINISTRATORS, "allow", False)],
+                [(cfg.SID_SYSTEM, "allow", False)],
+                # a refusal grants nobody anything
+                [(self.ME, "allow", False), ("S-1-5-32-545", "deny", False)]):
+            with self.subTest(entries=entries):
+                cfg._check_windows("x", self.acl(*entries))
+
+    def test_windows_refuses_any_other_identity_whatever_it_is_called(self):
+        for label, entries in (
+                ("a localised broad group (Users)",
+                 [(self.ME, "allow", False), ("S-1-5-32-545", "allow", False)]),
+                ("Everyone", [(self.ME, "allow", False),
+                              ("S-1-1-0", "allow", False)]),
+                ("Authenticated Users", [(self.ME, "allow", False),
+                                         ("S-1-5-11", "allow", False)]),
+                ("an unrelated user", [(self.ME, "allow", False),
+                                       (self.OTHER, "allow", False)]),
+                ("only an unrelated user", [(self.OTHER, "allow", False)]),
+                ("an inherited entry of an allowed identity",
+                 [(self.ME, "allow", True)]),
+                ("inherited Administrators",
+                 [(self.ME, "allow", False),
+                  (cfg.SID_ADMINISTRATORS, "allow", True)])):
+            with self.subTest(label):
                 with self.assertRaises(cfg.ConfigError) as caught:
-                    cfg._check_windows("x", lambda p: self.listing(*aces))
+                    cfg._check_windows("x", self.acl(*entries))
                 self.assertEqual(caught.exception.code,
                                  cfg.CONFIG_PERMISSIONS)
 
-    def test_windows_refuses_a_file_whose_list_cannot_be_read(self):
-        for listing in (None, "", "garbage without entries"):
-            with self.subTest(listing=listing):
+    def test_windows_refuses_an_entry_it_cannot_classify(self):
+        for entries in (
+                [(self.ME, "allow", False), (None, "other", False)],
+                [(self.ME, "allow", False), ("S-1-5-18", "other", False)],
+                [(self.ME, "allow", False), ("not-a-sid", "allow", False)],
+                [(self.ME, "allow", False), (123, "allow", False)],
+                [(self.ME, "allow", False), (cfg.SID_SYSTEM, "audit", False)]):
+            with self.subTest(entries=entries):
                 with self.assertRaises(cfg.ConfigError):
-                    cfg._check_windows("x", lambda p: listing)
+                    cfg._check_windows("x", self.acl(*entries))
+
+    def test_windows_refuses_a_file_whose_list_cannot_be_read(self):
+        def broken(path):
+            raise OSError("no")
+        for reader in (lambda p: None, lambda p: ([], self.ME),
+                       lambda p: ([(self.ME, "allow", False)], None),
+                       lambda p: ([(self.ME, "allow", False)], "junk"),
+                       broken):
+            with self.subTest(reader=reader):
+                with self.assertRaises(cfg.ConfigError):
+                    cfg._check_windows("x", reader)
 
     @unittest.skipUnless(WINDOWS, "the Windows access-list check")
     def test_the_real_check_on_a_real_windows_file(self):
+        """The runbook command makes the file pass; a grant to anyone else, by
+        any name, does not (the identities are read from the system)."""
         path = os.path.join(self.tmp, "r.toml")
         with open(path, "w") as handle:
             handle.write(sample_text(self.tmp))
@@ -254,10 +290,25 @@ class ConfigPermissions(_Tmp):
         cfg.load_config(path)
         icacls = os.path.join(os.environ["SystemRoot"], "System32",
                               "icacls.exe")
-        subprocess.run([icacls, path, "/grant", "Everyone:R"],
-                       capture_output=True, check=True)
-        with self.assertRaises(cfg.ConfigError):
-            cfg.load_config(path)
+        for sid in ("S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-19"):
+            with self.subTest(sid):
+                subprocess.run([icacls, path, "/grant", "*%s:R" % sid],
+                               capture_output=True, check=True)
+                with self.assertRaises(cfg.ConfigError):
+                    cfg.load_config(path)
+                restrict(path)           # the runbook command removes it again
+                cfg.load_config(path)
+
+    @unittest.skipUnless(WINDOWS, "reads the real identities")
+    def test_the_real_reader_gives_identities_not_names(self):
+        path = os.path.join(self.tmp, "r.toml")
+        with open(path, "w") as handle:
+            handle.write("x")
+        restrict(path)
+        entries, me = cfg._read_windows_acl(path)
+        self.assertTrue(entries and all(
+            cfg._SID_TEXT.fullmatch(sid) for sid, _k, _i in entries))
+        self.assertEqual({sid for sid, _k, _i in entries}, {me})
 
     @unittest.skipIf(WINDOWS, "POSIX mode bits")
     def test_the_real_check_on_a_real_posix_file(self):
@@ -571,13 +622,15 @@ class ClientTable(unittest.TestCase):
         self.assertEqual(self.acq()[:1], ("failed_permanent",))
 
     def test_any_other_invalid_request_fails_for_good_and_never_rebuilds(self):
-        for code in ("INVALID_REQUEST", "SCHEMA_UNSUPPORTED", "NO_SUCH_CODE"):
+        for code, stored in (("INVALID_REQUEST", "INVALID_REQUEST"),
+                             ("SCHEMA_UNSUPPORTED", "SCHEMA_UNSUPPORTED"),
+                             ("NO_SUCH_CODE", "UNKNOWN_CODE")):
             with self.subTest(code):
                 self.rig.restart(transport=Script(error(400, code)))
                 result = self.rig.reporter.cycle()
                 state, _t, last, rebuilds, _nb, _l = self.acq()
                 self.assertEqual((state, last, rebuilds),
-                                 ("failed_permanent", code, 0))
+                                 ("failed_permanent", stored, 0))
                 self.assertEqual(self.rig.state.one(
                     "SELECT body_original=body_current FROM acquisition")[0],
                     1)
@@ -643,7 +696,7 @@ class ClientTable(unittest.TestCase):
         self.go(net)
         self.assertEqual((len(net.calls), net.max_in_flight), (3, 1))
 
-    def test_the_error_code_of_an_answer_must_be_a_plain_word(self):
+    def test_an_error_code_that_is_not_a_leasewise_word_is_one_fixed_word(self):
         for odd in ("lowercase", "WITH SPACE", "X" * 90, "<script>"):
             with self.subTest(odd):
                 self.rig.restart(transport=Script(
@@ -651,7 +704,7 @@ class ClientTable(unittest.TestCase):
                 self.rig.reporter.cycle()
                 code = self.rig.state.one(
                     "SELECT last_error_code FROM acquisition")[0]
-                self.assertIn(code, ("UNKNOWN", None))
+                self.assertEqual(code, "UNKNOWN_CODE")
                 self.rig.state.conn.execute(
                     "UPDATE acquisition SET state='pending', last_error_code"
                     "=NULL")

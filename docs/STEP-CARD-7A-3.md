@@ -46,12 +46,10 @@ the identity value is an obvious fake.
    configuration fault but names no way back. The reporter clears all stops when
    it starts, so an operator who fixed the cause only restarts. Items that already
    failed for good stay failed. A still-broken agent stops again on its next answer.
-2. **Windows permission rule.** Mode bits mean nothing there, so the check reads
-   the access list with `icacls`: the file must have its own list (inheritance
-   removed) and give nothing to Everyone, Users or Authenticated Users; an
-   unreadable list is a refusal. Strict on purpose, because group names are
-   localised and inheritance is the one test that does not depend on language.
-   Elsewhere: no group or other permission bit.
+2. **Windows permission rule** (replaced in fix round 1, see below): the access
+   list is read as security identifiers and only you, SYSTEM and Administrators
+   may hold an entry; the file must have its own list. Elsewhere: no group or
+   other permission bit.
 3. **Plain `http` is allowed for loopback only**; any other host needs `https`.
    The identity travels in a header.
 4. **`status` while `run` owns the state.** A second reader cannot open an
@@ -83,7 +81,7 @@ Files: `A` = `tests/test_card7a3.py`, `B` = `tests/test_card7a3_commands.py`,
 | Requirement | Tests |
 |---|---|
 | `python -m quota_balancer reporter run\|drain\|status` | B `DrainSubprocess.test_drain_over_the_real_module_entry_point`, `Drain.test_the_commands_are_run_drain_and_status_only` |
-| restrictive permissions, checked where the OS allows | A `ConfigPermissions` (POSIX bits, Windows access lists with canned and real `icacls`, unreadable list, every command uses the real check) |
+| restrictive permissions, checked where the OS allows | A `ConfigPermissions` (POSIX bits, Windows access lists read as identifiers: canned readings and the real file, unreadable list, every command uses the real check) |
 | holds URL, identity, machine alias, one table per agent | A `ConfigFile` (loads with defaults; missing, foreign and unsafe keys; ceilings; URL rules; identity characters; relative paths) |
 | compound keys resolved from a `policy-ids --json` snapshot | A `ConfigResolution` (ids; other machine's seat; model by account; the real command's output) |
 | an ambiguous bare alias is refused | A `ConfigResolution.test_a_bare_seat_alias_that_is_ambiguous_is_refused`, `..._model_alias_...`, `test_a_unique_bare_model_alias_needs_no_account` |
@@ -128,6 +126,34 @@ Files: `A` = `tests/test_card7a3.py`, `B` = `tests/test_card7a3_commands.py`,
 | restarts at every step | C `Restarts` (a crash before each request, after each answer, inside each round stage, and on every cycle) |
 | the real writer's files | X `RealWriter` (skipped unless `QUOTA_REPORTER_AGENTTALK_SRC` is set) |
 | sentinels never appear in output, status, state, logs, exception text | B `Privacy` (outputs, state files, snapshot; internal fault; configuration errors; reprs; a 401 body) |
+
+## Fix round 1 (codex tk-4f6bd8f97976)
+
+- **F1, who may read the file (Windows).** The access list is read as security
+  identifiers through the Windows security API (`ctypes`, standard library), not
+  as names. Allowed: the current user, `S-1-5-18` (SYSTEM) and `S-1-5-32-544`
+  (Administrators). Any other identity, an unclassifiable entry, an inherited
+  entry or an unreadable list is a refusal. A deny entry is ignored (it grants
+  nobody anything). The runbook command now also resets unrelated grants.
+  Tests: `test_card7a3.ConfigPermissions` (canned readings, the real reader,
+  the real file with grants to Everyone, Authenticated Users, Users and
+  LocalService, each undone by the runbook command).
+- **F2, closed error words.** `decisions.closed_code`: only the codes in
+  `quota_balancer/errors.py` plus `UNKNOWN_CODE`, `BAD_ANSWER` and
+  `MALFORMED_RESPONSE` are ever stored or shown (applied in the client, in
+  `decide`, and again when status is built). Tests: `test_card7a3_fix1.ClosedWordsF2`.
+- **F3, an unreadable answer is a retry.** Any failure to decode a body (nesting
+  too deep, bad text, bad JSON) is classified inside the client; on 2xx, 5xx and
+  401 it is retried, never an internal fault. Tests: `UnreadableAnswerF3`.
+- **F4, loud permanent failures.** `status` lists failed acquisitions, reports
+  and finals with their codes (up to 50, plus the total) and adds one warning
+  line; a final says whether its observation was complete and that it was not
+  delivered. Tests: `PermanentFailuresF4`.
+- **F5, a recovered 401 is history.** The last 401 stays (code, time); a separate
+  `active` flag is cleared by the next accepted request; the advice shows only
+  while it is active. Tests: `CredentialHistoryF5`.
+- The README now says that the 5-second timeout applies to each network step,
+  not to the whole request (also item 8 above).
 
 ## Results
 

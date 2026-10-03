@@ -19,9 +19,9 @@ TIMEOUT_SECONDS = 5.0
 MAX_ANSWER_BYTES = 1024 * 1024
 IDENTITY_HEADER = "X-Machine-Identity"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
-BAD_ANSWER = "BAD_ANSWER"           # a success that lacked the lease id
+BAD_ANSWER = decisions.BAD_ANSWER
+MALFORMED_RESPONSE = decisions.MALFORMED_RESPONSE
 
-_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
                    r"[0-9a-f]{12}")
 
@@ -90,14 +90,19 @@ def _response(kind, status, raw):
     if raw and len(raw) <= MAX_ANSWER_BYTES:
         try:
             doc = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            doc = None
+        except Exception:               # ValueError, UnicodeError, RecursionError...
+            # Not an answer we can read. Retried like no answer at all, on a
+            # success too (a replay returns the stored answer, so it is safe);
+            # an error status keeps its number and decides as before.
+            if 200 <= status < 300:
+                return Response(None, MALFORMED_RESPONSE)
+            return Response(status, MALFORMED_RESPONSE if status >= 500
+                            else None)
         if isinstance(doc, dict):
             error = doc.get("error")
             if isinstance(error, dict):
-                value = error.get("code")
-                if isinstance(value, str) and _CODE.fullmatch(value):
-                    code = value
+                # Only Leasewise's own words: anything else is UNKNOWN_CODE.
+                code = decisions.closed_code(error.get("code"))
             value = doc.get("lease_id")
             if isinstance(value, str) and _UUID.fullmatch(value):
                 lease_id = value

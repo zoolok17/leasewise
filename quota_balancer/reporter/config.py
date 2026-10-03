@@ -14,7 +14,6 @@ A bare alias that matches more than one row is refused.
 import json
 import os
 import re
-import subprocess
 import sys
 import tomllib
 from urllib.parse import urlsplit
@@ -202,9 +201,12 @@ def load_config(path, *, permissions=None):
 
 # --- file permissions -------------------------------------------------------
 
-_BROAD = ("everyone", "\\users", "authenticated users", "s-1-1-0",
-          "s-1-5-11", "s-1-5-32-545")
-_ACE = re.compile(r"([^\r\n:]+?):((?:\([^)\r\n]*\))+)")
+# Windows: who may hold ANY access entry on the file, as security identifiers (never
+# as display names, which are localised). The current user's own SID is added.
+SID_SYSTEM = "S-1-5-18"
+SID_ADMINISTRATORS = "S-1-5-32-544"
+_ALLOWED_SIDS = frozenset({SID_SYSTEM, SID_ADMINISTRATORS})
+_SID_TEXT = re.compile(r"S-1-\d+(?:-\d+){1,15}")
 
 
 def _refuse_permissions(why):
@@ -216,13 +218,13 @@ def check_permissions(path):
     """Refuse a configuration file that other users could read.
 
     POSIX: no group or other permission bits at all.
-    Windows (mode bits mean nothing there): the access list from `icacls` must
-      * carry no entry of its own inherited from the folder (the file has its
-        own list: `icacls <file> /inheritance:r /grant:r <you>:F`), and
-      * grant nothing to Everyone, Users or Authenticated Users.
-    If the access list cannot be read the file is refused, never trusted."""
+    Windows (mode bits mean nothing there): the access list is read as security
+    identifiers. Only the current user, SYSTEM (S-1-5-18) and BUILTIN\\Administrators
+    (S-1-5-32-544) may hold an access entry, and no entry may be inherited from the
+    folder (the file has its own list). Any other identifier, an entry that cannot be
+    classified, or a list that cannot be read is a refusal, never a pass."""
     if sys.platform == "win32":
-        return _check_windows(path, _run_icacls)
+        return _check_windows(path, _read_windows_acl)
     return _check_posix(path)
 
 
@@ -235,36 +237,126 @@ def _check_posix(path):
         _refuse_permissions("group or other users can access it")
 
 
-def _run_icacls(path):
-    root = os.environ.get("SystemRoot", r"C:\Windows")
-    exe = os.path.join(root, "System32", "icacls.exe")
+def _check_windows(path, read_acl):
+    """`read_acl(path)` -> (entries, current_user_sid) or None, where each entry is
+    (sid_text, kind, inherited) and kind is "allow", "deny" or "other"."""
     try:
-        done = subprocess.run([exe, path], capture_output=True, timeout=15,
-                              check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if done.returncode != 0:
-        return None
-    return done.stdout.decode("utf-8", "replace")
-
-
-def _check_windows(path, run):
-    listing = run(path)
-    if listing is None:
-        _refuse_permissions("its access list cannot be read")
-    found = False
-    for principal, flags in _ACE.findall(listing):
-        found = True
-        flags = flags.lower()
-        if "(i)" in flags:
-            _refuse_permissions("it inherits access from its folder")
-        if "(deny)" in flags:
-            continue
-        name = principal.lower()
-        if any(name.endswith(b) or name == b for b in _BROAD):
-            _refuse_permissions("it grants access to a broad group")
+        found = read_acl(path)
+    except Exception:  # noqa: BLE001 - never a crash, never a pass
+        found = None
     if not found:
         _refuse_permissions("its access list cannot be read")
+    try:
+        entries, current = found
+        entries = list(entries)
+    except Exception:  # noqa: BLE001 - a reading of the wrong shape is a refusal
+        _refuse_permissions("its access list cannot be read")
+    if not isinstance(current, str) or _SID_TEXT.fullmatch(current) is None \
+            or not entries:
+        _refuse_permissions("its access list cannot be read")
+    allowed = _ALLOWED_SIDS | {current}
+    for entry in entries:
+        try:
+            sid, kind, inherited = entry
+        except Exception:  # noqa: BLE001
+            _refuse_permissions("an access entry cannot be classified")
+        if kind == "deny":
+            continue                    # a refusal grants nobody anything
+        if kind != "allow" or not isinstance(sid, str) \
+                or _SID_TEXT.fullmatch(sid) is None:
+            _refuse_permissions("an access entry cannot be classified")
+        if inherited:
+            _refuse_permissions("it inherits access from its folder")
+        if sid not in allowed:
+            _refuse_permissions("someone other than you, SYSTEM and "
+                                "Administrators can access it")
+
+
+def _read_windows_acl(path):
+    """The file's access list as security identifiers, through the Windows security
+    API (no tool output, no names). None when anything cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.LocalFree.argtypes = [ctypes.c_void_p]
+    k32.LocalFree.restype = ctypes.c_void_p
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    adv.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    adv.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                           ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetAce.restype = wintypes.BOOL
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                           ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.HANDLE)]
+    adv.OpenProcessToken.restype = wintypes.BOOL
+    adv.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    adv.GetTokenInformation.restype = wintypes.BOOL
+
+    def sid_text(sid_pointer):
+        text = wintypes.LPWSTR()
+        if not adv.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
+            return None
+        try:
+            return text.value
+        finally:
+            k32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+    def current_user():
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008,
+                                    ctypes.byref(token)):
+            return None
+        try:
+            size = wintypes.DWORD()
+            adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+            if not size.value:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if not adv.GetTokenInformation(token, 1, buffer, size,
+                                           ctypes.byref(size)):
+                return None
+            # TOKEN_USER starts with the pointer to the user's SID.
+            return sid_text(ctypes.c_void_p.from_buffer(buffer).value)
+        finally:
+            k32.CloseHandle(token)
+
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    # SE_FILE_OBJECT = 1, DACL_SECURITY_INFORMATION = 4
+    if adv.GetNamedSecurityInfoW(path, 1, 4, None, None, ctypes.byref(dacl),
+                                 None, ctypes.byref(descriptor)) != 0:
+        return None
+    try:
+        if not dacl.value:
+            return None                 # no list at all would mean "everyone"
+        count = ctypes.c_ushort.from_address(dacl.value + 4).value
+        entries = []
+        for index in range(count):
+            ace = ctypes.c_void_p()
+            if not adv.GetAce(dacl, index, ctypes.byref(ace)):
+                return None
+            ace_type = ctypes.c_ubyte.from_address(ace.value).value
+            flags = ctypes.c_ubyte.from_address(ace.value + 1).value
+            kind = {0: "allow", 1: "deny"}.get(ace_type, "other")
+            sid = sid_text(ctypes.c_void_p(ace.value + 8)) \
+                if kind != "other" else None
+            if kind != "other" and sid is None:
+                return None
+            entries.append((sid, kind, bool(flags & 0x10)))
+        return entries, current_user()
+    finally:
+        k32.LocalFree(descriptor)
 
 
 # --- resolution against a policy-ids snapshot ---------------------------------

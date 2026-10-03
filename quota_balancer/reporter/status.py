@@ -10,12 +10,14 @@ import datetime
 import json
 import os
 
-from . import rounds
+from . import decisions, rounds
 
 STATUS_VERSION = 1
 
 # Stored finals, reports and acquisitions are counted by their state.
-_NOTE_401 = "last_401"
+_NOTE_401 = "last_401"                  # history: the last 401, kept
+_NOTE_CREDENTIAL = "credential_active"  # present only while it is unresolved
+MAX_LISTED_FAILURES = 50
 _NOTE_JOURNAL = "journal_stopped"
 
 
@@ -37,6 +39,36 @@ def last_ok_note(agent):
 
 def last_401_note():
     return _NOTE_401
+
+
+def credential_active_note():
+    return _NOTE_CREDENTIAL
+
+
+def _failures(state, agent):
+    """Every permanently failed item (acquisition, report, final) with its closed
+    code. A final also says whether the observation behind it was complete: a
+    complete observation that was never delivered is a different thing from an
+    incomplete one."""
+    found = []
+    for message_id, code in state.all(
+            "SELECT message_id, last_error_code FROM acquisition WHERE "
+            "agent=? AND state='failed_permanent' ORDER BY id", (agent,)):
+        found.append({"kind": "acquisition", "message_id": message_id,
+                      "code": decisions.closed_code(code) or decisions.UNKNOWN_CODE})
+    for message_id, code in state.all(
+            "SELECT message_id, last_error_code FROM report WHERE agent=? "
+            "AND state='failed_permanent' ORDER BY id", (agent,)):
+        found.append({"kind": "report", "message_id": message_id,
+                      "code": decisions.closed_code(code) or decisions.UNKNOWN_CODE})
+    for message_id, code, complete in state.all(
+            "SELECT message_id, last_error_code, complete FROM final WHERE "
+            "agent=? AND state='failed_permanent' ORDER BY id", (agent,)):
+        found.append({"kind": "final", "message_id": message_id,
+                      "code": decisions.closed_code(code) or decisions.UNKNOWN_CODE,
+                      "observation_complete": bool(complete),
+                      "delivered": False})
+    return found
 
 
 def journal_stopped_note():
@@ -79,10 +111,14 @@ def _agent(state, agent, configured, now_ms, silent_after_ms):
               "WHERE agent=?", (agent,))
     acq = _counts(state, "SELECT state, COUNT(*) FROM acquisition WHERE "
                   "agent=? GROUP BY state", agent)
-    failed_codes = _counts(
-        state, "SELECT COALESCE(last_error_code, 'UNKNOWN'), COUNT(*) FROM "
-        "acquisition WHERE agent=? AND state='failed_permanent' GROUP BY 1",
-        agent)
+    failed_codes = {}
+    for code, count in _counts(
+            state, "SELECT COALESCE(last_error_code, 'UNKNOWN_CODE'), COUNT(*)"
+            " FROM acquisition WHERE agent=? AND state='failed_permanent' "
+            "GROUP BY 1", agent).items():
+        word = decisions.closed_code(code)
+        failed_codes[word] = failed_codes.get(word, 0) + count
+    failures = _failures(state, agent)
     reports = _counts(state, "SELECT state, COUNT(*) FROM report WHERE "
                       "agent=? GROUP BY state", agent)
     finals = _counts(state, "SELECT state, COUNT(*) FROM final WHERE agent=? "
@@ -98,7 +134,10 @@ def _agent(state, agent, configured, now_ms, silent_after_ms):
         "configured": configured,
         "silent": bool(silent),
         "stopped_by_configuration_fault":
-            None if stopped is None else {"code": stopped[0]},
+            None if stopped is None
+            else {"code": decisions.closed_code(stopped[0])},
+        "permanent_failures_total": len(failures),
+        "permanent_failures": failures[:MAX_LISTED_FAILURES],
         "streams": streams,
         "events_read": last[1],
         "last_event_at": iso(last[0]),
@@ -152,7 +191,8 @@ def build_status(state, configured, now_ms, silent_after_seconds):
                    "fixed (upgrade the reporter, or remove the journal)"}
     refused = state.note(_NOTE_401)
     report["last_401"] = None if refused is None else {
-        "code": refused[0], "at": iso(refused[1])}
+        "code": decisions.closed_code(refused[0]), "at": iso(refused[1]),
+        "active": state.note(_NOTE_CREDENTIAL) is not None}
     report["silent_configured_seats"] = sorted(
         n for n, a in report["agents"].items() if a["silent"])
     report["operator_actions"] = _actions(report)
@@ -163,10 +203,15 @@ def _actions(report):
     actions = []
     if report["journal_refused"]:
         actions.append("the journal is refused: see journal_refused")
-    if report["last_401"]:
+    if report["last_401"] and report["last_401"]["active"]:
         actions.append("Leasewise refused the identity: check the identity "
                        "value in the configuration")
     agents = report["agents"].values()
+    failed = sum(a["permanent_failures_total"] for a in agents)
+    if failed:
+        actions.append("%d item(s) failed for good and will not be retried "
+                       "(see permanent_failures: acquisitions, reports and "
+                       "finals, each with its code)" % failed)
     if any(a["messages"]["open"] or a["messages"]["incomplete"]
            or a["messages"]["outcome_unknown"]
            or a["acquisitions"]["pending"] for a in agents):
@@ -205,8 +250,11 @@ def render_text(report):
         out.append("!! THE JOURNAL IS REFUSED (%s): no new input is read"
                    % report["journal_refused"]["reason"])
     if report["last_401"]:
-        out.append("!! Leasewise refused our identity (%s) at %s"
-                   % (report["last_401"]["code"], report["last_401"]["at"]))
+        last = report["last_401"]
+        out.append("%s Leasewise refused our identity (%s) at %s%s"
+                   % ("!!" if last["active"] else "(history)", last["code"],
+                      last["at"], "" if last["active"]
+                      else "; accepted again since"))
     for name, agent in report["agents"].items():
         m = agent["messages"]
         out.append("%s%s: %d events, %d messages (%d open, %d complete, "
@@ -220,6 +268,15 @@ def render_text(report):
                        % agent["stopped_by_configuration_fault"]["code"])
         if agent["silent"]:
             out.append("  silent: no recent journal events")
+        for item in agent["permanent_failures"]:
+            extra = ""
+            if item["kind"] == "final":
+                extra = " (observation %s, NOT delivered)" % (
+                    "complete" if item["observation_complete"]
+                    else "incomplete")
+            out.append("  !! failed for good: %s of message %s, %s%s"
+                       % (item["kind"], item["message_id"], item["code"],
+                          extra))
     for line in report["operator_actions"]:
         out.append("-> " + line)
     return "\n".join(out)

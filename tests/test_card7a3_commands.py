@@ -36,7 +36,8 @@ AGENT_FIELDS = {
     "configured", "silent", "stopped_by_configuration_fault", "streams",
     "events_read", "last_event_at", "dropped_total", "damaged_lines",
     "damaged_stream_records", "messages", "finals", "late_observations",
-    "acquisitions", "reports", "last_successful_call"}
+    "acquisitions", "reports", "last_successful_call",
+    "permanent_failures", "permanent_failures_total"}
 TOP_FIELDS = {
     "status_version", "generated_at", "source", "rounds_completed", "agents",
     "journal_refused", "last_401", "silent_configured_seats",

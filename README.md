@@ -395,7 +395,9 @@ operator of a Leasewise store. See docs/STEP-CARD-7A-3.md.
 
 1. Save the ids once: `python -m quota_balancer --db inventory.db policy-ids --json > policy-ids.json`.
 2. Write the configuration file (a TOML file, see below) and make it private.
-   On Windows: `icacls reporter.toml /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:F"`.
+   On Windows: `icacls reporter.toml /reset && icacls reporter.toml /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:F"`
+   (the first part drops any grant to someone else, the second removes what the
+   folder passes down and gives the file to you alone).
    On Linux or macOS: `chmod 600 reporter.toml`.
 3. Read the journal once and send what is due:
 
@@ -441,10 +443,13 @@ Keys are compound, as `policy-ids --json` returns them: a seat is
 (this machine, seat alias), a model is (account, model alias). A bare alias that
 matches more than one row is refused at start-up. An agent that appears in the
 journal but has no table is "unconfigured": its events are read and counted and
-never sent. On Windows the permission check reads the file's access list with
-`icacls`: the file must have its own list (inheritance removed) and give
-nothing to Everyone, Users or Authenticated Users. On other systems no group or
-other permission bit may be set.
+never sent. **Who may read the file.** On Windows the reporter reads the file's
+access list as security identifiers (not names, which depend on the language of
+the system) and allows only three: you (the current user), SYSTEM (`S-1-5-18`)
+and the Administrators group (`S-1-5-32-544`). Any other identity, an entry it
+cannot classify, an entry inherited from the folder, or a list it cannot read
+stops the start with a fixed message. On other systems no group or other
+permission bit may be set.
 
 ### Commands
 
@@ -466,9 +471,21 @@ still waiting; 4 the journal is refused (see below).
 
 - **Leasewise is down.** Nothing is lost: everything is stored first and sent
   later with the same bytes and the same `Idempotency-Key`. One request is in
-  flight at a time, with 5-second timeouts; failures back off from 5 seconds to
-  15 minutes with jitter. A `401` is retried too, and its code stays visible in
-  `status` as `last_401` (usually a wrong identity value in the file).
+  flight at a time, with 5-second timeouts on each network step (connecting,
+  sending, reading), which is not a total limit on one request; failures back off
+  from 5 seconds to 15 minutes with jitter. An answer that cannot be read at all
+  (garbled, too deeply nested, not text) counts as no answer and is retried. A `401` is retried too. `status` keeps the last one as history
+  (`last_401`: code, time, and `active`). While it is active the advice is to
+  check the identity value in the file; the first request Leasewise accepts
+  afterwards makes it history and the advice goes away.
+- **Error words.** Only Leasewise's own error codes (the ones in
+  `quota_balancer/errors.py`) are ever saved or shown. Any other text an answer
+  carries becomes `UNKNOWN_CODE`; the reporter adds `BAD_ANSWER` (a success
+  without the lease) and `MALFORMED_RESPONSE` (an unreadable answer).
+- **Items that failed for good** (acquisitions, reports and finals) are listed in
+  `status` under `permanent_failures`, each with its code, and one warning line
+  appears. A final also says whether the observation behind it was complete: a
+  complete observation whose final was never delivered is shown as that.
 - **After an outage, or when `status` shows open or incomplete messages,** run
   Leasewise's `expire-sweep` yourself:
   `python -m quota_balancer --db inventory.db expire-sweep`. It moves leases
@@ -495,7 +512,9 @@ still waiting; 4 the journal is refused (see below).
 ### What `status --json` shows
 
 At the top: `rounds_completed`, `journal_refused`, `last_401`,
-`silent_configured_seats`, `operator_actions` (plain sentences). Per agent:
+`silent_configured_seats`, `operator_actions` (plain sentences); `last_401`
+carries `active`. Per agent, also `permanent_failures` and
+`permanent_failures_total`:
 `configured`, `silent`, `stopped_by_configuration_fault`, `streams` (seen,
 missing, with gaps, with torn tails), `events_read`, `dropped_total`,
 `damaged_lines`, `messages` (known, open, complete, incomplete with a reason,

@@ -125,9 +125,11 @@ def restrict(path):
                           os.environ["USERNAME"])
         icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                               "System32", "icacls.exe")
-        done = subprocess.run([icacls, path, "/inheritance:r", "/grant:r",
-                               who + ":F"], capture_output=True)
-        assert done.returncode == 0, done.stdout
+        # The runbook command: reset to the folder's list, drop everything
+        # inherited, then give the file to its owner alone.
+        for args in (["/reset"], ["/inheritance:r", "/grant:r", who + ":F"]):
+            done = subprocess.run([icacls, path, *args], capture_output=True)
+            assert done.returncode == 0, done.stdout
     else:
         os.chmod(path, 0o600)
 
