@@ -885,6 +885,10 @@ page goes through exactly the same strict rules as a file. Running another progr
 promises three things: the program and **everything it starts** end together (even a helper started in its first instant),
 it never freezes the reporter, and every failure is a plain word in `status`.
 
+**The reporter must run as the same Windows user as the gateway.** The receipt command reads that user's own ledger and
+credential file, so a reporter that runs as another user reads nothing useful. For the same reason the operator's `env`
+table below will need that user's application-data variable, so the program can find those files.
+
 ```toml
 [gateway_receipts]
 gateway = "g1"
@@ -939,8 +943,10 @@ Limits, plainly:
 - **The deadline is cooperative.** It holds while the Windows calls return normally. Not covered: creating the process, the
   setup before the clock starts, and a possible wait inside `PeekNamedPipe`. The reporter must be the only reader of the pipe.
 - A drive letter mapped to remote storage is not detected as a network path; the operator is responsible for it.
-- Helpers started through another Windows service (a scheduled task, a service) are outside any job. A launcher that
-  exits before the real program is reported as `leftover_process` or `exit_code` and its work is ended: name the real program.
+- Helpers started through another Windows service (a scheduled task, a service) are outside any job. If the first
+  program only starts the real one and exits, the reporter cannot wait for the real one: the work it started is ended and
+  the read is reported as `leftover_process` (or `exit_code` when the launcher itself failed). Put the real program in
+  `command`, not a launcher.
 - The job holds at most 32 processes and has no memory or processor limits.
 - Windows only; Linux and macOS are a later card.
 
@@ -1057,7 +1063,7 @@ bytes) exits with code 2. The reasons for `held` are only `coordinator_unreachab
    handed to every step, including the connection, each piece of Leasewise's answer (a peer that answers a few bytes at
    a time cannot stretch it), every wait for the store file, and the retry that opens the store, which does not start
    an attempt it cannot finish. If the deadline comes first the connection is closed and the answer is `held` with
-   `store_busy`; what was learned is kept, so the next run continues where it stopped. A grant that Leasewise made
+   `store_busy`; what was learned is kept, so the next run continues where it stopped. A transport failure just before the deadline can be answered `coordinator_unreachable` (with the normal back-off) instead of `store_busy`; which one it is depends on which side of the deadline the failure lands. Both answers keep the saved request. A grant that Leasewise made
    but that could not be saved in time is recovered by the next run, which sends the very same saved bytes and gets the
    same lease back. Cleaning up the exchange after the deadline measured at most a few milliseconds, **for plain HTTP and
    for HTTPS alike** (worst of ten runs: 2 ms; `test_card7l6a2_fix2` for a connection that uses up the whole budget and a

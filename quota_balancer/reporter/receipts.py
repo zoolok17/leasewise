@@ -1,11 +1,11 @@
 """The receipt source adapter (card L6a-1): the ONE place that knows how a gateway's receipts reach us.
 
 A gateway keeps one final receipt for every quota lease it served and hands them out in PAGES (DESIGN-6A 5.4). This
-module reads one page from its source and hands back a checked, closed value, or says why it could not. In this
-version the only source is a fixture file (the tests, and the only source until agenttalk ships its receipt command):
-either a whole ledger document `{"generation": ..., "receipts": [...]}`, from which the page after the asked-for number
-is made, or an already made page, served as it is. A command source (a program the reporter would run) is NOT part of
-this version: it needs its own card (L6a-1b), because the program must be started already contained.
+module reads one page from its source and hands back a checked, closed value, or says why it could not. There are
+two sources. A fixture file (the tests): either a whole ledger document `{"generation": ..., "receipts": [...]}`, from
+which the page after the asked-for number is made, or an already made page, served as it is. Or a command source (card
+L6a-1b, Windows only): a program the reporter runs, started already contained by `runner.py`, whose output is checked by
+exactly the same rules as a file.
 
 A page is one JSON object with exactly these keys: `envelope_version` (1), `generation` (the ledger's own
 identity, even when the page is empty), `after_seq` (the number asked for), `next_seq`, `has_more`, `receipts`.

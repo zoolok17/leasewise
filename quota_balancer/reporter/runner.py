@@ -1,4 +1,4 @@
-"""The contained Windows runner for a receipt command (card L6a-1b, step 2). The reporter does not call it yet.
+"""The contained Windows runner for a receipt command (card L6a-1b). The reporter's receipt reading calls it when a `command` source is configured.
 
 A program the reporter runs may start other programs, and when the reporter gives up on it (too slow, too much output,
 or the reporter itself stops) all of them must stop, including a helper started in the very first instant. So:
