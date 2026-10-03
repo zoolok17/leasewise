@@ -147,7 +147,7 @@ tests put events into the queue by hand.
 | `test_card7c2_decisions.py` (9) | the answer table above, including `202` not success for lease kinds, 4xx never an agent stop, an echoed unknown word becomes `UNKNOWN_CODE` |
 | `test_card7c2_state.py` (24) | fresh file is version 2; v1 migrates with lease rows untouched; second open is a no-op; a failed upgrade stays v1; the old code path refuses v2 and changes nothing; a newer unknown version is refused; one row per `event_id` with the first bytes; immutability; body allow-list with a fixed sentence; scheduling order and back-off; `apply` for every answer |
 | `test_card7c2_client.py` (11) | the path pair (limit rows only to the limit path; no lease kind can reach it; 14 refused paths); the wire bytes equal the stored bytes on every try; answer reading; no exception text kept |
-| `test_card7c2_delivery.py` (15) | a parked account refusing every lease never delays a limit row (same cycle, limit path first); a denied acquisition that stops its agent does not either; oldest first; a refused row fails alone; no answer stops the cycle before the lease pass; a back-off row is skipped; `401`; every try resends the same bytes across a restart; a sent row is never resent; no body value or exception text in errors, notes, counters or status |
+| `test_card7c2_delivery.py` (15) | a parked account refusing every lease never delays a limit row (same cycle, limit path first); a denied acquisition that stops its agent does not either; oldest first; a refused row fails alone; the passes stay separate (a limit row with no answer does not stop the lease pass, fix round 1); a back-off row is skipped; `401`; every try resends the same bytes across a restart; a sent row is never resent; no body value or exception text in errors, notes, counters or status |
 
 Each file was run red against the code before its commit (decisions: 9 tests, 24 errors before;
 state: 22 tests, 1 failure and 44 errors before; client: 11 tests, 14 failures before; delivery: 13
@@ -184,8 +184,10 @@ for delivery tests that belong to step 2.
 - This does not change section 7.2's rule in effect: it is the same rule, now true at the edges. The
   step 1 text above is updated; the README needed no change.
 
-Tests, `tests/test_card7c2_replay_domain.py` (8): each event is recorded **the old way** by running
-the limit-event code from the repository's own history (`da91e1f`), at `INT64_MAX`,
+Tests, `tests/test_card7c2_replay_domain.py` (8). **This file needs Git and the historical commit
+`da91e1f` in the repository, so it cannot run from a source archive or a shallow clone.** Each event is
+recorded **the old way** by running the limit-event code from the repository's own history
+(`da91e1f`), at `INT64_MAX`,
 `INT64_MAX - 1` and `INT64_MAX - 29 999`; the same body is then replayed through the new code and
 over HTTP: the same answer, no conflict, no margin (raw `retry_at`), and every table unchanged. The
 same for a legacy record. A changed reset under an old id is still a conflict; a replay above
@@ -293,3 +295,41 @@ code were written before their tests this time; the tests were then shown to hav
   in the README "Limits".
 - **Best effort (R-012).** A park that starts and ends while the reporter is not running, or between
   two scans, is never reported. The statement in `status` and the README section are step 4.
+
+## Fix round 2 (Codex's read of step 2 and fix round 1, tk-5fb0bb40fd91; the last for steps 1 and 2)
+
+### In plain words
+
+Three small things were left. None of them loses an event.
+
+1. **The queue's privacy promise was only a spelling check.** It was meant to accept only known window
+   words, but accepted any short lowercase word, so a private phrase could have been stored and sent.
+   It now accepts only `five_hour` and `seven_day`, the producer's own words, from ONE list that the
+   park-file reader shares, so the two can never differ.
+2. **A malformed evidence value crashed instead of being refused.** A list or an object raised a raw
+   error. The type is now checked before the value, so it gets the queue's fixed refusal.
+3. **The cycle summary could hide a login problem.** When the limit pass got "not authorised" (401)
+   and the lease pass then found the server down (503), the summary said only "unreachable"; the
+   other way round it said "credential". The two outcomes are now ranked: a credential refusal from
+   either pass shows as `credential`, above `unreachable`, above nothing. The rule is simple and does
+   not depend on order. Both passes still run; each stops only on its own wall.
+
+### Tests (`tests/test_card7c2_fix2.py`, 10 tests; red first: 6 errors and 5 failures before)
+
+- A closed window vocabulary: both producer words accepted (one, both, none); `synthetic_private_prose`
+  and other short lowercase words refused by the body builder AND through `add_limit_event`; entries
+  that are not text refused; the reader and the queue share one tuple (`is`).
+- Type before membership: a list, an object, `None`, a number, a boolean, bytes or a tuple as
+  `evidence_kind` give the fixed sentence "a limit event body is not valid", with no row inserted.
+- The summary: 401 then 503, 503 then 401 and 401 then 401 all give `credential`, both passes ran,
+  both rows are still pending with one try, the credential note is kept; 503 then 503 gives
+  `unreachable` with no credential note; the failure streak counts one blocked cycle.
+
+Codex's probes (`test_7c2_delta_probes.py`, copied into scratch, never edited, pointed at this
+worktree): 7 of 7 pass, including the four that failed.
+
+### Where the text changed
+
+The comment in `run.py` that said "Stop this cycle" now says this pass stops and the other still runs,
+and the delivery-test row above no longer says the cycle stops before the lease pass. The
+`replay_domain` test needs Git history (see above).
