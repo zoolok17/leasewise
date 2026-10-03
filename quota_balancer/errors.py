@@ -37,6 +37,9 @@ CODE_MONEY_LIMIT = "MONEY_LIMIT"
 CODE_WINDOW_LIMIT = "WINDOW_LIMIT"
 CODE_ACCOUNT_PARKED = "ACCOUNT_PARKED"
 CODE_CONCURRENCY_LIMIT = "CONCURRENCY_LIMIT"
+# Card L6a-0 (Codex F1): a final receipt left some INPUT usage unknown in a window, so input admission for
+# that scope and window waits until the window rolls over (a conservative refusal, never a guess).
+CODE_INPUT_USAGE_UNKNOWN = "INPUT_USAGE_UNKNOWN"
 
 # Card 5 private-HTTP transport errors (docs/DESIGN.md sections 6-7).
 # These never occur off the HTTP transport (there is no CLI request to
@@ -75,6 +78,7 @@ EXIT_CODES = {
     CODE_WINDOW_LIMIT: 2,
     CODE_ACCOUNT_PARKED: 2,
     CODE_CONCURRENCY_LIMIT: 2,
+    CODE_INPUT_USAGE_UNKNOWN: 2,
 }
 
 MSG_INVALID_CONFIG = "config document is invalid"
@@ -100,6 +104,7 @@ MSG_RECEIPT_CONFLICT = "a receipt for this lease conflicts with a stored receipt
 MSG_LEASE_EXPIRED = "the lease is expired"
 MSG_LEASE_CLOSED = "the lease is settled and closed"
 MSG_INPUT_LIMIT = "the input token limit is reached"
+MSG_INPUT_USAGE_UNKNOWN = "input usage in this window is unknown until the window rolls over"
 MSG_MONEY_LIMIT = "the money limit is reached"
 MSG_WINDOW_LIMIT = "the window limit is reached"
 MSG_ACCOUNT_PARKED = "the account is parked"

@@ -471,7 +471,8 @@ def grant(path, request, now_ms, wire_identity=None):
 
 
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
-                 input_cap, hold_sized, concurrency_new, now_ms):
+                 input_cap, hold_sized, concurrency_new, now_ms,
+                 shadow=False):
     """Enforce one (metric, period[, window_key]) group through the
     card-3 admission rule; a POLICY_DENIED maps to the group's 429 code.
     A non-metered lease admits with zero new hold (advisory: no
@@ -543,6 +544,30 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                          and (scope == "platform"
                               or (r["scope"] == scope
                                   and r["scope_id"] == scope_id))]
+            # (limit_ids above is deliberately loose for the platform
+            # singleton; this rule needs a limit AT this very scope.)
+            has_limit_here = any(
+                r["metric"] == metric and r["period"] == period
+                and r["scope"] == scope
+                and (scope == "platform" or r["scope_id"] == scope_id)
+                for r in limit_rows)
+            if metric == "input_tokens" and has_limit_here and not shadow \
+                    and conn.execute(
+                        # Card L6a-0 (Codex F1): the SUM above skips a NULL,
+                        # and a settled lease's hold no longer counts, so a
+                        # final receipt with UNKNOWN input would vanish from
+                        # this decision. While any such receipt sits in this
+                        # scope's window, input admission waits (a closed
+                        # refusal, never a guess) until the window rolls over.
+                        "SELECT 1 FROM receipts r JOIN leases l ON "
+                        "l.id=r.lease_id WHERE r.final=1 AND "
+                        "r.input_tokens IS NULL AND "
+                        "l.enforcement <> 'shadow' AND "
+                        + settled_bucket + "=? AND " + _chain_pred(scope)
+                        + " LIMIT 1",
+                        (ps,) + _chain_bind(scope, scope_id)).fetchone():
+                raise QuotaError(errors.CODE_INPUT_USAGE_UNKNOWN,
+                                 errors.MSG_INPUT_USAGE_UNKNOWN)
             holds = 0
             if limit_ids:
                 placeholders = ",".join("?" * len(limit_ids))
@@ -861,7 +886,7 @@ def _grant(conn, request, now_ms, wire_identity=None):
                 _METRIC_RANK[k[0]], _PERIOD_RANK[k[1]], k[2] or "")):
             _admit_group(conn, key, limit_rows, chain, account_id, budget,
                          metered, input_cap, hold_sized, concurrency_new,
-                         now_ms)
+                         now_ms, shadow=enforcement == "shadow")
 
         # One live slot per (seat, turn): the lease_live partial index.
         # Checked explicitly so the refusal is a typed conflict, not a
