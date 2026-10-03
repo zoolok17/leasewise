@@ -2,7 +2,7 @@
 
 Work item `card-7c-2`. Branch `card-7c-2`, from main `da91e1f`. Contract:
 `C:\lw\records\DESIGN-7C2.md` (the lead's decisions in its section 15 win). This record grows one
-step at a time; step 1 of 4 is below.
+step at a time; steps 1 and 2 of 4 are below.
 Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only. Audience: the lead and the reviewers.
 
 ## In plain words
@@ -85,3 +85,75 @@ directly with SQL.
   `retry_at` in the past. Nothing un-parks it by itself.
 - Steps 2 to 4 (the reporter's outbox and client, the marker reader and account map, the wiring,
   status and README) are not built yet.
+
+## Step 2: the reporter's outbox and client for limit events
+
+Built on step 1 (`437acb6`), in four small commits so a change from review lands cleanly:
+decisions, state, client, scheduling.
+
+### In plain words
+
+Once the reporter knows of a limit, the event must reach Leasewise even across restarts and
+outages, and nothing else in the reporter may hold it back. This step builds the safe queue (the
+outbox) for limit events and their sending. It does not read park files yet; that is step 3. The
+tests put events into the queue by hand.
+
+### What changed
+
+- **Answers (`decisions.py`, commit 1).** A new kind, `LIMIT`. `200`, `201` and `202` mean recorded.
+  No answer, `5xx`, `429` and `401` behave as for every kind (retry; `401` keeps the credential
+  notes). Any other `4xx` fails **that one row** for good: never an agent stop (a limit event has no
+  agent), never a rebuild, never a drop. `202` stays *not* success for the lease kinds, whose routes
+  never answer it.
+- **State (`state.py`, `mapper.py`, commit 2).** State version 2. A version-1 file is upgraded in
+  one transaction (table and triggers; lease rows untouched; a second open does nothing; a failed
+  upgrade leaves version 1). New table `limit_event`: one row per limit fact, `event_id` unique, the
+  frozen canonical body text, a delivery state, its tries and back-off, a closed error word.
+  Identity and body cannot be updated and a row cannot be deleted (triggers, like `final`).
+  `State.add_limit_event` stores a row in one transaction with `INSERT OR IGNORE`: the same
+  `event_id` twice is one row and the first bytes stay. It accepts only the allow-listed body
+  (exactly seven fields, checked types and bounds, a reset at most `INT64_MAX - 30 000`, the ceiling
+  Leasewise now enforces) and otherwise raises one fixed sentence that carries no value. `apply`
+  needed no new code: its generic table handling covers the new table.
+- **Client (`client.py`, commit 3).** The kind and the path are checked as a pair: a limit row goes
+  to exactly `/v1/limit-events` and to no other path; no lease kind can reach that path; the lease
+  rules are unchanged. A limit answer is read for its status and its closed error word only, so no
+  field of a `202` body is kept.
+- **Scheduling (`run.py`, commit 4).** `_send` runs two passes, the limit pass first. A lease answer
+  of retry or `429` (a parked account refuses every lease request) never delays a limit row, and a
+  denied lease that stops its agent never holds one. If the limit pass itself meets the wall (no
+  answer, `5xx`, `429`, `401`), the lease pass would meet the same wall, so the cycle stops. A row
+  waiting out its own back-off is skipped, and the lease pass still runs.
+
+### Decisions applied
+
+- **D4:** limit rows have their own pass, run first (lesson kn-941796d9afb6).
+- **D6:** state version 2 with a migration; no downgrade. A reporter built before this card refuses a
+  version-2 file with its existing fail-closed error. This is tested by running the state opener
+  with the old version number and the old table list, which is exactly the old code path: it raises
+  "the state file version is not supported" and the file (bytes, version, schema) is unchanged. It
+  is also stated in the README "Limits".
+- **D8:** `turn_id` names the limit fact (the step 1 comment; step 3 derives it).
+
+### Tests (`tests/test_card7c2_*.py`)
+
+| File | What it proves |
+| --- | --- |
+| `test_card7c2_decisions.py` (9) | the answer table above, including `202` not success for lease kinds, 4xx never an agent stop, an echoed unknown word becomes `UNKNOWN_CODE` |
+| `test_card7c2_state.py` (22) | fresh file is version 2; v1 migrates with lease rows untouched; second open is a no-op; a failed upgrade stays v1; the old code path refuses v2 and changes nothing; a newer unknown version is refused; one row per `event_id` with the first bytes; immutability; body allow-list with a fixed sentence; scheduling order and back-off; `apply` for every answer |
+| `test_card7c2_client.py` (11) | the path pair (limit rows only to the limit path; no lease kind can reach it; 14 refused paths); the wire bytes equal the stored bytes on every try; answer reading; no exception text kept |
+| `test_card7c2_delivery.py` (13) | a parked account refusing every lease never delays a limit row (same cycle, limit path first); a denied acquisition that stops its agent does not either; oldest first; a refused row fails alone; no answer stops the cycle before the lease pass; a back-off row is skipped; `401`; every try resends the same bytes across a restart; a sent row is never resent; no body value or exception text in errors, notes, counters or status |
+
+Each file was run red against the code before its commit (decisions: 9 tests, 24 errors before;
+state: 22 tests, 1 failure and 44 errors before; client: 11 tests, 14 failures before; delivery: 13
+tests, 12 failures before).
+
+### Limits (stated, not hidden)
+
+- Nothing reads the park files yet and `status` does not yet show limit events: steps 3 and 4.
+- A sent limit event is final in the outbox; if an operator later clears the block in Leasewise
+  while the park file still says the same thing, nothing is sent again (the same limit fact is one
+  event for ever). That is by design (DESIGN-7C2.md section 5).
+- If Leasewise keeps answering `429` or `5xx` for a limit event, it is retried with the usual
+  5-second to 15-minute back-off, for ever; nothing drops it.
+

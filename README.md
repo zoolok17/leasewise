@@ -529,9 +529,9 @@ dropped, failed, over the cap), `last_successful_call`. "Complete" means "no los
 the journal can see"; it is not a guarantee. `status` never shows the URL, the
 identity or any message text.
 
-## Card 7c-2 - the retry margin (step 1 of 4)
+## Card 7c-2 - limit events (steps 1 and 2 of 4)
 
-**Status: step 1 built.** When a reporter tells Leasewise that an account is out until a given
+**Status: steps 1 and 2 built.** When a reporter tells Leasewise that an account is out until a given
 time (`POST /v1/limit-events`), Leasewise now holds the account until **30 seconds after** that
 time, so the provider has really reopened. Leasewise adds the 30 seconds itself, once, to the new
 event's time only; the time the reporter sent is kept as sent. A repeated delivery of an event is
@@ -539,5 +539,22 @@ still a pure read.
 
 Blocks that already exist keep the `retry_at` they have: nothing is backfilled. Leasewise still does
 not un-park an account by itself; an operator clears the block (card 7c-3 will add recovery).
-See docs/STEP-CARD-7C-2.md. The reporter side of card 7c-2 (reading agenttalk's park marker and
-sending the event) comes in the next steps.
+**Step 2: the reporter's outbox for limit events.** Once the reporter knows of a limit, the event
+must reach Leasewise across restarts and outages, and nothing else may hold it back. The reporter's
+state file now has a table for limit events: each is stored once, with its body frozen, before
+anything is sent, and every retry resends exactly the stored bytes under the same `Idempotency-Key`.
+Limit events are sent by their own pass, which runs first in every cycle: a lease answer of "retry"
+or 429 (a parked account refuses every lease request) never delays one, and a limit event that
+Leasewise refuses fails only itself, never an agent and never the reporter. Leasewise's answer `202`
+means "recorded" for a limit event; the reporter keeps nothing from it. The client sends a limit
+event to `/v1/limit-events` and to nothing else. Nothing reads the park files yet (step 3).
+
+Limits:
+
+- **No downgrade of the state file.** The reporter's state file is now version 2 and a version-1 file
+  is upgraded the first time the new reporter opens it. A reporter built before this card meets a
+  version-2 file with its existing "the state file version is not supported" refusal: it never opens
+  or changes it. Keep a copy of the state file if you may need to go back.
+
+See docs/STEP-CARD-7C-2.md. The rest of the reporter side of card 7c-2 (reading agenttalk's park
+marker and the account map, then the wiring, status and the stated gap) comes in the next steps.

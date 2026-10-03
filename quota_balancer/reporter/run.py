@@ -103,11 +103,21 @@ class Reporter:
                                 self.clock())
 
     def _send(self, result):
+        """Two passes, the limit pass FIRST (card 7c-2). Limit events belong to no seat and no
+        message, so nothing a lease answers (a retry, a 429 from a parked account, a refusal) may
+        delay one. If the limit pass itself meets the wall (no answer, 5xx, 429, 401) the lease
+        pass would meet the same one, so the cycle stops."""
+        if self._send_pass(result, self.state.next_limit_item):
+            self._send_pass(result, self.state.next_item)
+
+    def _send_pass(self, result, pick):
+        """Send what `pick` offers, one request at a time. True if the pass ran out of due items;
+        False if it was stopped (told to stop, or blocked: result.blocked says which)."""
         while not self.stop.is_set():
             now = self.clock()
-            item = self.state.next_item(now)
+            item = pick(now)
             if item is None:
-                return
+                return True
             answer = self.client.send(item)
             if self.fault:
                 self.fault("answered")
@@ -122,7 +132,8 @@ class Reporter:
                 # other request would meet the same wall. Stop this cycle.
                 result.blocked = CREDENTIAL if answer.status == 401 \
                     else UNREACHABLE
-                return
+                return False
+        return False
 
     # --- the commands ----------------------------------------------------------
 
