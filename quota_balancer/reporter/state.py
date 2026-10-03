@@ -148,9 +148,10 @@ _LIMIT_DDL = (
 #                    source is frozen on the row.
 #   receipt_delivery stage 2: the frozen canonical settle body, created in one transaction only when a binding for
 #                    the frozen gateway matches.
-#   receipt_state    the mutable delivery-status table (the ONLY mutable one): captured, quarantined (with a closed
-#                    reason), pending, sent, failed.
-# Source, binding, capture and delivery rows cannot be changed or deleted; the state row cannot be deleted.
+#   receipt_state    the mutable delivery-status table: captured, quarantined (with a closed reason), pending, sent,
+#                    failed.
+# Two tables change in place: `receipt_state` (the delivery status) and `receipt_cursor` (its rows only move forward).
+# Source, binding, capture and delivery rows never change and are never deleted; a state row is never deleted.
 _RECEIPT_DDL = (
     "CREATE TABLE receipt_source(id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL,"
     " gateway_id TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(alias, gateway_id)) STRICT",

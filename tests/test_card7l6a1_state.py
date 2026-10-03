@@ -3,7 +3,7 @@
 Two durable stages (DESIGN-6A 8.3). Stage 1, CAPTURE: the evidence exactly as received, and the cursor, in one
 transaction, even when no binding is known. Stage 2, RELEASE: when a binding for the capture's FROZEN gateway is
 known, the immutable delivery body, created in one transaction with the state change. Quarantine and delivery state
-live in the one mutable table. The file moves from version 1 or 2 to version 3 in one transaction; a reporter that
+live in the mutable delivery-status table (the cursor rows also move forward). The file moves from version 1 or 2 to version 3 in one transaction; a reporter that
 knows only version 2 refuses a version-3 file. Everything here is synthetic.
 """
 
