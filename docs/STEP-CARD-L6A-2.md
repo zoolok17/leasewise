@@ -25,8 +25,11 @@ What keeps that true:
    ask, save" one section per message. A helper that dies releases it by dying; nobody cleans anything up.
 3. **Saved before sent.** The request, and every later body, is written down before it is sent. A lost answer is asked
    again with the very same bytes, and Leasewise recognises them and returns the lease it already made.
-4. **One deadline.** The whole run has 20 seconds, under the hook's 25. If it runs out it answers `held` with
-   `store_busy` and keeps what it learned, so the next run continues instead of starting over.
+4. **One deadline.** The whole run has 20 seconds, under the hook's 25, and it is one absolute deadline: the time left
+   is given to the connection, to each piece of Leasewise's answer, to every wait for the store file and to the open
+   retry (fix round 1; the first build only capped each request on its own). If it runs out the connection is closed and
+   the answer is `held` with `store_busy`; what was learned is kept, so the next run continues instead of starting
+   over. A grant Leasewise made but we could not save in time is recovered by resending the same stored bytes.
 5. **Saved before printed.** The grant is stored before anything is written to standard output.
 
 ### What was built
@@ -184,7 +187,7 @@ several tests fail.
   (an observe-only acquisition that holds nothing). Declare the agent first. This is not a second settlement authority.
 - A message at the body cap stays held.
 
-### Gates
+### Gates (first build, superseded by the fix round below)
 
 Free memory at the start: 8.9 GB. The full suite, in chunks each under 8 minutes, proven to cover every test file once
 (16 + 1 + 7 + 2 + 3 + 2 + 45 = 76 files, equal to the 76 `test_*.py` files):
@@ -202,5 +205,64 @@ Free memory at the start: 8.9 GB. The full suite, in chunks each under 8 minutes
 
 Scanner gate: `ruff check --isolated --no-cache --select E4,E7,E9,F,B quota_balancer tests` reports 74 (the baseline of main
 `363c87e`, none in a file this card changed); `bandit -r quota_balancer -q` reports 26 (Low 5, Medium 20, High 1, the accepted
-OVH SHA-1; baseline 34). The new `nosec` notes say why: a fixed-column query in the store writer, and the operator's own
-configured command started without a shell in `proctree.py`.
+OVH SHA-1; baseline 34). The only `nosec` notes this card adds are the two in `admission_store.py` (see the fix round
+below for the exact list). The step-2 text that also named a command started without a shell in `proctree.py` was wrong:
+that file left with the command sources (card L6a-1b), so it adds no suppression.
+
+## Fix round 1 (Codex's review of head 3ed6c760)
+
+### In plain words
+
+Codex found eight real gaps. All are closed. The two that matter most: the 20-second promise now really holds even when
+Leasewise answers a few bytes at a time (before, such a peer could stretch a run to 24 s), and a turn can no longer be
+sent twice by the journal side just because a bookkeeping step crashed half-way. Nothing already saved is ever deleted.
+
+- **F1, one real deadline.** One absolute deadline now runs through the whole exchange: connecting, sending, the answer
+  read in pieces (the time left is checked between pieces and caps each wait; a watchdog also shuts a blocked read), every
+  wait for the store file, and the open retry, which does not start an attempt it cannot finish. At the deadline the
+  connection is closed and the answer is `held` with `store_busy`, progress saved. A grant that Leasewise made but we
+  could not save is recovered by the next run, which resends the same stored bytes and gets the same lease.
+- **F2, the owner comes from the saved request.** The binding's gateway is read from the exact saved body that won (also
+  an older body found by the replay search), never from today's configuration. A saved request is recovered before any
+  check that reads today's settings; those checks apply to a new message only.
+- **F3, custody is not permission.** A replayed paid grant whose lease is now `uncertain` (expired) or `settled` is still
+  saved as the binding, so `recall`, `pending`, `closed` and receipts can use it; its time is stored as none and `admit`
+  answers `held` (`refused`), so the turn does not run.
+- **F4, exclusion at the sending boundary.** `State.next_item` no longer offers any acquisition, non-final or final row of
+  a declared agent or of a message with a known binding, whatever the `superseded` markers say. The immutable markers and
+  the counters stay; they are records, the rule is in the choice of what to send.
+- **F5, reporter state version 4.** One transaction upgrades L6a-1's final version 3 (and, through it, 1 and 2); the only
+  change is the `superseded` table with its triggers. The test fixture (`tests/fixtures/reporter-state-v3-l6a1.sqlite`) was
+  written by the real State of the final `card-l6a-1` head (main `55b229f`). An older reporter refuses version 4 with its
+  existing sentence; nothing is deleted.
+- **F6, an index.** `admission_attempt_admission` on `admission_attempt(admission_id)` makes the body count behind
+  `at_body_cap` an index lookup; a query-plan test checks there is no scan of that table.
+- **F7, the summary is independent of receipts.** The admission summary (body cap, store state) is refreshed each cycle
+  whenever `[admission]` is configured. With both blocks, the one checked store path does it (one read a cycle). A failed
+  read shows the state as read and the count as unknown (`null`), never a fresh zero; the text line and the action
+  sentences appear without a receipt source too.
+- **F8, suppressions.** Every `nosec` names its bandit test id and a reason. The complete list for this card:
+  `quota_balancer/reporter/admission_store.py:266` (`Writer.lookup`) and `:328` (`Writer.save_grant`), both
+  `# nosec B608 - fixed column names, values bound`. There are no others, and no bare ones.
+
+### Tests (new: 28 in two files; two older files changed only for the new version number)
+
+| What | Where |
+|---|---|
+| F1: a real local peer that drips its answer ends within the budget plus a small cleanup; the same through the whole run; store contention near the deadline; an open that cannot finish is not started; a grant committed but not saved at the deadline is recovered with the same bytes and one lease | `test_card7l6a2_fix1.Deadline` |
+| F2: save for gateway A, lose the answer, remap the alias to B, drop today's bounds, retry: the binding says A; a new message is still judged by today's settings | `test_card7l6a2_fix1.Owner` |
+| F3: expired and settled replays are saved and held; real handler, crash before the save, `expire-sweep`, retry | `test_card7l6a2_fix1.Custody`, `RealHandler` |
+| F4: 1,001 known-bound queued rows, an agent declared after its rows were queued, a crash between copying bindings and writing markers (acquisition, non-final and final) | `test_card7l6a2_fix1b.Exclusion` |
+| F5: the real v3 fixture upgrades with nothing deleted, a failed upgrade leaves it at 3, an older reporter refuses 4, versions 1 and 2 reach 4 | `test_card7l6a2_fix1b.Upgrade` (and the updated `test_card7c2_state`, `test_card7l6a1_state`) |
+| F6: no scan of the bodies table | `test_card7l6a2_fix1b.Plan` |
+| F7: admission only, unreadable summary then recovery, unknown before the first read, missing store, one read when both are configured | `test_card7l6a2_fix1b.Summary`, `OneCheckedPath` |
+
+Red first: the four F4 tests fail (4 of 4) with the new exclusion removed and pass with it. The F1 deadline test and the F3
+and F2 tests failed on the first build's behaviour (the deadline run answered `coordinator_unreachable` after the first
+request timed out; the old code saved no expired grant) and pass now.
+
+### Gates
+
+Chunks, each under 8 minutes: cards 1-4: 454; card 5: 122; L1: 215; L6: 40; R1: 69; billing: 46; card 7: 915 (2 skipped).
+Total **1861**, equal to the `discover` collection; the 78 test files match the seven patterns exactly once. ruff (gate
+set): 74 (the baseline, none in a file this card changed). bandit: 26 (Low 5, Medium 20, High 1, the accepted OVH SHA-1).

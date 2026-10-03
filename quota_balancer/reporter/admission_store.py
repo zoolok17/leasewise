@@ -50,6 +50,8 @@ DDL = (
     "CREATE UNIQUE INDEX admission_grant_seq ON admission(grant_seq)",
     "CREATE TABLE admission_attempt(id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " admission_id INTEGER NOT NULL REFERENCES admission(id), body TEXT NOT NULL, sent_ms INTEGER NOT NULL) STRICT",
+    # The body count of one message (the cap, and the summary the status reads) is an index lookup, never a scan.
+    "CREATE INDEX admission_attempt_admission ON admission_attempt(admission_id)",
     # Identity, request and grant never change once written; an attempt is never changed or deleted; nothing is deleted.
     "CREATE TRIGGER admission_key BEFORE UPDATE OF agent, message_id, request_id ON admission BEGIN"
     " SELECT RAISE(ABORT, 'an admission key is immutable'); END",
@@ -175,6 +177,7 @@ def read_admission(path, agent, message_id):
 
 # --- the writer (card L6a-2): only `reporter admit` opens the store this way -------------------------------------
 
+SAVE_RESERVE_MS = 500           # the least a save may wait, so that a grant already in hand is not lost at the deadline
 BUSY_TIMEOUT_MS = 3000          # a short wait for another writer; the caller's deadline is always shorter or equal
 
 
@@ -201,16 +204,19 @@ class Writer:
     either the old rows or the new ones. WAL mode and full synchronous writes make a committed row survive a power
     cut. The file and its folder are created on first use."""
 
-    def __init__(self, path):
+    def __init__(self, path, budget_ms=BUSY_TIMEOUT_MS):
+        """`budget_ms` is how long the first open may wait for another process; later waits follow `set_deadline`."""
         self.path = path
+        self._left = None
+        wait = max(1, min(BUSY_TIMEOUT_MS, int(budget_ms)))
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None)
+            conn = sqlite3.connect(path, timeout=wait / 1000.0, isolation_level=None)
         except (OSError, sqlite3.Error):
             raise StoreUnusable() from None
         self.conn = conn
         try:
-            conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+            conn.execute("PRAGMA busy_timeout=%d" % wait)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=FULL")
             if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
@@ -230,8 +236,17 @@ class Writer:
         with contextlib.suppress(sqlite3.Error):
             self.conn.close()
 
+    def set_deadline(self, seconds_left):
+        """From now on every wait for the file is at most the time `seconds_left()` says is left of the run (never more
+        than the short wait, and never less than a small reserve so that an answer already in hand can still be saved)."""
+        self._left = seconds_left
+
     @contextlib.contextmanager
     def txn(self):
+        if self._left is not None:
+            wait = max(SAVE_RESERVE_MS, min(BUSY_TIMEOUT_MS, int(self._left() * 1000)))
+            with contextlib.suppress(sqlite3.Error):
+                self.conn.execute("PRAGMA busy_timeout=%d" % wait)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:

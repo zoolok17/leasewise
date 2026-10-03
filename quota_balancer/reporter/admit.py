@@ -47,6 +47,7 @@ TOTAL_SECONDS = 20.0            # the whole run: lock, requests, rebuilds, repla
 LOCK_WAIT_SECONDS = 10.0
 POST_TIMEOUT_SECONDS = 5.0
 MIN_POST_SECONDS = 0.5          # less than this is left: not worth starting another request
+MIN_OPEN_SECONDS = 0.2          # less than this is left: not worth starting an attempt to open the store
 MAX_REBUILDS = 3
 MAX_REPLAYS = 4
 BACKOFF_MS = {"coordinator_unreachable": 10_000, "parked": 30_000, "refused": 60_000}
@@ -198,12 +199,25 @@ def _rebuilt_text(body_text, now_ms):
 
 # --- what comes back ----------------------------------------------------------------------------------------------
 
-def _grant_of(doc, env, now_ms):
-    """Leasewise's `200` or `201` answer -> the grant to save, or None when it is not a usable paid grant (a lease of
-    another kind, or an answer that is missing a field)."""
+def _grant_of(doc, body_text, now_ms):
+    """Leasewise's `200` or `201` answer to the saved body `body_text` -> the grant to save, or None when it is not a
+    paid grant at all (a lease of another kind, or an answer that is missing a field).
+
+    * **The owner comes from the saved body**, never from today's configuration: the binding names the gateway that
+      the request which won was written for, even if the alias was mapped elsewhere after a crash.
+    * **Custody is separate from permission to run.** A replay can show a lease that has since expired (`uncertain`)
+      or settled. It is still the lease of this message, so it is still saved (a close, a receipt and `recall` need
+      it); its time is recorded as none, so `admit` answers `held` and the turn does not run."""
     lease_id, expires = doc.get("lease_id"), doc.get("expires_at")
     if type(lease_id) is not str or not _UUID.fullmatch(lease_id) or type(expires) is not int \
-            or isinstance(expires, bool) or doc.get("enforcement") not in PAID or doc.get("state") != "active":
+            or isinstance(expires, bool) or doc.get("enforcement") not in PAID \
+            or doc.get("state") not in ("active", "uncertain", "settled"):
+        return None
+    try:
+        gateway_id = json.loads(body_text)["gateway_id"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if type(gateway_id) is not str or not _UUID.fullmatch(gateway_id):
         return None
     max_calls = max_micro_eur = None                  # metered-advisory: the gateway uses its own ledger ceiling
     if doc["enforcement"] == "metered":
@@ -211,9 +225,9 @@ def _grant_of(doc, env, now_ms):
         if type(caps) is not dict or type(caps.get("max_calls")) is not int or type(hold) is not int:
             return None
         max_calls, max_micro_eur = caps["max_calls"], hold
-    ttl = min((expires - now_ms) // 1000, wire.MAX_TTL)
-    return {"lease_id": lease_id, "gateway_id": env.admission.gateway_id, "ref_sha256": mapper.lease_ref_hash(lease_id),
-            "max_calls": max_calls, "max_micro_eur": max_micro_eur, "ttl_seconds": ttl, "expires_ms": expires}
+    ttl = min((expires - now_ms) // 1000, wire.MAX_TTL) if doc["state"] == "active" else 0
+    return {"lease_id": lease_id, "gateway_id": gateway_id, "ref_sha256": mapper.lease_ref_hash(lease_id),
+            "max_calls": max_calls, "max_micro_eur": max_micro_eur, "ttl_seconds": max(ttl, 0), "expires_ms": expires}
 
 
 def _post(env, row, body_text, deadline):
@@ -225,9 +239,9 @@ def _post(env, row, body_text, deadline):
     return env.client.post_acquisition(row["request_id"], body_text.encode("utf-8"), min(POST_TIMEOUT_SECONDS, left))
 
 
-def _saved(env, writer, row, doc):
-    """A usable grant is saved (once) and answered from what is stored. -> bytes, or None if it is not a paid grant."""
-    grant = _grant_of(doc, env, env.now_ms())
+def _saved(env, writer, row, doc, body_text):
+    """A paid grant is saved (once) and answered from what is stored. -> bytes, or None if it is not a paid grant."""
+    grant = _grant_of(doc, body_text, env.now_ms())
     if grant is None:
         return None
     env.fault("granted")                                # Leasewise has granted; nothing is saved yet
@@ -245,15 +259,20 @@ def _granted(status, doc):
 def _open(env, deadline):
     """Open the store for writing. Two helpers that create the file at the same moment can meet a lock that the
     database's own wait does not cover (switching a new file to WAL), so a busy open is tried again, inside the
-    lock-wait bound and the run's deadline, before it is given up as `store_busy`."""
+    lock-wait bound and the run's deadline, before it is given up as `store_busy`. An attempt is only started when
+    there is time to finish it, its wait is what is left, and every later wait follows the same deadline."""
     until = min(deadline, env.monotonic() + LOCK_WAIT_SECONDS)
     while True:
+        left = until - env.monotonic()
+        if left < MIN_OPEN_SECONDS:
+            raise store.StoreBusy()
         try:
-            return store.Writer(env.admission.store)
+            writer = store.Writer(env.admission.store, left * 1000)
         except store.StoreBusy:
-            if env.monotonic() >= until:
-                raise
-            env.sleep(admission_lock.POLL_SECONDS)
+            env.sleep(min(admission_lock.POLL_SECONDS, max(0.0, until - env.monotonic())))
+            continue
+        writer.set_deadline(lambda: deadline - env.monotonic())
+        return writer
 
 
 def _admit(request, env, deadline):
@@ -261,15 +280,21 @@ def _admit(request, env, deadline):
     agent = env.agents.get(request.agent)
     writer = None
     try:
+        row = None
         if os.path.isfile(admission.store):
             writer = _open(env, deadline)
             row = writer.lookup(request.agent, request.message_id)
             if row is not None and row["state"] == "granted":
                 return _answer(row)                     # grants never change: no lock, no Leasewise
-        if agent is None or request.agent not in admission.gateway_agents:
-            return wire.held("not_configured")
-        if _unprovable(request, agent, admission):
-            return wire.held("context_unprovable")
+        if row is None:
+            # Only a NEW message is judged by today's settings. A request that is already saved is recovered from what
+            # was saved, whatever the settings say now (configuration changes apply to new messages only).
+            if agent is None or request.agent not in admission.gateway_agents:
+                return wire.held("not_configured")
+            if _unprovable(request, agent, admission):
+                return wire.held("context_unprovable")
+        elif agent is None:
+            return wire.held("not_configured")           # nothing to rebuild a stale estimate from
         if writer is None:
             writer = _open(env, deadline)
         lock = admission_lock.KeyLock(admission.store, request.agent, request.message_id, env.monotonic, env.sleep)
@@ -306,9 +331,11 @@ def _locked(request, agent, env, writer, deadline):
         if sent is None:
             return wire.held("store_busy")              # out of time: the progress is in the store
         status, doc, code = sent
+        if status is None and deadline - env.monotonic() <= 0:
+            return wire.held("store_busy")              # the deadline cut the exchange short: the progress is in the store
         env.fault("posted")                             # the answer is here; nothing is saved yet
         if _granted(status, doc):
-            answer = _saved(env, writer, row, doc)
+            answer = _saved(env, writer, row, doc, body_text)
             return answer if answer is not None else _hold(env, writer, row, ERR_DENIED)
         if code == ERR_STALE and status is not None:
             if row["rebuilds"] >= MAX_REBUILDS:
@@ -347,9 +374,11 @@ def _search(request, env, writer, row, deadline):
         if sent is None:
             return wire.held("store_busy")
         status, doc, code = sent
+        if status is None and deadline - env.monotonic() <= 0:
+            return wire.held("store_busy")
         env.fault("posted")
         if _granted(status, doc):
-            answer = _saved(env, writer, row, doc)
+            answer = _saved(env, writer, row, doc, bodies[index])
             return answer if answer is not None else _hold(env, writer, row, ERR_DENIED)
         if code == ERR_CONFLICT:
             writer.mark_replayed(row["id"], index + 1)

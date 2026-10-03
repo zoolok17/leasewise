@@ -8,9 +8,13 @@ Nothing here keeps or prints text from an exception: a network failure is
 just "no answer". The identity travels only in the request header.
 """
 
+import contextlib
 import http.client
 import json
 import re
+import socket
+import threading
+import time
 
 from . import decisions
 from .decisions import Response
@@ -43,14 +47,47 @@ class HttpClient:
         return "HttpClient(<hidden>)"
 
     def _http(self, method, path, headers, body, timeout):
+        """One request with ONE absolute deadline for the whole exchange (connecting, sending, the answer's headers
+        and the answer read in pieces). A peer that answers a little at a time cannot stretch it: each step's timeout
+        is what is left, and at the deadline the connection is shut down from a watchdog so that even a blocked read
+        ends. Raises `TimeoutError` when the deadline came first."""
         factory = (http.client.HTTPSConnection if self._scheme == "https"
                    else http.client.HTTPConnection)
+        deadline = time.monotonic() + timeout
         conn = factory(self._host, self._port, timeout=timeout)
+        held = {"sock": None}
+
+        def stop():
+            with contextlib.suppress(OSError, AttributeError):
+                held["sock"].shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                conn.close()
+
+        watchdog = threading.Timer(timeout, stop)
+        watchdog.daemon = True
+        watchdog.start()
         try:
+            conn.connect()
+            held["sock"] = conn.sock
             conn.request(method, path, body=body, headers=headers)
             answer = conn.getresponse()
-            return answer.status, answer.read(MAX_ANSWER_BYTES + 1)
+            pieces, size = [], 0
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError()
+                with contextlib.suppress(OSError, AttributeError):
+                    held["sock"].settimeout(left)
+                piece = answer.read1(8192)
+                if not piece:
+                    break
+                pieces.append(piece)
+                size += len(piece)
+                if size > MAX_ANSWER_BYTES:
+                    break
+            return answer.status, b"".join(pieces)
         finally:
+            watchdog.cancel()
             conn.close()
 
     def send(self, item):

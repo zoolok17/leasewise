@@ -283,8 +283,9 @@ def _admission_store(state):
     agent = state_mod.RECEIPT_AGENT
     failures = {word: state.counter(agent, "store:" + name) for name, word in STORE_STATES.items() if name != "ok"}
     cap = state.note(state_mod.BODY_CAP_NOTE)
-    return {"state": current, "failures": failures, "at_body_cap": int(cap[0]) if cap is not None and cap[0].isdigit()
-            else 0}
+    # None = unknown: never read, or the last read failed. A failed read is never shown as a fresh zero.
+    return {"state": current, "failures": failures,
+            "at_body_cap": int(cap[0]) if cap is not None and cap[0].isdigit() else None}
 
 
 def _journal_suppression(state, gateway_agents):
@@ -423,12 +424,12 @@ def _actions(report, gateway_agents=()):
         actions.append("%d gateway receipt(s) were refused as a conflict: Leasewise has parked the account; look at "
                        "the parked account (its blocks) before anything else is sent"
                        % receipt["failed"]["RECEIPT_CONFLICT"])
-    if receipt["configured"]:
-        sentence = STORE_ACTIONS.get(receipt["admission_store"]["state"])
-        if sentence:
-            actions.append(sentence)
-        if receipt["admission_store"]["at_body_cap"]:
-            actions.append(BODY_CAP_ACTION % receipt["admission_store"]["at_body_cap"])
+    store = receipt["admission_store"]              # present whenever the store was read, with or without receipts
+    sentence = STORE_ACTIONS.get(store["state"])
+    if sentence:
+        actions.append(sentence)
+    if store["at_body_cap"]:
+        actions.append(BODY_CAP_ACTION % store["at_body_cap"])
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")
@@ -506,9 +507,11 @@ def render_text(report):
         out.append("gateway receipts: last seq %d, pending %d, delivered %d, failed %d. %s"
                    % (receipt["last_seq"], receipt["rows"]["pending"], receipt["rows"]["sent"],
                       receipt["rows"]["failed_permanent"], receipt["cached_input"]))
-        store = receipt.get("admission_store")      # a snapshot of the first build has none
-        if store is not None:
-            out.append("admission store: %s" % (store["state"] or "not read yet"))
+    store = None if receipt is None else receipt.get("admission_store")      # a snapshot of the first build has none
+    if store is not None and (receipt["configured"] or store["state"] is not None):
+        out.append("admission store: %s%s" % (store["state"] or "not read yet",
+                                              "" if store["at_body_cap"] is None
+                                              else ", %d at the body cap" % store["at_body_cap"]))
     for line in report["operator_actions"]:
         out.append("-> " + line)
     return "\n".join(out)

@@ -938,6 +938,8 @@ fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
 - **No downgrade of the state file.** It is now version 3 (1 and 2 are upgraded in one step). A reporter
   built before this card refuses a version-3 file with its existing "the state file version is not
   supported" sentence and never opens or changes it. Keep a copy if you may go back.
+  *(Card L6a-2 moves the file to version 4, which only adds the `superseded` record; see its section. A version-3
+  file is upgraded in one step, nothing is deleted, and the L6a-1 reporter refuses version 4 the same way.)*
 - **Advisory until R1.** Metered leases stay advisory in Leasewise until card R1.
 
 ### Technical detail
@@ -991,8 +993,14 @@ bytes) exits with code 2. The reasons for `held` are only `coordinator_unreachab
    per recovery episode); if Leasewise then says "same request, different body", an earlier body was granted after all, and
    the saved bodies are replayed, newest first (at most 4), to find that grant.
 4. The grant is saved **before** anything is printed.
-5. The whole run has one 20-second deadline (below the hook's 25 s). If it runs out it answers `held` with `store_busy`
-   and keeps what it learned, so the next run continues where it stopped.
+5. The whole run has one 20-second deadline (below the hook's 25 s), and it is one real clock: the time left is
+   handed to every step, including the connection, each piece of Leasewise's answer (a peer that answers a few bytes at
+   a time cannot stretch it), every wait for the store file, and the retry that opens the store, which does not start
+   an attempt it cannot finish. If the deadline comes first the connection is closed and the answer is `held` with
+   `store_busy`; what was learned is kept, so the next run continues where it stopped. A grant that Leasewise made
+   but that could not be saved in time is recovered by the next run, which sends the very same saved bytes and gets the
+   same lease back. Cleaning up after the deadline takes a fraction of a second, so the run ends within about a second
+   of 20 s, not at the end of the slowest step.
 6. Any other refusal or outage is `held` with a back-off kept in the file (10 s after an outage, 30 s when the account is
    parked, 60 s after a refusal), so a wrapper that asks again every few seconds does not call Leasewise every time.
 
