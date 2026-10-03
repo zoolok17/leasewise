@@ -1441,9 +1441,12 @@ _EVIDENCE_KINDS = frozenset((
 # place, record_limit_event, to the NEW event's reset only. The reset a
 # reporter sent stays raw in limit_events.resets_at (and in the replay
 # identity); a replay is a pure read and never recomputes anything. The
-# ceiling in _validate_limit_event keeps the sum inside a signed 64-bit
-# integer.
+# ceiling LIMIT_RESETS_AT_MAX keeps the sum inside a signed 64-bit integer;
+# it is checked for a NEW event only (fix round 1): a replay of an event
+# Leasewise already holds keeps the old domain.
 LIMIT_RETRY_MARGIN_MS = 30_000
+# The largest reset a NEW event may state: the margin must still fit in a signed 64-bit integer.
+LIMIT_RESETS_AT_MAX = policy.INT64_MAX - LIMIT_RETRY_MARGIN_MS
 
 
 def _validate_limit_event(event):
@@ -1466,8 +1469,10 @@ def _validate_limit_event(event):
             or event["evidence_kind"] not in _EVIDENCE_KINDS:
         _invalid()
     if event["resets_at"] is not None:
-        policy._check_int(event["resets_at"], 1,
-                          policy.INT64_MAX - LIMIT_RETRY_MARGIN_MS)
+        # The OLD domain, up to INT64_MAX: what Leasewise accepted before the margin. A replay of an
+        # event it already holds must keep behaving exactly as before, so the smaller ceiling
+        # (LIMIT_RESETS_AT_MAX) is checked only once the event is known to be NEW.
+        policy._check_int(event["resets_at"], 1)
     windows = event["exhausted_windows"]
     if not isinstance(windows, list) or not all(isinstance(w, str) for w in windows):
         _invalid()
@@ -1578,6 +1583,10 @@ def record_limit_event(path, event, now_ms, authorized_for_account=None):
                 conn.execute("COMMIT")
                 return {"block_id": block_id, "retry_at": block[0],
                         "state": block[1]}
+            # Known to be NEW now (an insert or a join): the margin needs room.
+            if (event["resets_at"] is not None
+                    and event["resets_at"] > LIMIT_RESETS_AT_MAX):
+                _invalid()
             account = conn.execute("SELECT id FROM accounts WHERE id=?",
                                    (event["account_id"],)).fetchone()
             if account is None:
