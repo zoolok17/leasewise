@@ -1049,6 +1049,12 @@ def policy_ids(path):
                 {"alias": alias, "id": account_id}
                 for alias, account_id in conn.execute(
                     "SELECT alias, id FROM accounts ORDER BY alias")]
+            # Card L6a-1: a gateway receipt names its gateway by id, so the gateways are listed too
+            # (the alias and the local id, nothing else: never a share, an account or a machine).
+            gateways = [
+                {"alias": alias, "id": gateway_id}
+                for alias, gateway_id in conn.execute(
+                    "SELECT alias, id FROM gateways ORDER BY alias")]
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -1058,7 +1064,7 @@ def policy_ids(path):
     finally:
         conn.close()
     return {"seats": seats, "models": models, "task_classes": task_classes,
-            "accounts": accounts}
+            "accounts": accounts, "gateways": gateways}
 
 
 def status(path):

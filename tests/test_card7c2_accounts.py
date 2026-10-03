@@ -44,7 +44,7 @@ class PolicyIds(unittest.TestCase):
         db = os.path.join(rig.ws.dir, "inventory.db")
         build_store(db, rig.ws.dir)
         data = store.policy_ids(db)
-        self.assertEqual(set(data), {"seats", "models", "task_classes", "accounts"})
+        self.assertEqual(set(data), {"seats", "models", "task_classes", "accounts", "gateways"})
         aliases = [a["alias"] for a in data["accounts"]]
         self.assertEqual(aliases, sorted(aliases))
         self.assertTrue(aliases)
