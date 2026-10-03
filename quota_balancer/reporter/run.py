@@ -13,7 +13,7 @@ import random
 import threading
 import time
 
-from . import decisions, events, rounds, status
+from . import capture, decisions, events, rounds, status
 
 # What a cycle ended with.
 OK = "ok"
@@ -28,9 +28,10 @@ def _now_ms():
 
 
 class CycleResult:
-    __slots__ = ("new_events", "sent", "blocked", "journal_stopped")
+    __slots__ = ("new_events", "sent", "blocked", "journal_stopped", "new_limit_events")
 
     def __init__(self):
+        self.new_limit_events = 0       # card 7c-2: limit events captured this cycle
         self.new_events = 0
         self.sent = 0
         self.blocked = None             # None, UNREACHABLE or CREDENTIAL
@@ -45,8 +46,9 @@ class CycleResult:
 
 class Reporter:
     def __init__(self, config, agents, state, client, *, clock=_now_ms,
-                 rng=random.random, stop=None, fault=None):
+                 rng=random.random, stop=None, fault=None, limit_sources=()):
         self.config = config
+        self.limit_sources = tuple(limit_sources)   # card 7c-2: resolved account map (may be empty)
         self.agents = agents            # {agent: mapper.AgentConfig}
         self.state = state
         self.client = client
@@ -64,6 +66,8 @@ class Reporter:
     def cycle(self):
         result = CycleResult()
         self._read(result)
+        if not self.stop.is_set():
+            self._capture(result)
         if not self.stop.is_set():
             self._send(result)
         # The back-off grows over consecutive blocked cycles. A cycle that
@@ -101,6 +105,21 @@ class Reporter:
         with self.state.txn():
             self.state.set_note(status.journal_stopped_note(), reason,
                                 self.clock())
+
+    def _capture(self, result):
+        """Notice the park markers of the configured folders and queue their limit events (card 7c-2).
+        A fault anywhere in here is caught whole: counted, no text kept, and it never stops lease
+        sending."""
+        if not self.limit_sources:
+            return
+        try:
+            result.new_limit_events = capture.run(self.state, self.limit_sources,
+                                                  self.config.machine, self.clock())
+        except Exception:               # noqa: BLE001 - nothing from the fault is kept
+            try:
+                self.state.note_capture_fault(self.clock())
+            except Exception:           # noqa: BLE001 - even the count may fail; sending goes on
+                pass
 
     def _send(self, result):
         """Two passes, the limit pass FIRST (card 7c-2), and the two stay SEPARATE. Limit events
