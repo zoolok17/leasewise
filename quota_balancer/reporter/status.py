@@ -223,7 +223,42 @@ def _limit_events(state, limit_sources):
     }
 
 
-def _gateway_receipts(state, source):
+QUARANTINE_ACTIONS = {
+    "unknown_reference": "No admission record names this receipt's lease yet: check that the admission store is the "
+                         "one this machine uses. It is sent by itself once its record appears.",
+    "wrong_gateway": "The lease's record expects another gateway than the one this receipt came from: check which "
+                     "gateway the receipt source is configured for. It is never sent.",
+    "duplicate_reference": "A second receipt arrived for a lease and ledger that already has one: look at the "
+                           "gateway. It is never sent.",
+}
+
+
+def _awaiting(state, source, now_ms):
+    """Bindings of this source's gateway that no capture has answered yet: how many, the age of the oldest in
+    seconds (since this reporter first copied it), and how many of them are past the lease's own expiry."""
+    if source is None:
+        return {"count": 0, "oldest_age_seconds": None}, 0
+    count, oldest, overdue = state.one(
+        "SELECT COUNT(*), MIN(copied_ms), COALESCE(SUM(expires_ms < ?), 0) FROM receipt_binding b"
+        " WHERE b.gateway_id=? AND NOT EXISTS (SELECT 1 FROM receipt_capture c WHERE c.ref_sha256=b.ref_sha256)",
+        (now_ms, source.gateway_id))
+    age = None if oldest is None else max(0, (now_ms - oldest) // 1000)
+    return {"count": count, "oldest_age_seconds": age}, overdue
+
+
+def _generation_changes(state):
+    """Per source, how many ledger generations were seen after the first, and when the latest appeared."""
+    out = []
+    for source_id, alias in state.all("SELECT id, alias FROM receipt_source ORDER BY id"):
+        seen, latest = state.one("SELECT COUNT(*), (SELECT first_seen_ms FROM receipt_cursor WHERE source_id=?"
+                                 " ORDER BY page_ord DESC LIMIT 1) FROM receipt_cursor WHERE source_id=?",
+                                 (source_id, source_id))
+        out.append({"gateway": alias, "count": max(0, seen - 1),
+                    "latest_first_seen": iso(latest) if seen > 1 else None})
+    return out
+
+
+def _gateway_receipts(state, source, now_ms):
     """The `gateway_receipts` object (card L6a-1): closed words and counts only. Never a path, a
     command, a lease id, a reference, a figure from a receipt or the text of a fault. `gateway` is the
     alias the OPERATOR wrote."""
@@ -247,6 +282,7 @@ def _gateway_receipts(state, source):
     read = state.note("receipt_last_read")
     ok = state.note(state_mod.last_ok_note(agent))
     configured = source is not None
+    awaiting, overdue = _awaiting(state, source, now_ms)
     return {
         "configured": configured,
         "gateway": source.gateway if configured else None,
@@ -257,6 +293,10 @@ def _gateway_receipts(state, source):
         "rows": rows,
         "failed": failed,
         "quarantine": quarantine,
+        "quarantine_action": dict(QUARANTINE_ACTIONS),
+        "generation_changes": _generation_changes(state),
+        "awaiting_receipt": awaiting,
+        "overdue": overdue,
         "read_later": {name: state.counter(agent, "read_later:" + name) for name in receipts.LATER_REASONS},
         "refused": {name: state.counter(agent, "refused:" + name) for name in receipts.REFUSED_REASONS},
         "read_fault": state.counter(agent, "read_fault"),
@@ -292,7 +332,7 @@ def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=
         "code": decisions.closed_code(refused[0]), "at": iso(refused[1]),
         "active": state.note(_NOTE_CREDENTIAL) is not None}
     report["limit_events"] = _limit_events(state, limit_sources)
-    report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts)
+    report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts, now_ms)
     report["silent_configured_seats"] = sorted(
         n for n, a in report["agents"].items() if a["silent"])
     report["operator_actions"] = _actions(report)
@@ -329,10 +369,13 @@ def _actions(report):
     if receipt["rows"]["failed_permanent"]:
         actions.append("%d gateway receipt(s) failed for good and will not be retried (see "
                        "gateway_receipts: failed, with each closed code)" % receipt["rows"]["failed_permanent"])
-    quarantined = sum(receipt["quarantine"].values())
-    if quarantined:
-        actions.append("%d gateway receipt(s) are quarantined and not sent: no matching lease binding or the "
-                       "wrong gateway (see gateway_receipts: quarantine)" % quarantined)
+    for reason, count in receipt["quarantine"].items():
+        if count:
+            actions.append("%d gateway receipt(s) are quarantined and not sent (%s): %s"
+                           % (count, reason, receipt["quarantine_action"][reason]))
+    if receipt["overdue"]:
+        actions.append("%d lease(s) are overdue: their expiry has passed and no gateway receipt has come (the lease "
+                       "keeps its hold; see gateway_receipts: awaiting_receipt)" % receipt["overdue"])
     if receipt["last_read_result"] == receipts.REFUSED:
         actions.append("the gateway receipt source was read but refused: no receipt after the last "
                        "stored one is taken until it is fixed (see gateway_receipts: refused)")

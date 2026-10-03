@@ -156,6 +156,8 @@ class Reporter:
             source_id = self.state.ensure_source(source.gateway, source.gateway_id, now)
             result.new_receipts = self._take_pages(source, source_id)
             self.state.release_waiting(self.clock())
+            if self.fault:
+                self.fault("released")          # stage 2 is durable: the delivery bodies and `pending`
         except Exception:               # noqa: BLE001 - nothing from the fault is kept
             try:
                 with self.state.txn():
@@ -185,11 +187,15 @@ class Reporter:
                 self.state.note_receipt_read(read.status, read.reason, now)
                 break
             page = read.page
+            if self.fault:
+                self.fault("read")              # the page is read and nothing of it is stored yet
             if generation is not None and page.generation != generation:
-                after = self.state.switch_generation(source_id, page.generation)
+                after = self.state.switch_generation(source_id, page.generation, now)
                 if page.after_seq != after:
                     continue                      # asked with the wrong cursor: nothing of it is taken
             added += self.state.capture_page(source_id, source.gateway_id, page, now)
+            if self.fault:
+                self.fault("captured")          # stage 1 is durable: the evidence and the cursor
             if not page.has_more:
                 break
         return added

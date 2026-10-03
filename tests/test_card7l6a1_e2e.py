@@ -20,7 +20,7 @@ from quota_balancer import store
 from quota_balancer.reporter.run import UNREACHABLE
 
 from tests.l6a1_env import GENERATION_B, add_binding, configure, ledger, receipt, write_json
-from tests.reporter_env import Rig
+from tests.reporter_env import Crash, Rig
 from tests.test_cardl1a import _grant_request, _sized_snapshot
 
 GATEWAY = "g1"                            # the gateway alias in the test store (machine desktop)
@@ -220,6 +220,61 @@ class EndToEnd(unittest.TestCase):
         reporter.cycle()
         self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))
         self.assertEqual(self.rig.lw.rows("SELECT COUNT(*) FROM adjustments"), [(0,)])
+        self.assertEqual(self.rig.lw.rows("SELECT COUNT(*) FROM blocks"), [(0,)])
+
+    def test_an_advisory_lease_settles_from_a_receipt_with_unknown_input_and_is_marked_usage_unknown(self):
+        """Requirement 7: the real handler's advisory acquisition, a binding in the admission store, a page whose final
+        has a null input count (the L6a-0 rule); the same page again sends nothing new."""
+        made = self.grant(seat="s1")
+        lease_id = made["lease_id"]
+        self.assertEqual(made["enforcement"], "metered_advisory")
+        reporter = self.start([receipt(lease_id, 1, input_tokens=None, output_tokens=300, actual_micro_eur=450)])
+        self.know(lease_id)
+        result = reporter.cycle()
+        self.assertEqual((result.new_receipts, result.sent, result.blocked), (1, 1, None))
+        self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))
+        self.assertEqual(self.receipts(lease_id), [(self.ids["gateways"][GATEWAY], 1, 2, None, 0, 300, 450,
+                                                    "completed", 1)])                      # null stays null, never 0
+        self.assertTrue(self.rig.lw.rows(
+            "SELECT 1 FROM audit WHERE action='lease_settled' AND object_id=? AND redacted_details LIKE '%usage_unknown%'",
+            (lease_id,)))
+        calls = len(self.rig.net.calls)
+        again = reporter.cycle()
+        self.assertEqual((again.new_receipts, again.sent, len(self.rig.net.calls)), (0, 0, calls))
+        self.assertEqual(len(self.receipts(lease_id)), 1)
+
+    def test_a_receipt_for_a_binding_that_names_another_gateway_never_reaches_the_real_handler(self):
+        lease_id = self.grant()["lease_id"]
+        reporter = self.start([receipt(lease_id, 1)])
+        add_binding(self.store, {"lease_id": lease_id, "gateway_id": "c4a2e9f0-3b7d-4c1e-8a55-0d9b2f6e7a12"})
+        reporter.cycle()
+        reporter.cycle()
+        self.assertEqual(self.rig.net.calls, [])
+        self.assertEqual(self.rig.lw.rows("SELECT COUNT(*) FROM receipts"), [(0,)])
+        self.assertEqual(self.lease_row(lease_id)[0], "active")
+
+    def test_a_lost_200_against_the_real_handler_is_replayed_to_the_same_settle(self):
+        """The first settle reaches the real handler and its answer is lost (the reporter is stopped before it applies
+        it); after the restart the very same bytes go again and the handler answers the replay with a 200."""
+        lease_id = self.grant()["lease_id"]
+        self.start([receipt(lease_id, 1)])
+        self.know(lease_id)
+        self.rig.close()
+
+        def stop(name):
+            if name == "answered":
+                raise Crash()
+        reporter = self.rig.open(fault=stop)
+        with self.assertRaises(Crash):
+            reporter.cycle()
+        self.assertEqual(self.lease_row(lease_id), ("settled", "completed"))    # the handler had it
+        self.assertEqual(self.rig.state.one("SELECT state FROM receipt_state")[0], "pending")
+        self.rig.close()
+        reporter = self.rig.open()
+        result = reporter.cycle()
+        self.assertEqual((result.sent, result.blocked), (1, None))
+        self.assertEqual(self.rig.state.one("SELECT state FROM receipt_state")[0], "sent")
+        self.assertEqual(len(self.receipts(lease_id)), 1)                       # one settle, replayed once
         self.assertEqual(self.rig.lw.rows("SELECT COUNT(*) FROM blocks"), [(0,)])
 
     def test_the_status_says_what_happened(self):

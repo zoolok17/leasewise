@@ -8,19 +8,24 @@ path, a command, a lease id, a reference, a figure from a receipt or exception t
 
 import json
 import os
+import sqlite3
 import unittest
 from unittest import mock
 
 from quota_balancer.reporter import receipts, status
 
-from tests.l6a1_env import GATEWAY_ALIAS, configure, ledger, lease, receipt, write_json
+from quota_balancer.reporter import mapper
+
+from tests.l6a1_env import (GATEWAY_ALIAS, GATEWAY_ID, GENERATION_B, OTHER_GATEWAY_ID, configure, ledger, lease,
+                            receipt, write_json)
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli
 from tests.test_card7l6a1_delivery import Net, error
 
 NOTE = ("Cached input is reported as 0: the gateway records none, so 0 is not proof that none was used.")
 OBJECT_KEYS = {"configured", "gateway", "last_seq", "last_read", "last_read_result", "stored", "rows", "failed",
-               "quarantine", "read_later", "refused", "read_fault", "last_ok", "cached_input"}
+               "quarantine", "quarantine_action", "generation_changes", "awaiting_receipt", "overdue", "read_later",
+               "refused", "read_fault", "last_ok", "cached_input"}
 
 
 class _Status(unittest.TestCase):
@@ -151,6 +156,126 @@ class Report(_Status):
         self.rig.close()
         object_ = self.rig.open(transport=Net()).report()["gateway_receipts"]
         self.assertEqual((object_["last_seq"], object_["rows"]["sent"], object_["stored"]), (2, 2, 2))
+
+
+class Custody(_Status):
+    """Step 2 (DESIGN-6A 8.3, 8.5, 8.8 item 2): what is waiting, set aside or overdue. Counts and fixed words only."""
+
+    def waiting(self, bound, **over):
+        """A reporter whose admission store binds `bound` leases (with the expiry in `over`) and whose ledger is empty."""
+        self.leases = [lease() for _ in range(bound)]
+        rows = [dict(lease_id=one, **over) for one in self.leases]
+        self.fixture = configure(self.rig, [], bindings=rows)
+        return self.rig.open(transport=Net())
+
+    def test_a_quarantine_says_what_to_do_in_one_fixed_sentence_per_reason(self):
+        object_ = self.reporter().report()["gateway_receipts"]
+        self.assertEqual(set(object_["quarantine_action"]), set(object_["quarantine"]))
+        for sentence in object_["quarantine_action"].values():
+            self.assertIsInstance(sentence, str)
+            self.assertNotIn(GATEWAY_ID, sentence)
+        self.assertEqual(object_["quarantine_action"], status.QUARANTINE_ACTIONS)
+
+    def test_bindings_with_no_receipt_are_awaiting_with_the_age_of_the_oldest(self):
+        reporter = self.waiting(2, expires_ms=self.rig.clock.ms + 3_600_000)
+        reporter.cycle()
+        self.rig.clock.advance(90)
+        object_ = reporter.report()["gateway_receipts"]
+        self.assertEqual(object_["awaiting_receipt"], {"count": 2, "oldest_age_seconds": 90})
+        self.assertEqual(object_["overdue"], 0)
+        self.assertEqual(reporter.report()["operator_actions"], [])          # waiting is not yet a fault
+
+    def test_an_awaiting_binding_past_its_own_expiry_is_overdue_and_asks_for_attention(self):
+        reporter = self.waiting(2, expires_ms=self.rig.clock.ms + 60_000)
+        reporter.cycle()
+        self.rig.clock.advance(61)
+        object_ = reporter.report()["gateway_receipts"]
+        self.assertEqual((object_["awaiting_receipt"]["count"], object_["overdue"]), (2, 2))
+        self.assertTrue(any("overdue" in line for line in reporter.report()["operator_actions"]))
+        self.assertNotIn(self.leases[0], json.dumps(reporter.report()))
+
+    def test_a_receipt_ends_the_wait_even_when_it_is_still_quarantined_or_failed(self):
+        one, two = lease(), lease()
+        soon = self.rig.clock.ms + 1000
+        self.fixture = configure(self.rig, [receipt(one, 1), receipt(two, 2)],
+                                 bindings=[{"lease_id": one, "expires_ms": soon}, {"lease_id": two, "expires_ms": soon}])
+        reporter = self.rig.open(transport=Net(receipt=[error("RECEIPT_CONFLICT", 409)]))
+        reporter.cycle()
+        self.rig.clock.advance(5)
+        object_ = reporter.report()["gateway_receipts"]
+        self.assertEqual((object_["awaiting_receipt"], object_["overdue"]), ({"count": 0, "oldest_age_seconds": None}, 0))
+
+    def test_a_binding_for_another_gateway_is_not_this_sources_to_wait_for(self):
+        self.fixture = configure(self.rig, [], bindings=[{"lease_id": lease(), "gateway_id": OTHER_GATEWAY_ID}])
+        reporter = self.rig.open(transport=Net())
+        reporter.cycle()
+        self.assertEqual(reporter.report()["gateway_receipts"]["awaiting_receipt"]["count"], 0)
+
+    def test_without_the_block_nothing_is_awaiting(self):
+        rig = Rig(server=False)
+        self.addCleanup(rig.cleanup)
+        object_ = rig.open(transport=Net()).report()["gateway_receipts"]
+        self.assertEqual((object_["awaiting_receipt"], object_["overdue"], object_["generation_changes"]),
+                         ({"count": 0, "oldest_age_seconds": None}, 0, []))
+
+    def test_a_new_ledger_generation_is_counted_with_when_it_was_first_seen(self):
+        one, two = lease(), lease()
+        self.fixture = configure(self.rig, [receipt(one, 1)], bindings=[one, two])
+        reporter = self.rig.open(transport=Net())
+        reporter.cycle()
+        self.assertEqual(reporter.report()["gateway_receipts"]["generation_changes"],
+                         [{"gateway": GATEWAY_ALIAS, "count": 0, "latest_first_seen": None}])
+        self.rig.clock.advance(120)
+        write_json(self.fixture, ledger([receipt(two, 1)], generation=GENERATION_B))
+        reporter.cycle()
+        changes = reporter.report()["gateway_receipts"]["generation_changes"]
+        self.assertEqual([(c["gateway"], c["count"]) for c in changes], [(GATEWAY_ALIAS, 1)])
+        self.assertEqual(changes[0]["latest_first_seen"], status.iso(self.rig.clock.ms))
+
+    def test_a_changed_gateway_mapping_is_a_new_source_and_both_show(self):
+        reporter = self.reporter()
+        reporter.cycle()
+        self.rig.state.ensure_source(GATEWAY_ALIAS, OTHER_GATEWAY_ID, self.rig.clock.ms)
+        changes = reporter.report()["gateway_receipts"]["generation_changes"]
+        self.assertEqual([c["gateway"] for c in changes], [GATEWAY_ALIAS, GATEWAY_ALIAS])
+
+    def test_none_of_it_names_a_lease_a_reference_a_gateway_id_or_a_path(self):
+        reporter = self.waiting(1, expires_ms=self.rig.clock.ms - 1)
+        reporter.cycle()
+        shown = json.dumps(reporter.report(), sort_keys=True) + status.render_text(reporter.report())
+        for private in (self.leases[0], mapper.lease_ref_hash(self.leases[0]), GATEWAY_ID, self.rig.ws.dir):
+            self.assertNotIn(private, shown)
+
+    def test_a_missing_or_busy_admission_store_keeps_the_receipts_and_is_read_again_later(self):
+        """Requirement 7: an unreadable store is never proof of anything. Receipts are still captured (quarantined as
+        unknown), nothing is sent, and the first read that works releases them."""
+        one = lease()
+        store = os.path.join(self.rig.ws.dir, "admission.db")
+        self.fixture = configure(self.rig, [receipt(one, 1)], store=store, bindings=[one])
+        os.rename(store, store + ".away")                                      # missing
+        reporter = self.rig.open(transport=Net())
+        reporter.cycle()
+        object_ = reporter.report()["gateway_receipts"]
+        self.assertEqual((object_["rows"]["quarantined"], object_["rows"]["sent"], object_["last_seq"]), (1, 0, 1))
+        self.assertEqual(self.rig.net.calls, [])
+        self.assertEqual(self.rig.state.counter("_gateway_receipts", "store:store_missing"), 1)
+        os.rename(store + ".away", store)
+        writer = sqlite3.connect(store, isolation_level=None)                  # busy: a writer holds the file
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN EXCLUSIVE")
+        reporter.cycle()
+        self.assertEqual(self.rig.state.counter("_gateway_receipts", "store:store_busy"), 1)
+        self.assertEqual(reporter.report()["gateway_receipts"]["rows"]["quarantined"], 1)
+        writer.execute("ROLLBACK")
+        reporter.cycle()                                                       # readable again: released and sent
+        self.assertEqual(reporter.report()["gateway_receipts"]["rows"], {"pending": 0, "sent": 1, "failed_permanent": 0,
+                                                                         "quarantined": 0})
+
+    def test_a_snapshot_from_the_first_build_without_the_new_words_still_renders(self):
+        report = self.reporter().report()
+        for key in ("quarantine_action", "generation_changes", "awaiting_receipt", "overdue"):
+            del report["gateway_receipts"][key]
+        self.assertIn("gateway receipts: last seq 0", status.render_text(report))
 
 
 class Command(_Status):

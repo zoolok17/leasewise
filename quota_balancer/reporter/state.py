@@ -136,7 +136,8 @@ _LIMIT_DDL = (
 #   receipt_source   who the receipts come from: a configured name AND the gateway it was bound to. A source mapped to
 #                    another gateway is another source (another identity, its own cursors); nothing is rebound.
 #   receipt_cursor   one per (source, generation): the last receipt number taken. `page_ord` says which generation
-#                    was read most recently, so a generation seen again (A, B, A) takes its kept cursor back.
+#                    was read most recently, so a generation seen again (A, B, A) takes its kept cursor back;
+#                    `first_seen_ms` says when it first appeared.
 #   receipt_binding  copied from the admission store's granted rows: reference hash -> lease, gateway.
 #   receipt_capture  stage 1: the evidence exactly as received, even when no binding is known. The gateway of its
 #                    source is frozen on the row.
@@ -149,6 +150,7 @@ _RECEIPT_DDL = (
     " gateway_id TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(alias, gateway_id)) STRICT",
     "CREATE TABLE receipt_cursor(source_id INTEGER NOT NULL REFERENCES receipt_source(id),"
     " generation TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0, page_ord INTEGER NOT NULL,"
+    " first_seen_ms INTEGER NOT NULL,"
     " PRIMARY KEY(source_id, generation)) STRICT",
     "CREATE TABLE receipt_binding(ref_sha256 TEXT PRIMARY KEY, lease_id TEXT NOT NULL, gateway_id TEXT NOT NULL,"
     " agent TEXT NOT NULL, message_id TEXT NOT NULL, expires_ms INTEGER NOT NULL, copied_ms INTEGER NOT NULL) STRICT",
@@ -393,13 +395,13 @@ class State:
     def _next_page_ord(self):
         return self.one("SELECT COALESCE(MAX(page_ord), 0) + 1 FROM receipt_cursor")[0]
 
-    def switch_generation(self, source_id, generation):
+    def switch_generation(self, source_id, generation, now_ms):
         """Make `generation` the current one for this source: a generation never seen starts its own cursor at 0,
         and one seen before takes its KEPT cursor back (A, B, A). Old cursors stay. -> its last_seq."""
         with self.txn():
             order = self._next_page_ord()
-            self.conn.execute("INSERT OR IGNORE INTO receipt_cursor(source_id, generation, last_seq, page_ord)"
-                              " VALUES(?,?,0,?)", (source_id, generation, order))
+            self.conn.execute("INSERT OR IGNORE INTO receipt_cursor(source_id, generation, last_seq, page_ord, first_seen_ms)"
+                              " VALUES(?,?,0,?,?)", (source_id, generation, order, now_ms))
             self.conn.execute("UPDATE receipt_cursor SET page_ord=? WHERE source_id=? AND generation=?",
                               (order, source_id, generation))
             self.bump(RECEIPT_AGENT, "generation_change")
@@ -413,8 +415,8 @@ class State:
         added = 0
         with self.txn():
             if self.cursor_for(source_id, page.generation) is None:
-                self.conn.execute("INSERT INTO receipt_cursor(source_id, generation, last_seq, page_ord)"
-                                  " VALUES(?,?,0,?)", (source_id, page.generation, self._next_page_ord()))
+                self.conn.execute("INSERT INTO receipt_cursor(source_id, generation, last_seq, page_ord, first_seen_ms)"
+                                  " VALUES(?,?,0,?,?)", (source_id, page.generation, self._next_page_ord(), now_ms))
             if self.cursor_for(source_id, page.generation) != page.after_seq:
                 raise StateError("a receipt page does not start at the stored cursor")
             for receipt in page.receipts:

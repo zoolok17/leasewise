@@ -217,7 +217,7 @@ class Sources(_Tmp):
         one = self.source(state)
         self.capture(state, [receipt(lease(), 1), receipt(lease(), 2)])
         self.assertEqual(state.current_cursor(one), (GENERATION, 2))
-        self.assertEqual(state.switch_generation(one, GENERATION_B), 0)
+        self.assertEqual(state.switch_generation(one, GENERATION_B, NOW), 0)
         self.assertEqual(state.current_cursor(one), (GENERATION_B, 0))
         self.assertEqual(state.cursor_for(one, GENERATION), 2)           # kept
         self.assertEqual(state.counter(state_mod.RECEIPT_AGENT, "generation_change"), 1)
@@ -226,10 +226,10 @@ class Sources(_Tmp):
         state = self.open()
         one = self.source(state)
         self.capture(state, [receipt(lease(), 1), receipt(lease(), 2), receipt(lease(), 3)], generation=GENERATION)
-        state.switch_generation(one, GENERATION_B)
+        state.switch_generation(one, GENERATION_B, NOW)
         self.capture(state, [receipt(lease(), 1)], generation=GENERATION_B)
         self.assertEqual(state.current_cursor(one), (GENERATION_B, 1))
-        self.assertEqual(state.switch_generation(one, GENERATION), 3)    # A again: its cursor, not 0
+        self.assertEqual(state.switch_generation(one, GENERATION, NOW), 3)    # A again: its cursor, not 0
         self.assertEqual(state.current_cursor(one), (GENERATION, 3))
         # and the next page of A starts after 3, and B's cursor is still its own
         self.assertEqual(self.capture(state, [receipt(lease(), 4)], after=3, generation=GENERATION), 1)
@@ -239,7 +239,7 @@ class Sources(_Tmp):
         state = self.open()
         self.capture(state, [receipt(lease(), 1)], generation=GENERATION)
         self.source(state)
-        state.switch_generation(1, GENERATION_B)
+        state.switch_generation(1, GENERATION_B, NOW)
         self.capture(state, [receipt(lease(), 1)], generation=GENERATION_B)
         self.assertEqual(self.raw("SELECT generation, seq FROM receipt_capture ORDER BY id"),
                          [(GENERATION, 1), (GENERATION_B, 1)])

@@ -5,6 +5,7 @@ generated ids and made-up figures. Nothing here reads a real gateway, ledger, ad
 import json
 import os
 import sqlite3
+import time
 import uuid
 
 from quota_balancer.reporter import admission_store, mapper
@@ -105,7 +106,7 @@ def grant(conn, one, number=0):
         " ref_sha256, ttl_seconds, expires_ms) VALUES(?,?,?,?, 'granted', ?,?,?,?,?,?)",
         (one.get("agent", "alpha"), one.get("message_id", "m%d-%s" % (number, uuid.uuid4().hex[:6])),
          str(uuid.uuid4()), "{}", lease_id, one.get("gateway_id", GATEWAY_ID), lease_id,
-         mapper.lease_ref_hash(lease_id), 1800, 1_788_224_400_000 + 1_800_000))
+         mapper.lease_ref_hash(lease_id), 1800, one.get("expires_ms", int(time.time() * 1000) + 86_400_000)))
 
 
 def add_binding(path, one):
