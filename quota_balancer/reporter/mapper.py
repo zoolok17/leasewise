@@ -52,6 +52,33 @@ def limit_body_text(body):
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
+def limit_key(machine, account_alias, window, reset_epoch, parked_at_ms):
+    """One limit fact: (installation, account alias, evidence kind, window, reset). With an unknown
+    reset the marker's park time (milliseconds) joins the key. The seat, the message and the wrapper
+    generation are NOT in it, so two seats on one account that hit one limit make one event."""
+    tail = str(reset_epoch) if reset_epoch is not None else "unknown|%d" % parked_at_ms
+    return "|".join((machine, account_alias, "claude_exhausted", window, tail))
+
+
+def limit_event_id(key):
+    return str(uuid.uuid5(NAMESPACE, "limit|" + key))
+
+
+def limit_turn_id(key):
+    """For a limit event `turn_id` names the limit fact, not a lease turn (Leasewise only checks that
+    it is a valid id and keeps it for the replay comparison)."""
+    return str(uuid.uuid5(NAMESPACE, "limit-turn|" + key))
+
+
+def limit_body(key, account_id, parked_at_ms, reset_epoch, window):
+    """The limit-event body, built field by field. `resets_at` is RAW (Leasewise adds the margin);
+    there is no `model_id`, so the block is account-wide."""
+    return {"event_id": limit_event_id(key), "account_id": account_id, "turn_id": limit_turn_id(key),
+            "observed_at": parked_at_ms, "evidence_kind": "claude_exhausted",
+            "resets_at": None if reset_epoch is None else reset_epoch * 1000,
+            "exhausted_windows": [window]}
+
+
 class AgentConfig:
     """One agent's already-resolved request settings (7a-3 builds these
     from the configuration file and a `policy-ids --json` snapshot)."""
