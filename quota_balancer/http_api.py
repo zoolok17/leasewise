@@ -136,6 +136,7 @@ _HTTP_STATUS = {
     errors.CODE_METER_STALE: 503,
     errors.CODE_RECONCILIATION_REQUIRED: 503,
     errors.CODE_SERVICE_UNAVAILABLE: 503,
+    errors.CODE_CAP_BASIS_CONFLICT: 409,
     # The billing words: the design's later HTTP mapping (docs/DESIGN.md section 11, "Later HTTP mapping").
     errors.CODE_BILLING_SCOPE_MISMATCH: 409,
     errors.CODE_BILLING_BASIS_UNKNOWN: 409,

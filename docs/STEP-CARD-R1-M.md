@@ -89,7 +89,7 @@ with a closed error. Red first: against the previous `store.py`, 5 of the 11 fai
 
 In plain words: the seven sums and the admission decisions were right. Three small things were put right.
 
-- **F1.** `money.reaches(terms, 0)` answered False for nothing to add, or only unknown amounts. A total of non-negative amounts has always
+- **F1.** `money.reaches(terms, 0)` answered False for nothing to add and UNKNOWN for only unknown amounts. A total of non-negative amounts has always
   reached 0, so the answer is now True, decided before any term is read. The strict `exceeds` is unchanged (`exceeds([], 0)` is False,
   `exceeds([UNKNOWN], 0)` is UNKNOWN). No grant was wrong, because the only caller passes a positive budget; later steps will use it.
 - **L1.** The text above claimed an overflowing allocation is always refused. It is refused when the tax basis is known; with an

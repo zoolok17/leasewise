@@ -156,6 +156,21 @@ def convert(amount, source, target, vat_bps, role):
     or outside 0..10000, or when the result would be above INT64_MAX. A value that is not an amount, a basis that is not in the
     closed set, or a role that is not one of ROLES is a MoneyError."""
     check(amount)
+    result = _scale(amount, source, target, vat_bps, role)
+    return result if result is UNKNOWN or result <= INT64_MAX else UNKNOWN
+
+
+def convert_total(amount, source, target, vat_bps, role):
+    """`convert` for an EXACT TOTAL, which may be above every stored bound (a sum of many amounts). The answer is exact up to
+    the saturation point and `SATURATION` above it, so a total that is above every cap stays above every cap after the
+    conversion, in either direction of rounding; the same UNKNOWN as `convert` when a basis or rate is missing."""
+    check(amount, maximum=_EXACT_MAX)
+    result = _scale(amount, source, target, vat_bps, role)
+    return result if result is UNKNOWN else saturate(result)
+
+
+def _scale(amount, source, target, vat_bps, role):
+    """The conversion itself, with no bound on the result: an int, or UNKNOWN when it cannot be done."""
     if role not in ROLES or source not in reduce.CLOSED_BASES or target not in reduce.CLOSED_BASES:
         raise MoneyError("conversion")
     if source == reduce.BASIS_UNKNOWN or target == reduce.BASIS_UNKNOWN:
@@ -168,8 +183,7 @@ def convert(amount, source, target, vat_bps, role):
         numerator, denominator = amount * (10_000 + vat_bps), 10_000
     else:
         numerator, denominator = amount * 10_000, 10_000 + vat_bps
-    result = (numerator + denominator - 1) // denominator if role == EXPOSURE else numerator // denominator
-    return result if result <= INT64_MAX else UNKNOWN
+    return (numerator + denominator - 1) // denominator if role == EXPOSURE else numerator // denominator
 
 
 class Sums:
@@ -215,3 +229,44 @@ def exact_sums(conn, tail, params, columns, guards=()):
 def exact_sum(conn, tail, params, column):
     """The exact total of one column (see `exact_sums`)."""
     return exact_sums(conn, tail, params, [column]).totals[0]
+
+
+# --- the accounting terms of DESIGN-R1.md 3.3 and 3.4, built as known or unknown (card R1-M5) -------------------------------
+
+MODE_COVERED = "covered"             # the report says which receipts it already includes: only the newer ones are added
+MODE_C = "C"                         # no coverage claim: every final receipt of the month is added (an upper bound)
+
+
+def gateway_exposure(report):
+    """`V_g` of one gateway: `settled + reserved + uncertain` of its latest USABLE report (`unattributed` is a subset of
+    `settled` and is never added again). `report` is a (settled, reserved, uncertain) triple, or None when there is no usable
+    report (missing, old, not approved, wrong period, unreconciled). No usable report, or a part that is unknown, is UNKNOWN:
+    never 0."""
+    if report is None:
+        return UNKNOWN
+    return add(*report)
+
+
+def account_exposure(gateway_terms):
+    """`V` of an account: the sum of `V_g` over EVERY gateway of the account. One gateway without usable evidence makes the
+    whole of it UNKNOWN (an account with no gateways has nothing to add, which is 0 and not unknown)."""
+    return add(*gateway_terms)
+
+
+def unreported_receipts(receipts, covered_through):
+    """`Q`'s receipt part: the final receipts of the account's month that the gateway's report does not include.
+
+    `receipts` is (seq, amount) for each final receipt of the month. When the report says how far it covers
+    (`covered_through`, the highest receipt number it includes), only the newer receipts are added. When it says nothing
+    (None) the answer is MODE C: every receipt, an upper bound that counts a settled lease twice, which is safe. Missing coverage
+    is never unknown and never 0. -> (mode, exact total)."""
+    if covered_through is None:
+        return MODE_C, add(*(amount for _seq, amount in receipts))
+    return MODE_COVERED, add(*(amount for seq, amount in receipts if seq > covered_through))
+
+
+def coordinator_headroom(cap, v, q, h):
+    """What the coordinator has left for one account: `cap - (V + Q + H)` (may be negative), UNKNOWN when any term is. The
+    evaluator's own figure leaves out `Q` (it does not see the lease books), and `Q >= 0`, so this is never the larger of the
+    two: the coordinator never admits what the evaluator refuses."""
+    return headroom(cap, [v, q, h])

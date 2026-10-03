@@ -540,12 +540,41 @@ part will:
   amount enters or is stored (2^63 - 1 in storage; on the reporter's wires, money in a receipt accepts up to 10^12 and money in an admission answer stops at 10^12 - 1), a sum compared with a limit stops as soon as it
   decides, and an **unknown amount is never 0**: a sum with an unknown term is unknown, though a known part that already passes
   the limit still refuses.
-- **Not yet (a later step, R1-M4):** conversions between the declared tax bases (`ex_vat`, `invoice_total`) on the lease side. Both
-  bases are `ex_vat` today, so nothing is compared across bases yet. The conversion helper exists and is tested (an amount that is
-  *spent* rounds up, a *limit* rounds down) but no admission code calls it. The model rates that size a hold are meant in the
-  ledger basis; that sentence becomes a rule with R1-M4.
+- **Fixed now (part 2, R1-M4): one declared unit on the lease side.** An account that has a billing policy has declared its tax
+  bases (`ex_vat` or `invoice_total`). Before admission compares money, the lease books are converted into the account's **cap
+  basis** (the basis of its budget and caps): the receipts, the open holds and the new hold, each **rounded up** (an amount that
+  is spent never counts for less than it is). The rule: **the receipts and the model rates that size a hold are in the policy's
+  ledger basis.** The gateway's receipts and reports are euros without VAT (agenttalk's answer C1), so a policy should declare
+  `ledger_basis = "ex_vat"`; that is a convention of the gateway, not a field Leasewise can check (residual risk R-016). A gateway
+  share used as its own ceiling rounds **down** (a limit never allows more than it is); used as an allocation against the cap it
+  still rounds up. Tokens and slots are never converted.
+  - **A cap shared by several accounts** (a team or project cap) holds the spending of accounts that may have different rates.
+    Each contributing account's receipts and holds are read separately, converted with **that account's own policy** (rounded
+    up), and only then added. The asking account's policy is never applied to another account's spending, and no account is left
+    out. A shared cap has no tax basis of its own, so **every account that shares it must declare the same cap basis**: if the
+    accounts that take part (the one asking, even with no spending yet, and every account that has a lease in that scope) declare
+    more than one known cap basis, the grant is refused with `CAP_BASIS_CONFLICT` ("accounts that share a spending cap declare
+    different cap bases; give them all the same cap basis"). This holds in advisory mode too, for team, project and platform caps,
+    and for money limits only. An account with no billing policy, or whose cap basis is `unknown`, does not take part (the
+    fallback below). **What to do:** give every account that shares the cap the same `cap_basis` in its billing policy.
+    Stated limits, not built: the configuration is not refused when it is imported (the conflict shows only when a lease is
+    asked for), and a shared cap costs one query per account.
+  - An account with **no billing policy** compares the lease books as they are.
+  - A policy that **cannot convert** (a basis is `unknown`, or the bases differ and no VAT rate is given) leaves that account's
+    lease books compared as they always were: there is nothing to convert with, and nothing is guessed. In a shared cap this
+    applies to that account's part only. **This already matters for advisory leases today:** a missing VAT rate can admit a lease
+    where a known rate would refuse it. It is also a gate item before enforcement is switched on.
+  - With equal bases (every account today: `ex_vat` and `ex_vat`) and with no policy, every answer is the one it always was.
+- **Fixed now (part 2, R1-M5): unknown stays unknown through the sums.** The evaluator and the opening planner add through the
+  same module: a sum with an unknown term is unknown (never the known part, never 0), and the evaluator then shows no headroom.
+  The terms of the admission inequality are built as known or unknown (`money.gateway_exposure`, `money.account_exposure`,
+  `money.unreported_receipts`, `money.coordinator_headroom`): a gateway without usable evidence makes its account's exposure
+  unknown, and **missing coverage is mode C**, the sum of all final receipts of the month, an upper bound that counts a settled
+  lease twice (safe, stated), never unknown and never 0. The coordinator's headroom is never larger than the evaluator's. These
+  terms are built and tested; the reducer that calls them is a later card (R1-3).
 
-Normal-size results are identical before and after.
+Results are identical before and after with equal bases and with no billing policy. With different bases the conversion decides,
+by design; with a policy that cannot convert, the answer is the old one.
 
 ### Technical detail (R1-M)
 
@@ -554,6 +583,15 @@ settled receipts and of open holds; money and input tokens use the same query te
 pure rule `policy.check_admission` saturated at `policy.USAGE_MAX` (2^63, one above the largest cap). `_advisory_budget_check` uses
 `money.reaches`, which stops at the first receipt that decides. `store._allocated` replaces the three `SUM(share_micro_eur)` queries.
 Tests: `tests/test_cardr1_money.py`, `tests/test_cardr1_money_store.py`. Record: `docs/STEP-CARD-R1-M.md`.
+
+Part 2: `lease._lease_basis` reads the account's policy (None when there is none or it cannot convert) and `lease._in_cap` converts
+a lease-book amount with `money.convert_total` (exact above every bound, saturated at 2^63, rounded up). `reduce.convert_basis`
+takes a rounding role (`"up"` by default, so every older caller is unchanged). `billing_eval._normalize_money` keeps
+`share_micro_eur` (the allocation, up) and adds `share_limit_micro_eur` (the ceiling, down), which `billing_open` reads.
+`lease._scope_total` reads a shared scope per account (`money.exact_sums` once per contributing account), converts each total with
+that account's own `_lease_basis`, and adds with `money.add`.
+Tests: `tests/test_cardr1_money_basis.py`, `tests/test_cardr1_money_unknown.py`, `tests/test_cardr1_money_shared.py`. Record:
+`docs/STEP-CARD-R1-M2.md`.
 
 ## Card 7a-2 - the reporter core
 

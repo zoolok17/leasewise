@@ -254,7 +254,7 @@ def _allocations_exact(ctx, req, provider_total):
     proofs = req["proofs"]
     ledger = _sum(b["baseline"] for b in baselines.values())
     gap = max(0, provider_total - ledger)          # P-L is not itself evidence
-    shares = {g["gateway"]: g["share_micro_eur"] for g in ctx["gateways"]}
+    shares = {g["gateway"]: g["share_limit_micro_eur"] for g in ctx["gateways"]}     # its ceiling: a limit, rounded down
     if set(proofs) != req["consumed"]:
         return False                               # every proof consumed once
     if not all(p["disjoint"] for p in proofs.values()):
