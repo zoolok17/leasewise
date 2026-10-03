@@ -911,6 +911,11 @@ fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
   100,000. The reporter now copies new grants in batches after a durable grant number (see card L6a-2 below), so no
   history size can stop it. Never delete admissions.
 - **Command sources are not available yet (card L6a-1b).** This version reads receipts from a fixture file only.
+  *Coming with L6a-1b; refused in this version.* Step 1 of that card already checks the settings at start-up, so a
+  mistake gets its own fixed sentence, but even a perfect block is still refused with the sentence above: `command` (an
+  argument list, the first an absolute `.exe` path on a local drive, Windows only), `timeout_seconds` (1 to 60, default
+  20) and `env` (at most 8 settings). The operator may not name `--after`, `--limit` or `--json` in any spelling; the
+  reporter adds them itself. Nothing is started yet.
   A source that is a program the reporter runs needs its own card, because the program must be started already
   contained. Its starting requirements: the program is created suspended, put into its job, then resumed (on POSIX
   its own session, with the limit that a descendant can leave it); it fails closed when it cannot be contained; one

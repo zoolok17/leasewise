@@ -13,13 +13,14 @@ A bare alias that matches more than one row is refused.
 
 import ipaddress
 import json
+import ntpath
 import os
 import re
 import sys
 import tomllib
 from urllib.parse import urlsplit
 
-from . import decisions, mapper
+from . import cmdline, decisions, mapper
 from .events import _NAME as _AGENT_NAME
 from ..validate import ALIAS_RE
 
@@ -45,13 +46,19 @@ MAX_LIMIT_SOURCES = 8
 _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
 # Card L6a-1: where a gateway's receipts are read from. Gateway receipts are read from a fixture file in this version.
-_RECEIPT_KEYS = ("gateway", "admission_store", "fixture")
-_RECEIPT_OPTIONAL = ("max_bytes", "page_limit")
+# Card L6a-1b (step 1): the settings of a command source are checked here, but a command is still refused at the end.
+_RECEIPT_KEYS = ("gateway", "admission_store")
+_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "env", "max_bytes", "page_limit")
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1000
+MAX_COMMAND_ARGS = 16
+MAX_RECEIPT_ENV = 8
+DEFAULT_COMMAND_TIMEOUT = 20
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 
-# A command source (a program the reporter runs) is not part of this version (card L6a-1b).
+# A command source (a program the reporter runs) is not part of this version (card L6a-1b, until step 3).
 MSG_NO_COMMAND_SOURCE = "Command receipt sources are not available in this version; use a fixture file."
+MSG_COMMAND_NOT_WINDOWS = "Command receipt sources are only available on Windows in this version; use a fixture file."
 
 CONFIG_INVALID = "CONFIG_INVALID"
 CONFIG_PERMISSIONS = "CONFIG_PERMISSIONS"
@@ -198,13 +205,71 @@ class GatewayReceipts:
     __str__ = __repr__
 
 
+def _windows():
+    return sys.platform == "win32"
+
+
+def _has_control_character(text):
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+
+
+def _receipt_command(value, where):
+    """The `command` setting: an argument list for a program run without a shell. Every refusal is one fixed sentence
+    that never holds text from the file. Nothing is started here; the reporter appends its own options last."""
+    if not isinstance(value, list) or not 0 < len(value) <= MAX_COMMAND_ARGS \
+            or not all(isinstance(item, str) and 0 < len(item) <= 1024 for item in value):
+        _invalid("%s: the command must be a list of 1 to %d texts" % (where, MAX_COMMAND_ARGS))
+    program = value[0]
+    drive, rest = ntpath.splitdrive(program)
+    if not drive or rest[:1] not in ("\\", "/"):
+        _invalid("%s: the command must start with an absolute path" % where)
+    if program.startswith(("\\\\", "//")):
+        _invalid("%s: the command may not start from a network path" % where)
+    if not program.lower().endswith(".exe"):
+        # Windows runs a .bat or .cmd file through cmd.exe, which splits arguments by other rules than our quoting.
+        _invalid("%s: the command must start with an .exe file" % where)
+    if any('"' in item or _has_control_character(item) for item in value):
+        _invalid("%s: the command has a character it may not have" % where)
+    if any(cmdline.names_reserved_option(item) for item in value[1:]):
+        _invalid("%s: the command may not name --after, --limit or --json in any spelling; the reporter adds them"
+                 % where)
+    return tuple(value)
+
+
+def _receipt_timeout(value, where):
+    if type(value) is not int or not 1 <= value <= 60:
+        _invalid("%s: timeout_seconds must be a whole number from 1 to 60" % where)
+    return value
+
+
+def _receipt_env(value, where):
+    if not isinstance(value, dict) or len(value) > MAX_RECEIPT_ENV \
+            or not all(isinstance(item, str) and 0 < len(item) <= 1024 for item in value.values()):
+        _invalid("%s: env must be a table of at most %d texts" % (where, MAX_RECEIPT_ENV))
+    for name, text in value.items():
+        if _ENV_NAME.fullmatch(name) is None:
+            _invalid("%s: an env name is not valid" % where)
+        if _has_control_character(text):
+            _invalid("%s: an env value has a character it may not have" % where)
+    return tuple(sorted(value.items()))
+
+
 def _gateway_receipts(table):
     where = "gateway_receipts"
     if not isinstance(table, dict):
         _invalid("%s: must be a table" % where)
-    if "command" in table:
-        _invalid(MSG_NO_COMMAND_SOURCE)
     _closed_keys(table, _RECEIPT_KEYS, _RECEIPT_OPTIONAL, where)
+    if ("fixture" in table) == ("command" in table):
+        _invalid("%s: name exactly one of fixture or command" % where)
+    if "fixture" in table and ("timeout_seconds" in table or "env" in table):
+        _invalid("%s: timeout_seconds and env belong to a command source" % where)
+    if "command" in table:
+        if not _windows():
+            _invalid(MSG_COMMAND_NOT_WINDOWS)
+        _receipt_command(table["command"], where)
+        _receipt_timeout(table.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT), where)
+        _receipt_env(table.get("env", {}), where)
+        _invalid(MSG_NO_COMMAND_SOURCE)         # every setting is fine; the runner comes with step 3
     row = GatewayReceipts()
     row.gateway = _alias(table["gateway"], where)
     row.gateway_id = None

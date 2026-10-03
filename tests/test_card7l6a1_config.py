@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 from quota_balancer import store
 from quota_balancer.reporter import config as cfg
@@ -67,28 +68,21 @@ class Block(_Tmp):
         self.assertEqual((source.gateway, source.fixture), (GATEWAY_ALIAS, self.fixture))
         self.assertEqual((source.max_bytes, source.page_limit, source.gateway_id), (1024 * 1024, 100, None))
 
-    def test_a_command_source_is_refused_at_start_up_with_a_fixed_sentence(self):
-        """D2/D3: a program the reporter would run is not part of this version (card L6a-1b)."""
-        for extra in ("command = %s\n" % _q([EXE, "x"]), "command = %s\n" % _q(LOUD), "command = []\n"):
-            with self.subTest(extra=extra[:20]):
-                text = "[gateway_receipts]\ngateway = %s\nadmission_store = %s\n%s" % (
-                    _q(GATEWAY_ALIAS), _q(self.store), extra)
-                with self.assertRaises(cfg.ConfigError) as caught:
-                    self.parse(text)
-                self.assertEqual(caught.exception.message, cfg.MSG_NO_COMMAND_SOURCE)
-                self.assertEqual(caught.exception.message,
-                                 "Command receipt sources are not available in this version; use a fixture file.")
-        with self.assertRaises(cfg.ConfigError) as caught:                      # even beside a fixture
-            self.parse(self.fixture_block("command = %s\n" % _q([EXE])))
+    def test_a_valid_command_source_is_still_refused_at_start_up_with_today_s_sentence(self):
+        """D2/D3: a program the reporter would run is not part of this version until card L6a-1b step 3."""
+        text = "[gateway_receipts]\ngateway = %s\nadmission_store = %s\ncommand = %s\n" % (
+            _q(GATEWAY_ALIAS), _q(self.store), _q([EXE, "x"]))
+        with mock.patch.object(cfg, "_windows", return_value=True):
+            with self.assertRaises(cfg.ConfigError) as caught:
+                self.parse(text)
         self.assertEqual(caught.exception.message, cfg.MSG_NO_COMMAND_SOURCE)
-
-    def test_the_command_only_settings_are_not_keys_any_more(self):
-        for extra in ("timeout_seconds = 5\n", "[gateway_receipts.env]\nA = \"x\"\n"):
-            self.refused(self.fixture_block(extra))
+        self.assertEqual(caught.exception.message,
+                         "Command receipt sources are not available in this version; use a fixture file.")
 
     def test_exactly_one_source_is_named(self):
         self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\n" % (_q(GATEWAY_ALIAS), _q(self.store)))
-        self.refused(self.fixture_block("command = %s\n" % _q([EXE])))
+        self.assertEqual(self.refused(self.fixture_block("command = %s\n" % _q([EXE]))).message,
+                         "gateway_receipts: name exactly one of fixture or command")
 
     def test_page_limit_is_a_whole_number_from_1_to_1000_and_defaults_to_100(self):
         """F5: the number of receipts the reporter asks for in one page."""
