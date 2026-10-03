@@ -528,3 +528,16 @@ missing, with gaps, with torn tails), `events_read`, `dropped_total`,
 dropped, failed, over the cap), `last_successful_call`. "Complete" means "no loss
 the journal can see"; it is not a guarantee. `status` never shows the URL, the
 identity or any message text.
+
+## Card 7c-2 - the retry margin (step 1 of 4)
+
+**Status: step 1 built.** When a reporter tells Leasewise that an account is out until a given
+time (`POST /v1/limit-events`), Leasewise now holds the account until **30 seconds after** that
+time, so the provider has really reopened. Leasewise adds the 30 seconds itself, once, to the new
+event's time only; the time the reporter sent is kept as sent. A repeated delivery of an event is
+still a pure read.
+
+Blocks that already exist keep the `retry_at` they have: nothing is backfilled. Leasewise still does
+not un-park an account by itself; an operator clears the block (card 7c-3 will add recovery).
+See docs/STEP-CARD-7C-2.md. The reporter side of card 7c-2 (reading agenttalk's park marker and
+sending the event) comes in the next steps.

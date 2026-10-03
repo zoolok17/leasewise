@@ -483,7 +483,9 @@ above; design silent or ambiguous, fail-closed reading):
     matches the reviewer's own wording ("recovery waits for evidence")
     read literally; a design that wants "any known value resolves an
     unknown block" would need a different, asymmetric merge rule no
-    finding actually asked for.
+    finding actually asked for. (Card 7c-2 step 1 adds the 30-second
+    margin to the NEW value before this merge: see
+    docs/STEP-CARD-7C-2.md. The rule above is unchanged.)
 23. **`gateway_snapshot`'s `gateway_id` must resolve to a REAL row in
     `gateways`, not merely be UUID-shaped.** `_translate_gateway_snapshot_
     payload` looks the id up (`SELECT alias FROM gateways WHERE id=?`)
