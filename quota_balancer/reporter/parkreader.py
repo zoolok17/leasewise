@@ -43,6 +43,7 @@ MARKER_STATE = "usage_limit_parked"
 STALE_SECONDS = 300                       # agenttalk's MARKER_STALE_SECONDS
 MAX_EPOCH = 4_102_444_800                 # 2100-01-01: no marker time is later than this
 MAX_RESET_AHEAD_SECONDS = 9 * 86400       # agenttalk keeps a reset at most 8 days ahead; one day of slack
+WAKE_AFTER_RESET_SECONDS = 30             # the wrapper's try-again time is the reset plus this
 MAX_UPDATED_AHEAD_SECONDS = 60            # a clock a little ahead of ours is fine; a lot is not
 MAX_PARKED_AHEAD_MS = 30_000
 
@@ -72,13 +73,13 @@ class Marker:
 class Scan:
     """The result of looking at one folder."""
 
-    __slots__ = ("markers", "read_later", "refused", "over_cap", "folder_unreadable")
+    __slots__ = ("markers", "read_later", "refused", "too_many_entries", "folder_unreadable")
 
     def __init__(self):
         self.markers = []
         self.read_later = 0
         self.refused = 0
-        self.over_cap = 0
+        self.too_many_entries = False         # a flag, never the size of the folder
         self.folder_unreadable = False
 
 
@@ -154,8 +155,9 @@ def _check(data, stem, now_ms):
     if reset is not None and not _whole(reset, 1, min(MAX_EPOCH, now_s + MAX_RESET_AHEAD_SECONDS)):
         return REFUSED, None
     wake = data["wake_epoch"]
-    if wake is not None and not _whole(wake, 1, MAX_EPOCH):
-        return REFUSED, None                  # checked, never sent
+    if wake is not None and not _whole(
+            wake, 1, min(MAX_EPOCH, now_s + MAX_RESET_AHEAD_SECONDS + WAKE_AFTER_RESET_SECONDS)):
+        return REFUSED, None                  # the reset's range plus the wake offset; checked, never sent
     for key in ("message_id",):
         if type(data[key]) is not str or _TEXT.fullmatch(data[key]) is None:
             return REFUSED, None
@@ -202,13 +204,23 @@ def read_marker(path, stem, now_ms):
 
 def scan(bus_root, now_ms):
     """Look at `<bus_root>/state/usage-limit-park/` once. -> Scan. A folder that does not exist means
-    nobody is parked (not an error); one that cannot be listed is `folder_unreadable`."""
+    nobody is parked (not an error); one that cannot be listed is `folder_unreadable`.
+
+    The walk is bounded BEFORE anything is collected: at most MAX_ENTRIES directory entries are
+    visited, the ignored ones counting too, then the names kept are sorted and read. One more entry is
+    looked at only to learn that there is more (`too_many_entries`); the folder is never counted. So in
+    a folder with more than MAX_ENTRIES entries some markers may not be seen in that scan."""
     result = Scan()
     folder = os.path.join(bus_root, *PARK_FOLDER)
     names = []
+    visited = 0
     try:
         with os.scandir(folder) as entries:
             for entry in entries:
+                if visited == MAX_ENTRIES:
+                    result.too_many_entries = True
+                    break
+                visited += 1
                 name = entry.name
                 if not name.endswith(".json") or _NAME.fullmatch(name[:-5]) is None:
                     continue
@@ -225,8 +237,7 @@ def scan(bus_root, now_ms):
         result.folder_unreadable = True
         return result
     names.sort()
-    result.over_cap = max(0, len(names) - MAX_ENTRIES)
-    for name in names[:MAX_ENTRIES]:
+    for name in names:
         outcome, marker = read_marker(os.path.join(folder, name), name[:-5], now_ms)
         if outcome == OK:
             result.markers.append(marker)

@@ -272,12 +272,19 @@ class Listing(_Folder):
         result = self.scan()
         self.assertEqual(self.outcome(result), (1, 0, 0))                      # only the real file
 
-    def test_more_than_the_cap_are_not_read_and_are_counted(self):
+    def test_more_than_the_cap_are_not_read_and_the_scan_says_so(self):
         for i in range(pr.MAX_ENTRIES + 5):
             self.put(marker(agent="agent-%04d" % i), name="agent-%04d" % i)
         result = self.scan()
         self.assertEqual(len(result.markers), pr.MAX_ENTRIES)
-        self.assertEqual(result.over_cap, 5)
+        self.assertTrue(result.too_many_entries)                  # a flag, never a count of the whole folder
+
+    def test_exactly_the_cap_is_not_too_many(self):
+        for i in range(pr.MAX_ENTRIES):
+            self.put(marker(agent="agent-%04d" % i), name="agent-%04d" % i)
+        result = self.scan()
+        self.assertEqual(len(result.markers), pr.MAX_ENTRIES)
+        self.assertFalse(result.too_many_entries)
 
     def test_several_files_give_independent_outcomes(self):
         self.put(marker(agent="agent-a"))
@@ -296,6 +303,99 @@ class Listing(_Folder):
         self.assertEqual(sorted(os.listdir(self.folder)), ["agent-a.json", "agent-c.json"])
 
 
+class FakeEntries:
+    """A fake `os.scandir` result that counts how far the reader advanced it."""
+
+    def __init__(self, names, total=None):
+        self.names = names
+        self.advances = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __iter__(self):
+        from types import SimpleNamespace
+        for name in self.names:
+            self.advances += 1
+            yield SimpleNamespace(name=name, is_symlink=lambda: False,
+                                  stat=lambda **kw: SimpleNamespace(st_file_attributes=0),
+                                  is_file=lambda **kw: True)
+
+
+class Bounded(unittest.TestCase):
+    """The folder walk is bounded BEFORE anything is collected, so a huge folder cannot delay lease
+    sending or use memory without bound. (One entry beyond the cap is looked at, to know there is more.)"""
+
+    def scan(self, names):
+        from unittest import mock
+        fake = FakeEntries(names)
+        with mock.patch.object(pr.os, "scandir", return_value=fake), \
+                mock.patch.object(pr, "read_marker", return_value=(pr.READ_LATER, None)) as read:
+            result = pr.scan("synthetic-unused-path", NOW)
+        return result, fake, read
+
+    def test_a_thousand_entries_are_not_all_visited_or_held(self):
+        result, fake, read = self.scan(["agent-%04d.json" % i for i in range(1000)])
+        self.assertLessEqual(fake.advances, pr.MAX_ENTRIES + 1)
+        self.assertEqual(read.call_count, pr.MAX_ENTRIES)
+        self.assertTrue(result.too_many_entries)
+
+    def test_ignored_names_count_toward_the_bound_too(self):
+        result, fake, read = self.scan(["notes-%04d.txt" % i for i in range(1000)])
+        self.assertLessEqual(fake.advances, pr.MAX_ENTRIES + 1)
+        self.assertEqual(read.call_count, 0)
+        self.assertTrue(result.too_many_entries)
+
+    def test_a_mixed_folder_keeps_only_what_it_visited(self):
+        names = ["junk-%04d.txt" % i for i in range(200)] + ["agent-%04d.json" % i for i in range(300)]
+        result, fake, read = self.scan(names)
+        self.assertLessEqual(fake.advances, pr.MAX_ENTRIES + 1)
+        self.assertEqual(read.call_count, pr.MAX_ENTRIES - 200)   # only the 56 json names inside the first 256
+        self.assertTrue(result.too_many_entries)
+
+    def test_a_normal_folder_is_unchanged(self):
+        result, fake, read = self.scan(["agent-a.json", "agent-b.json", "other.txt"])
+        self.assertEqual((fake.advances, read.call_count, result.too_many_entries), (3, 2, False))
+        self.assertEqual(result.read_later, 2)
+
+    def test_the_names_that_were_kept_are_still_read_in_sorted_order(self):
+        from unittest import mock
+        order = []
+        fake = FakeEntries(["agent-c.json", "agent-a.json", "agent-b.json"])
+        with mock.patch.object(pr.os, "scandir", return_value=fake), \
+                mock.patch.object(pr, "read_marker", side_effect=lambda p, stem, n: (order.append(stem),
+                                                                                    (pr.READ_LATER, None))[1]):
+            pr.scan("synthetic-unused-path", NOW)
+        self.assertEqual(order, ["agent-a", "agent-b", "agent-c"])
+
+
+class WakeBound(_Folder):
+    """`wake_epoch` is the wrapper's try-again time: the reset plus 30 seconds. It is checked in the same
+    range as the reset, with that offset allowed explicitly. It is never sent."""
+
+    def test_the_edges(self):
+        now_s = NOW // 1000
+        top = now_s + pr.MAX_RESET_AHEAD_SECONDS + pr.WAKE_AFTER_RESET_SECONDS
+        self.assertEqual(pr.WAKE_AFTER_RESET_SECONDS, 30)
+        for wake, expected in ((top, (1, 0, 0)), (top + 1, (0, 0, 1)), (1, (1, 0, 0)), (0, (0, 0, 1)),
+                               (None, (1, 0, 0)), (pr.MAX_EPOCH, (0, 0, 1)), (4_102_444_800, (0, 0, 1)),
+                               (now_s - 5, (1, 0, 0))):
+            with self.subTest(wake=wake):
+                self.assertEqual(self.outcome(self.one(marker(wake_epoch=wake))), expected)
+
+    def test_a_reset_at_its_own_edge_still_has_room_for_its_wake(self):
+        now_s = NOW // 1000
+        edge = now_s + pr.MAX_RESET_AHEAD_SECONDS
+        self.assertEqual(self.outcome(self.one(marker(reset_epoch=edge, wake_epoch=edge + 30))), (1, 0, 0))
+        self.assertEqual(self.outcome(self.one(marker(reset_epoch=edge + 1, wake_epoch=edge + 31))), (0, 0, 1))
+
+    def test_the_wake_is_still_never_kept(self):
+        self.assertNotIn("wake", " ".join(pr.Marker.__slots__))
+
+
 class Privacy(_Folder):
 
     def test_nothing_from_a_file_or_an_exception_comes_back(self):
@@ -307,7 +407,7 @@ class Privacy(_Folder):
             denied = self.scan()
         found = self.scan()
         for result in (denied, found):
-            text = repr([result.markers, result.read_later, result.refused, result.over_cap])
+            text = repr([result.markers, result.read_later, result.refused, result.too_many_entries])
             self.assertNotIn(loud, text)
             self.assertNotIn("agent-one", text)
         self.assertEqual(self.outcome(found), (1, 0, 1))

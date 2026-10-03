@@ -20,7 +20,7 @@ from .state import LIMIT_AGENT  # noqa: F401  (re-exported: the counters of a sc
 
 # What a scan counts (closed words). `captured` (new events) is cumulative, kept by the state.
 SKIP_COUNTS = ("read_later", "refused", "stale", "reset_passed", "unmapped", "window_unknown",
-               "parked_at_unknown", "over_cap", "folder_unreadable")
+               "parked_at_unknown", "too_many_entries", "folder_unreadable")
 
 
 def run(state, sources, machine, now_ms):
@@ -35,7 +35,7 @@ def run(state, sources, machine, now_ms):
         scanned = parkreader.scan(bus_root, now_ms)
         counts["read_later"] += scanned.read_later
         counts["refused"] += scanned.refused
-        counts["over_cap"] += scanned.over_cap
+        counts["too_many_entries"] += 1 if scanned.too_many_entries else 0
         counts["folder_unreadable"] += 1 if scanned.folder_unreadable else 0
         for found in scanned.markers:
             source = providers.get(found.provider)

@@ -304,12 +304,13 @@ class Skips(_Harness):
             self.assertEqual(self.run_capture(), 0)
         self.assertEqual(self.counts()["folder_unreadable"], 1)
 
-    def test_more_than_the_cap_are_counted(self):
+    def test_a_folder_with_more_than_the_cap_is_flagged_not_counted(self):
         for i in range(parkreader.MAX_ENTRIES + 3):
             self.put("agent-%04d" % i, parked_at="2026-09-09T03:08:%02dZ" % (i % 60), reset_epoch=None,
                      wake_epoch=None)
         self.run_capture()
-        self.assertEqual(self.counts()["over_cap"], 3)
+        self.assertEqual(self.counts()["too_many_entries"], 1)             # a flag per folder, never the folder size
+        self.assertNotIn("over_cap", self.counts())
 
     def test_nothing_is_added_for_no_sources(self):
         self.put()
