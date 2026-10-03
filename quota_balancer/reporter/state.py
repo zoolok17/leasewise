@@ -22,6 +22,11 @@ class StateOwned(StateError):
     """Another reporter owns the state file."""
 
 
+# Facts about the reporter itself, for `status`: the last credential refusal,
+# a journal it refuses, the last good call of each agent. Never a secret.
+_NOTE_DDL = ("CREATE TABLE IF NOT EXISTS note(name TEXT PRIMARY KEY, code TEXT,"
+             " at_ms INTEGER NOT NULL) STRICT")
+
 _DDL = (
     "CREATE TABLE meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT",
     "CREATE TABLE cursor(stream TEXT NOT NULL, segment INTEGER NOT NULL,"
@@ -86,6 +91,7 @@ _DDL = (
     " STRICT",
     "CREATE TABLE counter(agent TEXT NOT NULL, name TEXT NOT NULL,"
     " value INTEGER NOT NULL, PRIMARY KEY(agent, name)) STRICT",
+    _NOTE_DDL,
 )
 
 
@@ -129,6 +135,8 @@ class State:
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
             raise StateError("the state file version is not supported")
+        else:
+            self.conn.execute(_NOTE_DDL)    # a file made before card 7a-3
 
     def close(self):
         with contextlib.suppress(sqlite3.Error):
@@ -172,6 +180,25 @@ class State:
         row = self.one("SELECT value FROM counter WHERE agent=? AND name=?",
                        (agent, name))
         return row[0] if row else 0
+
+    def set_note(self, name, code, at_ms):
+        self.conn.execute(
+            "INSERT INTO note(name, code, at_ms) VALUES(?,?,?) ON CONFLICT"
+            "(name) DO UPDATE SET code=excluded.code, at_ms=excluded.at_ms",
+            (name, code, at_ms))
+
+    def clear_note(self, name):
+        self.conn.execute("DELETE FROM note WHERE name=?", (name,))
+
+    def note(self, name):
+        """(code, at_ms) or None."""
+        return self.one("SELECT code, at_ms FROM note WHERE name=?", (name,))
+
+    def clear_agent_stops(self):
+        """A start-up forgives every configuration stop, so an operator who
+        fixed the cause only has to restart. Items that already failed for
+        good stay failed; a still-broken agent stops again on its next answer."""
+        return self.conn.execute("DELETE FROM agent_state").rowcount
 
     # --- the outbox -------------------------------------------------------
 

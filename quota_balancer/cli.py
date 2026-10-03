@@ -112,6 +112,13 @@ def _build_parser():
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] == ["reporter"]:
+        # The observe-only reporter (card 7a-3) has its own options; it takes
+        # the journal and a configuration file, not the store path.
+        from .reporter.cli import main as reporter_main
+        return reporter_main(argv[1:])
     args = _build_parser().parse_args(argv)
     try:
         if args.verb == "init":
