@@ -2,7 +2,7 @@
 
 Work item `card-7c-2`. Branch `card-7c-2`, from main `da91e1f`. Contract:
 `C:\lw\records\DESIGN-7C2.md` (the lead's decisions in its section 15 win). This record grows one
-step at a time; steps 1 and 2 of 4 are below.
+step at a time; steps 1 to 3 of 4 are below.
 Interpreter: CPython 3.13 (`C:\lw\venv`), standard library only. Audience: the lead and the reviewers.
 
 ## In plain words
@@ -213,3 +213,83 @@ reproduction (`test_7c2_review_edges.py`, copied, never edited) passes: 2 of 2.
 
 Sections 16.2 to 16.5 (sample clocks, the stated one-outbox limit, folder identity, the reader table)
 are for step 3.
+
+## Step 3: the account map, the strict reader and the event
+
+Built on fix round 1 (`6440fca`), in small commits: config, policy-ids accounts, reader, event and
+capture, wiring. Sections of `DESIGN-7C2.md` 1 to 5, 8, 10 and 11, the lead's decisions D1, D7 to D12
+(section 15) and section 16.2 to 16.5.
+
+### In plain words
+
+This step makes the reporter actually notice a park. The operator's settings say which account each
+agenttalk folder's Claude seats use. The reporter reads the park files in those folders strictly:
+anything unexpected gives no event, and a file that may just be half written is looked at again on
+the next scan. For each fresh, valid file it builds the one frozen event for that account and limit
+and puts it in the step 2 queue. The wait cap, the status output, the README gap statement and the
+end-to-end test are step 4.
+
+### What changed
+
+- **Config (`config.py`).** A new optional `limit_events` block of sources: `bus_root`, `os_user`,
+  `provider`, `account`. Closed keys, every field required, `provider` only `claude` in v1 (the rule
+  is on a list, so a later `codex` source on the same folder needs no new rule), at most 8 sources.
+  **Uniqueness** is on the RESOLVED folder (`realpath` plus `normcase`) with the provider, never on
+  the text in the file. **Consistency:** one (`os_user`, `provider`) must name one account. The bus
+  folder may not contain the state file or the configuration file. A configuration without the block
+  is exactly as before. Errors are fixed sentences that repeat no value.
+- **`policy-ids` accounts (`store.py`, `config.py`).** `policy-ids` lists `accounts: [{alias, id}]`,
+  sorted, aliases and local ids only. `load_snapshot` accepts the list as optional (an older snapshot
+  has none). `resolve_limit_sources` gives each source its account id and refuses to start
+  (`CONFIG_UNRESOLVED`) when the account is missing, ambiguous (never picks the first) or has an id
+  that is not a UUID. The `reporter` command resolves it at start.
+- **The strict reader (`parkreader.py`).** Bounded listing (256 entries, `.json` names whose stem is an
+  agent name, links and reparse points skipped), bounded files (4,096 bytes), one flat JSON object
+  with exactly the eleven documented keys, no duplicate keys, no `NaN` or `Infinity`, whole numbers
+  only (a boolean is not a number), every value checked. Every file ends as OK, READ_LATER (missing,
+  cannot be opened, torn, or a documented key is missing) or REFUSED (an undocumented key, a wrong
+  type, out of range, another version or provider). A fractional `parked_at` is converted to
+  milliseconds counted down, never rounded up (D11). Only five values are kept; the agent name,
+  message id and generation are checked and dropped.
+- **Event and capture (`mapper.py`, `capture.py`, `state.py`).** The key, the ids and the body are as
+  in the spec (D8, D12): `event_id` and `turn_id` are uuid5 under the reporter's namespace with the
+  prefixes `limit|` and `limit-turn|`; `observed_at` is `parked_at` in milliseconds; `resets_at` is
+  RAW; `exhausted_windows` is `[window]`; no `model_id`. Fresh only (300 seconds, judged from the
+  marker's own time on the reporter's clock); a window or a park time of `null`, a stale marker and a
+  reset already passed give no event; a provider with no source in that folder is `unmapped`.
+  `State.record_capture` writes new rows, the cumulative `captured` count and the LAST scan's counts in
+  one transaction; a row that already exists is never touched.
+- **Wiring (`run.py`, `cli.py`).** `cycle` (so `run` and `drain`) is read, capture, send. A fault in
+  capture is caught whole, counted as `capture_fault`, keeps no text, and never stops lease sending.
+  The 60-second wait cap waits for step 4.
+
+### Tests (`tests/test_card7c2_*.py`)
+
+| File | What it proves |
+| --- | --- |
+| `test_card7c2_config.py` (19) | the block, closed keys, values, 8 sources, uniqueness on the resolved folder (trailing separator, `..`, forward slashes, case on Windows), room for a later codex source, consistency, the state and configuration file kept out of a bus folder, no value repeated in an error |
+| `test_card7c2_accounts.py` (11) | `policy-ids` accounts; the optional list; malformed lists; resolution; a missing, ambiguous or non-UUID account refuses start; no value in the message |
+| `test_card7c2_reader.py` (32) | valid markers (both real samples, each with its own fitting clock; one clock cannot fit both and the 9-day bound is not relaxed); torn files, a missing key, a sharing violation, a vanishing file; version 2, `true` as the version, an unknown provider, an extra key, wrong types and ranges, nesting, duplicate keys, `NaN`, oversize; listing rules, a symbolic link, 256 entries; privacy |
+| `test_card7c2_capture.py` (30) | the identity matrix (two seats one account; two messages one seat; a later reset; fresh to stale; a remapped account; two unknown resets; a re-park after another failure with an unknown reset is new and with a known reset is not); the frozen body; reset passed; null window or park time; unmapped; torn and refused files counted; one transaction |
+| `test_card7c2_wiring.py` (13) | capture and delivery in one cycle, `drain`, a parked account refusing every lease, a fault in capture, no capture without sources, the command refusing to start on a missing or ambiguous account |
+
+The existing tests that changed: `tests/test_cardl1c.py` `test_the_shape_is_closed_and_sorted` and
+`test_an_empty_store_lists_nothing` (the `policy-ids` listing gained `accounts`).
+
+The reader, the config and the capture tests were checked with deliberate faults (a mutant that
+refuses a missing key, accepts a boolean version, allows duplicate keys, rounds the park time up,
+drops the entry cap, the size bound, the stale check, the reset-passed check, the machine in the key,
+adds the margin in the reporter, and so on): every one made tests fail. The reader and the capture
+code were written before their tests this time; the tests were then shown to have teeth that way.
+
+### Limits (stated, not hidden)
+
+- **The map is trusted (R-011).** The files prove nothing about the account. If someone signs a
+  different account into the same OS user, the map is wrong until the operator edits it.
+- **One outbox, one memory (spec 16.3).** The frozen body holds only while the same state file is
+  kept. If the outbox is recreated, or two reporters run with the same `machine` alias, the same
+  `event_id` can be rebuilt with a different first-seen `observed_at`: Leasewise answers `409` and that
+  row fails for good, shown in `status` (step 4). There is no deduplication across outboxes. This is
+  in the README "Limits".
+- **Best effort (R-012).** A park that starts and ends while the reporter is not running, or between
+  two scans, is never reported. The statement in `status` and the README section are step 4.

@@ -529,9 +529,9 @@ dropped, failed, over the cap), `last_successful_call`. "Complete" means "no los
 the journal can see"; it is not a guarantee. `status` never shows the URL, the
 identity or any message text.
 
-## Card 7c-2 - limit events (steps 1 and 2 of 4)
+## Card 7c-2 - limit events (steps 1 to 3 of 4)
 
-**Status: steps 1 and 2 built.** When a reporter tells Leasewise that an account is out until a given
+**Status: steps 1 to 3 built.** When a reporter tells Leasewise that an account is out until a given
 time (`POST /v1/limit-events`), Leasewise now holds the account until **30 seconds after** that
 time, so the provider has really reopened. Leasewise adds the 30 seconds itself, once, to the new
 event's time only; the time the reporter sent is kept as sent. A repeated delivery of an event is
@@ -549,8 +549,44 @@ Leasewise refuses fails only itself, never an agent and never the reporter. Leas
 means "recorded" for a limit event; the reporter keeps nothing from it. The client sends a limit
 event to `/v1/limit-events` and to nothing else. Nothing reads the park files yet (step 3).
 
+**Step 3: the reporter notices a park.** agenttalk keeps one small file per parked seat
+(`state/usage-limit-park/<agent>.json`, documented in agenttalk's README as a file other programs may
+read). The reporter looks at those files in the folders you name, and turns each fresh one into one
+limit event for the account you declare. Add this to the reporter configuration (every key is
+required, `provider` is `claude` for now, at most 8 sources):
+
+```toml
+[[limit_events.sources]]
+bus_root = "C:/path/to/the/agenttalk/folder"   # read only; never the folder holding this file
+os_user  = "operator-desktop"                  # your own label for the OS user the seats run under
+provider = "claude"
+account  = "claude-main"                       # a Leasewise account alias
+```
+
+This map is a setting you are responsible for: the park files prove nothing about which account a
+seat uses, and a seat's name never decides it. If someone signs a different account into the same OS
+user, the map is wrong until you edit it, and the reporter cannot see the switch. Two sources may not
+name the same folder with the same provider (the folder is compared as it really is, so two spellings
+of one folder count as one), one OS user and provider must name one account, and the folder may not
+contain the reporter's state file or this configuration file. The reporter needs each account's id:
+`policy-ids` now lists `accounts` (alias and local id), so save its output again after upgrading; the
+reporter refuses to start if a configured account is missing or ambiguous in that file.
+
+A file is read strictly. A missing file, one that cannot be opened for a moment (on Windows), half a
+file, or one with a documented field missing is read again on the next look. A file with a field
+that is not documented, a wrong type, a value out of range or another version, and any provider other
+than `claude`, gives no event. A stale file (not refreshed for 300 seconds), a file without a window
+or a park time, and a reset that has already passed give no event either. Two seats on one account
+that hit the same limit make one event; a later reset makes a new one. Once captured, an event is
+stored with its body frozen and delivered even across restarts and outages.
+
 Limits:
 
+- **One outbox, one memory.** An event's body is frozen only while the same reporter state file is
+  kept. If the state file is recreated, or two reporters run with the same `machine` alias, the same
+  `event_id` can be rebuilt with a different first-seen time (`observed_at`); Leasewise then answers
+  `409` and that event fails for good, and `status` shows it. There is no deduplication across state
+  files.
 - **No downgrade of the state file.** The reporter's state file is now version 2 and a version-1 file
   is upgraded the first time the new reporter opens it. A reporter built before this card meets a
   version-2 file with its existing "the state file version is not supported" refusal: it never opens
