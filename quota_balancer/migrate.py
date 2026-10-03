@@ -528,7 +528,7 @@ _DDL_V9 = (
 MIGRATION_V9 = "\n".join(_DDL_V9) + "\nPRAGMA user_version=9;\n"
 
 
-# Card R1-3a (migration version 10): the six tables that keep a gateway's evidence (DESIGN-R1-3.md section 3). TABLES ONLY: no
+# Card R1-3a (migration version 10): the seven tables that keep a gateway's evidence (DESIGN-R1-3.md section 3, revision 2). TABLES ONLY: no
 # ALTER, no rebuild, and no row of any kind (no approval, adoption, transition or chain state, and no backfill from old readings).
 # Nothing reads or writes them until cards R1-3b and R1-3c. Money columns are whole numbers >= 0; a hash is 64 lowercase hex
 # characters; a generation is 32. The definitions live here, in one place.
@@ -538,14 +538,15 @@ _HEX32 = "length({c})=32 AND {c} NOT GLOB '*[^0-9a-f]*'"
 _DDL_V10 = (
     "CREATE TABLE gateway_epochs(\n"
     " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " reader_incarnation TEXT NOT NULL CHECK(" + _HEX32.format(c="reader_incarnation") + "),\n"
     " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
     " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
     " first_event_id TEXT NOT NULL REFERENCES readings(event_id),\n"
-    " PRIMARY KEY(gateway_id, ledger_epoch),\n"
-    " UNIQUE(gateway_id, generation)) STRICT;",
+    " PRIMARY KEY(gateway_id, reader_incarnation, ledger_epoch)) STRICT;",
     "CREATE TABLE gateway_totals(\n"
     " event_id TEXT PRIMARY KEY REFERENCES readings(event_id),\n"
     " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " reader_incarnation TEXT NOT NULL CHECK(" + _HEX32.format(c="reader_incarnation") + "),\n"
     " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
     " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
     " seq INTEGER NOT NULL CHECK(seq>=0),\n"
@@ -564,7 +565,7 @@ _DDL_V10 = (
     " observed_at INTEGER NOT NULL CHECK(observed_at>=0),\n"
     " received_at INTEGER NOT NULL CHECK(received_at>=0),\n"
     " CHECK(unattributed_micro_eur<=settled_micro_eur)) STRICT;",
-    "CREATE INDEX gateway_totals_chain ON gateway_totals(gateway_id, ledger_epoch, generation, seq);",
+    "CREATE INDEX gateway_totals_chain ON gateway_totals(gateway_id, reader_incarnation, ledger_epoch, seq);",
     "CREATE TABLE gateway_approvals(\n"
     " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
     " price_hash TEXT NOT NULL CHECK(" + _HEX64.format(c="price_hash") + "),\n"
@@ -576,6 +577,7 @@ _DDL_V10 = (
     " id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
     " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
     " event_id TEXT NOT NULL UNIQUE REFERENCES readings(event_id),\n"
+    " reader_incarnation TEXT NOT NULL CHECK(" + _HEX32.format(c="reader_incarnation") + "),\n"
     " ledger_epoch INTEGER NOT NULL CHECK(ledger_epoch>=0),\n"
     " generation TEXT NOT NULL CHECK(" + _HEX32.format(c="generation") + "),\n"
     " period_start INTEGER NOT NULL CHECK(period_start>=0),\n"
@@ -589,39 +591,57 @@ _DDL_V10 = (
     " adopted_at INTEGER NOT NULL CHECK(adopted_at>=0),\n"
     " operator TEXT,\n"
     " kind TEXT NOT NULL CHECK(kind IN ('operator','period_roll')),\n"
-    " quiet INTEGER NOT NULL CHECK(quiet IN (0,1)),\n"
     " prev_adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
     " CHECK((kind='operator') = (operator IS NOT NULL))) STRICT;",
     "CREATE INDEX gateway_adoptions_gateway ON gateway_adoptions(gateway_id, id);",
+    "CREATE TABLE gateway_readers(\n"
+    " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
+    " reader_incarnation TEXT NOT NULL CHECK(" + _HEX32.format(c="reader_incarnation") + "),\n"
+    " first_event_id TEXT NOT NULL REFERENCES readings(event_id),\n"
+    " first_seen_at INTEGER NOT NULL CHECK(first_seen_at>=0),\n"
+    " state TEXT NOT NULL CHECK(state IN ('pending','current','retired')),\n"
+    " decided_by_adoption INTEGER REFERENCES gateway_adoptions(id),\n"
+    " retired_at INTEGER CHECK(retired_at IS NULL OR retired_at>=0),\n"
+    " PRIMARY KEY(gateway_id, reader_incarnation),\n"
+    " CHECK((state='pending') = (decided_by_adoption IS NULL)),\n"
+    " CHECK((state='retired') = (retired_at IS NOT NULL))) STRICT;",
+    "CREATE UNIQUE INDEX gateway_readers_current ON gateway_readers(gateway_id) WHERE state='current';",
     "CREATE TABLE gateway_transitions(\n"
     " id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
     " gateway_id TEXT NOT NULL REFERENCES gateways(id),\n"
-    " kind TEXT NOT NULL CHECK(kind IN ('epoch_changed','epoch_generation_mismatch','price_hash_changed',"
+    " kind TEXT NOT NULL CHECK(kind IN ('reader_changed','epoch_changed','epoch_generation_mismatch','price_hash_changed',"
     "'child_cap_hash_changed','figure_fell','unattributed_rose','sequence_conflict','reported_by_gateway','owner_changed')),\n"
     " event_id TEXT REFERENCES readings(event_id),\n"
     " adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
+    " target_incarnation TEXT CHECK(target_incarnation IS NULL OR (" + _HEX32.format(c="target_incarnation") + ")),\n"
+    " conflict_incarnation TEXT CHECK(conflict_incarnation IS NULL OR (" + _HEX32.format(c="conflict_incarnation") + ")),\n"
+    " conflict_epoch INTEGER CHECK(conflict_epoch IS NULL OR conflict_epoch>=0),\n"
+    " conflict_seq INTEGER CHECK(conflict_seq IS NULL OR conflict_seq>=0),\n"
     " detected_at INTEGER NOT NULL CHECK(detected_at>=0),\n"
     " resolved_by_adoption INTEGER REFERENCES gateway_adoptions(id),\n"
     " CHECK((event_id IS NULL) = (kind='owner_changed')),\n"
+    " CHECK((kind='reader_changed') = (target_incarnation IS NOT NULL)),\n"
+    " CHECK((kind IN ('sequence_conflict','epoch_generation_mismatch')) = (conflict_incarnation IS NOT NULL)),\n"
+    " CHECK((conflict_incarnation IS NULL) = (conflict_epoch IS NULL) AND (conflict_epoch IS NULL) = (conflict_seq IS NULL)),\n"
     " UNIQUE(gateway_id, kind, event_id)) STRICT;",
+    "CREATE UNIQUE INDEX gateway_transitions_reader ON gateway_transitions(gateway_id, target_incarnation) "
+    "WHERE kind='reader_changed';",
     "CREATE INDEX gateway_transitions_open ON gateway_transitions(gateway_id, resolved_by_adoption);",
     "CREATE TABLE gateway_chain_state(\n"
     " gateway_id TEXT PRIMARY KEY REFERENCES gateways(id),\n"
     " current_adoption_id INTEGER REFERENCES gateway_adoptions(id),\n"
     " last_quiet_event_id TEXT REFERENCES readings(event_id),\n"
     " last_quiet_unattributed INTEGER CHECK(last_quiet_unattributed IS NULL OR last_quiet_unattributed>=0),\n"
-    " quiet_baseline_event_id TEXT REFERENCES readings(event_id),\n"
-    " quiet_baseline_unattributed INTEGER CHECK(quiet_baseline_unattributed IS NULL OR quiet_baseline_unattributed>=0),\n"
     " late_reports INTEGER NOT NULL DEFAULT 0 CHECK(late_reports>=0),\n"
     " old_chain_reports INTEGER NOT NULL DEFAULT 0 CHECK(old_chain_reports>=0),\n"
     " duplicate_reports INTEGER NOT NULL DEFAULT 0 CHECK(duplicate_reports>=0),\n"
-    " CHECK((last_quiet_event_id IS NULL) = (last_quiet_unattributed IS NULL)),\n"
-    " CHECK((quiet_baseline_event_id IS NULL) = (quiet_baseline_unattributed IS NULL))) STRICT;",
+    " retired_reader_reports INTEGER NOT NULL DEFAULT 0 CHECK(retired_reader_reports>=0),\n"
+    " CHECK((last_quiet_event_id IS NULL) = (last_quiet_unattributed IS NULL))) STRICT;",
 )
 
 # The tables of the evidence history, in creation order (the removal guards and the tests read this list).
-EVIDENCE_TABLES = ("gateway_epochs", "gateway_totals", "gateway_approvals", "gateway_adoptions", "gateway_transitions",
-                   "gateway_chain_state")
+EVIDENCE_TABLES = ("gateway_epochs", "gateway_totals", "gateway_approvals", "gateway_adoptions", "gateway_readers",
+                   "gateway_transitions", "gateway_chain_state")
 
 # The canonical version-10 migration script, kept for comparison (the tests build stores from the scripts).
 MIGRATION_V10 = "\n".join(_DDL_V10) + "\nPRAGMA user_version=10;\n"

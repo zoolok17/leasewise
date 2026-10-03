@@ -121,7 +121,7 @@ class Card1Tests(_Base):
              "blocks", "leases", "holds", "receipts", "adjustments",
              "audit", "daily_totals", "limit_events", "http_request_identity",
              "gateway_epochs", "gateway_totals", "gateway_approvals",
-             "gateway_adoptions", "gateway_transitions",
+             "gateway_adoptions", "gateway_readers", "gateway_transitions",
              "gateway_chain_state"},
         )
         self.assertEqual(journal.lower(), "wal")
@@ -320,7 +320,7 @@ class Card1CarryOverTests(_Base):
              "blocks", "leases", "holds", "receipts", "adjustments",
              "audit", "daily_totals", "limit_events", "http_request_identity",
              "gateway_epochs", "gateway_totals", "gateway_approvals",
-             "gateway_adoptions", "gateway_transitions",
+             "gateway_adoptions", "gateway_readers", "gateway_transitions",
              "gateway_chain_state"},
         )
 

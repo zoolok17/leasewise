@@ -1,15 +1,18 @@
-"""Card R1-3a: migration 10, the six evidence tables (DESIGN-R1-3.md sections 3 and 7).
+"""Card R1-3a: migration 10, the seven evidence tables (DESIGN-R1-3.md sections 3 and 7, revision 2).
 
 This step only creates the EMPTY tables that cards R1-3b and R1-3c will fill, and makes the configuration import forget a gateway's
 approvals and adoption when the gateway moves to another machine or account. Nothing reads or writes the tables yet.
 
-* the six tables exist with their columns, checks and indexes, and a fresh store and a migrated version-9 store end with the same schema;
+* the seven tables exist with their columns, checks and indexes, and a fresh store and a migrated version-9 store end with the same schema;
 * the migration is tables only: atomic (a failure part-way leaves version 9 and no new table), idempotent, and it invents no row;
 * the older reader (version 9) refuses a version-10 store before it touches it;
 * re-pointing a kept gateway to another machine or account gives exactly three effects (its approvals deleted, its chain state
   pointing at no adoption with the adoption rows kept, one `owner_changed` transition with no event id); changing only its share
   gives none of them;
-* removing a gateway that has evidence rows is refused, table by table, and the removal-guard list matches the live foreign keys.
+* removing a gateway that has evidence rows is refused, table by table, and the removal-guard list matches the live foreign keys;
+* the reader identity model: epochs are kept per reader incarnation (a generation may appear under several), a gateway has at most one
+  `current` reader, a reader's retirement is recorded, a `reader_changed` transition is one row per incarnation, and a conflict stores the
+  identity that collided.
 
 Synthetic data only.
 """
@@ -29,6 +32,8 @@ from tests.test_card2b1 import ERROR_INVALID_CONFIG, VALID_DOC, _Base, _config_i
 PRICE = "a" * 64
 CAP = "b" * 64
 GENERATION = "c" * 32
+INC = "d" * 32
+INC2 = "e" * 32
 
 
 class _Schema(_Base):
@@ -71,42 +76,45 @@ class _Schema(_Base):
         """One row in every evidence table of `alias` (the rows a later card would write). -> the adoption id."""
         gateway = self.gateway_id(alias)
         first, second = self.reading(alias + "-1", alias), self.reading(alias + "-2", alias)
-        self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?)", (gateway, 1, GENERATION, first))
+        self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC, 1, GENERATION, first))
         for event, seq in ((first, 1), (second, 2)):
-            self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                event, gateway, 1, GENERATION, seq, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10))
+            self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                event, gateway, INC, 1, GENERATION, seq, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10))
         self.run_sql("INSERT INTO gateway_approvals VALUES(?,?,?,?,?)", (gateway, PRICE, CAP, 5, "operator"))
-        self.run_sql("INSERT INTO gateway_adoptions(gateway_id, event_id, ledger_epoch, generation, period_start, seq, "
-                     "settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, price_hash, "
-                     "child_cap_hash, adopted_at, operator, kind, quiet, prev_adoption_id) "
+        self.run_sql("INSERT INTO gateway_adoptions(gateway_id, event_id, reader_incarnation, ledger_epoch, generation, "
+                     "period_start, seq, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, "
+                     "price_hash, child_cap_hash, adopted_at, operator, kind, prev_adoption_id) "
                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
-                     (gateway, first, 1, GENERATION, 1000, 1, 500, 20, 5, 1, PRICE, CAP, 6, "operator", "operator", 1))
+                     (gateway, first, INC, 1, GENERATION, 1000, 1, 500, 20, 5, 1, PRICE, CAP, 6, "operator", "operator"))
         adoption = self.one("SELECT id FROM gateway_adoptions WHERE gateway_id=?", (gateway,))[0][0]
+        self.run_sql("INSERT INTO gateway_readers VALUES(?,?,?,?,?,?,NULL)", (gateway, INC, first, 3, "current", adoption))
         self.run_sql("INSERT INTO gateway_transitions(gateway_id, kind, event_id, adoption_id, detected_at, resolved_by_adoption) "
                      "VALUES(?,?,?,?,?,NULL)", (gateway, "figure_fell", second, adoption, 11))
-        self.run_sql("INSERT INTO gateway_chain_state VALUES(?,?,NULL,NULL,NULL,NULL,3,0,1)", (gateway, adoption))
+        self.run_sql("INSERT INTO gateway_chain_state VALUES(?,?,NULL,NULL,3,0,1,0)", (gateway, adoption))
         return adoption
 
 
 class Tables(_Schema):
 
     EXPECTED = {
-        "gateway_epochs": ["gateway_id", "ledger_epoch", "generation", "first_event_id"],
-        "gateway_totals": ["event_id", "gateway_id", "ledger_epoch", "generation", "seq", "period_start", "period_end",
-                           "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur", "unattributed_micro_eur",
-                           "receipts_seq", "quiet", "held_over_reservation", "price_hash", "child_cap_hash", "gateway_flag",
-                           "observed_at", "received_at"],
+        "gateway_epochs": ["gateway_id", "reader_incarnation", "ledger_epoch", "generation", "first_event_id"],
+        "gateway_totals": ["event_id", "gateway_id", "reader_incarnation", "ledger_epoch", "generation", "seq", "period_start",
+                           "period_end", "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur",
+                           "unattributed_micro_eur", "receipts_seq", "quiet", "held_over_reservation", "price_hash",
+                           "child_cap_hash", "gateway_flag", "observed_at", "received_at"],
         "gateway_approvals": ["gateway_id", "price_hash", "child_cap_hash", "approved_at", "operator"],
-        "gateway_adoptions": ["id", "gateway_id", "event_id", "ledger_epoch", "generation", "period_start", "seq",
-                              "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur", "unattributed_micro_eur",
-                              "price_hash", "child_cap_hash", "adopted_at", "operator", "kind", "quiet", "prev_adoption_id"],
-        "gateway_transitions": ["id", "gateway_id", "kind", "event_id", "adoption_id", "detected_at", "resolved_by_adoption"],
+        "gateway_adoptions": ["id", "gateway_id", "event_id", "reader_incarnation", "ledger_epoch", "generation", "period_start",
+                              "seq", "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur", "unattributed_micro_eur",
+                              "price_hash", "child_cap_hash", "adopted_at", "operator", "kind", "prev_adoption_id"],
+        "gateway_readers": ["gateway_id", "reader_incarnation", "first_event_id", "first_seen_at", "state",
+                            "decided_by_adoption", "retired_at"],
+        "gateway_transitions": ["id", "gateway_id", "kind", "event_id", "adoption_id", "target_incarnation",
+                                "conflict_incarnation", "conflict_epoch", "conflict_seq", "detected_at", "resolved_by_adoption"],
         "gateway_chain_state": ["gateway_id", "current_adoption_id", "last_quiet_event_id", "last_quiet_unattributed",
-                                "quiet_baseline_event_id", "quiet_baseline_unattributed", "late_reports", "old_chain_reports",
-                                "duplicate_reports"],
+                                "late_reports", "old_chain_reports", "duplicate_reports", "retired_reader_reports"],
     }
 
-    def test_the_version_is_ten_and_the_six_tables_exist_with_their_columns(self):
+    def test_the_version_is_ten_and_the_seven_tables_exist_with_their_columns(self):
         self.assertEqual(migrate.SCHEMA_VERSION, 10)
         self.assertEqual(self.one("PRAGMA user_version"), [(10,)])
         self.assertEqual(set(EVIDENCE_TABLES), set(self.EXPECTED))
@@ -118,27 +126,30 @@ class Tables(_Schema):
 
     def test_the_indexes_exist(self):
         names = {row[0] for row in self.one("SELECT name FROM sqlite_master WHERE type='index'")}
-        self.assertTrue({"gateway_totals_chain", "gateway_adoptions_gateway", "gateway_transitions_open"} <= names)
+        self.assertTrue({"gateway_totals_chain", "gateway_adoptions_gateway", "gateway_transitions_open",
+                         "gateway_transitions_reader", "gateway_readers_current"} <= names)
 
     def test_the_checks_refuse_what_a_later_card_must_never_write(self):
         gateway = self.gateway_id("g1")
         event = self.reading("check")
-        totals = (event, gateway, 1, GENERATION, 1, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10)
+        totals = (event, gateway, INC, 1, GENERATION, 1, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10)
         bad = {
-            "a hash that is not 64 lowercase hex": totals[:14] + ("A" * 64,) + totals[15:],
-            "a generation that is not 32 hex": totals[:3] + ("c" * 31,) + totals[4:],
-            "a negative amount": totals[:7] + (-1,) + totals[8:],
-            "unattributed above settled": totals[:7] + (499,) + totals[8:10] + (500,) + totals[11:],
-            "a quiet flag that is not 0 or 1": totals[:12] + (2,) + totals[13:],
-            "a period that ends before it starts": totals[:5] + (2000, 1000) + totals[7:],
-            "a negative held-over count": totals[:13] + (-1,) + totals[14:],
+            "a hash that is not 64 lowercase hex": totals[:15] + ("A" * 64,) + totals[16:],
+            "a generation that is not 32 hex": totals[:4] + ("c" * 31,) + totals[5:],
+            "an incarnation that is not 32 hex": totals[:2] + ("d" * 31,) + totals[3:],
+            "a negative amount": totals[:8] + (-1,) + totals[9:],
+            "unattributed above settled": totals[:8] + (499,) + totals[9:11] + (500,) + totals[12:],
+            "a quiet flag that is not 0 or 1": totals[:13] + (2,) + totals[14:],
+            "a period that ends before it starts": totals[:6] + (2000, 1000) + totals[8:],
+            "a negative held-over count": totals[:14] + (-1,) + totals[15:],
         }
+        marks = ",".join("?" * 20)
         for label, row in bad.items():
             with self.subTest(label):
                 with self.assertRaises(sqlite3.IntegrityError):
-                    self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+                    self.run_sql("INSERT INTO gateway_totals VALUES(" + marks + ")", row)
         self.assertEqual(self.one("SELECT COUNT(*) FROM gateway_totals"), [(0,)])
-        self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", totals)    # the good row is accepted
+        self.run_sql("INSERT INTO gateway_totals VALUES(" + marks + ")", totals)             # the good row is accepted
 
     def test_the_other_tables_refuse_their_closed_words(self):
         gateway = self.gateway_id("g1")
@@ -152,26 +163,81 @@ class Tables(_Schema):
         with self.assertRaises(sqlite3.IntegrityError):                      # and owner_changed never has one
             self.run_sql("INSERT INTO gateway_transitions(gateway_id, kind, event_id, detected_at) VALUES(?,'owner_changed',?,1)",
                          (gateway, first))
-        adoption = ("INSERT INTO gateway_adoptions(gateway_id, event_id, ledger_epoch, generation, period_start, seq, "
-                    "settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, price_hash, "
-                    "child_cap_hash, adopted_at, operator, kind, quiet) VALUES(?,?,1,?,1,1,0,0,0,0,?,?,1,?,?,0)")
+        adoption = ("INSERT INTO gateway_adoptions(gateway_id, event_id, reader_incarnation, ledger_epoch, generation, "
+                    "period_start, seq, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, "
+                    "price_hash, child_cap_hash, adopted_at, operator, kind) VALUES(?,?,?,1,?,1,1,0,0,0,0,?,?,1,?,?)")
         with self.assertRaises(sqlite3.IntegrityError):                      # an operator adoption names its operator
-            self.run_sql(adoption, (gateway, first, GENERATION, PRICE, CAP, None, "operator"))
+            self.run_sql(adoption, (gateway, first, INC, GENERATION, PRICE, CAP, None, "operator"))
         with self.assertRaises(sqlite3.IntegrityError):                      # a month roll has none
-            self.run_sql(adoption, (gateway, first, GENERATION, PRICE, CAP, "operator", "period_roll"))
+            self.run_sql(adoption, (gateway, first, INC, GENERATION, PRICE, CAP, "operator", "period_roll"))
         with self.assertRaises(sqlite3.IntegrityError):
-            self.run_sql(adoption, (gateway, first, GENERATION, PRICE, CAP, "operator", "automatic"))
-        with self.assertRaises(sqlite3.IntegrityError):                      # a quiet baseline is both columns or neither
-            self.run_sql("INSERT INTO gateway_chain_state(gateway_id, quiet_baseline_event_id) VALUES(?,?)", (gateway, first))
-        with self.assertRaises(sqlite3.IntegrityError):                      # one generation, one epoch
-            self.run_sql("INSERT INTO gateway_epochs VALUES(?,1,?,?)", (gateway, GENERATION, first))
-            self.run_sql("INSERT INTO gateway_epochs VALUES(?,2,?,?)", (gateway, GENERATION, first))
+            self.run_sql(adoption, (gateway, first, INC, GENERATION, PRICE, CAP, "operator", "automatic"))
+        with self.assertRaises(sqlite3.IntegrityError):                      # the quiet pair is both columns or neither
+            self.run_sql("INSERT INTO gateway_chain_state(gateway_id, last_quiet_event_id) VALUES(?,?)", (gateway, first))
+
+    def test_epochs_are_kept_per_reader_incarnation_and_a_generation_may_appear_under_several(self):
+        gateway = self.gateway_id("g1")
+        first = self.reading("epochs")
+        self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC, 1, GENERATION, first))
+        self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC, 2, GENERATION, first))     # a return to a generation
+        self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC2, 1, GENERATION, first))    # another reader, same ledger
+        with self.assertRaises(sqlite3.IntegrityError):                                    # one epoch of one reader means one row
+            self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC, 1, "f" * 32, first))
+        self.assertEqual(self.one("SELECT COUNT(*) FROM gateway_epochs"), [(3,)])
+
+    def test_readers_have_one_state_a_deciding_adoption_and_at_most_one_current_per_gateway(self):
+        gateway = self.gateway_id("g1")
+        first = self.reading("readers")
+        adoption = self.seed("g2")                                            # any adoption id will do (foreign keys are off)
+        insert = "INSERT INTO gateway_readers VALUES(?,?,?,?,?,?,?)"
+        with self.assertRaises(sqlite3.IntegrityError):                      # a pending reader has no deciding adoption
+            self.run_sql(insert, (gateway, INC, first, 1, "pending", adoption, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # a decided reader names its adoption
+            self.run_sql(insert, (gateway, INC, first, 1, "current", None, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # retired has a time, and only retired has
+            self.run_sql(insert, (gateway, INC, first, 1, "retired", adoption, None))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.run_sql(insert, (gateway, INC, first, 1, "current", adoption, 5))
+        with self.assertRaises(sqlite3.IntegrityError):                      # a state word that is not closed
+            self.run_sql(insert, (gateway, INC, first, 1, "chosen", adoption, None))
+        self.run_sql(insert, (gateway, INC, first, 1, "pending", None, None))
+        self.run_sql(insert, (gateway, INC2, first, 2, "retired", adoption, 9))
+        self.run_sql(insert, (gateway, "f" * 32, first, 3, "pending", None, None))        # several pending readers are fine
+        self.run_sql("UPDATE gateway_readers SET state='current', decided_by_adoption=? WHERE gateway_id=? AND reader_incarnation=?",
+                     (adoption, gateway, INC))
+        with self.assertRaises(sqlite3.IntegrityError):                      # but only one current reader
+            self.run_sql("UPDATE gateway_readers SET state='current', decided_by_adoption=? WHERE gateway_id=? "
+                         "AND reader_incarnation=?", (adoption, gateway, "f" * 32))
+
+    def test_a_reader_changed_transition_is_one_row_per_incarnation_and_a_conflict_stores_the_identity_that_collided(self):
+        gateway = self.gateway_id("g1")
+        first, second = self.reading("t1"), self.reading("t2")
+        insert = ("INSERT INTO gateway_transitions(gateway_id, kind, event_id, target_incarnation, conflict_incarnation, "
+                  "conflict_epoch, conflict_seq, detected_at) VALUES(?,?,?,?,?,?,?,1)")
+        with self.assertRaises(sqlite3.IntegrityError):                      # reader_changed names its incarnation
+            self.run_sql(insert, (gateway, "reader_changed", first, None, None, None, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # and only reader_changed does
+            self.run_sql(insert, (gateway, "figure_fell", first, INC, None, None, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # a conflict stores incarnation, epoch and seq
+            self.run_sql(insert, (gateway, "sequence_conflict", first, None, None, None, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # all three or none
+            self.run_sql(insert, (gateway, "sequence_conflict", first, None, INC, 1, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # and only for the two conflict kinds
+            self.run_sql(insert, (gateway, "figure_fell", first, None, INC, 1, 2))
+        self.run_sql(insert, (gateway, "sequence_conflict", first, None, INC, 1, 2))
+        self.run_sql(insert, (gateway, "epoch_generation_mismatch", first, None, INC, 1, 2))
+        self.run_sql(insert, (gateway, "reader_changed", first, INC2, None, None, None))
+        with self.assertRaises(sqlite3.IntegrityError):                      # a second report of the same new reader adds no row
+            self.run_sql(insert, (gateway, "reader_changed", second, INC2, None, None, None))
+        self.run_sql(insert, (gateway, "reader_changed", second, "f" * 32, None, None, None))   # another new reader does
+        with self.assertRaises(sqlite3.IntegrityError):                      # the same collision twice is one row
+            self.run_sql(insert, (gateway, "sequence_conflict", first, None, INC, 1, 2))
 
 
 class Migration(_Schema):
 
     def downgrade_to_nine(self):
-        """The store as a version-9 Leasewise left it: the six tables dropped and the stamp set back (the data is kept)."""
+        """The store as a version-9 Leasewise left it: the seven tables dropped and the stamp set back (the data is kept)."""
         conn = self.conn()
         try:
             for table in reversed(EVIDENCE_TABLES):
@@ -274,6 +340,9 @@ class Repointing(_Schema):
         self.assertEqual(got["chain"], [(None, 3, 1)])                                   # points at no adoption; the rest stays
         self.assertEqual(got["transitions"], [("figure_fell", got["transitions"][0][1], None), ("owner_changed", None, None)])
         self.assertEqual(self.effects("g2"), other_before)                               # another gateway is untouched
+        self.assertEqual(self.one("SELECT reader_incarnation, state FROM gateway_readers WHERE gateway_id=?",
+                                  (self.gateway_id("g1"),)), [(INC, "current")])           # the reader and epoch rows stay as history
+        self.assertEqual(self.one("SELECT COUNT(*) FROM gateway_epochs WHERE gateway_id=?", (self.gateway_id("g1"),)), [(1,)])
 
     def test_moving_a_gateway_to_another_account_has_the_same_effects(self):
         doc = self.doc()

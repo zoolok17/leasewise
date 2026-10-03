@@ -336,6 +336,7 @@ REMOVAL_GUARDS = {
         ("adjustments", "gateway_id"),
         ("gateway_epochs", "gateway_id"), ("gateway_totals", "gateway_id"),
         ("gateway_approvals", "gateway_id"), ("gateway_adoptions", "gateway_id"),
+        ("gateway_readers", "gateway_id"),
         ("gateway_transitions", "gateway_id"), ("gateway_chain_state", "gateway_id")),
 }
 
