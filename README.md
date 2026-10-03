@@ -825,10 +825,8 @@ and a receipt is only released from the first to the second when the right paper
 **What waits, and what is set aside.**
 
 - A receipt whose lease has no record yet is **quarantined: `unknown_reference`**. Nothing is sent.
-  New captures with bindings are considered first. Previously quarantined captures are reconsidered on every
-  cycle once their binding exists: each cycle looks up the waiting receipts whose record has appeared, wherever
-  they sit in the list, oldest first, up to 500, so no number of waiting receipts can keep another from being
-  released.
+  Each cycle considers captures whose binding exists, oldest first, whether newly captured or previously
+  quarantined, up to 500, so no number of waiting receipts can keep another from being released.
 - A receipt whose record names **another gateway** is quarantined: `wrong_gateway`. Nothing is ever sent
   for it. This (and `duplicate_reference`) is permanent: a record never changes, so it is never looked at again
   and stays visible in `status`. The same holds if a source's name is later pointed at a different gateway: the receipts already

@@ -43,8 +43,7 @@ LIMIT_PROVIDERS = ("claude",)
 MAX_LIMIT_SOURCES = 8
 _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
-# Card L6a-1: where a gateway's receipts are read from. Exactly one of `fixture` (a file, for tests)
-# or `command` (an argument list, run without a shell).
+# Card L6a-1: where a gateway's receipts are read from. Gateway receipts are read from a fixture file in this version.
 _RECEIPT_KEYS = ("gateway", "admission_store", "fixture")
 _RECEIPT_OPTIONAL = ("max_bytes", "page_limit")
 DEFAULT_PAGE_LIMIT = 100
