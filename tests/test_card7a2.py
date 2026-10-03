@@ -525,9 +525,8 @@ class CompletenessD3(_Base):
 
     def test_two_different_message_times_are_inconsistent(self):
         s = self.journal.add_stream("g1", T0)
-        s.dispatch("m1", "t1", T0 + 2000 + MARGIN, message_at=T0 + 1000)
-        s.disposed("m1", "completed", T0 + 3000 + MARGIN,
-                   message_at=T0 + 1001 + MARGIN)
+        s.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        s.disposed("m1", "completed", T0 + 3000, message_at=T0 + 1500)
         self.round()
         self.assertIn("clock_inconsistent", self.status("m1")[2].split(","))
 
@@ -1446,17 +1445,18 @@ class FixRound1Skew(_Base):
         self.assertNotIn("clock_inconsistent", self.reasons("ok"))
         self.assertIn("clock_inconsistent", self.reasons("bad"))
 
-    def test_two_copies_of_a_message_time_may_differ_by_the_margin(self):
+    def test_copies_of_one_message_time_must_agree_exactly(self):
+        # Every copy of message_at is the same stored value (the message
+        # record's ts), so the sender-clock margin never applies between
+        # copies: any difference, however small, is inconsistent.
         s = self.journal.add_stream("g1", T0)
-        s.dispatch("ok", "t-ok", T0 + 2000 + MARGIN, message_at=T0 + 2000)
-        s.disposed("ok", "completed", T0 + 3000 + MARGIN,
-                   message_at=T0 + 2000 + MARGIN)
-        s.dispatch("bad", "t-bad", T0 + 6000 + MARGIN + 1, message_at=T0 + 6000)
-        s.disposed("bad", "completed", T0 + 7000 + MARGIN + 1,
-                   message_at=T0 + 6000 + MARGIN + 1)
+        s.dispatch("same", "t-same", T0 + 3000, message_at=T0 + 2000)
+        s.disposed("same", "completed", T0 + 4000, message_at=T0 + 2000)
+        s.dispatch("apart", "t-apart", T0 + 7000, message_at=T0 + 6000)
+        s.disposed("apart", "completed", T0 + 8000, message_at=T0 + 6001)
         self.round()
-        self.assertNotIn("clock_inconsistent", self.reasons("ok"))
-        self.assertIn("clock_inconsistent", self.reasons("bad"))
+        self.assertNotIn("clock_inconsistent", self.reasons("same"))
+        self.assertIn("clock_inconsistent", self.reasons("apart"))
 
 
 class FixRound1Unauthenticated(_Base):
