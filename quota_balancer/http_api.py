@@ -125,6 +125,24 @@ _HTTP_STATUS = {
     errors.CODE_ACCOUNT_PARKED: 429,
     errors.CODE_CONCURRENCY_LIMIT: 429,
     errors.CODE_STORE_ERROR: 503,
+    # Card R1-0: the rest of the design's error list (docs/DESIGN.md section 7). Defined and mapped here; the
+    # steps and cards that need them emit them.
+    errors.CODE_CONTEXT_ROTATION_REQUIRED: 400,
+    errors.CODE_UNSUPPORTED_EFFORT: 400,
+    errors.CODE_CONTEXT_UNAVAILABLE: 403,
+    errors.CODE_ENVELOPE_INCOMPATIBLE: 403,
+    errors.CODE_INPUT_BOUND_UNAVAILABLE: 403,
+    errors.CODE_POLICY_MISMATCH: 409,
+    errors.CODE_METER_STALE: 503,
+    errors.CODE_RECONCILIATION_REQUIRED: 503,
+    errors.CODE_SERVICE_UNAVAILABLE: 503,
+    # The billing words: the design's later HTTP mapping (docs/DESIGN.md section 11, "Later HTTP mapping").
+    errors.CODE_BILLING_SCOPE_MISMATCH: 409,
+    errors.CODE_BILLING_BASIS_UNKNOWN: 409,
+    errors.CODE_BILLING_UNKNOWN: 503,
+    errors.CODE_BILLING_STALE: 503,
+    errors.CODE_BILLING_DIVERGENCE: 409,
+    errors.CODE_OPENING_UNSAFE: 409,
 }
 
 

@@ -336,8 +336,9 @@ POST /readings {event_id,account_id,seat_id?,observed_at,kind,payload}: owner re
   settled. Sequence increases; duplicate events replay; epoch/hash change needs reconciliation.
   sized_ready requires deployed 6b plus re-init/canary evidence for the approved new hash;
   a lease request cannot set readiness or the operator-owned coverage flag.
-- usage: {turn_id,lease_id?,input_tokens,cached_input_tokens,output_tokens,calls,final,uncoordinated};
-  cumulative, use maxima rather than adding samples; never settles money.
+- ~~usage: {turn_id,lease_id?,input_tokens,cached_input_tokens,output_tokens,calls,final,uncoordinated};
+  cumulative, use maxima rather than adding samples; never settles money.~~
+  Removed 2026-10-03 (lead decision D-116): usage travels in /settle receipts; the kind stays refused.
 POST /limit-events {event_id,account_id,model_id?,turn_id,observed_at,evidence_kind,
 resets_at,exhausted_windows}: reporter authorized for account; evidence_kind is one of
 codex_exhausted/claude_exhausted/provider_usage_429. 202 {block_id,retry_at,state}.
