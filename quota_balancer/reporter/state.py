@@ -12,11 +12,14 @@ import sqlite3
 
 from . import decisions, mapper
 
-SCHEMA_VERSION = 2       # 2: card 7c-2 added the limit_event table (version 1 files are migrated)
+SCHEMA_VERSION = 3       # 2: card 7c-2 added limit_event; 3: card L6a-1 added gateway_receipt and lease_ref
+                         # (older files are migrated; a reporter that knows less refuses a newer file)
 
 # The agent word on a limit item. Real agent names start with a letter or a digit, so this can
 # never be one: a limit event belongs to no seat and no message.
 LIMIT_AGENT = "_limit_events"
+# The same for a gateway receipt (card L6a-1): it belongs to one lease and to no seat and no message.
+RECEIPT_AGENT = "_gateway_receipts"
 _ALIAS = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 
@@ -126,7 +129,29 @@ _LIMIT_DDL = (
     " SELECT RAISE(ABORT, 'a limit event is immutable'); END",
 )
 
-_DDL = _DDL_V1 + _LIMIT_DDL
+# Version 3 (card L6a-1): the gateway-receipt outbox and the lease references. One receipt row per
+# (gateway, ledger generation, seq), keyed by `event_id`; the body is the frozen canonical settle
+# text and is never recomputed. A receipt whose reference matches no lease of ours is stored as
+# failed for good (so its `seq` is still passed) and has no lease id. `lease_ref` maps the sha256
+# of a lease id (what the gateway keeps) back to the lease id.
+_RECEIPT_DDL = (
+    "CREATE TABLE gateway_receipt(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " event_id TEXT NOT NULL UNIQUE, gateway_alias TEXT NOT NULL, generation TEXT NOT NULL,"
+    " seq INTEGER NOT NULL, ref_sha256 TEXT NOT NULL, lease_id TEXT, body TEXT NOT NULL,"
+    " state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','sent','failed_permanent')),"
+    " tries INTEGER NOT NULL DEFAULT 0, not_before_ms INTEGER NOT NULL DEFAULT 0,"
+    " last_error_code TEXT, stored_ms INTEGER NOT NULL,"
+    " CHECK(lease_id IS NOT NULL OR state='failed_permanent'),"
+    " UNIQUE(gateway_alias, generation, seq)) STRICT",
+    "CREATE TRIGGER gateway_receipt_immutable BEFORE UPDATE OF event_id, gateway_alias, generation,"
+    " seq, ref_sha256, lease_id, body, stored_ms ON gateway_receipt BEGIN"
+    " SELECT RAISE(ABORT, 'a gateway receipt is immutable'); END",
+    "CREATE TRIGGER gateway_receipt_keep BEFORE DELETE ON gateway_receipt BEGIN"
+    " SELECT RAISE(ABORT, 'a gateway receipt is immutable'); END",
+    "CREATE TABLE lease_ref(ref_sha256 TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE) STRICT",
+)
+
+_DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL
 
 
 class State:
@@ -167,11 +192,18 @@ class State:
             for statement in _DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
-        elif version == 1 and SCHEMA_VERSION >= 2:
-            # Version 1 -> 2, inside the caller's transaction: all or nothing.
-            self.conn.execute(_NOTE_DDL)            # a file made before card 7a-3
-            for statement in _LIMIT_DDL:
+        elif version in (1, 2) and SCHEMA_VERSION >= 3:
+            # Version 1 -> 3 or 2 -> 3, inside the caller's transaction: all or nothing.
+            if version == 1:
+                self.conn.execute(_NOTE_DDL)        # a file made before card 7a-3
+                for statement in _LIMIT_DDL:
+                    self.conn.execute(statement)
+            for statement in _RECEIPT_DDL:
                 self.conn.execute(statement)
+            # Every lease already acquired can be named by a receipt, so its reference is kept.
+            for (lease_id,) in self.conn.execute(
+                    "SELECT lease_id FROM acquisition WHERE lease_id IS NOT NULL").fetchall():
+                self.remember_lease(lease_id)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
             raise StateError("the state file version is not supported")
@@ -298,6 +330,71 @@ class State:
         return Item(decisions.LIMIT, LIMIT_AGENT, "", "/v1/limit-events", json.loads(row[2]),
                     row[1], ("limit_event", row[0]), None)
 
+    # --- the gateway-receipt outbox (card L6a-1) ------------------------------
+
+    def remember_lease(self, lease_id):
+        """Keep the reference of one lease (the sha256 of its id) so that a gateway receipt naming
+        that reference can be sent to the lease. Inside the caller's transaction."""
+        self.conn.execute("INSERT OR IGNORE INTO lease_ref(ref_sha256, lease_id) VALUES(?,?)",
+                          (mapper.lease_ref_hash(lease_id), lease_id))
+
+    def receipt_cursor(self, gateway_alias):
+        """The last receipt `seq` stored for this gateway (0 if none)."""
+        row = self.one("SELECT value FROM meta WHERE key=?", ("receipt_seq:" + gateway_alias,))
+        return row[0] if row else 0
+
+    def record_receipts(self, gateway_alias, gateway_id, receipts, now_ms):
+        """One read's result, in ONE transaction: each new receipt as a frozen outbox row (a row that
+        already exists is left exactly as it is), and the last `seq` moved to the last receipt of the
+        read. A failure anywhere stores nothing and moves nothing. -> the number of new rows."""
+        added = 0
+        with self.txn():
+            last = self.receipt_cursor(gateway_alias)
+            for receipt in receipts:
+                try:
+                    body = mapper.receipt_body(gateway_id, receipt)
+                    text = mapper.receipt_body_text(body)
+                except ValueError:
+                    raise StateError("a receipt body is not valid") from None
+                found = self.one("SELECT lease_id FROM lease_ref WHERE ref_sha256=?", (receipt.ref_sha256,))
+                lease_id = None if found is None else found[0]
+                state = "pending" if lease_id is not None else "failed_permanent"
+                code = None if lease_id is not None else decisions.UNKNOWN_LEASE
+                row = self.conn.execute(
+                    "INSERT OR IGNORE INTO gateway_receipt(event_id, gateway_alias, generation, seq,"
+                    " ref_sha256, lease_id, body, state, last_error_code, stored_ms)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (body["event_id"], gateway_alias, receipt.generation, receipt.seq,
+                     receipt.ref_sha256, lease_id, text, state, code, now_ms))
+                added += row.rowcount
+                last = max(last, receipt.seq)
+            if receipts:
+                self.conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET"
+                    " value=excluded.value", ("receipt_seq:" + gateway_alias, last))
+            if added:
+                self.bump(RECEIPT_AGENT, "stored", added)
+            self.set_note("receipt_last_read", "ok", now_ms)
+        return added
+
+    def note_receipt_read(self, status, reason, now_ms):
+        """A read that stored nothing (`read_later` or `refused`): count it by its closed reason and
+        say when. Never any text from the source."""
+        with self.txn():
+            self.bump(RECEIPT_AGENT, "%s:%s" % (status, reason))
+            self.set_note("receipt_last_read", status, now_ms)
+
+    def next_receipt_item(self, now_ms):
+        """The oldest receipt row that is pending and due, as an Item, or None. A receipt belongs to
+        one lease and to no seat and no message: nothing about an agent or another lease holds it back."""
+        row = self.one(
+            "SELECT id, event_id, body, lease_id FROM gateway_receipt WHERE state='pending'"
+            " AND not_before_ms<=? ORDER BY id LIMIT 1", (now_ms,))
+        if row is None:
+            return None
+        return Item(decisions.RECEIPT, RECEIPT_AGENT, "", "/v1/leases/%s/settle" % row[3],
+                    json.loads(row[2]), row[1], ("gateway_receipt", row[0]), row[3])
+
     # --- the outbox -------------------------------------------------------
 
     def next_item(self, now_ms):
@@ -368,6 +465,7 @@ class State:
                         "UPDATE acquisition SET state='acquired', lease_id=?,"
                         " last_error_code=NULL WHERE id=?",
                         (response.lease_id, row_id))
+                    self.remember_lease(response.lease_id)
                 else:
                     self.conn.execute(
                         "UPDATE %s SET state='sent', last_error_code=NULL "

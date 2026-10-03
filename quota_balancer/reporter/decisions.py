@@ -10,15 +10,16 @@ from .. import errors as _errors
 MAX_REBUILDS = 3
 
 # The only error words the reporter ever stores or shows: the codes Leasewise itself
-# can send (quota_balancer/errors.py) plus three words of its own. Whatever else an
+# can send (quota_balancer/errors.py) plus four words of its own. Whatever else an
 # answer says (it could echo anything, even the identity) becomes UNKNOWN_CODE.
 UNKNOWN_CODE = "UNKNOWN_CODE"
 BAD_ANSWER = "BAD_ANSWER"                  # a success that lacked the lease id
 MALFORMED_RESPONSE = "MALFORMED_RESPONSE"  # an answer that could not be decoded
+UNKNOWN_LEASE = "UNKNOWN_LEASE"            # card L6a-1: a receipt whose reference matches no lease of ours
 LEASEWISE_CODES = frozenset(
     value for name, value in vars(_errors).items()
     if name.startswith("CODE_") and isinstance(value, str))
-CLOSED_CODES = LEASEWISE_CODES | {UNKNOWN_CODE, BAD_ANSWER, MALFORMED_RESPONSE}
+CLOSED_CODES = LEASEWISE_CODES | {UNKNOWN_CODE, BAD_ANSWER, MALFORMED_RESPONSE, UNKNOWN_LEASE}
 
 
 def closed_code(code):
@@ -32,6 +33,7 @@ ACQUIRE = "acquire"
 REPORT = "report"
 FINAL = "final"
 LIMIT = "limit"                # card 7c-2: an account-level limit event (no agent, no message)
+RECEIPT = "receipt"            # card L6a-1: a gateway's final receipt for one quota lease
 
 # Actions.
 DONE = "done"                  # accepted: record it
@@ -72,7 +74,7 @@ class Decision:
 
 
 def decide(kind, response, rebuilds=0):
-    """`kind` is ACQUIRE, REPORT, FINAL or LIMIT; `rebuilds` is how many rebuilds
+    """`kind` is ACQUIRE, REPORT, FINAL, LIMIT or RECEIPT; `rebuilds` is how many rebuilds
     this acquisition already used (it survives restarts in the state)."""
     status, code = response.status, closed_code(response.code)
     if status == 401:
@@ -87,6 +89,14 @@ def decide(kind, response, rebuilds=0):
         if status in (200, 201, 202):
             return Decision(DONE)
         return Decision(FAIL, code)
+    if kind == RECEIPT:
+        # A gateway's final receipt belongs to one lease and to no agent: nothing it is answered
+        # can stop an agent, rebuild or drop. 200 is settled (a replay of the same event is a 200
+        # too); LEASE_CLOSED means the lease is already closed, so there is nothing left to do.
+        # Every other refusal, RECEIPT_CONFLICT included, fails THIS row for good with its word.
+        if status in (200, 201) or code == "LEASE_CLOSED":
+            return Decision(DONE)
+        return Decision(FAIL, code or UNKNOWN_CODE)
     if status in (200, 201):
         return Decision(DONE)
     if code == "ESTIMATE_STALE":
