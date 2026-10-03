@@ -54,6 +54,9 @@ CODE_POLICY_MISMATCH = "POLICY_MISMATCH"                          # 409
 CODE_METER_STALE = "METER_STALE"                                  # 503
 CODE_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"          # 503
 CODE_SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"                  # 503
+# Card R1-M part 2, fix round 2 (D-177): accounts that share one money cap declare different cap bases (with VAT and without),
+# so their spending cannot be added into one number. A configuration conflict, refused at admission.
+CODE_CAP_BASIS_CONFLICT = "CAP_BASIS_CONFLICT"                    # 409
 
 # Card 5 private-HTTP transport errors (docs/DESIGN.md sections 6-7).
 # These never occur off the HTTP transport (there is no CLI request to
@@ -104,6 +107,7 @@ EXIT_CODES = {
     CODE_METER_STALE: 2,
     CODE_RECONCILIATION_REQUIRED: 2,
     CODE_SERVICE_UNAVAILABLE: 3,
+    CODE_CAP_BASIS_CONFLICT: 2,
 }
 
 MSG_INVALID_CONFIG = "config document is invalid"
@@ -146,6 +150,7 @@ MSG_POLICY_MISMATCH = "the request names a policy revision that is not current; 
 MSG_METER_STALE = "the usage evidence is too old to decide; wait for a fresh report and try again"
 MSG_RECONCILIATION_REQUIRED = "the gateway needs an operator reconciliation before this request can be decided"
 MSG_SERVICE_UNAVAILABLE = "the coordinator cannot answer right now; try again later"
+MSG_CAP_BASIS_CONFLICT = "accounts that share a spending cap declare different cap bases; give them all the same cap basis"
 
 # Every code and its fixed message, in one place: a test checks that no code is missing here and that no two
 # codes say the same thing.
@@ -186,6 +191,7 @@ MESSAGES = {
     CODE_METER_STALE: MSG_METER_STALE,
     CODE_RECONCILIATION_REQUIRED: MSG_RECONCILIATION_REQUIRED,
     CODE_SERVICE_UNAVAILABLE: MSG_SERVICE_UNAVAILABLE,
+    CODE_CAP_BASIS_CONFLICT: MSG_CAP_BASIS_CONFLICT,
 }
 
 

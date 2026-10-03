@@ -551,7 +551,14 @@ part will:
   - **A cap shared by several accounts** (a team or project cap) holds the spending of accounts that may have different rates.
     Each contributing account's receipts and holds are read separately, converted with **that account's own policy** (rounded
     up), and only then added. The asking account's policy is never applied to another account's spending, and no account is left
-    out. The cap is read in each account's cap basis, so accounts that share a cap should declare the same cap basis.
+    out. A shared cap has no tax basis of its own, so **every account that shares it must declare the same cap basis**: if the
+    accounts that take part (the one asking, even with no spending yet, and every account that has a lease in that scope) declare
+    more than one known cap basis, the grant is refused with `CAP_BASIS_CONFLICT` ("accounts that share a spending cap declare
+    different cap bases; give them all the same cap basis"). This holds in advisory mode too, for team, project and platform caps,
+    and for money limits only. An account with no billing policy, or whose cap basis is `unknown`, does not take part (the
+    fallback below). **What to do:** give every account that shares the cap the same `cap_basis` in its billing policy.
+    Stated limits, not built: the configuration is not refused when it is imported (the conflict shows only when a lease is
+    asked for), and a shared cap costs one query per account.
   - An account with **no billing policy** compares the lease books as they are.
   - A policy that **cannot convert** (a basis is `unknown`, or the bases differ and no VAT rate is given) leaves that account's
     lease books compared as they always were: there is nothing to convert with, and nothing is guessed. In a shared cap this

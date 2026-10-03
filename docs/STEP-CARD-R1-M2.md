@@ -78,16 +78,21 @@ this rule. A reserved or uncertain attempt is charged at the reserve rates, and 
 6. **A shared cap is summed per account** (fix round 1, D-172). A team or project cap holds the spending of several accounts. Each
    account's receipts and holds are read separately, converted with that account's own policy (rounded up) and then added; the
    asking account's policy is never applied to another account's spending, and no account is left out. The cap is read in each
-   account's cap basis, so accounts that share a cap should declare the same one.
+   account's cap basis, so accounts that share a cap should declare the same one. (Enforced in fix round 2, decision 7.)
+7. **A shared money cap whose accounts declare different cap bases is refused** (fix round 2, D-177). See the section below.
 
 ## Tests
 
-Red first: against the previous code, all 37 new tests of the first build fail (4 failures and 305 errors, counting the subtests),
-but many only because the new helpers do not exist yet. **These describe unchanged behaviour and would pass against the old
-behaviour:** all four `Unchanged` tests, `test_equal_bases_give_the_same_figure_for_both_uses`, `test_an_unknown_basis_converts_nothing`,
-`test_an_overflow_is_still_invalid_config_and_so_is_a_value_that_is_not_an_amount`,
-`test_checked_lets_unknown_through_and_refuses_what_the_store_could_not_keep` (for the amounts the store can keep) and
-`test_a_known_part_that_passes_the_limit_still_decides_through_the_module`. They are there so that they keep passing.
+**Red first, as measured.** The two first-build files (37 test methods) were run against the code of `9b0838f` (before the first
+build). Outcomes, with test methods and subtests kept apart: **309 failed outcomes** (4 failures and 305 errors; of these, 28 methods
+errored and 2 failed as a whole, and 279 are failed subtests of the grid tests), **3 methods passed** and **3 subtests passed**.
+Many of the failures are only because the new helpers did not exist yet. The three methods that pass against the old code describe
+unchanged behaviour: `EvaluatorSums.test_a_known_part_that_passes_the_limit_still_decides_through_the_module`,
+`SharesAsLimits.test_an_unknown_basis_converts_nothing` and `Unchanged.test_a_whole_advisory_grant_with_equal_bases_is_unchanged`. The
+other tests that pin unchanged answers (the rest of `Unchanged`, and the rounding and overflow tests) also describe behaviour that
+already existed, but they cannot run against the old code because they call the new helpers. (An earlier version of this record said
+"all 37 failed" and listed more tests as passing before; the lead's note quoted 7 passed methods, which I could not reproduce: I
+count 3 passed methods plus 3 passed subtests.)
 
 `tests/test_cardr1_money_basis.py` (17):
 - `Different`: `test_the_account_receipts_are_converted_up_before_the_budget_is_compared`,
@@ -164,3 +169,41 @@ because A's spending was recalculated at B's rate as 1,100.
 - **Docs.** The D-168 fallback is now stated to affect advisory admission today (decision 1); the rounding statement is corrected
   (decision 3); the README no longer says "every answer unchanged" except for equal bases and no policy; the tests that describe
   unchanged behaviour are named above.
+
+## Fix round 2 (Codex's delta read; D-177): a shared money cap whose accounts declare different cap bases is refused
+
+In plain words: each account declares the tax basis its caps are counted in (with VAT or without). A team, project or platform cap
+has no basis of its own. If two accounts that share a cap declare different bases, one account's spending counted with VAT was added to
+another's counted without VAT, and the total meant nothing. Codex reproduced it through the public imports and the public grant: a
+shared cap of 1,150; A declares `invoice_total` and B declares `ex_vat` (both ledgers `ex_vat`, both at 20% VAT); B settles 1,000 and
+A's next advisory grant was admitted; with B switched to `invoice_total` the same spending is 1,200 and A was refused `MONEY_LIMIT`.
+
+- **The rule.** For each scope that has an applicable money limit, the accounts that take part are the requester (even with no
+  spending yet) and every account that has a lease in that scope. Only accounts with a billing policy whose `cap_basis` is known
+  (`ex_vat` or `invoice_total`) count. If more than one known cap basis remains, the grant is refused with the new closed code
+  **`CAP_BASIS_CONFLICT`**. It is checked in one place (`lease._require_one_cap_basis`), before any scope total is compared, so the
+  receipt and the hold paths cannot disagree. It applies in advisory mode too, and never to a token limit. The requester's basis is never
+  picked and no account's spending is dropped. An account with no policy, or with `cap_basis = unknown`, does not take part: it stays
+  the accepted D-168 fallback, for that account's part only.
+- **The code.** `CAP_BASIS_CONFLICT`: wire status 409 (a conflict of configuration), exit code 2 (a request condition), one fixed
+  message: "accounts that share a spending cap declare different cap bases; give them all the same cap basis". `POLICY_MISMATCH` was
+  not reused (it means the request names a revision that is not current), nor `MONEY_LIMIT` (nothing has been spent past the cap).
+  The existing code-list tests pass unchanged: they read the registry, so the new word is covered by them (an exit code, a fixed
+  message, no two codes sharing a message).
+- **What the operator does:** give every account that shares the cap the same `cap_basis` in its billing policy.
+- **A consequence worth knowing.** An account that is not asking and has no lease in the scope does not take part, so the account that
+  has spent is not refused when it asks: only an account asking *alongside* different declared bases is. Once both have leases, both are
+  refused.
+- **Tests** (`tests/test_cardr1_money_capbasis.py`, 12; Codex's case through `import_config`, `billing_policy_import`, `grant` and
+  `settle`). `Conflict`: `test_mixed_cap_bases_refuse_the_requester_with_the_new_code_for_every_scope` (team, project, platform),
+  `test_the_refusal_is_the_same_wherever_the_spending_is` (the other way round), `test_with_one_cap_basis_the_scope_is_evaluated_normally`
+  (refused `MONEY_LIMIT` at 1,200 against 1,150, admitted against 1,200), `test_the_conflict_is_found_again_when_it_is_introduced_later`,
+  `test_once_both_accounts_have_a_lease_in_the_scope_both_are_refused`, `test_nothing_is_written_by_a_refused_grant`. `DoesNotTakePart`: no policy, `cap_basis = unknown`, a requester with no policy, a cap
+  used by one account only, and token limits. `TheCode`: `test_the_new_code_is_defined_everywhere_a_code_must_be`. **Red first:** against
+  the previous `lease.py` (with the code defined), 5 of the 12 methods fail (9 failed outcomes, counting subtests) and 7 pass; the 7
+  describe behaviour that does not change. Against the previous code as a whole, 10 of 12 fail (the code does not exist).
+- **Stated limits, recorded as follow-ups and not built (the stopping rule):**
+  1. the conflicting configuration is not refused when it is imported (`validate_policies`, `import_config`,
+     `billing_policy_import`); it shows only when a lease is asked for;
+  2. `money.saturate(UNKNOWN)` raises `TypeError` (Codex L1, latent: no current caller passes UNKNOWN);
+  3. a shared scope costs one query per contributing account (Codex's cost note).

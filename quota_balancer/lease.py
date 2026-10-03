@@ -580,6 +580,29 @@ def _in_cap(amount, basis):
     return money.convert_total(amount, basis[0], basis[1], basis[2], money.EXPOSURE)
 
 
+def _scope_accounts(conn, scope, scope_id):
+    """The accounts that have any lease in this scope: the accounts whose spending a shared cap adds up."""
+    return [row[0] for row in conn.execute(
+        "SELECT DISTINCT l.account_id FROM leases l WHERE " + _chain_pred(scope),  # nosec B608 - fixed predicate text, id bound
+        _chain_bind(scope, scope_id))]
+
+
+def _require_one_cap_basis(conn, scope, scope_id, requester):
+    """A money cap shared by several accounts has no tax basis of its own; each account declares the basis its caps are counted
+    in (card R1-M part 2, fix round 2, D-177). Spending counted with VAT cannot be added to spending counted without it, so when
+    the accounts that take part in this scope (the requester, even with no spending yet, and every account that has a lease in the
+    scope) declare more than one KNOWN cap basis, the grant is refused CAP_BASIS_CONFLICT. An account with no billing policy, or
+    whose cap basis is `unknown`, does not take part (the accepted fallback). Neither the requester's basis is picked nor any
+    account's spending dropped. This is the one place that decides it, before any scope total is compared."""
+    bases = set()
+    for account in set(_scope_accounts(conn, scope, scope_id)) | {requester}:
+        row = conn.execute("SELECT cap_basis FROM billing_policies WHERE account_id=?", (account,)).fetchone()
+        if row is not None and row[0] in (reduce.BASIS_EX_VAT, reduce.BASIS_INVOICE_TOTAL):
+            bases.add(row[0])
+    if len(bases) > 1:
+        raise QuotaError(errors.CODE_CAP_BASIS_CONFLICT, errors.MSG_CAP_BASIS_CONFLICT)
+
+
 def _scope_total(conn, scope, scope_id, is_money, fetch, requester, requester_basis):
     """The exact total of one scope's lease-book amounts, as the number the pure admission rule compares (card R1-M, D-172).
 
@@ -592,11 +615,8 @@ def _scope_total(conn, scope, scope_id, is_money, fetch, requester, requester_ba
     account's cap basis, so accounts that share a cap are expected to declare the same cap basis."""
     if not is_money:
         return money.saturate(fetch("", ()))
-    accounts = [row[0] for row in conn.execute(
-        "SELECT DISTINCT l.account_id FROM leases l WHERE " + _chain_pred(scope),  # nosec B608 - fixed predicate text, id bound
-        _chain_bind(scope, scope_id))]
     terms = []
-    for account in accounts:
+    for account in _scope_accounts(conn, scope, scope_id):
         basis = requester_basis if account == requester else _lease_basis(conn, account)
         terms.append(_in_cap(fetch(" AND l.account_id = ?", (account,)), basis))
     return money.saturate(money.add(*terms))
@@ -693,6 +713,15 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
         else:
             settled_bucket = "l.period_start"
         for scope, scope_id in scope_ids:
+            # (the platform singleton matches every platform row loaded for this group)
+            # This rule needs a limit AT this very scope.
+            has_limit_here = any(
+                r["metric"] == metric and r["period"] == period
+                and r["scope"] == scope
+                and (scope == "platform" or r["scope_id"] == scope_id)
+                for r in limit_rows)
+            if metric == "money_micro_eur" and has_limit_here:
+                _require_one_cap_basis(conn, scope, scope_id, account_id)
             settled = _scope_total(
                 conn, scope, scope_id, metric == "money_micro_eur",
                 lambda extra, more, scope=scope, scope_id=scope_id: _money_sums(
@@ -713,12 +742,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                               or (r["scope"] == scope
                                   and r["scope_id"] == scope_id))]
             # (limit_ids above is deliberately loose for the platform
-            # singleton; this rule needs a limit AT this very scope.)
-            has_limit_here = any(
-                r["metric"] == metric and r["period"] == period
-                and r["scope"] == scope
-                and (scope == "platform" or r["scope_id"] == scope_id)
-                for r in limit_rows)
+            # singleton; has_limit_here, computed first, needs a limit AT this very scope.)
             if metric == "input_tokens" and has_limit_here and not shadow \
                     and conn.execute(
                         # Card L6a-0 (Codex F1): the SUM above skips a NULL,
