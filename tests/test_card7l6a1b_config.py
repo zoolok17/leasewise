@@ -23,6 +23,7 @@ from tests.l6a1_env import GATEWAY_ALIAS
 from tests.reporter_env import agent_table, config_text
 
 LOUD = "loud-value-l6a1b-5f3a"
+ACCEPTED = "<accepted>"
 PROGRAM = r"C:\tools\receipts\agenttalk.exe"
 
 
@@ -60,10 +61,13 @@ class _Case(unittest.TestCase):
                                             {"alpha": agent_table()}, extra=raw))
 
     def message(self, raw):
-        with self.assertRaises(cfg.ConfigError) as caught:
+        """The refusal's sentence, or ACCEPTED when the block is a valid source."""
+        try:
             self.parse(raw)
-        self.assertEqual(caught.exception.code, cfg.CONFIG_INVALID)
-        return caught.exception.message
+        except cfg.ConfigError as caught:
+            self.assertEqual(caught.code, cfg.CONFIG_INVALID)
+            return caught.message
+        return ACCEPTED
 
 
 class Sentences(_Case):
@@ -88,7 +92,7 @@ class Sentences(_Case):
             with self.subTest(bad=repr(bad)[:30]):
                 self.assertEqual(self.message(self.block(command=bad)), shape)
         self.assertEqual(self.message(self.block(command=[PROGRAM] + ["x"] * 15)),
-                         cfg.MSG_NO_COMMAND_SOURCE)                         # 16 texts is the most
+                         ACCEPTED)                         # 16 texts is the most
 
     def test_the_program_must_be_an_absolute_path(self):
         absolute = "gateway_receipts: the command must start with an absolute path"
@@ -115,7 +119,7 @@ class Sentences(_Case):
                 self.assertEqual(self.message(self.block(command=[bad])), exe)
         for good in (r"C:\tools\agenttalk.exe", r"C:\tools\AGENTTALK.EXE", r"C:/tools/agenttalk.Exe", r"D:\a b\x.exe"):
             with self.subTest(good=good):
-                self.assertEqual(self.message(self.block(command=[good])), cfg.MSG_NO_COMMAND_SOURCE)
+                self.assertEqual(self.message(self.block(command=[good])), ACCEPTED)
 
     def test_a_double_quote_or_a_control_character_in_any_argument(self):
         bad_char = "gateway_receipts: the command has a character it may not have"
@@ -141,7 +145,7 @@ class Sentences(_Case):
         for good in (1, 20, 60):
             with self.subTest(good=good):
                 self.assertEqual(self.message(self.block(command=[PROGRAM], keys="timeout_seconds = %d\n" % good)),
-                                 cfg.MSG_NO_COMMAND_SOURCE)
+                                 ACCEPTED)
 
     def test_timeout_and_env_belong_to_a_command_source(self):
         sentence = "gateway_receipts: timeout_seconds and env belong to a command source"
@@ -164,9 +168,9 @@ class Sentences(_Case):
             with self.subTest(value=repr(bad)):
                 self.assertEqual(self.message(self.block(command=[PROGRAM], keys="env = {A = %s}\n" % _q(bad))), value)
         eight = {"V%d" % number: "x" for number in range(8)}
-        self.assertEqual(self.message(self.block(command=[PROGRAM], env=eight)), cfg.MSG_NO_COMMAND_SOURCE)
+        self.assertEqual(self.message(self.block(command=[PROGRAM], env=eight)), ACCEPTED)
         self.assertEqual(self.message(self.block(command=[PROGRAM], keys='env = {A_1 = "a b"}\n')),
-                         cfg.MSG_NO_COMMAND_SOURCE)
+                         ACCEPTED)
 
     def test_no_refusal_holds_text_from_the_file(self):
         bad_blocks = (
@@ -186,17 +190,24 @@ class Platform(unittest.TestCase):
                 self.assertEqual(cfg._windows(), expected)
 
 
-class StillRefused(_Case):
+class Accepted(_Case):
+    """A block that passes every check is a source now (card L6a-1b, step 3)."""
 
-    def test_a_block_that_passes_every_check_is_refused_with_todays_sentence(self):
+    def test_a_block_that_passes_every_check_is_accepted_and_keeps_its_settings(self):
         raw = self.block(command=[PROGRAM, "-m", "agenttalk", "gateway", "receipts"], keys="timeout_seconds = 30\n",
                          env={"AGENTTALK_ROOT": r"C:\lw\team", "TEMP_X": "a b"})
-        self.assertEqual(self.message(raw),
-                         "Command receipt sources are not available in this version; use a fixture file.")
-        self.assertEqual(self.message(self.block(command=[PROGRAM])), cfg.MSG_NO_COMMAND_SOURCE)
+        source = self.parse(raw).gateway_receipts
+        self.assertEqual(source.command, (PROGRAM, "-m", "agenttalk", "gateway", "receipts"))
+        self.assertEqual((source.timeout_seconds, source.env, source.fixture),
+                         (30, (("AGENTTALK_ROOT", r"C:\lw\team"), ("TEMP_X", "a b")), None))
+        self.assertEqual(repr(source), "GatewayReceipts(<hidden>)")
 
-    def test_the_checks_come_first_and_their_own_sentence_wins(self):
-        self.assertNotEqual(self.message(self.block(command=[PROGRAM, "--after"])), cfg.MSG_NO_COMMAND_SOURCE)
+    def test_the_default_time_limit_is_20_and_the_program_path_is_kept_with_backslashes(self):
+        source = self.parse(self.block(command=["C:/tools/receipts/agenttalk.exe", "x"])).gateway_receipts
+        self.assertEqual((source.timeout_seconds, source.command[0]), (20, r"C:\tools\receipts\agenttalk.exe"))
+
+    def test_the_checks_still_come_first_and_their_own_sentence_wins(self):
+        self.assertNotEqual(self.message(self.block(command=[PROGRAM, "--after"])), ACCEPTED)
 
     def test_a_fixture_block_works_as_before(self):
         source = self.parse(self.block(fixture=True)).gateway_receipts

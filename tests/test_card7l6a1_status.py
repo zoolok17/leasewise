@@ -25,7 +25,7 @@ from tests.test_card7l6a1_delivery import Net, error
 NOTE = ("Cached input is reported as 0: the gateway records none, so 0 is not proof that none was used.")
 OBJECT_KEYS = {"configured", "gateway", "last_seq", "last_read", "last_read_result", "stored", "rows", "failed",
                "quarantine", "quarantine_action", "admission_store", "journal_suppression", "generation_changes", "awaiting_receipt", "overdue", "read_later",
-               "refused", "read_fault", "last_ok", "cached_input"}
+               "refused", "read_fault", "last_ok", "cached_input", "last_read_reason", "source_kind", "cleanup_incomplete"}
 
 
 class _Status(unittest.TestCase):

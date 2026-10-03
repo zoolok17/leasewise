@@ -16,7 +16,7 @@ Status: **built**. Steps 2 (the Windows runner) and 3 (wiring into the reporter 
 The reporter will one day run agenttalk's receipt command and read what it prints. Before it may run anything, it has to
 be sure the operator's settings are sane. This step builds only that: the reporter now checks the `command`, its options,
 its time limit and its environment when it starts, and every mistake is refused with one fixed sentence that never repeats
-what the file said. **Nothing is run.** Even a perfect setting is still refused with today's sentence ("Command receipt
+what the file said. **Nothing is run (in this step; step 3 changes this).** Even a perfect setting is still refused with today's sentence ("Command receipt
 sources are not available in this version; use a fixture file."), so nobody can switch the feature on by accident before the
 safe runner exists.
 
@@ -80,8 +80,7 @@ small independent reader that splits the line back), and that no refusal repeats
 
 ## Step 2 of 3: the contained Windows runner (built, not wired in)
 
-Status: **built**. The reporter does not call the runner yet: a valid `command` is still refused at start-up with today's
-sentence. Step 3 wires it in (the cycle budget, the status words, the page rules on the command's bytes).
+Status: **built**. The reporter did not call the runner in this step; step 3 (below) wires it in.
 
 ### In plain words
 
@@ -162,3 +161,60 @@ the old forward-slash acceptance fail the new cases).
 - A launcher that exits before the real program is `leftover_process` or `exit_code`, and the work is ended.
 - Helpers started through another Windows service are outside any job. A drive letter mapped to remote storage is not detected.
 - No memory or processor limits in the job, only a limit on the number of processes (32).
+
+## Step 3 of 3: the runner is wired into the reporter (status, cycle budget, privacy)
+
+Status: **built**. A correctly configured `command` now reads real receipt pages. Live use still waits for two things:
+agenttalk's real receipt command, and the lead's check of how that command reads its options (the compatibility requirement).
+
+### In plain words
+
+The runner of step 2 is connected to the reporter. A `command` on Windows is no longer refused at start-up (every other
+refusal stays), and each cycle runs it to read a page: the page goes through exactly the same strict rules as a fixture file,
+it is captured and released the same way, the cursor moves, and the next read asks for the receipts after the new cursor.
+
+Every failure is a plain word in `status` (it could not start, a protective step failed, it was too slow, it was stopped, it
+exited with an error, a helper held the output, looking at it failed) and then **nothing is captured and the cursor does not
+move**. The advice in `status` follows the failure that is true now: it goes away when a read succeeds, instead of
+staying because of an old count.
+
+Reading receipts cannot hold up the sending of other reports for long: a cycle has a time budget for receipt reading,
+checked before each read starts, and when it is spent the cycle stops reading and goes on to send.
+
+### What was built
+
+- `config.py`: `command`, `timeout_seconds` and `env` are stored on the source (the program path keeps backslashes); the old
+  "not available" sentence is gone; the "only on Windows" sentence stays.
+- `receipts.py`: `read_page(source, after_seq, stop)` runs the contained runner for a command source and hands its bytes
+  **straight** to `parse_page(raw, after_seq, source.page_limit)` (never the fixture-only whole-ledger format). `ok` is a page;
+  `too_large` is a refused page; every other word is read later with that word. `ReadResult.cleanup_confirmed` says whether the
+  end of the job was confirmed. `LATER_REASONS` gains the command words.
+- `run.py` (`_take_pages`): the cycle's receipt budget `max(timeout_seconds, 30)` seconds on a monotonic clock, checked
+  before each read; the reporter's stop event is handed to the read; after each command read the end of the job is noted.
+- `state.py`: the current failure word and the current end-of-job state are kept as notes (replaced by the next read), and
+  the unconfirmed ends are counted.
+- `status.py` (additive, `status_version` stays 3): `source_kind`, `last_read_reason`, `cleanup_incomplete` (`count` and
+  `current`), the new read-later keys, the advice sentences, and a text line for the source and for the unconfirmed ends
+  ("termination requested but not confirmed"). A snapshot of an older reporter is read with defaults.
+
+### Tests (`test_card7l6a1b_wired.py`, 23; the older config, status and adapter tests were adjusted)
+
+Fake commands are small scripts the tests write, run by the base Python (never agenttalk, never a gateway).
+
+| What | Where |
+|---|---|
+| a page is captured and released, the cursor moves, the second cycle asks `--after` the new cursor, our three options are last and the configured arguments arrive unchanged; the result equals a fixture's row for row; a limit of 2 reads in pieces | `EndToEnd` |
+| each failure word reaches `status` with nothing captured and the cursor unmoved: `exit_code`, `not_json`, `cannot_run`, `cannot_contain`, `timeout`, `leftover_process`, `read_failed`, a refused `too_large`, `interrupted` (a stop mid-read; the program is gone); an unconfirmed end is counted, never a success, and clears; the advice follows the current failure; the send passes are independent of a failing read | `Failures` |
+| the cycle budget with a virtual clock: a read that starts just before the budget ends runs and no further read starts; the send passes still run; the budget is at least 30 and otherwise the time limit; the next cycle goes on from the cursor | `Budget` |
+| a loud string in the output, the error output, the path, an argument and the environment appears nowhere in status, notes, counters, tables or the source's repr | `Privacy` |
+| a status snapshot of an older reporter is read with defaults | `OldSnapshot` |
+
+Red first: against the previous source, all 23 fail. Two mutations were tried to prove the tests bite: removing the budget
+check fails 4 of the 4 budget tests, and not handing the stop event to the read makes the stop test run to the 30 s deadline.
+
+### Honest notes
+
+- The cycle bound, with normally returning Windows calls, is `max(t, 30) + t + 2` seconds for receipt reading (about 52 s at
+  the default, about 122 s at 60); it bounds receipt reading, not the whole cycle.
+- Live use needs the real receipt command and a check that its parser reads `--after N --limit M --json` as options.
+- Limits as in step 2 (Windows only, mapped drives, the cooperative deadline, helpers started through another service).

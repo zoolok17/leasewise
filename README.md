@@ -878,14 +878,78 @@ id, an amount or a path):
 - `refused` and `read_later`: how often a read was refused or had to wait, by closed reason;
 - `last_seq`, `stored`, `last_read`, `last_ok` and the note about cached input.
 
+### A command source (card L6a-1b, Windows only)
+
+In plain words: instead of a test file, the reporter can run agenttalk's receipt command and read the page it prints. The
+page goes through exactly the same strict rules as a file. Running another program is the dangerous part, so the reporter
+promises three things: the program and **everything it starts** end together (even a helper started in its first instant),
+it never freezes the reporter, and every failure is a plain word in `status`.
+
+```toml
+[gateway_receipts]
+gateway = "g1"
+admission_store = "C:/path/to/admission.db"
+command = ["C:/path/to/agenttalk.exe", "gateway", "receipts"]   # an argument list, no shell; the first is an .exe
+timeout_seconds = 20                                             # 1 to 60, default 20: one deadline for one read
+# max_bytes = 1048576                                            # the most output read (1024 to 4194304)
+# page_limit = 100                                               # receipts in one page, 1 to 1000
+
+[gateway_receipts.env]                                           # at most 8; the only extra settings the program gets
+AGENTTALK_ROOT = "C:/lw/team"
+```
+
+What the reporter does with it:
+
+- It appends `--after N --limit M --json` **last**, where `N` is the last receipt number it took. Do not write
+  them yourself: any argument that could be read as one of those names is refused at start-up (`--after`, `--after=5`,
+  `--aft`, `--a`, `--l`, `--j` and a bare `--` are all refused; a plain word or `-m` is fine).
+- **Start-up refusals** (one fixed sentence each, never repeating what the file said): not Windows; the command is not a
+  list of 1 to 16 texts; the first element is not a fully qualified `X:\...` path (`C:foo` and `\foo` are refused; `/` is
+  read as `\`); it starts from a network or device path (`\\server`, `//server`, `\\?\`, `\\.\`); it is not an `.exe`
+  (Windows would run a `.bat` or `.cmd` through `cmd.exe`, which splits arguments by other rules); an argument has a double
+  quote or a control character; a reserved option; `timeout_seconds` or `env` outside their bounds, or given with a fixture.
+- **Containment.** The program is created frozen and already inside a Windows job that ends everything in it, checked to be
+  inside, and only then allowed to run. If that cannot be done, nothing runs. When the read ends (or the reporter stops)
+  the job is ended and its own count of live processes is polled to zero. If that cannot be confirmed, the read says so
+  and its output is **not used**.
+- **What the program gets.** Standard input that ends at once, standard error thrown away, only two handles (nothing else
+  the reporter holds), the folder of the program file as its working directory, and an environment of only `SYSTEMROOT`,
+  `SYSTEMDRIVE`, `PATH`, `TEMP` and `TMP` (from the reporter's own environment) plus your `env` table (yours wins, names
+  matched without regard to case). Unlisted variables are excluded. This is lifetime containment, not a sandbox against your
+  own command.
+- **The words in `status`** (`gateway_receipts.read_later`, counts only; nothing is captured and the cursor does not move):
+  `source_missing`, `not_json`, `cannot_run` (it could not be started), `cannot_contain` (a protective step failed: it
+  never ran), `timeout`, `interrupted` (the reporter was stopping), `exit_code` (a non-zero exit: its output is ignored),
+  `leftover_process` (it exited but a helper still held the output), `read_failed`. Too much output is a refused page
+  (`refused.too_large`). `cleanup_incomplete` counts reads whose end was "termination requested but not confirmed";
+  `status` also shows the source kind (`fixture` or `command`) and the last read's word. Advice sentences follow the
+  **current** failure: they go away when a read succeeds.
+- **The cycle budget.** A cycle reads receipts for at most `max(timeout_seconds, 30)` seconds, checked **before** each read
+  starts; then it stops taking pages (the next cycle goes on from the cursor) and the send passes run. A read that starts
+  just before the budget ends runs for its own deadline, so, **with normally returning Windows calls, receipt reading can
+  occupy roughly `max(timeout_seconds, 30) + timeout_seconds + 2` seconds: about 52 s at the default, about 122 s at 60.**
+  This bounds receipt reading, not the whole cycle.
+
+Limits, plainly:
+
+- **Before live use, the receipt command's own option parser must be checked.** The command must parse the appended
+  `--after N --limit M --json` as options. Configured arguments must not introduce aliases of those options,
+  argument-file expansion (`@file`), or a remainder/forwarding mode that consumes them. Other parsers are unsupported. The
+  refusal of shortened spellings is a guard, not a proof for every parser.
+- **The deadline is cooperative.** It holds while the Windows calls return normally. Not covered: creating the process, the
+  setup before the clock starts, and a possible wait inside `PeekNamedPipe`. The reporter must be the only reader of the pipe.
+- A drive letter mapped to remote storage is not detected as a network path; the operator is responsible for it.
+- Helpers started through another Windows service (a scheduled task, a service) are outside any job. A launcher that
+  exits before the real program is reported as `leftover_process` or `exit_code` and its work is ended: name the real program.
+- The job holds at most 32 processes and has no memory or processor limits.
+- Windows only; Linux and macOS are a later card.
+
 ### How to set it up
 
 1. **Save the ids again.** `policy-ids` also lists `gateways` (alias and local id). Save its output
    again; an older snapshot has none, and the reporter then refuses to start if `gateway_receipts` is set.
-2. **Add the block** to the reporter configuration. Name `admission_store` and a `fixture` file. **A `command`
-   source (a program the reporter would run) is not available in this version**: the reporter refuses to start with
-   "Command receipt sources are not available in this version; use a fixture file." Live use needs card L6a-1b (see
-   the limits):
+2. **Add the block** to the reporter configuration. Name `admission_store` and **exactly one** receipt source: a
+   `fixture` file (tests) or a `command` (a program the reporter runs, **Windows only**; see "A command source" below):
 
 ```toml
 [gateway_receipts]
@@ -910,19 +974,12 @@ fixture = "C:/path/to/receipts.json"            # a ledger file (tests)
 - **No history limit any more (card L6a-2).** Card L6a-1 read the granted rows of the admission store whole, up to
   100,000. The reporter now copies new grants in batches after a durable grant number (see card L6a-2 below), so no
   history size can stop it. Never delete admissions.
-- **Command sources are not available yet (card L6a-1b).** This version reads receipts from a fixture file only.
-  *Coming with L6a-1b; refused in this version.* Step 1 of that card already checks the settings at start-up, so a
-  mistake gets its own fixed sentence, but even a perfect block is still refused with the sentence above: `command` (an
-  argument list, the first an absolute `.exe` path on a local drive, Windows only), `timeout_seconds` (1 to 60, default
-  20) and `env` (at most 8 settings). The operator may not name `--after`, `--limit` or `--json` in any spelling; the
-  reporter adds them itself. Nothing is started yet.
-  A source that is a program the reporter runs needs its own card, because the program must be started already
-  contained. Its starting requirements: the program is created suspended, put into its job, then resumed (on POSIX
-  its own session, with the limit that a descendant can leave it); it fails closed when it cannot be contained; one
-  deadline covers reading, exit and cleanup, with no blocking close after a timed wait; and the reserved options
-  (`--after`, `--limit`) are refused in every spelling.
-- **Fixture-only.** agenttalk does not have the receipt command yet (its card 6a-1), so the page format
-  is our reading of the design and lives in one file (`quota_balancer/reporter/receipts.py`).
+- **Command sources are for Windows only (card L6a-1b).** On any other system a configured `command` is refused at
+  start-up with "Command receipt sources are only available on Windows in this version; use a fixture file." (see
+  "A command source" below for what it does and what it does not promise).
+- **The page format is still our reading of the design.** agenttalk does not have the receipt command yet (its card
+  6a-1), so the page format lives in one file (`quota_balancer/reporter/receipts.py`); a fixture file is the only source
+  that exists today.
 - **Nothing is compacted.** Kept receipts and their messages are never edited or deleted. A page with a
   gap or a repeated number is refused whole.
 - **A replaced ledger cannot rebuild old receipts that were never received.** The record of a lease does

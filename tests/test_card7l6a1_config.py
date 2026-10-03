@@ -68,16 +68,17 @@ class Block(_Tmp):
         self.assertEqual((source.gateway, source.fixture), (GATEWAY_ALIAS, self.fixture))
         self.assertEqual((source.max_bytes, source.page_limit, source.gateway_id), (1024 * 1024, 100, None))
 
-    def test_a_valid_command_source_is_still_refused_at_start_up_with_today_s_sentence(self):
-        """D2/D3: a program the reporter would run is not part of this version until card L6a-1b step 3."""
+    def test_a_valid_command_source_is_accepted_on_windows_and_a_fixture_one_has_no_command(self):
+        """Card L6a-1b step 3: a correctly configured command is a source now; the checks themselves are in
+        test_card7l6a1b_config."""
         text = "[gateway_receipts]\ngateway = %s\nadmission_store = %s\ncommand = %s\n" % (
             _q(GATEWAY_ALIAS), _q(self.store), _q([EXE, "x"]))
         with mock.patch.object(cfg, "_windows", return_value=True):
-            with self.assertRaises(cfg.ConfigError) as caught:
-                self.parse(text)
-        self.assertEqual(caught.exception.message, cfg.MSG_NO_COMMAND_SOURCE)
-        self.assertEqual(caught.exception.message,
-                         "Command receipt sources are not available in this version; use a fixture file.")
+            source = self.parse(text).gateway_receipts
+        self.assertEqual((source.command, source.timeout_seconds, source.env, source.fixture),
+                         ((EXE, "x"), 20, (), None))
+        fixture = self.parse(self.fixture_block()).gateway_receipts
+        self.assertEqual((fixture.command, fixture.timeout_seconds, fixture.env), (None, None, ()))
 
     def test_exactly_one_source_is_named(self):
         self.refused("[gateway_receipts]\ngateway = %s\nadmission_store = %s\n" % (_q(GATEWAY_ALIAS), _q(self.store)))
