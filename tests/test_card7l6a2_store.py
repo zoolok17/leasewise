@@ -180,9 +180,11 @@ class ReaderSeesCommits(_Dir):
         one.save_grant(row["id"], grant())
         other = one.begin_request("alpha", "m2", "req-2", "A", 10)
         one.conn.execute("BEGIN IMMEDIATE")
-        one.conn.execute("UPDATE admission SET state='granted', lease_id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',"
-                         " gateway_id='7b1e3c52-0d4a-4a8e-9c61-5f2a8d3b9e01', reference='x', ref_sha256=?,"
-                         " ttl_seconds=1, expires_ms=1 WHERE id=?", ("a" * 64, other["id"]))
+        second = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        one.conn.execute("UPDATE admission SET state='granted', lease_id=?,"
+                         " gateway_id='7b1e3c52-0d4a-4a8e-9c61-5f2a8d3b9e01', reference=?, ref_sha256=?,"
+                         " ttl_seconds=1, expires_ms=1 WHERE id=?",
+                         (second, second, hashlib.sha256(second.encode("ascii")).hexdigest(), other["id"]))
         status, found = store.read_bindings(self.path)                                    # not committed yet
         self.assertEqual((status, len(found)), (store.OK, 1))
         one.conn.execute("COMMIT")
