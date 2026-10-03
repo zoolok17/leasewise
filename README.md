@@ -548,10 +548,16 @@ part will:
   `ledger_basis = "ex_vat"`; that is a convention of the gateway, not a field Leasewise can check (residual risk R-016). A gateway
   share used as its own ceiling rounds **down** (a limit never allows more than it is); used as an allocation against the cap it
   still rounds up. Tokens and slots are never converted.
+  - **A cap shared by several accounts** (a team or project cap) holds the spending of accounts that may have different rates.
+    Each contributing account's receipts and holds are read separately, converted with **that account's own policy** (rounded
+    up), and only then added. The asking account's policy is never applied to another account's spending, and no account is left
+    out. The cap is read in each account's cap basis, so accounts that share a cap should declare the same cap basis.
   - An account with **no billing policy** compares the lease books as they are.
-  - A policy that **cannot convert** (a basis is `unknown`, or the bases differ and no VAT rate is given) leaves the lease books
-    compared as they always were: there is nothing to convert with, and nothing is guessed.
-  - With equal bases (every account today: `ex_vat` and `ex_vat`) every answer is the one it always was.
+  - A policy that **cannot convert** (a basis is `unknown`, or the bases differ and no VAT rate is given) leaves that account's
+    lease books compared as they always were: there is nothing to convert with, and nothing is guessed. In a shared cap this
+    applies to that account's part only. **This already matters for advisory leases today:** a missing VAT rate can admit a lease
+    where a known rate would refuse it. It is also a gate item before enforcement is switched on.
+  - With equal bases (every account today: `ex_vat` and `ex_vat`) and with no policy, every answer is the one it always was.
 - **Fixed now (part 2, R1-M5): unknown stays unknown through the sums.** The evaluator and the opening planner add through the
   same module: a sum with an unknown term is unknown (never the known part, never 0), and the evaluator then shows no headroom.
   The terms of the admission inequality are built as known or unknown (`money.gateway_exposure`, `money.account_exposure`,
@@ -560,7 +566,8 @@ part will:
   lease twice (safe, stated), never unknown and never 0. The coordinator's headroom is never larger than the evaluator's. These
   terms are built and tested; the reducer that calls them is a later card (R1-3).
 
-Normal-size results are identical before and after.
+Results are identical before and after with equal bases and with no billing policy. With different bases the conversion decides,
+by design; with a policy that cannot convert, the answer is the old one.
 
 ### Technical detail (R1-M)
 
@@ -574,7 +581,10 @@ Part 2: `lease._lease_basis` reads the account's policy (None when there is none
 a lease-book amount with `money.convert_total` (exact above every bound, saturated at 2^63, rounded up). `reduce.convert_basis`
 takes a rounding role (`"up"` by default, so every older caller is unchanged). `billing_eval._normalize_money` keeps
 `share_micro_eur` (the allocation, up) and adds `share_limit_micro_eur` (the ceiling, down), which `billing_open` reads.
-Tests: `tests/test_cardr1_money_basis.py`, `tests/test_cardr1_money_unknown.py`. Record: `docs/STEP-CARD-R1-M2.md`.
+`lease._scope_total` reads a shared scope per account (`money.exact_sums` once per contributing account), converts each total with
+that account's own `_lease_basis`, and adds with `money.add`.
+Tests: `tests/test_cardr1_money_basis.py`, `tests/test_cardr1_money_unknown.py`, `tests/test_cardr1_money_shared.py`. Record:
+`docs/STEP-CARD-R1-M2.md`.
 
 ## Card 7a-2 - the reporter core
 

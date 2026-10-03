@@ -64,21 +64,30 @@ this rule. A reserved or uncertain attempt is charged at the reserve rates, and 
 1. **A policy that cannot convert leaves the lease books as they were.** If the policy's ledger or cap basis is `unknown`, or the
    bases differ and no VAT rate is given, `_lease_basis` is None and admission compares the books as it always did. The design said an
    unknown term should make enforced admission refuse. I did not do that: it would change the answers of accounts that exist today
-   and it was not in the lead's decisions. It is stated in the README, pinned by a test, and is a question for the lead. (Only enforced
-   metered leases are affected, and those are off: `METERED_ENFORCEMENT_ACTIVATED` is False.)
+   and it was not in the lead's decisions (accepted as D-168). It is stated in the README and pinned by a test. **It already affects
+   advisory admission today**: the advisory budget check and the scope caps apply to advisory leases, so a missing VAT rate can admit
+   a lease where a known rate would refuse it. It also remains a gate item before enforcement (`METERED_ENFORCEMENT_ACTIVATED`)
+   is switched on. In a shared cap the fallback applies to the unconvertible account's part only.
 2. **Gateway receipts are taken as `ex_vat`** (agenttalk's answer C1). Leasewise has no field to check it; the policy's
    `ledger_basis` is what the operator declares. This is residual risk R-016, a convention, not a verified fact.
 3. **The conversion is applied to the sum of a group, not to each row,** except in the advisory check, which folds receipt by
-   receipt and stops early. Rounding the sum up never counts less than the exact value and counts at most one micro-EUR less than
-   rounding each row up.
+   receipt and stops early. Rounding a sum up and summing individually rounded rows differ by up to n - 1 units for n rows (ten rows
+   of 1 at 20% give 12 against 20), and **both are at least the exact exposure**, so neither counts less than what was spent.
 4. **Holds** keep their stored raw amounts (the stored evidence is never rewritten); the conversion happens at the comparison.
 5. **Caps** (`limits.hard`) are read as being in the cap basis, like the budget.
+6. **A shared cap is summed per account** (fix round 1, D-172). A team or project cap holds the spending of several accounts. Each
+   account's receipts and holds are read separately, converted with that account's own policy (rounded up) and then added; the
+   asking account's policy is never applied to another account's spending, and no account is left out. The cap is read in each
+   account's cap basis, so accounts that share a cap should declare the same one.
 
 ## Tests
 
-Red first: against the previous code, all 37 new tests fail (4 failures and 305 errors, counting the subtests). The tests that pin
-unchanged answers (`Unchanged`) describe behaviour that already existed; they pass before and after, and are there so that they keep
-passing.
+Red first: against the previous code, all 37 new tests of the first build fail (4 failures and 305 errors, counting the subtests),
+but many only because the new helpers do not exist yet. **These describe unchanged behaviour and would pass against the old
+behaviour:** all four `Unchanged` tests, `test_equal_bases_give_the_same_figure_for_both_uses`, `test_an_unknown_basis_converts_nothing`,
+`test_an_overflow_is_still_invalid_config_and_so_is_a_value_that_is_not_an_amount`,
+`test_checked_lets_unknown_through_and_refuses_what_the_store_could_not_keep` (for the amounts the store can keep) and
+`test_a_known_part_that_passes_the_limit_still_decides_through_the_module`. They are there so that they keep passing.
 
 `tests/test_cardr1_money_basis.py` (17):
 - `Different`: `test_the_account_receipts_are_converted_up_before_the_budget_is_compared`,
@@ -129,3 +138,29 @@ no existing test does both.
   normalisation, so the agreement is checked against real code, not against a copy.
 - The unknown-basis choice (decision 1 above) deserves the lead's eye.
 - Not done, by decision: no change to `validate_policies.py`; no per-gateway comparison of reports with receipts (no such path yet).
+
+## Fix round 1 (Codex's read of part 2; D-172)
+
+In plain words: a team cap is shared by several accounts, and the first build converted everyone's past spending with the policy of
+whichever account was asking. So a second account with another VAT rate could make spending that was already over the cap look
+below it, and its lease was admitted. Codex reproduced it through the public advisory grant: a team cap of 1,150 in the invoice
+basis; account A (20% VAT) has spent 1,000 excluding VAT, which is 1,200; A was refused and B (10% VAT, no spending) was admitted,
+because A's spending was recalculated at B's rate as 1,100.
+
+- **Fix.** `lease._scope_total` reads a shared scope once per contributing account, converts each account's exact total with that
+  account's own policy (an exposure, rounded up), and adds with `money.add`. It is used for the scope receipts and the scope holds.
+  The account budget is one account's own and is unchanged. An account whose policy cannot convert contributes its raw amount, for its
+  own part only (the accepted fallback).
+- **Tests** (`tests/test_cardr1_money_shared.py`, 8). Red first: against the previous `lease.py`, 7 of the 8 fail (2 failures, 5
+  errors); the one that passes is the cap the spending does not reach. Codex's reproduction through the public grant
+  (`test_account_a_is_refused_and_so_is_account_b`), the same for holds
+  (`test_open_holds_of_another_account_are_converted_with_that_accounts_policy`), a cap the spending does not reach admits both
+  (`test_a_cap_that_the_spending_does_not_reach_still_admits_both`), changing the requester never changes the value of historical
+  spending (`test_changing_the_requester_never_changes_the_value_of_historical_spending`), equal bases are the plain sum
+  (`test_equal_bases_are_the_plain_sum_whoever_asks`), an account with no policy contributes its raw amount
+  (`test_an_account_with_no_policy_contributes_its_raw_amount`), one unconvertible account falls back for its own part only
+  (`test_an_unconvertible_account_keeps_its_raw_amount_for_its_own_part_only`), and a huge account stays above every cap
+  (`test_the_total_of_a_huge_account_stays_above_every_cap`).
+- **Docs.** The D-168 fallback is now stated to affect advisory admission today (decision 1); the rounding statement is corrected
+  (decision 3); the README no longer says "every answer unchanged" except for equal bases and no policy; the tests that describe
+  unchanged behaviour are named above.
