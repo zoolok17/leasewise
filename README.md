@@ -340,7 +340,8 @@ A report (`/settle` receipt) about a **shadow** lease may now say "unknown" for
 its token counts: `input_tokens`, `cached_input_tokens` and `output_tokens` may each
 be `null` (stored as NULL, not 0); `calls` stays a required whole number. Every
 other kind of lease (metered, advisory, subscription) must still report whole
-numbers; a `null` there is `INVALID_REQUEST`. Shadow reports are observe-only:
+numbers; a `null` there is `INVALID_REQUEST`, except for the one case that card
+L6a-0 adds below. Shadow reports are observe-only:
 whether known or unknown, they never count toward any token or money limit. This
 needs schema version 9 (`init` upgrades a version-8 store in one transaction,
 keeping every receipt).
@@ -369,6 +370,59 @@ last among the policy checks and never for a replay, so receiving it proves that
 lease exists for that request id: the caller may rebuild the request with a
 fresh estimate. Every other bad request is still `INVALID_REQUEST`. See
 docs/STEP-CARD-L1D.md.
+
+## Card L6a-0 - unknown token counts on a gateway's final receipt
+
+**Status: built.** When a paid-model gateway "charges the reserve" for an attempt it could not prove,
+it knows the money but not how many tokens were used. Until now Leasewise refused any final receipt
+with an unknown token count for a lease that is not shadow, so such a lease could never be settled.
+Now it can, in exactly one case, and the lease is marked so that nobody mistakes "unknown" for "zero".
+Audience: the operator and anyone who reads Leasewise's receipts later. See docs/STEP-CARD-L6A-0.md.
+
+**The rule.** A receipt may leave `input_tokens` and/or `output_tokens` as `null` only when all of
+these are true:
+1. it is a **final** receipt;
+2. it names the lease's **own gateway** (no gateway, or another one, is not enough; another gateway
+   is still `RECEIPT_CONFLICT` and parks the account);
+3. it carries the money, `actual_micro_eur`;
+4. `cached_input_tokens` is a whole number (the gateway sends 0);
+5. the lease is `metered` or `metered_advisory`.
+
+Anything else with a null count is still `INVALID_REQUEST`; subscription and shadow leases behave as
+before. Replays work as usual: the same receipt again is a harmless `200`, and a changed one under the
+same event id is `IDEMPOTENCY_CONFLICT`.
+
+**What happens to the lease.** It settles. The money is settled and any overrun recorded exactly as
+before. A **token hold is kept whole** (nothing is refunded, no token overrun is computed), because an
+unknown number is not a zero.
+
+**How it is marked.** There is no new column. A lease is `usage_unknown` when its final receipt has a
+null input or output count (`lease.usage_unknown(conn, lease_id)`), and the audit row written when the
+lease settles says `"usage_unknown": 1`.
+
+**The next lease waits (input budget).** Accepting the receipt is not enough: the admission check adds
+up the input tokens of settled leases, an addition skips unknown values, and a settled lease holds
+nothing any more (an advisory lease never held anything). So unknown input would silently vanish from
+the next decision. Instead: **while any final receipt of a lease that is not shadow has unknown input
+tokens inside a scope's window, a new lease that needs that scope's input limit is refused with
+`INPUT_USAGE_UNKNOWN`** (HTTP 429, exit code 2, the text "input usage in this window is unknown until
+the window rolls over"). Details:
+- it applies to every scope (platform, project, team, seat) that has an input-token limit in that
+  window, and only to the scopes the receipt's lease belongs to;
+- the window is the lease's grant day or grant month, as for every other settled usage, so **the refusal
+  lasts until the window rolls over** (the next day for a daily limit, the next month for a monthly one);
+  nothing clears it earlier;
+- a receipt with **known** input and unknown **output** does not trigger it: its known input stays in
+  the sum;
+- shadow requests and shadow receipts are not affected (they never count toward any limit);
+- money is not affected: the account budget only adds up money, which a final receipt always carries.
+
+**For anyone who reads receipts later (reports, analytics): a null token count means "unknown", never
+0.** Do not add it up as zero and do not average over it. The admission check above is the one reader
+of the input column today, and it treats unknown as a reason to wait, not as zero.
+
+**Limit.** The gateway side that produces such receipts is not built yet (card 6a); today only a test
+or an operator can send one.
 
 ## Card 7a-2 - the reporter core
 
