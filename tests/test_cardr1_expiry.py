@@ -169,6 +169,24 @@ class AdvisoryBudget(_Case):
                 else:
                     self.refused(errors.CODE_MONEY_LIMIT, NOW + 2000)
 
+    def test_a_total_larger_than_the_database_can_add_is_still_money_limit_never_store_error(self):
+        """Codex's corner: each amount may be the largest whole number the store keeps, so SQLite's SUM would overflow."""
+        top = 2 ** 63 - 1
+        self.store(budget=top)
+        first, second = self.grant(), self.grant()                     # both are granted before either settles
+        self.settle(first["lease_id"], NOW + 1000, money=top)
+        self.settle(second["lease_id"], NOW + 1000, money=1)
+        with self.assertRaises(errors.QuotaError) as caught:
+            self.grant(NOW + 2000)
+        self.assertEqual(caught.exception.code, errors.CODE_MONEY_LIMIT)
+
+    def test_a_large_history_stops_adding_as_soon_as_the_cap_is_reached(self):
+        self.store(budget=1000)
+        leases = [self.grant()["lease_id"] for _ in range(4)]
+        for lease_id in leases:
+            self.settle(lease_id, NOW + 1000, money=400)
+        self.refused(errors.CODE_MONEY_LIMIT, NOW + 2000)
+
     def test_an_account_with_no_spend_is_never_refused(self):
         self.store(budget=1)
         self.assertEqual(self.grant()["enforcement"], "metered_advisory")

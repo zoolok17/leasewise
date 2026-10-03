@@ -559,14 +559,21 @@ def _annotations(conn, chain, account_id, enforcement, now_ms):
 def _advisory_budget_check(conn, account_id, budget, now_ms):
     """m7 (card R1-2): an advisory lease holds nothing, so the account budget never saw it. It is refused
     MONEY_LIMIT once the account's KNOWN final receipt money for this month has reached the cap (inclusive).
-    Only final receipts with a known `actual_micro_eur` count (the SUM skips an unknown one); holds are not
-    added; a shadow lease never counts. This stops work on known spend only and claims no complete accounting."""
-    spent = conn.execute(
-        "SELECT COALESCE(SUM(r.actual_micro_eur),0) FROM receipts r JOIN leases l ON l.id=r.lease_id "
-        "WHERE r.final=1 AND l.enforcement <> 'shadow' AND l.period_start=? AND l.account_id=?",
-        (_month_start_ms(now_ms), account_id)).fetchone()[0]
-    if spent >= budget:
-        raise QuotaError(errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT)
+    Only final receipts with a known `actual_micro_eur` count; holds are not added; a shadow lease never counts.
+    This stops work on known spend only and claims no complete accounting.
+
+    The amounts are added here, as whole Python numbers, and the adding stops the moment the total reaches the
+    cap. The database's own SUM is not used: each amount may be as large as the largest number it keeps, and a
+    total that overflows would answer "the store failed" instead of "the budget is used up"."""
+    spent = 0
+    for (amount,) in conn.execute(
+            "SELECT r.actual_micro_eur FROM receipts r JOIN leases l ON l.id=r.lease_id "
+            "WHERE r.final=1 AND r.actual_micro_eur IS NOT NULL AND l.enforcement <> 'shadow' "
+            "AND l.period_start=? AND l.account_id=?",
+            (_month_start_ms(now_ms), account_id)):
+        spent += amount
+        if spent >= budget:
+            raise QuotaError(errors.CODE_MONEY_LIMIT, errors.MSG_MONEY_LIMIT)
 
 
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,

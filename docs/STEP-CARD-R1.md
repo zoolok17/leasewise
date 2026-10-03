@@ -193,6 +193,19 @@ reached its cap, and a test proves again that paid enforcement is impossible tod
 N5 (a replay after the project loses the account), N3 (an overrun re-parks a probing block) and m4 (a subscription seat
 on a paid account) are **no longer open**: they were closed by cards L1d, L1a and 5, and these tests keep them pinned.
 
+### Fix round 1: the total cannot overflow
+
+Codex found one corner: the advisory budget check added up the known spend with the database's own `SUM`, and each
+amount may be as large as the largest whole number the database keeps, so the total could overflow and answer
+`STORE_ERROR` (503, "the store failed") instead of `MONEY_LIMIT` (429, "the budget is used up"). The lease was stopped
+either way, so no money leaked, but the answer was wrong. The check now reads the known final amounts and adds them as
+whole Python numbers, stopping as soon as the total reaches the cap; nothing else about it changed. Tests:
+`AdvisoryBudget.test_a_total_larger_than_the_database_can_add_is_still_money_limit_never_store_error` (budget
+`2**63-1`; two leases granted before either settles; finals of `2**63-1` and `1`; the next grant is `MONEY_LIMIT`;
+red before the fix) and `test_a_large_history_stops_adding_as_soon_as_the_cap_is_reached`.
+Older accounting queries elsewhere in `lease.py` still use SQLite `SUM`. An overflow there fails closed with
+`STORE_ERROR`; this round does not change them.
+
 ### Limits and claims (12.6)
 
 After R1 Phase 1: window checks are explicit about missing, stale and unknown evidence and a window known to be used up
