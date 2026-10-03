@@ -1186,5 +1186,309 @@ class PrivacyCore(_Base):
             self.assertEqual(str(exc), "the journal record is invalid")
 
 
+# --- fix round 1 (tk-15619ce77471): F1-F5 and L1-L2 -------------------------------
+
+MARGIN = rounds.CLOCK_SKEW_ALLOWANCE_SECONDS * 1000
+
+
+class FixRound1Completeness(_Base):
+    def test_f1_a_rotation_header_is_a_watermark_not_an_observed_event(self):
+        s = self.journal.add_stream("g1", T0)
+        # Two events were written, then their complete lines were damaged;
+        # each rotation header still attests to its number.
+        s.seq = s.written_seq = 1
+        s.raw(b"{broken first event}\n")
+        s.rotate(T0 + 2000)
+        s.seq = s.written_seq = 2
+        s.raw(b"{broken second event}\n")
+        s.rotate(T0 + 3000)
+        s.dispatch("m1", "known", T0 + 4000, message_at=T0 + 1000)
+        s.disposed("m1", "completed", T0 + 5000, message_at=T0 + 1000)
+        self.round()
+        self.assertEqual(self.state.counter("alpha", "damaged_lines"), 2)
+        final = self.final("m1")
+        self.assertEqual(final["complete"], 0)
+        self.assertIn("seq_gap", self.status("m1")[2].split(","))
+        self.assertIsNone(final["body"]["input_tokens"])
+        self.assertEqual(final["body"]["calls"], 1)          # only what was seen
+
+    def test_f1_a_watermark_beyond_every_read_event_is_a_lost_tail(self):
+        s = self.journal.add_stream("g1", T0)
+        s.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        s.seq = s.written_seq = 9                            # events 3..9 vanished
+        s.rotate(T0 + 3000)
+        s.disposed("m1", "completed", T0 + 3500, message_at=T0 + 1000)
+        s.seq = s.written_seq = 12
+        s.rotate(T0 + 9000)                                  # a header, no events
+        self.round()
+        self.assertIn("seq_gap", self.status("m1")[2].split(","))
+
+    def test_f2_a_loss_before_the_disposition_in_the_same_millisecond(self):
+        s = self.journal.add_stream("g1", T0)
+        s.dispatch("m1", "known", T0 + 2000, end_at=T0 + 3000,
+                   message_at=T0 + 1000)
+        s.lose()
+        s.lose()
+        s.disposed("m1", "completed", T0 + 3000, message_at=T0 + 1000)
+        self.round()
+        self.assertEqual(self.final("m1")["complete"], 0)
+        self.assertIn("seq_gap", self.status("m1")[2].split(","))
+
+    def test_f2_a_loss_after_the_disposition_does_not_taint_it(self):
+        s = self.journal.add_stream("g1", T0)
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        s.lose()
+        s.dispatch("m2", "t2", T0 + 3000, message_at=T0 + 2500)
+        self.round()
+        self.assertEqual(self.final("m1")["complete"], 1)
+
+    def test_f2_across_streams_a_timestamp_tie_counts_as_overlapping(self):
+        g1 = self.journal.add_stream("g1", T0)
+        g1.dispatch("x", "t-x", T0 + 2900, end_at=T0 + 3000, message_at=T0 + 100)
+        g1.lose()                                  # lost in g1, after 3000
+        g1.close(T0 + 4000)
+        g2 = self.journal.add_stream("g2", T0 + 2950, previous="g1")
+        message(g2, "m1", T0 + 2000, T0 + 2960, T0 + 3000)
+        self.round()
+        self.assertEqual(self.final("m1")["complete"], 0)
+        self.assertIn("seq_gap", self.status("m1")[2].split(","))
+
+    def test_f4_a_kind_that_is_a_list_or_an_object_is_a_damaged_line(self):
+        s = self.journal.add_stream("g1", T0)
+        for number, kind in ((1, []), (2, {"a": 1})):
+            s.raw(line(_event_obj(kind=kind, stream="alpha.g1", seq=number)))
+            s.seq = s.written_seq = number
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        self.round()                                  # must not raise
+        self.assertEqual(self.state.counter("alpha", "damaged_lines"), 2)
+        self.assertIsNotNone(self.final("m1"))        # the later records were read
+        self.assertEqual(self.final("m1")["complete"], 0)
+        self.assertIn("seq_gap", self.status("m1")[2].split(","))
+
+    def test_f4_a_deeply_nested_line_is_a_closed_parser_error(self):
+        with self.assertRaises(events.JournalError):
+            events.parse_event(b"[" * 1200 + b"0" + b"]" * 1200)
+        with self.assertRaises(events.JournalError):
+            events.parse_stream_record(b"[" * 1200 + b"0" + b"]" * 1200)
+        s = self.journal.add_stream("g1", T0)
+        s.raw(b"[" * 1200 + b"0" + b"]" * 1200 + b"\n")
+        s.seq = s.written_seq = 1
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        self.round()
+        self.assertEqual(self.state.counter("alpha", "damaged_lines"), 1)
+
+
+class FixRound1Crash(_Base):
+    def expected_after_crash(self, stage):
+        s = self.journal.add_stream("g1", T0)
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+
+        def crash(name):
+            if name == stage:
+                raise RuntimeError("simulated crash")
+        with self.assertRaises(RuntimeError):
+            self.round(fault=crash)
+        self.reopen()
+        s.dispatch("m1", "late", T0 + 4000, message_at=T0 + 1000)
+        self.round()
+        late = self.state.one("SELECT COALESCE(SUM(count),0) FROM late")[0]
+        return (self.final("m1")["body"]["calls"], self.count("report"), late)
+
+    def test_f3_a_crash_after_the_data_keeps_the_round_boundary(self):
+        self.assertEqual(self.expected_after_crash("data"), (1, 1, 2))
+
+    def test_f3_a_crash_after_the_cursor_keeps_the_round_boundary(self):
+        self.assertEqual(self.expected_after_crash("cursor"), (1, 1, 2))
+
+    def test_f3_no_crash_gives_the_same_answer(self):
+        s = self.journal.add_stream("g1", T0)
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        self.round()
+        s.dispatch("m1", "late", T0 + 4000, message_at=T0 + 1000)
+        self.round()
+        late = self.state.one("SELECT COALESCE(SUM(count),0) FROM late")[0]
+        self.assertEqual((self.final("m1")["body"]["calls"],
+                          self.count("report"), late), (1, 1, 2))
+
+    def test_f3_the_crashed_round_is_finished_before_new_input_is_read(self):
+        s = self.journal.add_stream("g1", T0)
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+
+        def crash(name):
+            if name == "cursor":
+                raise RuntimeError("simulated crash")
+        with self.assertRaises(RuntimeError):
+            self.round(fault=crash)
+        self.reopen()
+        self.assertEqual(self.count("final"), 0)
+        result = self.round()
+        self.assertEqual(self.count("final"), 1)
+        self.assertEqual(result.new_events, 0)
+
+
+class FixRound1Agents(_Base):
+    def setUp(self):
+        super().setUp()
+        self.configs["beta"] = AgentConfig("beta", SEAT, MODEL, "bounded_read",
+                                           "opus", 1, 2, 1000, 500, 1000)
+        self.beta = Journal(self.root, "beta")
+
+    def test_f5_a_configuration_fault_drops_and_counts_the_queued_reports(self):
+        a = self.journal.add_stream("g1", T0)
+        b = self.beta.add_stream("g1", T0)
+        a.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        a.dispatch("m1", "t2", T0 + 2100, message_at=T0 + 1000)
+        message(b, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        a.disposed("m1", "completed", T0 + 2500, message_at=T0 + 1000)
+        self.round()
+        item = self.state.next_item(NOW)
+        self.assertEqual((item.agent, item.kind), ("alpha", "acquire"))
+        self.state.apply(item, Response(403, "POLICY_DENIED"), NOW)
+        self.assertEqual(self.state.all(
+            "SELECT state FROM report WHERE agent='alpha'"),
+            [("dropped",), ("dropped",)])
+        self.assertEqual(self.state.counter("alpha", "reports_dropped"), 2)
+        self.assertEqual(self.state.one(
+            "SELECT state FROM final WHERE agent='alpha'")[0], "pending")
+        self.assertEqual(self.state.one(
+            "SELECT state FROM report WHERE agent='beta'")[0], "pending")
+        self.assertEqual(self.state.counter("beta", "reports_dropped"), 0)
+
+    def test_f5_reports_that_arrive_after_the_stop_are_dropped_and_counted(self):
+        a = self.journal.add_stream("g1", T0)
+        a.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        self.round()
+        item = self.state.next_item(NOW)
+        self.state.apply(item, Response(403, "POLICY_DENIED"), NOW)
+        a.dispatch("m2", "t2", T0 + 3000, message_at=T0 + 2000)
+        self.round()
+        self.assertEqual(self.state.all(
+            "SELECT message_id, state FROM report ORDER BY id"),
+            [("m1", "dropped"), ("m2", "dropped")])
+        self.assertEqual(self.state.counter("alpha", "reports_dropped"), 2)
+
+    def test_f5_a_fault_answered_to_a_report_drops_it_too(self):
+        a = self.journal.add_stream("g1", T0)
+        a.dispatch("m1", "t1", T0 + 2000, message_at=T0 + 1000)
+        self.round()
+        first = self.state.next_item(NOW)
+        self.state.apply(first, accept(first), NOW)
+        report = self.state.next_item(NOW)
+        self.assertEqual(report.kind, decisions.REPORT)
+        self.state.apply(report, Response(403, "FORBIDDEN"), NOW)
+        self.assertEqual(self.state.one("SELECT state FROM report")[0],
+                         "dropped")
+        self.assertEqual(self.state.counter("alpha", "reports_dropped"), 1)
+
+
+class FixRound1Skew(_Base):
+    """L1: every comparison of the sender's `message_at` with a local time
+    allows CLOCK_SKEW_ALLOWANCE_SECONDS, on each side of the margin."""
+
+    def reasons(self, mid):
+        return self.status(mid)[2].split(",")
+
+    def test_the_missing_predecessor_rule_has_a_margin(self):
+        start = T0 + 100_000
+        s = self.journal.add_stream("g2", start, previous="g1")
+        message(s, "inside", start + MARGIN - 1, start + MARGIN + 5000,
+                start + MARGIN + 6000)
+        message(s, "outside", start + MARGIN, start + MARGIN + 7000,
+                start + MARGIN + 8000)
+        self.round()
+        self.assertIn("missing_stream", self.reasons("inside"))
+        self.assertNotIn("missing_stream", self.reasons("outside"))
+
+    def test_a_registered_stream_without_files_has_a_margin_too(self):
+        self.journal.add_stream("g1", T0, header=False)
+        g2 = self.journal.add_stream("g2", T0 + 100_000, previous="g1")
+        base = T0 + 100_000 + MARGIN
+        message(g2, "inside", base - 1, base + 1000, base + 2000)
+        message(g2, "outside", base, base + 3000, base + 4000)
+        self.round()
+        self.assertIn("missing_stream", self.reasons("inside"))
+        self.assertNotIn("missing_stream", self.reasons("outside"))
+
+    def test_a_loss_in_another_stream_has_a_margin(self):
+        g1 = self.journal.add_stream("g1", T0)
+        g1.dispatch("x", "t-x", T0 + 1000, end_at=T0 + 1100, message_at=T0 + 100)
+        g1.lose()
+        g1.close(T0 + 3000)                       # the lost event is before 3000
+        g2 = self.journal.add_stream("g2", T0 + 3500, previous="g1")
+        inside = T0 + 3000 + MARGIN
+        message(g2, "inside", inside, T0 + 4000, T0 + 4100)
+        message(g2, "outside", inside + 1, T0 + 4200, T0 + 4300)
+        self.round()
+        self.assertIn("seq_gap", self.reasons("inside"))
+        self.assertNotIn("seq_gap", self.reasons("outside"))
+
+    def test_a_message_time_after_its_disposition_has_a_margin(self):
+        s = self.journal.add_stream("g1", T0)
+        s.disposed("ok", "outcome_unknown", T0 + 3000,
+                   message_at=T0 + 3000 + MARGIN)
+        s.disposed("bad", "outcome_unknown", T0 + 3100,
+                   message_at=T0 + 3100 + MARGIN + 1)
+        self.round()
+        self.assertNotIn("clock_inconsistent", self.reasons("ok"))
+        self.assertIn("clock_inconsistent", self.reasons("bad"))
+
+    def test_a_message_time_after_a_dispatch_start_has_a_margin(self):
+        s = self.journal.add_stream("g1", T0)
+        s.dispatch("ok", "t-ok", T0 + 2000, message_at=T0 + 2000 + MARGIN)
+        s.disposed("ok", "completed", T0 + 5000, message_at=T0 + 2000 + MARGIN)
+        s.dispatch("bad", "t-bad", T0 + 6000,
+                   message_at=T0 + 6000 + MARGIN + 1)
+        s.disposed("bad", "completed", T0 + 9000,
+                   message_at=T0 + 6000 + MARGIN + 1)
+        self.round()
+        self.assertNotIn("clock_inconsistent", self.reasons("ok"))
+        self.assertIn("clock_inconsistent", self.reasons("bad"))
+
+    def test_two_copies_of_a_message_time_may_differ_by_the_margin(self):
+        s = self.journal.add_stream("g1", T0)
+        s.dispatch("ok", "t-ok", T0 + 2000 + MARGIN, message_at=T0 + 2000)
+        s.disposed("ok", "completed", T0 + 3000 + MARGIN,
+                   message_at=T0 + 2000 + MARGIN)
+        s.dispatch("bad", "t-bad", T0 + 6000 + MARGIN + 1, message_at=T0 + 6000)
+        s.disposed("bad", "completed", T0 + 7000 + MARGIN + 1,
+                   message_at=T0 + 6000 + MARGIN + 1)
+        self.round()
+        self.assertNotIn("clock_inconsistent", self.reasons("ok"))
+        self.assertIn("clock_inconsistent", self.reasons("bad"))
+
+
+class FixRound1Unauthenticated(_Base):
+    def test_a_401_is_a_retry_with_the_code_kept_for_status(self):
+        s = self.journal.add_stream("g1", T0)
+        message(s, "m1", T0 + 1000, T0 + 2000, T0 + 3000)
+        self.round()
+        for kind in (decisions.ACQUIRE, decisions.REPORT, decisions.FINAL):
+            item = self.state.next_item(NOW)
+            while item.kind != kind:
+                self.state.apply(item, accept(item), NOW)
+                item = self.state.next_item(NOW)
+            decision = self.state.apply(item, Response(401, "UNAUTHENTICATED"),
+                                        NOW)
+            self.assertEqual(decision.action, decisions.RETRY)
+            table = {"acquire": "acquisition", "report": "report",
+                     "final": "final"}[kind]
+            row = self.state.one("SELECT state, last_error_code, tries FROM "
+                                 + table)
+            self.assertEqual(row[0], "pending", kind)
+            self.assertEqual(row[1], "UNAUTHENTICATED")
+            self.assertEqual(row[2], 1)
+            later = self.state.next_item(NOW + 10 ** 9)
+            self.assertEqual(later.kind, kind)         # still the same request
+        self.assertEqual(self.count("acquisition", "state='failed_permanent'"), 0)
+        self.assertEqual(self.count("report", "state='failed_permanent'"), 0)
+        self.assertEqual(self.count("final", "state='failed_permanent'"), 0)
+
+    def test_a_401_without_a_body_still_names_the_code(self):
+        for kind in (decisions.ACQUIRE, decisions.REPORT, decisions.FINAL):
+            decision = decisions.decide(kind, Response(401))
+            self.assertEqual((decision.action, decision.code),
+                             (decisions.RETRY, "UNAUTHENTICATED"))
+
+
 if __name__ == "__main__":
     unittest.main()
