@@ -148,7 +148,8 @@ def _status(config, args):
         state = State(path)
         try:
             report = status_mod.build_status(
-                state, set(config.agents), now, config.silent_after_seconds)
+                state, set(config.agents), now, config.silent_after_seconds,
+                config.limit_sources)
         finally:
             state.close()
     except StateOwned:

@@ -10,10 +10,18 @@ import datetime
 import json
 import os
 
-from . import decisions, rounds
+from . import capture, decisions, rounds
 from . import state as state_mod
 
-STATUS_VERSION = 1
+STATUS_VERSION = 2          # 2: card 7c-2 added the top-level `limit_events` object
+
+# Said by `status` and the README, word for word (claude-agenttalk-lead approved it; DESIGN-7B 13.12):
+# capture of limit events is best effort, and this is what closes the gap.
+LIMIT_GAP = ("A park that starts and ends while the reporter is not running, or between two checks, is "
+             "never reported. The seat still parks on its own, and the next refusal after the reporter is "
+             "back is reported. This closes when agenttalk keeps a permanent \"parked\" record in its turn "
+             "journal (a later agenttalk change, after the turn-journal pull request #300 is merged, "
+             "together with Codex limit events). Until then, limit events are best effort.")
 
 # Stored finals, reports and acquisitions are counted by their state.
 _NOTE_401 = state_mod.NOTE_LAST_401
@@ -170,9 +178,45 @@ def _agent(state, agent, configured, now_ms, silent_after_ms):
     }
 
 
-def build_status(state, configured, now_ms, silent_after_seconds):
+def _limit_events(state, limit_sources):
+    """The `limit_events` object: closed words and counts only. Never a path, a file name, an agent
+    name, a message id, a parsed value or the text of a fault. `sources` lists what the OPERATOR wrote
+    in the account map (an OS-user label, the provider, an account alias): the one thing that shows
+    which map is in use."""
+    agent = capture.LIMIT_AGENT
+    rows = {"pending": 0, "sent": 0, "failed_permanent": 0}
+    for name, count in state.all("SELECT state, COUNT(*) FROM limit_event GROUP BY state"):
+        rows[name] = count
+    failed = {}
+    for code, count in state.all("SELECT last_error_code, COUNT(*) FROM limit_event "
+                                 "WHERE state='failed_permanent' GROUP BY last_error_code"):
+        word = decisions.closed_code(code) or decisions.UNKNOWN_CODE
+        failed[word] = failed.get(word, 0) + count
+    scan = state.note("limit_last_scan")
+    fault = state.note("limit_last_fault")
+    ok = state.note(state_mod.last_ok_note(state_mod.LIMIT_AGENT))
+    configured = bool(limit_sources)
+    return {
+        "configured": configured,
+        "sources": sorted(({"os_user": s.os_user, "provider": s.provider, "account": s.account}
+                           for s in limit_sources),
+                          key=lambda s: (s["os_user"], s["provider"], s["account"])),
+        "last_scan": None if scan is None else iso(scan[1]),
+        "scan": {name: state.counter(agent, "scan:" + name) for name in capture.SKIP_COUNTS},
+        "captured": state.counter(agent, "captured"),
+        "rows": rows,
+        "failed": failed,
+        "capture_fault": {"count": state.counter(agent, "capture_fault"),
+                          "last": None if fault is None else iso(fault[1])},
+        "last_ok": None if ok is None else iso(ok[1]),
+        "gap": LIMIT_GAP if configured else None,
+    }
+
+
+def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=()):
     """The whole report as plain data. `configured` is the set of agent
-    names that have a table in the configuration file."""
+    names that have a table in the configuration file; `limit_sources` is the
+    account map of card 7c-2 (empty: limit events are off)."""
     agents = {row[0] for row in state.all(
         "SELECT agent FROM stream UNION SELECT agent FROM acquisition "
         "UNION SELECT agent FROM event")} | set(configured)
@@ -194,6 +238,7 @@ def build_status(state, configured, now_ms, silent_after_seconds):
     report["last_401"] = None if refused is None else {
         "code": decisions.closed_code(refused[0]), "at": iso(refused[1]),
         "active": state.note(_NOTE_CREDENTIAL) is not None}
+    report["limit_events"] = _limit_events(state, limit_sources)
     report["silent_configured_seats"] = sorted(
         n for n, a in report["agents"].items() if a["silent"])
     report["operator_actions"] = _actions(report)
@@ -222,6 +267,13 @@ def _actions(report):
     if any(a["stopped_by_configuration_fault"] for a in agents):
         actions.append("an agent is stopped by a configuration fault: fix "
                        "it, then start the reporter again")
+    limit = report["limit_events"]
+    if limit["rows"]["failed_permanent"]:
+        actions.append("%d limit event(s) failed for good and will not be retried (see limit_events: "
+                       "failed, with each closed code)" % limit["rows"]["failed_permanent"])
+    if limit["capture_fault"]["count"]:
+        actions.append("limit event capture failed %d time(s) (last at %s): lease sending was not "
+                       "affected" % (limit["capture_fault"]["count"], limit["capture_fault"]["last"]))
     return actions
 
 
@@ -278,6 +330,8 @@ def render_text(report):
             out.append("  !! failed for good: %s of message %s, %s%s"
                        % (item["kind"], item["message_id"], item["code"],
                           extra))
+    if report["limit_events"]["configured"]:
+        out.append("limit events (best effort): " + report["limit_events"]["gap"])
     for line in report["operator_actions"]:
         out.append("-> " + line)
     return "\n".join(out)

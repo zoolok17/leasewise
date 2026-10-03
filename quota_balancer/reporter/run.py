@@ -96,7 +96,8 @@ class Reporter:
     def report(self):
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
-                                   self.config.silent_after_seconds)
+                                   self.config.silent_after_seconds,
+                                   self.limit_sources)
 
     def _read(self, result):
         try:
