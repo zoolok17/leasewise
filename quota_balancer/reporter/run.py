@@ -21,6 +21,10 @@ UNREACHABLE = "unreachable"         # no answer, 5xx or 429: try again later
 CREDENTIAL = "credential"           # a 401: the identity must be fixed
 
 MAX_SLEEP_SECONDS = 900
+# While limit capture is configured the wait between cycles never exceeds this, even while Leasewise
+# is not answering: the wrapper refreshes a park file about once a minute and a file counts as fresh
+# for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
+LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
 
 
 def _worse(current, new):
@@ -185,4 +189,7 @@ class Reporter:
             if result.blocked is not None:
                 wait = max(wait, decisions.backoff_ms(
                     self.failures, self.rng()) / 1000.0)
-            self.stop.wait(min(wait, MAX_SLEEP_SECONDS))
+            longest = MAX_SLEEP_SECONDS
+            if self.limit_sources:
+                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)
+            self.stop.wait(min(wait, longest))
