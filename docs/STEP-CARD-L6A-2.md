@@ -197,10 +197,10 @@ Free memory at the start: 8.9 GB. The full suite, in chunks each under 8 minutes
 | `test_cardl6*.py` | 40 |
 | `test_cardr1*.py` | 16 |
 | `test_billing*.py` | 46 |
-| `test_card7*.py` | 901 (2 skipped, as before) |
-| **Total** | **1794** (equals the `discover` collection) |
+| `test_card7*.py` | 887 (2 skipped, as before) |
+| **Total** | **1780** (equals the `discover` collection) |
 
 Scanner gate: `ruff check --isolated --no-cache --select E4,E7,E9,F,B quota_balancer tests` reports 74 (the baseline of main
-`363c87e`, none in a file this card changed); `bandit -r quota_balancer -q` reports 27 (Low 6, Medium 20, High 1, the accepted
+`363c87e`, none in a file this card changed); `bandit -r quota_balancer -q` reports 26 (Low 5, Medium 20, High 1, the accepted
 OVH SHA-1; baseline 34). The new `nosec` notes say why: a fixed-column query in the store writer, and the operator's own
 configured command started without a shell in `proctree.py`.
