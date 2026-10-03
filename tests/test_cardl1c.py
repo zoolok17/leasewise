@@ -432,7 +432,10 @@ class MigrationV9(_Base):
         self.assertEqual(run_cli("--db", db, "init").returncode, 0)
         conn = sqlite3.connect(db)
         conn.execute("PRAGMA foreign_keys=ON")
-        lease_id = conn.execute("SELECT id FROM leases LIMIT 1").fetchone()[0]
+        # the fixture gives lease1 its receipts: pick the two leases in a fixed
+        # order (an unordered query returned either one, by UUID order)
+        lease_id = conn.execute(
+            "SELECT id FROM leases ORDER BY rowid LIMIT 1").fetchone()[0]
 
         def insert(**kw):
             values = dict(event_id=str(uuid.uuid4()), lease_id=lease_id,
@@ -461,8 +464,9 @@ class MigrationV9(_Base):
             with self.assertRaises(sqlite3.IntegrityError, msg=str(bad)):
                 insert(**bad)
         # the final-receipt partial index still allows one final per lease
-        other = conn.execute("SELECT id FROM leases WHERE id<>?",
-                             (lease_id,)).fetchone()[0]
+        other = conn.execute(
+            "SELECT id FROM leases WHERE id<>? ORDER BY rowid LIMIT 1",
+            (lease_id,)).fetchone()[0]
         insert(lease_id=other, final=1)
         with self.assertRaises(sqlite3.IntegrityError):
             insert(lease_id=other, final=1)
