@@ -85,3 +85,66 @@ named there but not defined fails by name). After: all pass.
 ### Limits
 
 Defining a word does not use it: until R1-1 and Phase 2 emit them, a caller can never see any of the new words.
+
+## Step R1-1: honest window checks and warn mode
+
+Work item `card-r1-1`, branch `card-r1-1`, from main `363c87e` (R1-0 merged). Spec: DESIGN-R1.md **section 12.2**
+(which replaces 5.1, 5.2, 11.4 and the O-R1-5 ruling) and 12.1. Commit 1 of two.
+
+### In plain words
+
+A grant used to look only at the last usage number of a window. It now decides from everything it knows: the number,
+how old it is, whether the window has reset since, and whether it is known at all. A window known to be used up
+refuses. An old or never-seen window is allowed with a warning. A window the source says it does not know refuses an
+admission seat and only warns a warn-mode seat. The answer shows the warnings and the window facts.
+
+### The table (12.2) and the tests that pin each cell
+
+Module `tests/test_cardr1_windows.py`; each cell runs in both modes unless it differs.
+
+| Window evidence | Admission | Warn | Test |
+| --- | --- | --- | --- |
+| known, current, below | admit | admit | `TheTable.test_known_current_and_below_the_ceiling_is_admitted_without_a_warning` |
+| known, at or above (equality, above, 100%) | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_known_at_the_ceiling_refuses_and_so_does_known_above_it` |
+| known, at or above, old | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_known_at_the_ceiling_refuses_even_when_the_reading_is_old` |
+| exhausted, reset time passed, no new observation | `WINDOW_LIMIT` | `WINDOW_LIMIT` | `test_exhaustion_is_not_forgotten_after_the_reset_time_passes` |
+| known, below, not current | `METER_STALE` warning | same | `test_known_below_the_ceiling_but_old_is_admitted_with_a_stale_warning` |
+| explicit unknown (NULL) | `WINDOW_LIMIT` | `WINDOW_LIMIT` warning | `test_an_explicit_unknown_refuses_an_admission_seat_and_warns_a_warn_seat` |
+| never observed (no row) | `METER_STALE` warning, `confidence: missing` | same | `test_a_window_never_observed_is_admitted_with_a_stale_warning_and_is_never_an_observed_zero` |
+| shadow request | never refused | | `test_a_shadow_request_is_never_refused_by_a_window` |
+| metered or metered-advisory lease | like admission mode | | `test_a_metered_advisory_lease_follows_the_admission_rules` |
+
+Freshness (`Freshness`): `test_600_seconds_is_current_and_600_seconds_and_a_millisecond_is_not`,
+`test_a_recent_sample_whose_reset_has_passed_is_not_current`,
+`test_a_sample_taken_after_the_reset_is_current_even_though_the_reset_time_has_passed`,
+`test_an_observation_up_to_30_seconds_in_the_future_counts_as_age_zero`,
+`test_an_observation_further_in_the_future_is_not_trusted_as_current`.
+Refusals in both modes (`Refusals`): `test_a_parked_block_refuses_in_both_modes`,
+`test_the_concurrency_limit_refuses_in_both_modes`.
+Annotations (`Annotations`): one record and one warning per window with two limits, the tightest ceiling decides,
+several windows by key, closed record keys and no source identity (privacy), empty lists without a window limit, only
+the two closed codes. Replay (`Replay`): current annotations, grant untouched, never refused, shadow empty.
+
+### What changed, and what a reader may notice
+
+- **Inclusive comparison (F5).** `used_bps >= ceiling` refuses. The old generic check admitted a reading exactly at the
+  limit; that changed on purpose.
+- **Freshness** is `reduce.window_current`: the observation time (the table holds nothing else), 600 s, a reset passed
+  with no newer observation, 30 s of future slop counting as age 0.
+- **The answer** (`lease.grant`, and `http_api.handle_grant` on the wire) carries `warnings` and `windows`, built from
+  the same read as the decision. They were always empty before.
+- **Shadow** requests used to be run through the window check like everything else; they are now never refused by it.
+  No existing test relied on the old behaviour.
+- **One earlier test changed:** `test_cardr1_codes.test_nothing_in_the_product_emits_a_new_word_yet` now allows
+  `METER_STALE` in `lease.py` as a warning and checks that it is never raised as a refusal.
+- **Comment fix (M-010 nit):** the `http_api.py` note on `usage` now says the kind is retired (D-116) and stays refused.
+- **A window limit can apply to a metered or metered-advisory lease** (limits are by scope, not by seat kind). Such a
+  lease is treated like admission mode, as the brief said.
+
+### Limits (12.2, F7)
+
+- Admitting an old or never-observed reading below the ceiling is an **availability exception**. It does not bound
+  what other consumers used since the reading; the ceiling is not a safety margin for that.
+- A window known at or above its ceiling, or explicitly unknown, can lock an admission seat out until a fresh
+  observation arrives. Nothing clears it on a timer. The recovery probe is the planned way to get one.
+- The 600-second wall cap is the only freshness rule; the idle-seat allowance needs turn tracking that is not built.

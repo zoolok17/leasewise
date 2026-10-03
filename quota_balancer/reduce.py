@@ -219,6 +219,25 @@ def window_freshness(observed_at, now_ms):
     return False, FRESH_WALL_CAP
 
 
+def window_current(observed_at, resets_at, now_ms):
+    """Return (current, age_ms) for a window at GRANT time (card R1-1).
+
+    Measured by the observation time, never the ingest time. Current means
+    at most 600 s old and not past its reset time without a newer
+    observation: after a reset only a new observation proves a new epoch,
+    time passing proves nothing. An observation up to 30 s in the future
+    (clock slop) counts as age 0; one further ahead is no evidence of
+    anything and is not current."""
+    if observed_at - now_ms > FUTURE_SLOP_MS:
+        return False, 0
+    age_ms = max(0, now_ms - observed_at)
+    if age_ms > WALL_CAP_MS:
+        return False, age_ms
+    if resets_at is not None and now_ms >= resets_at and observed_at < resets_at:
+        return False, age_ms
+    return True, age_ms
+
+
 # Billing freshness (section 11): fresh iff age <= max_age, no idle
 # exemption. `max_age_ms` is None when no policy supplies a max_age (the
 # freshness is then "unknown", not assumed fresh or stale).

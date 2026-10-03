@@ -424,6 +424,62 @@ of the input column today, and it treats unknown as a reason to wait, not as zer
 **Limit.** The gateway side that produces such receipts is not built yet (card 6a); today only a test
 or an operator can send one.
 
+## Card R1 - honest window checks, the expiry clamp and the advisory budget
+
+**Status: R1-1 built.** (R1-2 is added below when it lands.) Leasewise's grant now says what it knows and what
+it does not about a usage window, and a seat in warn mode is told instead of refused where the evidence is only old
+or missing. Audience: the operator of a Leasewise store. Paid enforcement stays impossible (see the limits).
+
+### R1-1: what a grant does with a usage window
+
+A window limit says "stop above N% of this usage window". The grant used to look only at the last number. It now
+looks at everything it has: the number, how old the observation is, whether the window has reset since, and whether
+the number is known at all.
+
+| What Leasewise knows about the window | Admission seat (`subscription_admission`) | Warn seat (`subscription_warn`) |
+| --- | --- | --- |
+| a known number, recent, below the limit | admitted | admitted |
+| a known number **at or above** the limit (old or recent) | refused: `WINDOW_LIMIT` | refused: `WINDOW_LIMIT` |
+| a known number below the limit, but **old** (see below) | admitted, with a `METER_STALE` warning | the same |
+| **explicitly unknown** (the source said it does not know) | refused: `WINDOW_LIMIT` | admitted, with a `WINDOW_LIMIT` warning |
+| **never observed** (no record at all) | admitted, with a `METER_STALE` warning | the same |
+
+- **At the limit is over the limit.** The check is inclusive. Before this step a reading exactly at the limit was let
+  through; that changed on purpose.
+- **Old** means the observation is more than 600 seconds old, or the window's reset time has passed and nothing has
+  been observed since. An observation up to 30 seconds in the future (clock difference) counts as brand new. Age is
+  measured from when the source observed it, never from when it arrived.
+- **A window that was never observed is not "0%".** Its record says `confidence: missing`.
+- A metered or advisory lease on a paid account is treated like an admission seat. A shadow request (observe only)
+  is never refused by a window. A concurrency limit and a parked account (a provider usage limit) refuse in both
+  modes.
+
+**What the answer shows.** The grant answer carries two lists. `warnings` has entries `{code, window_key}` with only
+the codes `WINDOW_LIMIT` and `METER_STALE`, each once. `windows` has one record per window the lease is limited by:
+`window_key`, `used_bps`, `resets_at`, `confidence` (`observed`, `unknown` or `missing`), `source_stale`, `age_ms` and
+`current`. Neither list names where a reading came from, and neither carries any raw text. Both come from the same read
+as the decision.
+
+**A replay.** Asking again for the same grant returns the same lease with the *current* lists. It never runs the
+admission again, never changes the stored lease, and never refuses because the window changed since.
+
+**Limits of this step (please read).**
+
+- Admitting an old or never-observed reading below the limit is an **availability exception**, not a safety margin. It
+  says nothing about what other users consumed since the reading was taken.
+- A window known to be used up, or explicitly unknown, can keep an admission seat locked out **until a fresh
+  observation arrives**. Nothing clears it by timer; only a new observation does. The recovery probe (a later card) is
+  the planned way to get one.
+- The freshness rule uses the 600-second cap only. The longer allowance for an idle seat needs turn tracking that is
+  not built.
+
+### Technical detail
+
+`lease._admit_window` decides each window group from one read of the `windows` row (`_window_record`); `_window_verdict`
+holds the table; `reduce.window_current` is the freshness rule. `lease.grant` returns `windows` and `warnings`, and
+`http_api.handle_grant` puts them on the wire. A replay builds them with `_annotations` from the stored policy snapshot's
+scope chain. Tests: `tests/test_cardr1_windows.py`.
+
 ## Card 7a-2 - the reporter core
 
 `quota_balancer/reporter/` is the part of the observe-only reporter that decides

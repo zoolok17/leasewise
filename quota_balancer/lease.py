@@ -470,6 +470,83 @@ def grant(path, request, now_ms, wire_identity=None):
         conn.close()
 
 
+# The two warning words of a grant's `warnings` (card R1-1, DESIGN-R1 12.2): a window limit that would refuse
+# but for the seat's warn mode, and a reading that is old or missing.
+_WARN_LIMIT = errors.CODE_WINDOW_LIMIT
+_WARN_STALE = errors.CODE_METER_STALE
+
+
+def _window_record(conn, account_id, window_key, now_ms):
+    """One window as the grant sees it, from ONE read. Never observed (no row) is `missing`, never an
+    observed zero; a NULL `used_bps` is `unknown`. The record carries no source identity and no raw text."""
+    row = conn.execute(
+        "SELECT used_bps, resets_at, observed_at, source_stale FROM windows WHERE account_id=? AND window_key=?",
+        (account_id, window_key)).fetchone()
+    if row is None:
+        return {"window_key": window_key, "used_bps": None, "resets_at": None, "confidence": "missing",
+                "source_stale": False, "age_ms": None, "current": False}
+    used, resets_at, observed_at, source_stale = row
+    current, age_ms = reduce.window_current(observed_at, resets_at, now_ms)
+    return {"window_key": window_key, "used_bps": used, "resets_at": resets_at,
+            "confidence": "observed" if used is not None else "unknown",
+            "source_stale": bool(source_stale), "age_ms": age_ms, "current": current}
+
+
+def _window_verdict(record, ceiling, mode):
+    """(code, refuses) for one window against its tightest ceiling (DESIGN-R1 12.2). `mode` is "admission" or
+    "warn". Known and at or above the ceiling blocks whatever its age (inclusive); an unknown value blocks in
+    admission mode and warns in warn mode; an old or missing reading is admitted with a warning."""
+    used = record["used_bps"]
+    if record["confidence"] == "missing":
+        return _WARN_STALE, False
+    if used is None:
+        return _WARN_LIMIT, mode == "admission"
+    if used >= ceiling:
+        return _WARN_LIMIT, True
+    if not record["current"]:
+        return _WARN_STALE, False
+    return None, False
+
+
+def _window_mode(enforcement):
+    return "warn" if enforcement == "subscription_warn" else "admission"
+
+
+def _admit_window(conn, key, limit_rows, chain, account_id, enforcement, now_ms):
+    """Admission for one window group. Refuses with WINDOW_LIMIT where DESIGN-R1 12.2 says so, else returns
+    (record, warning-or-None) for the answer. A shadow request is never refused by a window."""
+    window_key = key[2]
+    ceilings = [r["hard"] for r in limit_rows
+                if r["metric"] == "window_bps" and r["window_key"] == window_key
+                and r["scope_id"] == (_PLATFORM_ID if r["scope"] == "platform" else chain[r["scope"]])]
+    record = _window_record(conn, account_id, window_key, now_ms)
+    code, refuses = _window_verdict(record, min(ceilings), _window_mode(enforcement))
+    if refuses and enforcement != "shadow":
+        raise QuotaError(errors.CODE_WINDOW_LIMIT, errors.MSG_WINDOW_LIMIT)
+    return record, (None if code is None else {"code": code, "window_key": window_key})
+
+
+def _annotations(conn, chain, account_id, enforcement, now_ms):
+    """The CURRENT `windows` and `warnings` of a lease already granted (a replay): what a grant made now
+    would show, never a refusal and never a change to the stored lease. Shadow leases show none."""
+    if enforcement == "shadow":
+        return [], []
+    ids = {"platform": _PLATFORM_ID, **{k: v for k, v in chain.items() if k in ("project", "team", "seat")}}
+    ceilings = {}
+    for scope, scope_id, window_key, hard in conn.execute(
+            "SELECT scope, scope_id, window_key, hard FROM limits WHERE metric='window_bps'"):
+        if ids.get(scope) == scope_id:
+            ceilings[window_key] = min(hard, ceilings.get(window_key, hard))
+    windows, warnings = [], []
+    for window_key in sorted(ceilings):
+        record = _window_record(conn, account_id, window_key, now_ms)
+        windows.append(record)
+        code, _refuses = _window_verdict(record, ceilings[window_key], _window_mode(enforcement))
+        if code is not None:
+            warnings.append({"code": code, "window_key": window_key})
+    return windows, warnings
+
+
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                  input_cap, hold_sized, concurrency_new, now_ms,
                  shadow=False):
@@ -478,9 +555,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
     A non-metered lease admits with zero new hold (advisory: no
     reservation), and a shadow lease consumes no concurrency slot."""
     metric, period, window_key = key
-    if metric == "window_bps":
-        new = 0  # window usage is observed, not reserved
-    elif metric == "concurrency":
+    if metric == "concurrency":
         new = concurrency_new  # one live lease; a shadow one consumes none
     elif metered:
         new = input_cap if metric == "input_tokens" else hold_sized
@@ -490,23 +565,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
     scope_ids = [(s, chain[s]) for s in ("platform", "project",
                                          "team", "seat")
                  if chain[s] is not None]
-    if metric == "window_bps":
-        # Window usage is account-level (windows table): one usage for
-        # every applicable scope; a missing window is no observation
-        # (0 bps), a NULL used_bps is unknown usage and fails closed.
-        w = conn.execute(
-            "SELECT used_bps FROM windows WHERE account_id=? AND "
-            "window_key=?", (account_id, window_key)).fetchone()
-        if w is None:
-            used = 0
-        elif w[0] is None:
-            code, msg = _LIMIT_CODES["window_bps"]
-            raise QuotaError(code, msg)
-        else:
-            used = w[0]
-        for scope, scope_id in scope_ids:
-            usage[(scope, scope_id)] = (used, 0)
-    elif metric == "concurrency":
+    if metric == "concurrency":
         # Concurrency counts the live and uncertain leases of the
         # scope; a shadow lease consumes no slot.
         for scope, scope_id in scope_ids:
@@ -662,8 +721,11 @@ def _grant(conn, request, now_ms, wire_identity=None):
                                  errors.MSG_IDEMPOTENCY_CONFLICT)
             row = _lease_row(conn, existing[0])
             _record_http_identity(conn, wire_identity, now_ms)
+            snapshot = json.loads(existing[2])
+            windows, warnings = _annotations(
+                conn, snapshot.get("chain") or {}, row["account_id"], row["enforcement"], now_ms)
             conn.execute("COMMIT")
-            return _lease_dict(row, replayed=True)
+            return dict(_lease_dict(row, replayed=True), windows=windows, warnings=warnings)
 
         team = conn.execute("SELECT id, project_id FROM teams WHERE id=?",
                             (seat[2],)).fetchone()
@@ -882,8 +944,16 @@ def _grant(conn, request, now_ms, wire_identity=None):
         if metered and budget is not None:
             groups.setdefault(("money_micro_eur", "month", None), [])
         concurrency_new = 0 if enforcement == "shadow" else 1
+        windows, warnings = [], []
         for key in sorted(groups, key=lambda k: (
                 _METRIC_RANK[k[0]], _PERIOD_RANK[k[1]], k[2] or "")):
+            if key[0] == "window_bps":
+                record, warning = _admit_window(conn, key, limit_rows, chain, account_id, enforcement, now_ms)
+                if enforcement != "shadow":
+                    windows.append(record)
+                    if warning is not None and warning not in warnings:
+                        warnings.append(warning)
+                continue
             _admit_group(conn, key, limit_rows, chain, account_id, budget,
                          metered, input_cap, hold_sized, concurrency_new,
                          now_ms, shadow=enforcement == "shadow")
@@ -971,7 +1041,7 @@ def _grant(conn, request, now_ms, wire_identity=None):
              json.dumps({"final": 0})))
         _record_http_identity(conn, wire_identity, now_ms)
         conn.execute("COMMIT")
-        return _lease_dict(_lease_row(conn, lease_id))
+        return dict(_lease_dict(_lease_row(conn, lease_id)), windows=windows, warnings=warnings)
     except BaseException:
         rollback_quietly(conn)
         raise

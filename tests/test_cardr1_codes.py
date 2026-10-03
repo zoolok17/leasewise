@@ -134,11 +134,15 @@ class Wiring(unittest.TestCase):
         self.assertNotIn("UNSUPPORTED_EFFORT", inspect.getsource(lease))
 
     def test_nothing_in_the_product_emits_a_new_word_yet(self):
+        """Card R1-1 uses METER_STALE as a grant WARNING (never as a refusal); every other new word is still unused."""
         import inspect
         from quota_balancer import lease, store
         for module in (lease, store):
             source = inspect.getsource(module)
             for word in NEW:
+                if word == "METER_STALE" and module is lease:
+                    self.assertNotIn("QuotaError(errors.CODE_METER_STALE", source)     # a warning, never a refusal
+                    continue
                 self.assertNotIn("CODE_" + word, source, (module.__name__, word))
 
 
