@@ -23,6 +23,11 @@ LIMIT_GAP = ("A park that starts and ends while the reporter is not running, or 
              "journal (a later agenttalk change, after the turn-journal pull request #300 is merged, "
              "together with Codex limit events). Until then, limit events are best effort.")
 
+# Said in the text view when the report is the snapshot of a reporter older than status version 2
+# (still running during an upgrade): it never claims that limit capture is off.
+OLDER_REPORTER = ("A reporter from before this version is still running. Its status has no limit-event "
+                  "section, so nothing is said here about limit events.")
+
 # Stored finals, reports and acquisitions are counted by their state.
 _NOTE_401 = state_mod.NOTE_LAST_401
 _NOTE_CREDENTIAL = state_mod.NOTE_CREDENTIAL_ACTIVE
@@ -330,8 +335,13 @@ def render_text(report):
             out.append("  !! failed for good: %s of message %s, %s%s"
                        % (item["kind"], item["message_id"], item["code"],
                           extra))
-    if report["limit_events"]["configured"]:
-        out.append("limit events (best effort): " + report["limit_events"]["gap"])
+    limit = report.get("limit_events")
+    if limit is None:
+        # A snapshot of a reporter from before status version 2: it has no limit-event section, and
+        # that says nothing about whether capture is on. Say only that.
+        out.append(OLDER_REPORTER)
+    elif limit["configured"]:
+        out.append("limit events (best effort): " + limit["gap"])
     for line in report["operator_actions"]:
         out.append("-> " + line)
     return "\n".join(out)

@@ -47,8 +47,21 @@ class Section(unittest.TestCase):
                        "### Limits", "R-011", "One outbox, one memory", "more than 256 entries", "No backfill",
                        "No downgrade", "refuses to start", "Claude only", "does not un-park an account by itself",
                        "Advisory until R1", "save its output again", "limit_events.sources",
-                       "the reporter never writes into the folder", "never longer than 60 seconds"):
+                       "the reporter never writes into the folder",
+                       "the wait between two finished cycles is at most 60 seconds"):
             self.assertIn(needle, body, needle)
+
+    def test_the_wait_cap_is_not_promised_as_a_gap_between_scans(self):
+        body = " ".join(section().split())
+        for promise in ("never longer than 60 seconds", "never more than 60 seconds apart", "60 seconds apart"):
+            self.assertNotIn(promise, body, promise)
+        self.assertIn("reading and sending can make the time between two looks longer", body)
+
+    def test_the_account_map_and_counts_are_pointed_to_in_json_not_in_the_plain_text(self):
+        body = " ".join(section().split())
+        step = body[body.index("**Look at `reporter status"):body.index("### What is read")]
+        self.assertTrue(step.startswith("**Look at `reporter status --json`.**"), step[:60])
+        self.assertIn("the plain text view shows only the gap sentence and the lines that ask for action", step.lower())
 
     def test_the_plain_words_come_before_the_technical_detail(self):
         body = section()

@@ -30,6 +30,9 @@ MSG_OWNED = ("the state is owned by another reporter: `run` and `drain` "
              "cannot overlap; stop the other one first")
 MSG_STATE = "the state file cannot be used"
 MSG_INTERNAL = "the reporter stopped on an internal fault"
+STATUS_VERSION_CODE = "STATUS_VERSION"
+MSG_STATUS_VERSION = ("the running reporter's status has a version this program does not know: "
+                      "upgrade this program, or stop the running reporter")
 
 
 def _error(code, message):
@@ -157,6 +160,12 @@ def _status(config, args):
             status_mod.snapshot_path(config.state_path))
         if report is None:
             _error(STATE_OWNED, MSG_OWNED + " (no snapshot yet)")
+            return EXIT_REFUSED
+        version = report.get("status_version")
+        if type(version) is not int or not 1 <= version <= status_mod.STATUS_VERSION:
+            # Older versions are shown as they are (the text view says what is missing); a version
+            # this program does not know is never guessed at.
+            _error(STATUS_VERSION_CODE, MSG_STATUS_VERSION)
             return EXIT_REFUSED
     except StateError:
         _error(STATE_FAILED, MSG_STATE)
