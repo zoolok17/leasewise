@@ -187,7 +187,7 @@ several tests fail.
 ### Gates
 
 Free memory at the start: 8.9 GB. The full suite, in chunks each under 8 minutes, proven to cover every test file once
-(16 + 1 + 7 + 2 + 1 + 2 + 45 = 74 files, equal to the 74 `test_*.py` files):
+(16 + 1 + 7 + 2 + 3 + 2 + 45 = 76 files, equal to the 76 `test_*.py` files):
 
 | Chunk | Tests |
 |---|---|
@@ -195,10 +195,10 @@ Free memory at the start: 8.9 GB. The full suite, in chunks each under 8 minutes
 | `test_card5*.py` | 122 |
 | `test_cardl1*.py` | 215 |
 | `test_cardl6*.py` | 40 |
-| `test_cardr1*.py` | 16 |
+| `test_cardr1*.py` | 69 |
 | `test_billing*.py` | 46 |
 | `test_card7*.py` | 887 (2 skipped, as before) |
-| **Total** | **1780** (equals the `discover` collection) |
+| **Total** | **1833** (equals the `discover` collection) |
 
 Scanner gate: `ruff check --isolated --no-cache --select E4,E7,E9,F,B quota_balancer tests` reports 74 (the baseline of main
 `363c87e`, none in a file this card changed); `bandit -r quota_balancer -q` reports 26 (Low 5, Medium 20, High 1, the accepted
