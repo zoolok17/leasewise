@@ -125,8 +125,11 @@ def wait_for(path, seconds=10.0):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if os.path.exists(path):
-            with open(path, encoding="ascii") as handle:
-                text = handle.read()
+            try:
+                with open(path, encoding="ascii") as handle:
+                    text = handle.read()
+            except OSError:
+                text = ""                                       # the program is replacing the file right now
             if text:
                 return text
         time.sleep(0.01)
@@ -146,8 +149,11 @@ class Probe:
     def is_set(self):
         for path in self.markers:
             if path not in self.watches and os.path.exists(path):
-                with open(path, encoding="ascii") as handle:
-                    text = handle.read()
+                try:
+                    with open(path, encoding="ascii") as handle:
+                        text = handle.read()
+                except OSError:
+                    continue                                    # the program is replacing the file right now: look again
                 if text:
                     self.watches[path] = Watch(int(text))
         if self.ready and all(path in self.watches or os.path.exists(path) for path in self.ready) and not self.fired:
@@ -618,6 +624,138 @@ result = runner.run(%(command)r, 0, 10, timeout_seconds=60, max_bytes=1000, win=
         helper.kill()
         helper.wait(10)
         self.assertTrue(root.gone(5) and grandchild.gone(5), "the tree outlived its reporter")
+
+
+class BufferLifetime(_Case):
+    """F1 (Codex's read): the attribute list keeps pointers to the two value arrays until it is deleted, so both arrays must
+    still be alive when `delete_attributes` runs, on success and on every partial setup failure."""
+
+    def run_checking(self, fail=None):
+        import gc
+        import weakref
+        seen = {"refs": [], "alive": None, "stored_before_first_update": None}
+        owners = []
+
+        class Owner(runner._Owned):
+            def __init__(self, win):
+                super().__init__(win)
+                owners.append(self)
+
+        def remember(spy, value, attributes, attribute, array):
+            seen["refs"].append(weakref.ref(array))
+
+        def failing(answer):
+            def update(attributes, attribute, array):
+                if seen["stored_before_first_update"] is None:
+                    seen["stored_before_first_update"] = len(owners[0].values)
+                seen["refs"].append(weakref.ref(array))
+                return answer(len(seen["refs"]))
+            return update
+
+        def at_delete(spy, value, attributes):
+            gc.collect()
+            seen["alive"] = [ref() is not None for ref in seen["refs"]]
+            seen["owned"] = len(owners[0].values)
+        marker = self.path("never-life.txt")
+        spy = Spy(fail={"update_attribute": failing(fail)} if fail else {},
+                  after={"update_attribute": remember, "delete_attributes": at_delete})
+        self.spies.append(spy)
+        with mock.patch.object(runner, "_Owned", Owner):
+            result = runner.run(self.command("first_action", marker), 0, 1, timeout_seconds=10, max_bytes=100000, win=spy)
+        gc.collect()
+        return result, seen, [ref() is None for ref in seen["refs"]]
+
+    def test_both_arrays_are_alive_when_the_attribute_list_is_deleted(self):
+        result, seen, gone_after = self.run_checking()
+        self.assertEqual(result.word, runner.OK)
+        self.assertEqual(seen["alive"], [True, True])                 # the handle list and the job list
+        self.assertEqual(seen["owned"], 2)                            # and the owner still held both then
+        self.assertEqual(gone_after, [True, True])                    # released only afterwards
+
+    def test_they_are_alive_when_the_first_attribute_fails(self):
+        result, seen, _gone = self.run_checking(fail=lambda n: False)
+        self.assertEqual(result.word, runner.CANNOT_CONTAIN)
+        self.assertEqual(seen["stored_before_first_update"], 2)       # both were stored before either was handed over
+        self.assertEqual(seen["alive"], [True])                       # the one handed over is alive; the owner holds both
+        self.assertEqual(seen["owned"], 2)
+
+    def test_they_are_alive_when_the_second_attribute_fails(self):
+        result, seen, _gone = self.run_checking(fail=lambda n: n == 1)    # the handle list works, the job list does not
+        self.assertEqual(result.word, runner.CANNOT_CONTAIN)
+        self.assertEqual(seen["stored_before_first_update"], 2)
+        self.assertEqual(seen["alive"], [True, True])
+        self.assertEqual(seen["owned"], 2)
+
+
+class Grace(_Case):
+    """F2 (Codex's read): once the main program has exited, ONE grace deadline applies, also while data keeps flowing."""
+
+    WRITER = '''
+import os, sys, time
+open(sys.argv[1] + '.t', 'w').write(str(os.getpid()))
+os.replace(sys.argv[1] + '.t', sys.argv[1])
+payload = b' ' * (2 * 1024 * 1024) + %r
+for offset in range(0, len(payload), 4096):
+    os.write(1, payload[offset:offset + 4096])
+    time.sleep(0.003)
+''' % PAGE.encode()
+
+    ROOT = '''
+import os, subprocess, sys, time
+marker = sys.argv[2]
+subprocess.Popen([sys.executable, sys.argv[1], marker], stdout=sys.stdout)
+while not os.path.exists(marker):
+    time.sleep(0.01)
+os._exit(0)
+'''
+
+    def test_a_helper_that_keeps_writing_valid_page_bytes_after_the_main_program_exits_is_a_leftover_not_a_page(self):
+        writer = _write(self.path("writer.py"), self.WRITER)
+        root = _write(self.path("root_writer.py"), self.ROOT)
+        marker = self.path("writer.pid")
+
+        class SlowReader(Spy):
+            """A scheduling delay between the peek and the read, so that data is always waiting (Codex's setup)."""
+
+            def __init__(self):
+                super().__init__()
+                self.first_exit = None
+
+            def read(self, handle, count):
+                if self.first_exit is None and self.watch is not None and self.watch.gone(0):
+                    self.first_exit = time.monotonic()                   # the main program has exited (a kept handle)
+                time.sleep(0.04)
+                return super().read(handle, count)
+
+        probe = Probe(markers=[marker])
+        spy = SlowReader()
+        self.spies.append(spy)
+        self.probes.append(probe)
+        result = runner.run([PYTHON, root, writer, marker], 0, 1, timeout_seconds=20, max_bytes=3 * 1024 * 1024,
+                            stop=probe, win=spy)
+        ended = time.monotonic()
+        self.assertEqual((result.word, result.data, result.cleanup_confirmed), (runner.LEFTOVER, None, True))
+        self.assertIsNotNone(spy.first_exit)
+        self.assertLess(ended - spy.first_exit, runner.LINGER_SECONDS + MARGIN)    # the grace plus a stated margin
+        self.assertTrue(probe.watches[marker].gone(3))                             # the helper is gone with the job
+        self.assert_clean(spy)
+
+    def test_a_normal_program_that_writes_a_large_page_and_exits_is_still_ok(self):
+        big = _write(self.path("bigpage.py"), "import sys\nsys.stdout.write(' ' * (900 * 1024) + %r)\n" % PAGE)
+        result = runner.run([PYTHON, big], 0, 1, timeout_seconds=20, max_bytes=1024 * 1024)
+        self.assertEqual(result.word, runner.OK)
+        self.assertEqual(len(result.data), 900 * 1024 + len(PAGE))
+        self.assertTrue(result.cleanup_confirmed)
+
+    def test_the_quiet_holder_and_the_deadline_cap_still_hold(self):
+        marker = self.path("holder3.pid")
+        probe = Probe(markers=[marker])
+        result = self.run_it("holder", marker, stop=probe, timeout=20)
+        self.assertEqual(result.word, runner.LEFTOVER)
+        self.assertLess(self.elapsed, runner.LINGER_SECONDS + MARGIN + 2)
+        with mock.patch.object(runner, "LINGER_SECONDS", 30.0):
+            self.run_it("holder", self.path("holder4.pid"), timeout=1)
+        self.assertLess(self.elapsed, 1 + MARGIN)                                  # the grace never passes the deadline
 
 
 class Nested(_Case):

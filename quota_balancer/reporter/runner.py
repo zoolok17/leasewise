@@ -309,6 +309,7 @@ class _Owned:
         self.win = win
         self.handles = {}
         self.attributes = None          # the attribute list, freed at the end
+        self.values = []                # the arrays the list points to: they live as long as the list does (see _finish)
         self.created = False            # a process exists (frozen or running): the job must be ended and confirmed
         self.ended_alone = True         # False when ending the process by its own handle failed
 
@@ -369,8 +370,11 @@ def _start(win, owned, program, line, block, clock, timeout_seconds, max_bytes, 
     attributes = owned.attributes = win.init_attributes(2)
     if attributes is None:
         return CANNOT_CONTAIN, None
+    # The attribute list keeps POINTERS to these arrays until it is deleted, so they belong to the owner, are stored before
+    # either is handed over, and are released only after `delete_attributes` has returned (in `_finish`).
     inherited = (ctypes.c_void_p * 2)(nul, write)          # only these two handles go to the program
     jobs = (ctypes.c_void_p * 1)(job)                      # and it is created inside this job
+    owned.values.extend((inherited, jobs))
     if not win.update_attribute(attributes, _HANDLE_LIST, inherited) \
             or not win.update_attribute(attributes, _JOB_LIST, jobs):
         return CANNOT_CONTAIN, None                        # never create-then-assign: the program is not created
@@ -397,15 +401,29 @@ def _read(win, pipe, process, clock, timeout_seconds, max_bytes, stop, sleep):
     deadline = clock() + timeout_seconds
     chunks, size = [], 0
     finished = exited = False
-    linger = None
+    grace_end = None
     while True:
         if stop is not None and stop.is_set():
             return INTERRUPTED, None
         now = clock()
         if now >= deadline:
             return TIMEOUT, None
+        if not exited:
+            # On EVERY pass, also the ones that just read data: has the main program exited? (a wait of zero time)
+            answer = win.wait(process, 0)
+            if answer == "failed":
+                return READ_FAILED, None
+            if answer == "signaled":
+                exited = True
+                grace_end = min(deadline, now + LINGER_SECONDS)        # ONE grace deadline, never past the deadline
         kind, count = win.peek(pipe)
-        if kind == "data":
+        if kind == "error":
+            return READ_FAILED, None
+        if kind == "eof":
+            finished = True
+        elif exited and clock() >= grace_end:
+            return LEFTOVER, None                          # the pipe is still open after the grace, data or not: a helper
+        elif kind == "data":                               # holds it, so the output is not the command's alone
             piece = win.read(pipe, min(count, max_bytes + 1 - size))
             if piece is None:
                 return READ_FAILED, None
@@ -414,26 +432,20 @@ def _read(win, pipe, process, clock, timeout_seconds, max_bytes, stop, sleep):
             if size > max_bytes:
                 return TOO_LARGE, None
             continue                                       # more may be waiting: look again before any pause
-        if kind == "eof":
-            finished = True
-        elif kind == "error":
-            return READ_FAILED, None
-        if not exited:
-            answer = win.wait(process, int(min(POLL_SECONDS, deadline - now) * 1000) or 1)
-            if answer == "failed":
-                return READ_FAILED, None
-            if answer == "signaled":
-                exited = True
-                linger = min(deadline, clock() + LINGER_SECONDS)       # never past the deadline
-        elif not finished:
-            if clock() >= linger:
-                return LEFTOVER, None                      # a helper still holds the output: it is not the command's alone
-            sleep(POLL_SECONDS)
         if exited and finished:
             code = win.exit_code(process)
             if code is None:
                 return READ_FAILED, None
             return (OK, b"".join(chunks)) if code == 0 else (EXIT_CODE, None)
+        if not exited:                                     # idle: a short wait that wakes at once when the program exits
+            answer = win.wait(process, int(min(POLL_SECONDS, deadline - now) * 1000) or 1)
+            if answer == "failed":
+                return READ_FAILED, None
+            if answer == "signaled":
+                exited = True
+                grace_end = min(deadline, clock() + LINGER_SECONDS)
+        else:
+            sleep(POLL_SECONDS)
 
 
 def _finish(win, owned, clock, sleep):
@@ -458,6 +470,7 @@ def _finish(win, owned, clock, sleep):
     confirmed = confirmed and owned.ended_alone
     if owned.attributes is not None:
         win.delete_attributes(owned.attributes)
+    owned.values.clear()                    # only now: the list is gone, nothing points at the arrays any more
     for label in ("read", "write", "nul", "thread", "process", "job"):      # the job last: kill-on-close is the net
         owned.close(label)
     return confirmed

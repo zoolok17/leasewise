@@ -218,3 +218,34 @@ check fails 4 of the 4 budget tests, and not handing the stop event to the read 
   the default, about 122 s at 60); it bounds receipt reading, not the whole cycle.
 - Live use needs the real receipt command and a check that its parser reads `--after N --limit M --json` as options.
 - Limits as in step 2 (Windows only, mapped drives, the cooperative deadline, helpers started through another service).
+
+## Fix round 1 (Codex's read of the runner)
+
+Codex read the runner. The containment holds (the program starts inside its job) and the HTTPS fix works. Two runner details
+were wrong. Neither changes `run(...)` or `Result`, so step 3 stands as built.
+
+### In plain words
+
+- **F1, two small blocks of memory freed too early.** Windows is told to keep using two small arrays (the list of handles the
+  program inherits, and the job it is created in) until the attribute list is deleted. Python could free them as soon as the
+  setup function returned. It worked by luck. Now both arrays belong to the same owner as the attribute list, are stored before
+  either is handed over, and are released only after the list has been deleted.
+- **F2, the half-second grace was not enforced while data flowed.** When the main program had exited but a helper kept writing
+  output without a pause, the loop always found more data and never looked at the grace, so the helper's output could be
+  accepted as the page (Codex measured a page accepted 2.6 s after the main program ended). Now, on every pass, including the
+  pass that has just read data, the loop asks (with a wait of zero time) whether the main program has exited. Once it has, there
+  is **one** grace deadline, `min(overall deadline, exit + 0.5 s)`, enforced while data is being drained as well as while idle. If
+  the output pipe is still open after the grace, the answer is `leftover_process`, with no bytes, and the usual job cleanup runs.
+
+### Tests (in `test_card7l6a1b_runner.py`, 6 new)
+
+| What | Where |
+|---|---|
+| at the moment the attribute list is deleted both arrays are alive: on success, when the first attribute update fails, and when the second fails (the owner held both before the first update) | `BufferLifetime` |
+| a helper keeps writing valid page bytes after the main program exited (the main program's exit is seen through a handle the test keeps; a scheduling delay between peek and read keeps data always waiting): `leftover_process`, within the grace plus a two-second margin, no bytes, the helper gone with the job | `Grace` |
+| a normal program that writes a 900 KB page and exits is still `ok`; the quiet holder and the deadline cap of the grace still hold | `Grace` |
+
+Red first: against the previous runner, 4 of the 6 fail (the three lifetime tests, which need the owner to hold the arrays, and
+the helper test, which got `ok` with 2 MB of output). The handshakes are files the programs write and handles the test keeps,
+not sleeps.
+
