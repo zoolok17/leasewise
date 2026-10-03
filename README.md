@@ -978,10 +978,10 @@ Limits, plainly:
 - **The deadline is cooperative.** It holds while the Windows calls return normally. Not covered: creating the process, the
   setup before the clock starts, and a possible wait inside `PeekNamedPipe`. The reporter must be the only reader of the pipe.
 - A drive letter mapped to remote storage is not detected as a network path; the operator is responsible for it.
-- Helpers started through another Windows service (a scheduled task, a service) are outside any job. If the first
-  program only starts the real one and exits, the reporter cannot wait for the real one: the work it started is ended and
-  the read is reported as `leftover_process` (or `exit_code` when the launcher itself failed). Put the real program in
-  `command`, not a launcher.
+- Helpers started through another Windows service (a scheduled task, a service) are outside any job. A helper that
+  keeps stdout open beyond the post-exit grace causes `leftover_process`. Helpers that do not hold stdout are ended during
+  job cleanup, and a successful page may still be accepted. Configure a program that waits for the work needed to produce
+  its page.
 - The job holds at most 32 processes and has no memory or processor limits.
 - Windows only; Linux and macOS are a later card.
 

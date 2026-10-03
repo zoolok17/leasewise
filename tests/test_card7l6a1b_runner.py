@@ -103,11 +103,15 @@ class Watch:
 
     def __init__(self, pid):
         self.handle = _k32.OpenProcess(0x00100000 | 0x1000, False, pid)            # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
-        # no handle: the process was already gone when we asked (a process id that is not running)
+        # no handle: we do NOT know whether the process is gone (it may be, or Windows may have refused); see `opened`
+
+    @property
+    def opened(self):
+        return bool(self.handle)
 
     def gone(self, seconds=0):
         if not self.handle:
-            return True
+            raise AssertionError("no process handle was retained, so whether the process is gone is unknown")
         return _k32.WaitForSingleObject(self.handle, int(seconds * 1000)) == 0
 
     def close(self):
@@ -158,7 +162,9 @@ class Probe:
                 except OSError:
                     continue                                    # the program is replacing the file right now: look again
                 if text:
-                    self.watches[path] = Watch(int(text))
+                    watch = Watch(int(text))
+                    if watch.opened:                            # a failed open is unknown, never "gone": try again next look
+                        self.watches[path] = watch
         if self.ready and not self.fired and all(self._is_ready(path) for path in self.ready):
             self.fired = True
             if self.then:
@@ -820,6 +826,27 @@ class ProbeReadiness(unittest.TestCase):
             self.assertTrue(probe.is_set())                           # read at last: handle retained, then ready
             self.assertEqual(ran, [[marker]])                         # and the callback saw the retained handle
             self.assertFalse(probe.is_set())                          # it fires once
+
+    def test_a_process_that_could_not_be_opened_is_unknown_never_gone_and_never_ready(self):
+        with tempfile.TemporaryDirectory(prefix="quota-l6a1b-probe-") as folder:
+            marker = os.path.join(folder, "up.pid")
+            with open(marker, "w", encoding="ascii") as handle:
+                handle.write(str(os.getpid()))
+            ran = []
+            probe = Probe(markers=[marker], ready=[marker], then=lambda: ran.append(True))
+            self.addCleanup(probe.close)
+            with mock.patch.object(_k32, "OpenProcess", return_value=0):
+                self.assertFalse(probe.is_set())
+                self.assertFalse(probe.is_set())
+                self.assertEqual((probe.watches, ran, probe.fired), ({}, [], False))
+                watch = Watch(os.getpid())
+                self.assertFalse(watch.opened)
+                with self.assertRaises(AssertionError):
+                    watch.gone()                                  # it never answers True when it does not know
+            self.assertTrue(probe.is_set())                       # a real handle at last: ready, and the callback runs once
+            self.assertEqual(ran, [True])
+            self.assertTrue(probe.watches[marker].opened)
+            self.assertFalse(probe.watches[marker].gone())        # this very process is alive
 
     def test_a_ready_path_that_names_no_process_is_ready_when_it_exists(self):
         with tempfile.TemporaryDirectory(prefix="quota-l6a1b-probe-") as folder:
