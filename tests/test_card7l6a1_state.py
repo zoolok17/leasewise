@@ -617,8 +617,8 @@ class Offer(_Tmp):
 
     def released(self, state, count=2):
         leases = [lease() for _ in range(count)]
-        state.copy_bindings([binding(l) for l in leases], NOW)
-        self.capture(state, [receipt(l, n + 1) for n, l in enumerate(leases)])
+        state.copy_bindings([binding(one) for one in leases], NOW)
+        self.capture(state, [receipt(one, n + 1) for n, one in enumerate(leases)])
         state.release_waiting(NOW)
         return leases
 

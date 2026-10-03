@@ -108,11 +108,11 @@ class EndToEnd(unittest.TestCase):
     def test_every_outcome_word_settles(self):
         words = ("completed", "cancelled", "failed", "provider_limit")
         leases = [self.grant()["lease_id"] for _ in words]
-        reporter = self.start([receipt(l, n + 1, outcome=word) for n, (l, word) in enumerate(zip(leases, words))])
+        reporter = self.start([receipt(one, n + 1, outcome=word) for n, (one, word) in enumerate(zip(leases, words, strict=True))])
         self.know(*leases)
         result = reporter.cycle()
         self.assertEqual((result.new_receipts, result.sent, result.blocked), (4, 4, None))
-        for lease_id, word in zip(leases, words):
+        for lease_id, word in zip(leases, words, strict=True):
             self.assertEqual(self.lease_row(lease_id), ("settled", word), word)
 
     def test_a_second_cycle_sends_nothing_new(self):

@@ -37,7 +37,7 @@ class _Status(unittest.TestCase):
     def reporter(self, rows=None, net=None, count=1):
         self.leases = [lease() for _ in range(count)]
         if rows is None:
-            rows = [receipt(l, n + 1) for n, l in enumerate(self.leases)]
+            rows = [receipt(one, n + 1) for n, one in enumerate(self.leases)]
         self.fixture = configure(self.rig, rows, bindings=self.leases)
         return self.rig.open(transport=net or Net())
 

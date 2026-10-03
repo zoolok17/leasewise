@@ -17,7 +17,7 @@ Nothing here ever looks a process up by its name.
 import contextlib
 import os
 import signal
-import subprocess
+import subprocess  # nosec B404 - the program to run is the operator's own configured command
 import sys
 
 if sys.platform == "win32":
@@ -86,7 +86,8 @@ class Tree:
             else:
                 taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
                 with contextlib.suppress(OSError, subprocess.SubprocessError):
-                    subprocess.run([taskkill, "/T", "/F", "/PID", str(self.proc.pid)], stdin=subprocess.DEVNULL,
+                    subprocess.run([taskkill, "/T", "/F", "/PID", str(self.proc.pid)],  # nosec B603 - a fixed system tool, an exact pid
+                                   stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         else:
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -105,6 +106,6 @@ def start(argv, env, stdout):
     """Run `argv` (no shell, no standard input, no standard error) in its own session or job. -> Tree."""
     kwargs = {"shell": False, "stdin": subprocess.DEVNULL, "stdout": stdout, "stderr": subprocess.DEVNULL, "env": env}
     if sys.platform == "win32":
-        proc = subprocess.Popen(argv, **kwargs)
+        proc = subprocess.Popen(argv, **kwargs)  # nosec B603 - no shell; the operator's own configured command
         return Tree(proc, _make_job(proc))
-    return Tree(subprocess.Popen(argv, start_new_session=True, **kwargs), None)
+    return Tree(subprocess.Popen(argv, start_new_session=True, **kwargs), None)  # nosec B603 - as above

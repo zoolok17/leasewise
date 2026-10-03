@@ -66,7 +66,7 @@ class _Rig(unittest.TestCase):
         self.net = net
         if rows is None:
             self.leases = [lease() for _ in range(count)]
-            rows = [receipt(l, n + 1) for n, l in enumerate(self.leases)]
+            rows = [receipt(one, n + 1) for n, one in enumerate(self.leases)]
         configure(self.rig, rows, bindings=self.leases)
         return self.rig.open(transport=net)
 
