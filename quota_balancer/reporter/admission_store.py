@@ -35,11 +35,16 @@ DDL = (
     " rebuilds INTEGER NOT NULL DEFAULT 0,"
     " state TEXT NOT NULL DEFAULT 'requested' CHECK(state IN ('requested','granted')),"
     " last_error_code TEXT, not_before_ms INTEGER NOT NULL DEFAULT 0, last_pending_ms INTEGER,"
+    " return_seq INTEGER, replay_tried INTEGER NOT NULL DEFAULT 0,"
     " lease_id TEXT, gateway_id TEXT, reference TEXT, ref_sha256 TEXT, max_calls INTEGER, max_micro_eur INTEGER,"
     " ttl_seconds INTEGER, expires_ms INTEGER, closed_ms INTEGER,"
     " CHECK(state='requested' OR (lease_id IS NOT NULL AND gateway_id IS NOT NULL AND reference IS NOT NULL"
     " AND ref_sha256 IS NOT NULL AND ttl_seconds IS NOT NULL AND expires_ms IS NOT NULL)),"
     " UNIQUE(agent, message_id), UNIQUE(ref_sha256)) STRICT",
+    # A durable counter for the order `pending` returns entries in (card L6a-2): it only ever grows, so a clock that
+    # stands still or goes back cannot change who is "least recently returned".
+    "CREATE TABLE admission_meta(name TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT",
+    "INSERT INTO admission_meta(name, value) VALUES('return_seq', 0)",
     "CREATE TABLE admission_attempt(id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " admission_id INTEGER NOT NULL REFERENCES admission(id), body TEXT NOT NULL, sent_ms INTEGER NOT NULL) STRICT",
     # Identity, request and grant never change once written; an attempt is never changed or deleted; nothing is deleted.
@@ -128,3 +133,140 @@ def read_bindings(path):
         one.agent, one.message_id, one.expires_ms = agent, message_id, expires_ms
         found.append(one)
     return OK, found
+
+
+# --- the writer (card L6a-2): only `reporter admit` opens the store this way -------------------------------------
+
+BUSY_TIMEOUT_MS = 3000          # a short wait for another writer; the caller's deadline is always shorter or equal
+
+
+class StoreBusy(Exception):
+    """Another process holds the file for longer than the short wait: the caller answers "busy" and tries later."""
+
+
+class StoreUnusable(Exception):
+    """The file is not this layout (another version, or not a database). Nothing is changed."""
+
+
+COLUMNS = ("id", "agent", "message_id", "request_id", "body_current", "rebuilds", "state", "last_error_code",
+           "not_before_ms", "last_pending_ms", "return_seq", "replay_tried", "lease_id", "gateway_id", "reference",
+           "ref_sha256", "max_calls", "max_micro_eur", "ttl_seconds", "expires_ms", "closed_ms")
+
+
+def _busy(exc):
+    text = str(exc)
+    return "locked" in text or "busy" in text
+
+
+class Writer:
+    """The one writer of the store. Every change is its own short `BEGIN IMMEDIATE` transaction, so a crash leaves
+    either the old rows or the new ones. WAL mode and full synchronous writes make a committed row survive a power
+    cut. The file and its folder are created on first use."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None)
+        except (OSError, sqlite3.Error):
+            raise StoreUnusable() from None
+        self.conn = conn
+        try:
+            conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
+                with self.txn():
+                    if conn.execute("PRAGMA user_version").fetchone()[0] == 0:       # another helper may have won
+                        create(conn)
+            if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                raise StoreUnusable()
+        except sqlite3.OperationalError as exc:
+            self.close()
+            raise (StoreBusy() if _busy(exc) else StoreUnusable()) from None
+        except (sqlite3.Error, StoreUnusable):
+            self.close()
+            raise StoreUnusable() from None
+
+    def close(self):
+        with contextlib.suppress(sqlite3.Error):
+            self.conn.close()
+
+    @contextlib.contextmanager
+    def txn(self):
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            raise (StoreBusy() if _busy(exc) else StoreUnusable()) from None
+        try:
+            yield self.conn
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                self.conn.execute("ROLLBACK")
+            raise
+        else:
+            self.conn.execute("COMMIT")
+
+    def lookup(self, agent, message_id):
+        """The row of this message as a dict, or None."""
+        try:
+            row = self.conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE agent=? AND message_id=?",
+                                    (agent, message_id)).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise (StoreBusy() if _busy(exc) else StoreUnusable()) from None
+        return None if row is None else dict(zip(COLUMNS, row))
+
+    def begin_request(self, agent, message_id, request_id, body_text, now_ms):
+        """Save the request and its first body, once. A row that already exists is returned as it is."""
+        with self.txn() as conn:
+            row = self.lookup(agent, message_id)
+            if row is not None:
+                return row
+            cursor = conn.execute("INSERT INTO admission(agent, message_id, request_id, body_current) VALUES(?,?,?,?)",
+                                  (agent, message_id, request_id, body_text))
+            conn.execute("INSERT INTO admission_attempt(admission_id, body, sent_ms) VALUES(?,?,?)",
+                         (cursor.lastrowid, body_text, now_ms))
+            return self.lookup(agent, message_id)
+
+    def rebuild(self, admission_id, body_text, now_ms):
+        """A new body for the same request, saved (as the current one and as an attempt) before it is sent."""
+        with self.txn() as conn:
+            conn.execute("UPDATE admission SET body_current=?, rebuilds=rebuilds+1 WHERE id=? AND state='requested'",
+                         (body_text, admission_id))
+            conn.execute("INSERT INTO admission_attempt(admission_id, body, sent_ms) VALUES(?,?,?)",
+                         (admission_id, body_text, now_ms))
+
+    def attempts(self, admission_id, limit=4):
+        """The saved bodies, newest first."""
+        return [row[0] for row in self.conn.execute(
+            "SELECT body FROM admission_attempt WHERE admission_id=? ORDER BY id DESC LIMIT ?",
+            (admission_id, limit))]
+
+    def mark_replayed(self, admission_id, count):
+        """`count` of the newest bodies have been replayed without finding the winning grant (never goes down)."""
+        with self.txn() as conn:
+            conn.execute("UPDATE admission SET replay_tried=MAX(replay_tried, ?) WHERE id=?", (count, admission_id))
+
+    def note_error(self, admission_id, code, not_before_ms, restart_recovery):
+        """Remember why the last try ended and when to try again. `restart_recovery` forgets the recovery progress
+        (the rebuild count and the replayed bodies) because the next run starts a new episode; a run that ran out of
+        time keeps it."""
+        with self.txn() as conn:
+            conn.execute("UPDATE admission SET last_error_code=?, not_before_ms=? WHERE id=? AND state='requested'",
+                         (code, not_before_ms, admission_id))
+            if restart_recovery:
+                conn.execute("UPDATE admission SET rebuilds=0, replay_tried=0 WHERE id=? AND state='requested'",
+                             (admission_id,))
+
+    def save_grant(self, admission_id, grant):
+        """Fill the grant, once, and only if the row is still `requested`. Returns the row as stored: if another helper
+        already saved a grant, that one, never this caller's."""
+        with self.txn() as conn:
+            conn.execute(
+                "UPDATE admission SET state='granted', lease_id=?, gateway_id=?, reference=?, ref_sha256=?, max_calls=?,"
+                " max_micro_eur=?, ttl_seconds=?, expires_ms=?, last_error_code=NULL, not_before_ms=0"
+                " WHERE id=? AND state='requested'",
+                (grant["lease_id"], grant["gateway_id"], grant["lease_id"], grant["ref_sha256"], grant["max_calls"],
+                 grant["max_micro_eur"], grant["ttl_seconds"], grant["expires_ms"], admission_id))
+            row = conn.execute("SELECT " + ",".join(COLUMNS) + " FROM admission WHERE id=?", (admission_id,)).fetchone()
+            return dict(zip(COLUMNS, row))

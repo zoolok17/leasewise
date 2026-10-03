@@ -42,7 +42,8 @@ class Layout(_Dir):
         self.assertTrue({"admission", "admission_attempt"} <= tables)
         columns = [r[1] for r in self.raw("PRAGMA table_info(admission)")]
         self.assertEqual(columns, ["id", "agent", "message_id", "request_id", "body_current", "rebuilds", "state",
-                                   "last_error_code", "not_before_ms", "last_pending_ms", "lease_id", "gateway_id",
+                                   "last_error_code", "not_before_ms", "last_pending_ms", "return_seq",
+                                   "replay_tried", "lease_id", "gateway_id",
                                    "reference", "ref_sha256", "max_calls", "max_micro_eur", "ttl_seconds",
                                    "expires_ms", "closed_ms"])
 

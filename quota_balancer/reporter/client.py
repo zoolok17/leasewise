@@ -73,6 +73,33 @@ class HttpClient:
         return _response(item.kind, status, raw, self._identity)
 
 
+    def post_acquisition(self, key, body_bytes, timeout=None):
+        """POST stored acquisition bytes exactly as they are to `/v1/leases` (card L6a-2: `reporter admit`).
+        -> (status or None, the answer as a dict or None, the closed error word or None). Never raises, keeps no text
+        from a fault, and treats an answer that echoes the identity as unreadable."""
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body_bytes)),
+                   "Accept": "application/json", "Connection": "close",
+                   IDENTITY_HEADER: self._identity, IDEMPOTENCY_HEADER: key}
+        try:
+            status, raw = self._transport("POST", "/v1/leases", headers, body_bytes,
+                                          self._timeout if timeout is None else min(self._timeout, timeout))
+        except Exception:               # no text is kept: see the module note
+            return None, None, None
+        if type(status) is not int or isinstance(status, bool):
+            return None, None, None
+        if not raw or len(raw) > MAX_ANSWER_BYTES:
+            return status, None, None
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except Exception:               # ValueError, UnicodeError, RecursionError...
+            return status, None, None
+        if not isinstance(doc, dict) or (self._identity and self._identity in json.dumps(doc)):
+            return status, None, None
+        error = doc.get("error")
+        code = decisions.closed_code(error.get("code")) if isinstance(error, dict) else None
+        return status, doc, code
+
+
 LIMIT_PATH = "/v1/limit-events"
 
 
