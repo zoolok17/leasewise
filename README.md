@@ -1002,12 +1002,17 @@ bytes) exits with code 2. The reasons for `held` are only `coordinator_unreachab
    an attempt it cannot finish. If the deadline comes first the connection is closed and the answer is `held` with
    `store_busy`; what was learned is kept, so the next run continues where it stopped. A grant that Leasewise made
    but that could not be saved in time is recovered by the next run, which sends the very same saved bytes and gets the
-   same lease back. Cleaning up the exchange after the deadline measured at most a few milliseconds
-   (`test_card7l6a2_fix2`: a connection that uses up the whole budget, a peer that answers a few bytes at a time); the
-   one thing allowed past the deadline is a save that is already in hand, which may wait at most 0.5 s for the store
-   file. So the run ends within the deadline plus well under a second, and the tests allow one second.
-   **The connection obeys the deadline too:** it is made with the time that is left, its socket belongs to the watchdog from
-   the moment it exists, and nothing is sent or waited for after the deadline. For that reason, **with `[admission]`
+   same lease back. Cleaning up the exchange after the deadline measured at most a few milliseconds, **for plain HTTP and
+   for HTTPS alike** (worst of ten runs: 2 ms; `test_card7l6a2_fix2` for a connection that uses up the whole budget and a
+   peer that answers a few bytes at a time, `test_card7l6a1b_https` for the secure-connection setup). The one thing allowed
+   past the deadline is a save that is already in hand, which may wait at most 0.5 s for the store file. So the run ends
+   within the deadline plus well under a second, and the tests allow one second.
+   **The connection obeys the deadline too, and so does the HTTPS handshake:** the connection is made with the time that is
+   left, its socket belongs to the watchdog from the moment it exists (for HTTPS, from before the handshake, and the
+   handshake is given only what is left of the budget, not the whole budget again), and nothing is sent or waited for
+   after the deadline. **What is still outside the deadline, for HTTPS:** the local work of building the certificate
+   settings and checking the certificate (about 50 ms of processor time, counted in the budget but not interruptible).
+   Certificate checking itself is unchanged. For that reason, **with `[admission]`
    the address of Leasewise (`base_url`) must be an IP address or `localhost`**: a host name is refused at start-up
    ("base_url: with [admission], the host must be an IP address or localhost"), because looking a name up cannot be
    stopped by a deadline. `localhost` is connected as `127.0.0.1` without asking the resolver (Leasewise serves on IPv4

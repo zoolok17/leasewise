@@ -304,9 +304,11 @@ Codex's second read closed six of the eight findings and found two only half clo
 ### The bound, as measured
 
 With a connection that uses up the whole budget, or a peer that answers a few bytes at a time, the exchange ends within a
-few milliseconds of the deadline (measured, worst of ten runs: 2 ms). The one thing allowed past the deadline is a save that
-is already in hand (a grant Leasewise made), which may wait at most 0.5 s (`SAVE_RESERVE_MS`) for the store file. The
-tests allow the deadline plus 1 s: `test_card7l6a2_fix2.Connect` and `test_card7l6a2_fix1.Deadline`.
+few milliseconds of the deadline (measured, worst of ten runs: 2 ms), **for plain HTTP and for HTTPS** (the HTTPS handshake
+was brought under the deadline afterwards, in card L6a-1b's follow-up commit: see "The HTTPS handshake" below). The one thing
+allowed past the deadline is a save that is already in hand (a grant Leasewise made), which may wait at most 0.5 s
+(`SAVE_RESERVE_MS`) for the store file. The tests allow the deadline plus 1 s: `test_card7l6a2_fix2.Connect`,
+`test_card7l6a2_fix1.Deadline` and `test_card7l6a1b_https`.
 
 ### Tests (new, in `test_card7l6a2_fix2.py`)
 
@@ -325,8 +327,9 @@ Red first: against the previous head, 8 of the 17 new tests fail (14 failures co
 
 - With `[admission]`, Leasewise's address must be an IP address or `localhost`.
 - The `run` path without `[admission]` may still use a host name; its lookup is not bounded and it has no hook promise.
-- For an `https` base URL the handshake steps are each bounded by the time left, not jointly; the watchdog ends the
-  exchange once it is connected.
+- *(Corrected by the HTTPS follow-up; the first version of this limit said the handshake was not bounded jointly.)* For an
+  `https` base URL the only work outside the deadline is local: building the certificate settings and checking the
+  certificate (about 50 ms of processor time, not interruptible). See "The HTTPS handshake".
 
 
 ### Gates (fix round 2)
@@ -335,3 +338,28 @@ Chunks, each under 8 minutes: cards 1-4: 454; card 5: 122; L1: 215; L6: 40; R1: 
 Total **1878**, equal to the `discover` collection; the 79 test files match the seven patterns exactly once. ruff (gate
 set): 74 (the baseline). bandit: 26 (Low 5, Medium 20, High 1, the accepted OVH SHA-1). The only `nosec` notes are still
 `admission_store.py:266` and `:328`, both `B608 - fixed column names, values bound`.
+
+## The HTTPS handshake (a follow-up, made on card L6a-1b after L6a-2 was merged)
+
+Codex approved L6a-2 with one stated limit (L1): over HTTPS the secure-connection setup (the TLS handshake) could run past the
+budget. In its probe a 2-second budget took 3.6 seconds. Nothing unsafe happened (no request was sent after the deadline and the
+saved request stayed recoverable), but the words promised more than that.
+
+**Cause.** The socket's timeout was set to the time left *before* the connection was made. A connection that took 1.6 s of a
+2 s budget then handed the handshake the whole 2 s again (1.6 + 2.0 = 3.6 s), and the watchdog did not own the socket during the
+handshake, because wrapping a socket for TLS hands its descriptor to a new object.
+
+**Fix** (`client.py`, `_http`). For HTTPS the wrap is done in two steps: the wrap that does not touch the network, the new
+socket handed to the watchdog at once (it owns the descriptor now, so the watchdog can end a blocked handshake), the timeout
+set again to the time left at that moment, and then the handshake. Certificate checking is the real context's and is unchanged.
+
+**The bound, as measured.** With a connection that takes 1.6 s of a 2 s budget, with a peer that never answers the ClientHello,
+and with a peer that answers it a byte at a time, the call ends at the deadline (worst of fifteen runs: 2 ms over); before the
+fix the first of these took 3.61 s. The whole `admit` route answers `held` with `store_busy` and the row stays `requested`.
+Not covered, and local: building the certificate settings (about 50 ms) and checking the certificate.
+
+**Tests** (`test_card7l6a1b_https.py`, 5; no certificate is needed because the peers speak no real TLS). Red first: against
+the previous client, 2 of the 5 fail (3.61 s and 3.63 s against a 2 s budget) and pass now. They cover the late connection, a
+peer that accepts late and stays silent, a peer that answers a byte at a time, a deadline that passes during the connection (the
+peer receives not even a ClientHello), the watchdog thread ending in each case, and the whole `admit` route.
+
