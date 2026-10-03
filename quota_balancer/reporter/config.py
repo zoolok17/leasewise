@@ -29,12 +29,18 @@ _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 TOP_REQUIRED = ("version", "base_url", "identity", "machine", "journal_root",
                 "state_path", "policy_ids")
-TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds")
+TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events")
 AGENT_REQUIRED = ("seat", "model", "task_class", "effort", "expected_calls",
                   "max_calls", "output_cap", "per_call_output_cap", "ttl_ms")
 AGENT_OPTIONAL = ("account", "team")
 _CEILINGS = ("expected_calls", "max_calls", "output_cap",
              "per_call_output_cap", "ttl_ms")
+
+# Card 7c-2: the account map. Each source says: the seats of this provider, under this OS user, on
+# the agenttalk folder `bus_root`, use this Leasewise account. v1 reads Claude only.
+LIMIT_PROVIDERS = ("claude",)
+MAX_LIMIT_SOURCES = 8
+_LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 
 CONFIG_INVALID = "CONFIG_INVALID"
 CONFIG_PERMISSIONS = "CONFIG_PERMISSIONS"
@@ -58,7 +64,8 @@ class Config:
 
     __slots__ = ("scheme", "host", "port", "identity", "machine",
                  "journal_root", "state_path", "policy_ids_path",
-                 "poll_seconds", "silent_after_seconds", "agents")
+                 "poll_seconds", "silent_after_seconds", "agents",
+                 "limit_sources")
 
     def __repr__(self):
         return "Config(<hidden>)"
@@ -106,6 +113,66 @@ def _path(value, where):
     if not os.path.isabs(value) or "\x00" in value:
         _invalid("%s: a path must be absolute" % where)
     return value
+
+
+class LimitSource:
+    """One line of the account map. `folder` is the RESOLVED, normalised bus folder."""
+
+    __slots__ = ("bus_root", "os_user", "provider", "account", "folder")
+
+    def __repr__(self):
+        return "LimitSource(<hidden>)"
+
+    __str__ = __repr__
+
+
+def folder_key(path):
+    """The folder a path really names: resolved (dots, links, trailing separators) and normalised
+    (case and slashes on Windows). Two spellings of one folder give one key."""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):
+        _invalid("a folder path cannot be resolved")
+
+
+def _inside(child, parent):
+    """True if the resolved path `child` is the resolved folder `parent` or lies under it."""
+    base = parent.rstrip(os.sep) + os.sep
+    return child == base.rstrip(os.sep) or child.startswith(base)
+
+
+def _limit_sources(table, state_path):
+    where = "limit_events"
+    if not isinstance(table, dict):
+        _invalid("%s: must be a table" % where)
+    _closed_keys(table, ("sources",), (), where)
+    rows = table["sources"]
+    if not isinstance(rows, list) or not 0 < len(rows) <= MAX_LIMIT_SOURCES:
+        _invalid("%s: sources must be a list of 1 to %d tables" % (where, MAX_LIMIT_SOURCES))
+    state_key = folder_key(state_path)
+    found, seen, accounts = [], set(), {}
+    for row in rows:
+        if not isinstance(row, dict):
+            _invalid("%s: a source must be a table" % where)
+        _closed_keys(row, _LIMIT_SOURCE_KEYS, (), where + " source")
+        source = LimitSource()
+        source.bus_root = _path(row["bus_root"], where + " source")
+        source.os_user = _alias(row["os_user"], where + " source")
+        provider = row["provider"]
+        if not isinstance(provider, str) or provider not in LIMIT_PROVIDERS:
+            _invalid("%s source: this provider is not supported" % where)
+        source.provider = provider
+        source.account = _alias(row["account"], where + " source")
+        source.folder = folder_key(source.bus_root)
+        if (source.folder, source.provider) in seen:
+            _invalid("%s: two sources name the same folder and provider" % where)
+        seen.add((source.folder, source.provider))
+        if accounts.setdefault((source.os_user, source.provider), source.account) != source.account:
+            _invalid("%s: one OS user and provider must name one account" % where)
+        if _inside(state_key, source.folder):
+            _invalid("%s: the state file may not be inside a bus folder" % where)
+        found.append(source)
+    return tuple(found)
 
 
 def _parse_url(value):
@@ -172,6 +239,9 @@ def parse_config(text):
     config.poll_seconds = _positive(data.get("poll_seconds", 5), "poll_seconds")
     config.silent_after_seconds = _positive(
         data.get("silent_after_seconds", 86400), "silent_after_seconds")
+    config.limit_sources = ()
+    if "limit_events" in data:
+        config.limit_sources = _limit_sources(data["limit_events"], config.state_path)
     agents = data.get("agents", {})
     if not isinstance(agents, dict):
         _invalid("agents: must be a table of agent tables")
@@ -200,7 +270,13 @@ def load_config(path, *, permissions=None):
         text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         _invalid("the configuration file cannot be read")
-    return parse_config(text)
+    config = parse_config(text)
+    if config.limit_sources:
+        here = folder_key(path)
+        if any(_inside(here, source.folder) for source in config.limit_sources):
+            # The file holds a secret and never belongs in a bus folder.
+            _invalid("limit_events: the configuration file may not be inside a bus folder")
+    return config
 
 
 # --- file permissions -------------------------------------------------------
