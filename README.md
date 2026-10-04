@@ -709,6 +709,46 @@ result; `store._roll_period`, `store._promote_reader` (retire first, then promot
 one retired-reader classification, shared with the collision record) are the writers. `billing_eval._gateway_usable` stays a second line of
 defence: a version-4 chain must be one reader, generation and month. Tests: `tests/test_cardr13c_evidence.py`. Record: `docs/STEP-CARD-R1-3C.md`.
 
+## Card R1-READER, step 1 - the reader's reading and computing parts (nothing live yet)
+
+In plain words: Leasewise will one day take a paid gateway's books from a small reader on the gateway's machine. This step builds only the
+parts of that reader that **read and compute**. **Nothing here reads a live gateway, keeps any state, or sends anything**, and nothing changes for
+any seat, lease or admission decision. The reader is not used until the later steps are built, the gateway is upgraded in the operator's maintenance
+window, and Codex has checked the reader against agenttalk's merged command.
+
+What exists now:
+
+- **The runner can run the report command.** The contained Windows runner (card L6a-1b) has a second, closed mode, `report`, that adds **no**
+  arguments. The command it runs must end with the fixed words `gateway report --json`. The receipt mode is unchanged and is still the default.
+- **A strict reader of the report.** It requires every field it uses, with exact types and bounds, refuses a version it does not know, ignores the
+  keys it does not use, and keeps no name or path. A gateway with no child-turn feature, or without quota lease binding, is refused with its own
+  word (`child_cap_not_ready`).
+- **A reader of the receipt page with the month.** The page keeps its version (1). A caller says which row shape it expects: the existing rows, or
+  month rows with `charge_period` (a month or null). The keys stay closed.
+- **The money, as the lead's worked example:** the four amounts, the count of settled-over-reservation attempts, the hold flag, and
+  "spend nobody owns" = the settled total, less the receipts of that month (up to the same snapshot's number, in the same generation), less the
+  settled cost of leased turns that have no receipt yet. A result below zero is refused, never rounded up. Every report counts as quiet, derived from
+  the report version.
+
+**Where the names come from:** agenttalk's merged head `921c82d4` (its guide `docs/QWEN-OVH-TRIAL.md`, "Receipts" and "The ledger report"), in
+one table, `reporter/gwcontract.py`. The tests include agenttalk's own documented report and page, exactly as it prints them.
+
+**The unowned figure is not exact monthly lease attribution.** A receipt that spans two months is counted in neither, so each month's share of it
+stays in "spend nobody owns" although a lease owns it. Wherever Leasewise shows the figure, it keeps that qualification.
+
+**One thing to decide before the gateway is upgraded:** the older receipt path (`reporter/run.py`, seat-lease receipts) reads existing rows and would
+refuse every row of a gateway at `921c82d4` or later. This step does not change it. Details: `docs/STEP-CARD-R1-READER-1.md`.
+
+Design: `DESIGN-R1-READER.md` (revision 3). Record: `docs/STEP-CARD-R1-READER-1.md`.
+
+### Technical detail (R1-READER step 1)
+
+`runner.run(..., mode=runner.MODE_REPORT)` appends nothing and starts nothing unless the command ends with `runner.REPORT_TAIL`; `MODE_RECEIPTS`
+(default) appends `--after N --limit M --json`; an unknown mode, or a receipts run without whole numbers, starts nothing (`cannot_run`). Failures of
+the report command (exit code 2) arrive as the runner's `exit_code`. `receipts.parse_page(..., month_rows=False)` and `read_page(..., month_rows=False)`:
+the envelope is always version 1; `month_rows=True` returns `MonthReceipt` rows. `gwreport.parse_snapshot`, `fold_page`, `compute` and the `Totals`,
+`Snapshot` and `Figures` values are pure. Tests: `tests/test_cardr1reader1_report.py`.
+
 ## Card 7a-2 - the reporter core
 
 `quota_balancer/reporter/` is the part of the observe-only reporter that decides

@@ -27,7 +27,7 @@ import datetime
 import json
 import re
 
-from . import runner
+from . import gwcontract, runner
 
 OK = "ok"
 READ_LATER = "read_later"
@@ -40,6 +40,10 @@ REFUSED_REASONS = ("not_an_object", "bad_version", "bad_envelope", "wrong_after"
                    "duplicate_key", "bad_row", "bad_order")
 
 ENVELOPE_VERSION = 1
+# Card R1-READER step 1: the page envelope stays version 1 for every reader. A caller picks the ROW SHAPE it expects: the existing rows
+# (the keys of `KEYS`), or month rows (the same keys plus `charge_period`, a month "YYYY-MM" or null; `gwcontract.py`). A row of the other
+# shape is `bad_row`. Month rows are used only against a report that says `child_receipt_report_version` 2.
+_MONTH = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
 ENVELOPE_KEYS = frozenset({"envelope_version", "generation", "after_seq", "next_seq", "has_more", "receipts"})
 # The closed fields of one receipt: the gateway's own columns, without the agent or the message (names stay local).
 KEYS = frozenset({"seq", "quota_lease_ref_sha256", "outcome", "calls", "input_tokens", "output_tokens",
@@ -68,6 +72,13 @@ class Receipt:
         return "Receipt(<hidden>)"
 
     __str__ = __repr__
+
+
+class MonthReceipt(Receipt):
+    """A receipt read from a month row: the same fields, and the month its charges lie in ("YYYY-MM"), or None when they span months or
+    there was no charge. Existing-shape rows stay plain `Receipt`s, whose fields are unchanged."""
+
+    __slots__ = ("charge_period",)
 
 
 class Page:
@@ -118,10 +129,16 @@ def _iso(text):
     return True
 
 
-def _row(doc):
+def _row(doc, month_rows=False):
     """One receipt from its JSON object, or _Refused. Closed keys, exact types, bounds."""
-    if type(doc) is not dict or frozenset(doc) != KEYS:
+    keys = KEYS | {gwcontract.KEY_CHARGE_PERIOD} if month_rows else KEYS
+    if type(doc) is not dict or frozenset(doc) != keys:
         raise _Refused("bad_row")
+    month = None
+    if month_rows:
+        month = doc[gwcontract.KEY_CHARGE_PERIOD]
+        if month is not None and not (type(month) is str and _MONTH.fullmatch(month)):
+            raise _Refused("bad_row")
     if not (_int(doc["seq"], 1, INT64_MAX) and _int(doc["calls"], 0, MAX_CALLS)
             and _count(doc["input_tokens"], MAX_TOKENS) and _count(doc["output_tokens"], MAX_TOKENS)
             and _int(doc["actual_micro_eur"], 0, MAX_MICRO_EUR) and _iso(doc["closed_at"])):
@@ -131,10 +148,14 @@ def _row(doc):
         raise _Refused("bad_row")
     if doc["calls"] == 0 and (doc["input_tokens"] != 0 or doc["output_tokens"] != 0 or doc["actual_micro_eur"] != 0):
         raise _Refused("bad_row")        # no call: both counts and the money must be the number 0 (null is not 0)
-    row = Receipt()
+    if month_rows and doc["calls"] == 0 and month is not None:
+        raise _Refused("bad_row")        # month rows (agenttalk 921c82d4): a receipt with no calls has no charge, so no month
+    row = MonthReceipt() if month_rows else Receipt()
     row.seq, row.ref_sha256, row.outcome = doc["seq"], doc["quota_lease_ref_sha256"], doc["outcome"]
     row.calls, row.input_tokens, row.output_tokens = doc["calls"], doc["input_tokens"], doc["output_tokens"]
     row.actual_micro_eur, row.closed_at = doc["actual_micro_eur"], doc["closed_at"]
+    if month_rows:
+        row.charge_period = month
     return row
 
 
@@ -158,11 +179,12 @@ def _loads(raw):
         raise _Later("not_json") from None
 
 
-def parse_page(raw, after_seq, limit=MAX_ROWS):
+def parse_page(raw, after_seq, limit=MAX_ROWS, month_rows=False):
     """The bytes a source gave -> a Page, or _Later/_Refused. Every rule of the page is checked here, so a page that
     is stored is a page that was whole: the version, the closed keys, the generation, the asked-for number, the
     receipts, and that the numbers rise by exactly one. `limit` is the page length that was asked for: a longer page
-    is refused before anything is read from it."""
+    is refused before anything is read from it. The envelope is always version 1. `month_rows` is the row shape the caller
+    expects (see above); a row of the other shape is `bad_row`."""
     doc = _loads(raw)
     if type(doc) is not dict:
         raise _Refused("not_an_object")
@@ -179,7 +201,7 @@ def parse_page(raw, after_seq, limit=MAX_ROWS):
         raise _Refused("wrong_after")
     if len(doc["receipts"]) > min(limit, MAX_ROWS):
         raise _Refused("too_many")
-    rows = [_row(item) for item in doc["receipts"]]
+    rows = [_row(item, month_rows) for item in doc["receipts"]]
     expected = after_seq
     for row in rows:
         if row.seq != expected + 1:
@@ -193,7 +215,7 @@ def parse_page(raw, after_seq, limit=MAX_ROWS):
     return page
 
 
-def _fixture_page(raw, after_seq, max_bytes, limit):
+def _fixture_page(raw, after_seq, max_bytes, limit, month_rows=False):
     """A fixture holds either a made page (served as it is) or a whole ledger `{"generation", "receipts"}`, from
     which the page after `after_seq` is made the way the gateway would make it."""
     doc = _loads(raw)
@@ -208,7 +230,7 @@ def _fixture_page(raw, after_seq, max_bytes, limit):
         raw = json.dumps(doc).encode("utf-8")
         if len(raw) > max_bytes:
             raise _Refused("too_large")
-    return parse_page(raw, after_seq, limit)
+    return parse_page(raw, after_seq, limit, month_rows)
 
 
 def _read_fixture(path, max_bytes):
@@ -222,7 +244,7 @@ def _read_fixture(path, max_bytes):
     return raw
 
 
-def _read_command(source, after_seq, stop):
+def _read_command(source, after_seq, stop, month_rows=False):
     """One page from a command source: the contained runner answers a closed word, and only `ok` carries bytes, which go
     STRAIGHT to the page rules (never through the fixture-only whole-ledger format). Any other word is read later with that
     word; too much output is a refused page. Nothing the program printed is kept."""
@@ -230,7 +252,7 @@ def _read_command(source, after_seq, stop):
                       max_bytes=source.max_bytes, env=source.env, stop=stop)
     try:
         if done.word == runner.OK:
-            result = ReadResult(OK, None, parse_page(done.data, after_seq, source.page_limit))
+            result = ReadResult(OK, None, parse_page(done.data, after_seq, source.page_limit, month_rows))
         elif done.word == runner.TOO_LARGE:
             result = ReadResult(REFUSED, "too_large")
         else:
@@ -243,14 +265,14 @@ def _read_command(source, after_seq, stop):
     return result
 
 
-def read_page(source, after_seq, stop=None):
+def read_page(source, after_seq, stop=None, month_rows=False):
     """One page of `source` after `after_seq` -> ReadResult. Never raises on bad input. `stop` (anything with
-    `is_set()`) ends a command read in progress."""
+    `is_set()`) ends a command read in progress. `month_rows` is the row shape the caller expects (see `parse_page`)."""
     if source.command is not None:
-        return _read_command(source, after_seq, stop)
+        return _read_command(source, after_seq, stop, month_rows)
     try:
         page = _fixture_page(_read_fixture(source.fixture, source.max_bytes), after_seq, source.max_bytes,
-                             source.page_limit)
+                             source.page_limit, month_rows)
     except _Later as exc:
         return ReadResult(READ_LATER, exc.args[0])
     except _Refused as exc:
