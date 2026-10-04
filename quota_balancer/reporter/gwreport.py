@@ -96,6 +96,13 @@ def _period(value):
     return value
 
 
+def _need(row, *keys):
+    """Every key the reader uses is PRESENT in the row before any value is read. A missing key is damage; only an explicit null is "no value"
+    (a lookup with a default would read a missing `actual_micro_eur` as "no cost recorded yet" and change the figures)."""
+    if any(key not in row for key in keys):
+        _refuse()
+
+
 def _rows(doc, key):
     rows = doc.get(key)
     if type(rows) is not list:
@@ -104,6 +111,18 @@ def _rows(doc, key):
         if type(row) is not dict:
             _refuse()
     return rows
+
+
+def _months(doc, key, amount_key):
+    """A list of {period, amount} rows -> {month: amount}. Both keys present, one row per month, in month order (agenttalk's own rule)."""
+    found = {}
+    for row in _rows(doc, key):
+        _need(row, c.KEY_PERIOD, amount_key)
+        month = _period(row[c.KEY_PERIOD])
+        if month in found or (found and month < max(found)):
+            _refuse()
+        found[month] = _amount(row[amount_key])
+    return found
 
 
 def parse_snapshot(raw):
@@ -148,28 +167,16 @@ def parse_snapshot(raw):
         if type(value) is not str or _HEX64.fullmatch(value) is None:
             _refuse()                                          # with the caps ready, neither hash may be null
     snap.price_hash, snap.child_cap_hash = doc[c.KEY_PRICE_HASH], doc[c.KEY_CAP_HASH]
-    periods = {}
-    for row in _rows(doc, c.KEY_PERIODS):
-        month = _period(row.get(c.KEY_PERIOD))
-        if month in periods:
-            _refuse()
-        periods[month] = _amount(row.get(c.KEY_COMMITTED))
-    snap.periods = periods
+    snap.periods = _months(doc, c.KEY_PERIODS, c.KEY_COMMITTED)
     unresolved = []
     for row in _rows(doc, c.KEY_UNRESOLVED):
-        state = row.get(c.KEY_STATE)
-        actual = row.get(c.KEY_ACTUAL)
+        _need(row, c.KEY_STATE, c.KEY_RESERVED, c.KEY_ACTUAL)        # the cost may be null (not recorded yet) but never absent
+        state, actual = row[c.KEY_STATE], row[c.KEY_ACTUAL]
         if type(state) is not str or state not in c.STATES:
             _refuse()
-        unresolved.append((state, _amount(row.get(c.KEY_RESERVED)), None if actual is None else _amount(actual)))
+        unresolved.append((state, _amount(row[c.KEY_RESERVED]), None if actual is None else _amount(actual)))
     snap.unresolved = tuple(unresolved)
-    unreceipted = {}
-    for row in _rows(doc, c.KEY_UNRECEIPTED):
-        month = _period(row.get(c.KEY_PERIOD))
-        if month in unreceipted:
-            _refuse()
-        unreceipted[month] = _amount(row.get(c.KEY_UNRECEIPTED_AMOUNT))
-    snap.unreceipted = unreceipted
+    snap.unreceipted = _months(doc, c.KEY_UNRECEIPTED, c.KEY_UNRECEIPTED_AMOUNT)
     hold = doc.get(c.KEY_HOLD)
     if type(hold) is not bool:
         _refuse()

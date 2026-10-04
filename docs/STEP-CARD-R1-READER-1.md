@@ -99,3 +99,14 @@ unchanged; the month lives on a subclass for month rows only.
 - The cycle (step 3) must always read month rows when it uses a report with `child_receipt_report_version` 2; `fold_page` refuses existing-shape rows.
 - The unowned figure is **not exact monthly lease attribution** (agenttalk's documented limit): a cross-month receipt's shares stay in it. Wherever
   Leasewise shows it, it keeps that qualification.
+
+## Fix round 1 (Codex's read of `ee250bd`)
+
+- **F1 (blocking):** a row of `unresolved` that lacked `actual_micro_eur` was read as "no cost recorded yet", which changed the figures (an over-reservation
+  attempt counted as ordinary uncertain money, and `held_over_reservation` dropped). Every key the reader uses is now required to be **present** in every
+  nested row (`gwreport._need`) before any value is read; an explicit null and an explicit 0 stay valid. The sweep covered `periods` rows (`period`,
+  `committed_micro_eur`), `unresolved` rows (`state`, `reserved_micro_eur`, `actual_micro_eur`) and `unreceipted_bound_actual` rows (`period`, `micro_eur`);
+  receipt rows were already closed-key in both shapes. Months in `periods` and `unreceipted_bound_actual` must also come in month order, as agenttalk prints them.
+- **B1:** a month row with `calls` 0 must have `charge_period` null (agenttalk's `check_receipt_page`); a zero-cost row with calls above 0 may name a month.
+  Existing-shape callers are unchanged.
+- **N1:** the design's wording about a damaged state and about the unowned figure was aligned (see the record, revision 3 fix).

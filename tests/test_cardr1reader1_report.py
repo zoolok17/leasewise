@@ -155,6 +155,34 @@ class Projection(unittest.TestCase):
                     doc = snapshot_doc(**{key: value})
                     refused(self, lambda doc=doc: gwreport.parse_snapshot(raw(doc)), gwreport.STATUS_SHAPE)
 
+    def test_a_missing_cost_key_in_an_unresolved_row_is_refused_never_read_as_no_cost_yet(self):
+        row = {c.KEY_STATE: "uncertain", c.KEY_RESERVED: 6, c.KEY_ACTUAL: 7}
+        fig = figures(snapshot(**{c.KEY_UNRESOLVED: [row], c.KEY_HOLD: True, c.KEY_HOLD_REASON: "attempt_over_reservation"}))
+        self.assertEqual((fig.uncertain, fig.held_over_reservation), (0, 1))                  # over its reservation: counted as held only
+        gone = {key: value for key, value in row.items() if key != c.KEY_ACTUAL}               # the SAME row with only the key deleted
+        refused(self, lambda: snapshot(**{c.KEY_UNRESOLVED: [gone]}), gwreport.STATUS_SHAPE)
+        for actual in (None, 0):                                                              # an explicit null and an explicit 0 stay valid
+            self.assertEqual(snapshot(**{c.KEY_UNRESOLVED: [dict(row, **{c.KEY_ACTUAL: actual})]}).unresolved,
+                             (("uncertain", 6, actual),))
+
+    def test_a_missing_key_in_every_nested_row_kind_is_refused(self):
+        rows = {
+            c.KEY_PERIODS: {c.KEY_PERIOD: P, c.KEY_COMMITTED: 40},
+            c.KEY_UNRESOLVED: {c.KEY_STATE: "reserved", c.KEY_RESERVED: 3, c.KEY_ACTUAL: None},
+            c.KEY_UNRECEIPTED: {c.KEY_PERIOD: P, c.KEY_UNRECEIPTED_AMOUNT: 5},
+        }
+        for list_key, row in rows.items():
+            self.assertTrue(snapshot(**{list_key: [row]}))
+            for key in row:
+                with self.subTest(list=list_key, missing=key):
+                    refused(self, lambda list_key=list_key, row=row, key=key: snapshot(
+                        **{list_key: [{k: v for k, v in row.items() if k != key}]}), gwreport.STATUS_SHAPE)
+
+    def test_months_must_come_in_order_as_agenttalk_prints_them(self):
+        two = [{c.KEY_PERIOD: P, c.KEY_COMMITTED: 1}, {c.KEY_PERIOD: EARLIER, c.KEY_COMMITTED: 1}]
+        refused(self, lambda: snapshot(**{c.KEY_PERIODS: two}), gwreport.STATUS_SHAPE)
+        self.assertEqual(snapshot(**{c.KEY_PERIODS: two[::-1]}).periods, {EARLIER: 1, P: 1})
+
     def test_the_largest_amount_is_accepted_and_one_more_is_not(self):
         top = 10 ** 12
         snap = snapshot(**{c.KEY_PERIODS: [{c.KEY_PERIOD: P, c.KEY_COMMITTED: top}], c.KEY_THROUGH: 2 ** 63 - 1})
@@ -240,6 +268,17 @@ class ReceiptPage(unittest.TestCase):
                 with self.assertRaises(receipts._Refused) as caught:
                     receipts.parse_page(raw(page_doc([row])), 0, month_rows=True)
                 self.assertEqual(caught.exception.args[0], "bad_row")
+
+    def test_a_month_row_with_no_calls_must_have_no_month(self):
+        def read(row, month_rows=True):
+            return receipts.parse_page(raw(page_doc([row])), 0, month_rows=month_rows)
+        with self.assertRaises(receipts._Refused) as caught:
+            read(receipt(1, 0, P, calls=0))
+        self.assertEqual(caught.exception.args[0], "bad_row")
+        self.assertIsNone(read(receipt(1, 0, None, calls=0)).receipts[0].charge_period)
+        self.assertEqual(read(receipt(1, 0, P)).receipts[0].charge_period, P)                  # calls > 0, cost 0: may still name a month
+        plain = {key: value for key, value in receipt(1, 0, P, calls=0).items() if key != c.KEY_CHARGE_PERIOD}
+        self.assertEqual(read(plain, month_rows=False).receipts[0].calls, 0)                    # existing-shape callers are unchanged
 
     def test_the_order_and_gap_checks_still_apply(self):
         for rows, word in (([receipt(2, 1, P)], "bad_order"), ([receipt(1, 1, P), receipt(1, 1, P)], "bad_order")):

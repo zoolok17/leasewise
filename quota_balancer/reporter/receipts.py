@@ -148,6 +148,8 @@ def _row(doc, month_rows=False):
         raise _Refused("bad_row")
     if doc["calls"] == 0 and (doc["input_tokens"] != 0 or doc["output_tokens"] != 0 or doc["actual_micro_eur"] != 0):
         raise _Refused("bad_row")        # no call: both counts and the money must be the number 0 (null is not 0)
+    if month_rows and doc["calls"] == 0 and month is not None:
+        raise _Refused("bad_row")        # month rows (agenttalk 921c82d4): a receipt with no calls has no charge, so no month
     row = MonthReceipt() if month_rows else Receipt()
     row.seq, row.ref_sha256, row.outcome = doc["seq"], doc["quota_lease_ref_sha256"], doc["outcome"]
     row.calls, row.input_tokens, row.output_tokens = doc["calls"], doc["input_tokens"], doc["output_tokens"]
