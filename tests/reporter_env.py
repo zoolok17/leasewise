@@ -278,6 +278,7 @@ class Rig:
         agents = cfg.resolve_agents(config, snapshot)
         limit_sources = cfg.resolve_limit_sources(config, snapshot)       # card 7c-2; () without the block
         gateway_receipts = cfg.resolve_gateway_receipts(config, snapshot)  # card L6a-1; None without the block
+        gateway_report = cfg.resolve_gateway_report(config, snapshot)      # card R1-READER step 3b; None without the table
         self.state = State(self.ws.state)
         real = HttpClient(config.scheme, config.host, config.port,
                           config.identity)._http
@@ -287,7 +288,8 @@ class Rig:
         self.reporter = Reporter(config, agents, self.state, client,
                                  clock=self.clock, rng=lambda: 0.5,
                                  stop=stop, fault=fault,
-                                 limit_sources=limit_sources, gateway_receipts=gateway_receipts)
+                                 limit_sources=limit_sources, gateway_receipts=gateway_receipts,
+                                 gateway_report=gateway_report)
         return self.reporter
 
     def close(self):

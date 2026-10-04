@@ -19,7 +19,7 @@ import sys
 import tomllib
 from urllib.parse import urlsplit
 
-from . import cmdline, decisions, mapper
+from . import cmdline, decisions, mapper, runner
 from .events import _NAME as _AGENT_NAME
 from ..validate import ALIAS_RE
 
@@ -31,7 +31,7 @@ _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 TOP_REQUIRED = ("version", "base_url", "identity", "machine", "journal_root",
                 "state_path", "policy_ids")
 TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "gateway_receipts",
-                "admission")
+                "admission", "gateway_report")
 AGENT_REQUIRED = ("seat", "model", "task_class", "effort", "expected_calls",
                   "max_calls", "output_cap", "per_call_output_cap", "ttl_ms")
 AGENT_OPTIONAL = ("account", "team")
@@ -81,7 +81,7 @@ class Config:
     __slots__ = ("scheme", "host", "port", "identity", "machine",
                  "journal_root", "state_path", "policy_ids_path",
                  "poll_seconds", "silent_after_seconds", "agents",
-                 "limit_sources", "gateway_receipts", "admission")
+                 "limit_sources", "gateway_receipts", "admission", "gateway_report")
 
     def __repr__(self):
         return "Config(<hidden>)"
@@ -284,6 +284,63 @@ def _gateway_receipts(table):
     return row
 
 
+# Card R1-READER step 3b (DESIGN-R1-READER.md 13): the money reader's report command. Windows only, like the receipt command, under the same
+# rules, and it needs the receipt source to be a command on the SAME gateway. The command ends with `runner.REPORT_TAIL` (the reporter appends
+# nothing in this mode); without this table the money reader does nothing.
+# `account` is the alias of the gateway's own metered account: Leasewise accepts a gateway's report only from the machine AND the account that
+# own the gateway (`store._reduce_gateway_snapshot`), and the reader has no other way to learn it (the policy-ids snapshot lists accounts
+# and gateways separately). DESIGN-R1-READER.md 13 does not name it; it is the one key added to that table.
+_REPORT_KEYS = ("gateway", "account", "command")
+_REPORT_OPTIONAL = ("timeout_seconds", "env", "max_bytes", "interval_seconds")
+# Lead decision D-217: a new report is made at most once per `interval_seconds`. The ceiling keeps a report well inside Leasewise's 120-second
+# freshness window (`evidence_view.FRESH_MS`), so the newest report can always be adopted.
+DEFAULT_REPORT_INTERVAL = 60
+MIN_REPORT_INTERVAL, MAX_REPORT_INTERVAL = 30, 100
+
+
+class GatewayReport:
+    """The money reader's report command. The repr hides everything (a path can name a deployment)."""
+
+    __slots__ = ("gateway", "account", "gateway_id", "account_id", "command", "timeout_seconds", "env", "max_bytes", "interval_seconds")
+
+    def __repr__(self):
+        return "GatewayReport(<hidden>)"
+
+    __str__ = __repr__
+
+
+def _report_command(value, where):
+    """The `command` of the report table: the receipt command's rules, and it must END with the fixed tail `gateway report --json`. The tail
+    is the one place `--json` may be named; nothing else may name `--after`, `--limit` or `--json`."""
+    tail = list(runner.REPORT_TAIL)
+    if not isinstance(value, list) or value[-len(tail):] != tail or len(value) <= len(tail):
+        _invalid("%s: the command must be a program path followed by its arguments and end with: %s" % (where, " ".join(tail)))
+    return _receipt_command(value[:-1], where) + (tail[-1],)
+
+
+def _gateway_report(table):
+    where = "gateway_report"
+    if not isinstance(table, dict):
+        _invalid("%s: must be a table" % where)
+    _closed_keys(table, _REPORT_KEYS, _REPORT_OPTIONAL, where)
+    if not _windows():
+        _invalid("The report command is only available on Windows in this version.")
+    row = GatewayReport()
+    row.gateway = _alias(table["gateway"], where)
+    row.account = _alias(table["account"], where)
+    row.gateway_id = row.account_id = None
+    row.command = _report_command(table["command"], where)
+    row.timeout_seconds = _receipt_timeout(table.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT), where)
+    row.env = _receipt_env(table.get("env", {}), where)
+    row.max_bytes = table.get("max_bytes", 1024 * 1024)
+    if type(row.max_bytes) is not int or not 1024 <= row.max_bytes <= 4 * 1024 * 1024:
+        _invalid("%s: max_bytes must be a whole number from 1024 to 4194304" % where)
+    row.interval_seconds = table.get("interval_seconds", DEFAULT_REPORT_INTERVAL)
+    if type(row.interval_seconds) is not int or not MIN_REPORT_INTERVAL <= row.interval_seconds <= MAX_REPORT_INTERVAL:
+        _invalid("%s: interval_seconds must be a whole number from %d to %d" % (where, MIN_REPORT_INTERVAL, MAX_REPORT_INTERVAL))
+    return row
+
+
 # Card L6a-2: the turn admission program (`reporter admit`). The store path, the gateway the leases are for, the agents
 # whose turns the gateway admits, and the operator's token bounds (an unproven bound is never invented).
 _ADMISSION_REQUIRED = ("store", "gateway", "gateway_agents")
@@ -412,6 +469,14 @@ def parse_config(text):
     config.gateway_receipts = None
     if "gateway_receipts" in data:
         config.gateway_receipts = _gateway_receipts(data["gateway_receipts"])
+    config.gateway_report = None
+    if "gateway_report" in data:
+        config.gateway_report = _gateway_report(data["gateway_report"])
+        receipts = config.gateway_receipts
+        if receipts is None or receipts.command is None:
+            _invalid("gateway_report: the receipts must be read by a command (gateway_receipts with a command)")
+        if receipts.gateway != config.gateway_report.gateway:
+            _invalid("gateway_report: the gateway must be the one gateway_receipts names")
     config.admission = None
     if "admission" in data:
         config.admission = _admission(data["admission"])
@@ -714,6 +779,31 @@ def resolve_gateway_receipts(config, snapshot):
     for name in GatewayReceipts.__slots__:
         setattr(resolved, name, getattr(source, name))
     resolved.gateway_id = ids[0]
+    return resolved
+
+
+def _one_id(pairs, alias, what):
+    ids = [value for name, value in pairs if name == alias]
+    if not ids:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_report: the %s is not in the policy-ids snapshot" % what)
+    if len(ids) > 1:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_report: the %s alias is ambiguous in the policy-ids snapshot" % what)
+    if _UUID_TEXT.fullmatch(ids[0]) is None:
+        raise ConfigError(CONFIG_UNRESOLVED, "gateway_report: the %s id in the policy-ids snapshot is not valid" % what)
+    return ids[0]
+
+
+def resolve_gateway_report(config, snapshot):
+    """-> the GatewayReport with its gateway's and account's local ids filled in, or None without the table. Each alias must be in the snapshot
+    exactly once with a UUID id, else the reporter refuses to start. Never the first of several, never a guess. The messages name no value."""
+    source = getattr(config, "gateway_report", None)
+    if source is None:
+        return None
+    resolved = GatewayReport()
+    for name in GatewayReport.__slots__:
+        setattr(resolved, name, getattr(source, name))
+    resolved.gateway_id = _one_id(snapshot["gateways"], source.gateway, "gateway")
+    resolved.account_id = _one_id(snapshot["accounts"], source.account, "account")
     return resolved
 
 

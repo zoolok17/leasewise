@@ -29,6 +29,7 @@ import sqlite3
 from collections import namedtuple
 
 from ..validate_readings import derive_event_id
+from .gwreport import Totals
 
 CONTINUITY_CONFLICT = "continuity_conflict"
 SEND_REFUSED = "send_refused"
@@ -325,6 +326,15 @@ def _store_receipts(state, generation, totals):
         state.conn.execute("INSERT INTO gwr_receipt_months(generation, period, receipts, total_micro_eur) VALUES(?,?,?,?)",
                            (generation, period, count, total))
     _fault("receipt_months")
+
+
+def saved_totals(state, generation):
+    """The receipts already read for `generation` (a `gwreport.Totals`), or an empty one when none were read. Reads only."""
+    row = state.one("SELECT read_through_seq, no_month FROM gwr_receipts WHERE generation=?", (generation,))
+    if row is None:
+        return Totals(generation, 0, (), 0)
+    months = state.all("SELECT period, receipts, total_micro_eur FROM gwr_receipt_months WHERE generation=? ORDER BY period", (generation,))
+    return Totals(generation, row[0], tuple(tuple(month) for month in months), row[1])
 
 
 def mint(state, generation, build, totals, now_ms):
