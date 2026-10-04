@@ -18,7 +18,7 @@ import datetime
 import json
 import re
 
-from . import money
+from . import money, receipt_coverage
 
 FRESH_MS = 120_000                  # a report is fresh for 120 s (the item 4 of the predicate; also the evaluator's bracket)
 
@@ -195,6 +195,17 @@ def usable(conn, gateway_id, now_ms):
     return STATE_USABLE, chain
 
 
+def coverage(conn, gateway_id, latest):
+    """The C3 comparison (card R1-3e) for the report `status` describes: the report against this gateway's FINAL receipts. Information only.
+    Leasewise's receipts carry no ledger generation and no month, so today every receipt is mode C: the answer is (None, False)."""
+    receipts = [receipt_coverage.Receipt(gateway_id, None, seq, None, amount) for seq, amount in conn.execute(
+        "SELECT seq, actual_micro_eur FROM receipts WHERE gateway_id=? AND final=1 ORDER BY seq", (gateway_id,))]
+    result = receipt_coverage.compare(
+        receipt_coverage.Report(gateway_id, latest["generation"], latest["receipts_seq"], latest["period_start"], latest["settled_micro_eur"]),
+        receipts, receipts_carry_generation=False)                  # the `receipts` table has no generation column (a later card adds it)
+    return result.unreceipted_micro_eur, result.receipts_exceed_settled
+
+
 def project(conn, gateway_id, now_ms):
     """The `evidence` object of `status` for one gateway (8.3), or None when it has no version-4 report. Only numbers, closed words,
     local aliases' ids and random identities: no amount other than the quiet figure, no hash, no path."""
@@ -213,6 +224,7 @@ def project(conn, gateway_id, now_ms):
     open_rows = conn.execute("SELECT id, kind, event_id FROM gateway_transitions WHERE gateway_id=? AND resolved_by_adoption IS NULL "
                              "ORDER BY id", (gateway_id,)).fetchall()
     counters = (0, 0, 0, 0) if chain is None else tuple(chain[3:7])
+    unreceipted, exceeds = coverage(conn, gateway_id, latest)
     return {
         "state": state,
         "approved": _approved(conn, gateway_id, latest),
@@ -229,6 +241,8 @@ def project(conn, gateway_id, now_ms):
         "old_chain_reports": counters[1],
         "duplicate_reports": counters[2],
         "retired_reader_reports": counters[3],
+        "unreceipted_micro_eur": unreceipted,                    # null when coverage cannot be proven (mode C: today always); never 0 for unknown
+        "receipts_exceed_settled": exceeds,
         "action": ACTION_SENTENCE if open_rows or latest["gateway_flag"] else None,
     }
 

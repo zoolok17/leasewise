@@ -128,15 +128,17 @@ clock after it holds the lock; a very long `--resolve` number is bad input; and 
   unchanged dump; the boundary (120 000) is adopted; a report of the month that ends while the command waits is refused.
   **The sweep** (lesson `lw.freshness-clock-after-write-lock`), every place in `store.py` that reads the clock:
   `store.py` `import_config` (owner-changed stamp, read inside the transaction, a stamp only: fine); `reading_import` (read before the lock; it is used for the
-  30-second future refusal and as the `received_at` stamp: the early reading only makes the refusal stricter and the stamp earlier, no freshness decision
-  rests on it, so the gap does not matter, and it is not changed); `gateway_approve` (a stamp only, now read after the lock); `gateway_adopt` (fixed);
+  30-second future refusal, which the early reading only makes stricter, and it is the one stamp of everything the import writes: `received_at`, the reader
+  and transition rows, the automatic month roll and its audit row (`store.py` `_apply_assessment`, `_roll_period`). These are stamps, not decisions: no
+  freshness or order decision rests on them, so the gap does not matter, and it is not changed); `gateway_approve` (a stamp only, now read after the lock); `gateway_adopt` (fixed);
   `evidence_inputs` and `status` (read transactions: the clock is now read after the first read of the snapshot, not before the connection). Callers of the
   other modules (`lease.py` and the rest) pass their own time and are outside this card.
 - **B1: `--resolve` is bounded.** A text is checked for ASCII digits and at most 19 characters BEFORE any conversion; a number must be 0 to 2^63-1; anything
   else is the existing `INVALID_CONFIG` sentence (exit 2) and nothing is echoed. The 4 301-digit case runs through `cli.main` and leaves the store unchanged.
 - **N1: a real race.** The old test (one call after the other) is renamed to what it proves. The new test starts two threads on two connections: A holds the
-  write lock (paused at step 2) until B has asked for it and is blocked; A commits; B then re-reads under the lock and is refused. The store shows exactly A's
-  adoption.
+  write lock (paused at step 2) until B is about to call `BEGIN IMMEDIATE`; a probe connection with no busy timeout then gets "database is locked" (a real
+  database signal that A holds the lock); A commits; B then re-reads under the lock and is refused. The store shows exactly A's adoption. (Made stronger in
+  card R1-3e, which also records B's call on a monotonic clock: it began before A let go and returned only after. The test no longer sleeps.)
 - **Found by that race:** if the second operator names the SAME report the first just adopted, the predicate used to pass and the second insert hit the
   database's unique key on the event id, which surfaced as a store error. An already adopted report is now a clean `ADOPTION_REFUSED`, with the existing word
   `not_newest` in `status` (nothing newer to adopt). A test pins it.
