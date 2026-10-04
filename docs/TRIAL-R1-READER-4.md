@@ -4,6 +4,8 @@ Mode: how-to. For: the operator, at the desktop where the gateway runs, in a mai
 (`tests/trial/`, `docs/STEP-CARD-R1-READER-4-PREP.md`); **not yet run against the real gateway**. Leasewise commit to install: `<COMMIT>` (the lead fills
 this in at the merge). Plan: lead decision D-221.
 
+**How to paste.** Paste each block **whole** and press Enter **once**. Every block starts with `. {` and ends with `}`, so PowerShell runs it only when all of it has arrived, and if any line fails the **whole** block stops (a block that checks something and then acts never acts after a failed check). If anything is printed in red, **stop and tell the lead**; do not paste the next block.
+
 ## What this trial does, in plain words
 
 Leasewise has a "money reader" that asks the gateway for its own account of the month's spending, works out how much of it no lease accounts for,
@@ -62,6 +64,8 @@ Then run this block. It does four things, in this order, and stops at the first 
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Src        = Join-Path $Trial 'src'                     # Leasewise's source, extracted
 $Store      = Join-Path $Trial 'store\inventory.db'      # Leasewise's store
 $StateDir   = Join-Path $Trial 'state'                   # the reader's own state
@@ -121,6 +125,8 @@ $Saved = [ordered]@{
 }
 [IO.File]::WriteAllText($Names, ($Saved | ConvertTo-Json -Depth 3), $Utf8)
 Test-Path -LiteralPath $Names
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": choose another name. If it stops with "Someone else can
@@ -138,11 +144,15 @@ The checksum must match exactly. If it does not, **stop and tell the lead**; do 
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Archive).Hash
 if ($Actual -ne $ExpectedSha) { throw 'The archive does not match its checksum. Stop here and tell the lead.' }
 New-Item -ItemType Directory -Force $Src | Out-Null
 Expand-Archive -LiteralPath $Archive -DestinationPath $Src
 Get-ChildItem $Src | Select-Object -ExpandProperty Name
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints the names of the unpacked items: `README.md`, `docs`, `pyproject.toml`, `quota_balancer`, `tests` and similar. From now on run every Leasewise
@@ -150,7 +160,11 @@ command from inside that folder:
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 Set-Location $Src
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 ## Step 3: check Python and the gateway program
@@ -159,11 +173,15 @@ Both checks only read. Neither changes anything.
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 & $Py -c 'import sys; print(sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 11) else 1)'
 if ($LASTEXITCODE -ne 0) { throw 'Python is older than 3.11.' }
 $Rep = (& $GatewayExe @GatewayPre gateway report --json) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'The gateway program could not print its report.' }
 '{0} {1} {2}' -f $Rep.gateway_report_version, $Rep.child_cap_ready, $Rep.child_receipt_report_version
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints the Python version (for example `3.12.4`), then `1 True 2`. If the second line differs (a different report version, `False` for the caps,
@@ -177,6 +195,8 @@ accepts a gateway's report from the machine **and** the account that own the gat
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Inventory = @"
 {"version":2,
  "accounts":[{"alias":"$AccountAlias","vendor":"ovh","kind":"metered","budget_micro_eur":$BudgetMicroEur}],
@@ -196,6 +216,8 @@ if ($LASTEXITCODE -ne 0) { throw 'config-import failed' }
 & $Py -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
 if ($LASTEXITCODE -ne 0) { throw 'policy-ids failed' }
 (Get-Content -LiteralPath $PolicyIds -Raw | ConvertFrom-Json).gateways | ForEach-Object { $_.alias }
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 The first three commands print nothing when they work. The last line prints your gateway alias once. (No seats, models or limits are needed: this trial
@@ -213,6 +235,8 @@ continue in a window that lacks the helper functions.)
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 New-Item -ItemType File -Path $ConfigPath | Out-Null           # empty: nothing secret yet
 Protect-Path $ConfigPath $false                                # its own list: you, SYSTEM, Administrators; nothing inherited
 Assert-Private $ConfigPath $true                               # read back by identifier; stops here if anything is wrong
@@ -259,6 +283,8 @@ LOCALAPPDATA = $(& $ToToml $env:LOCALAPPDATA)
 Assert-Private $ConfigPath $true                               # and it is still private after the write
 Remove-Variable Id, Bytes, ConfigText
 (Get-Acl -LiteralPath $ConfigPath).Access | ForEach-Object { $_.IdentityReference.Value }
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 The last line lists who can open the file: **your** user name, `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`, and nobody else. The reader itself refuses to start if anyone
@@ -286,20 +312,26 @@ application-data folder, so its variable **`LOCALAPPDATA`** is named in both `en
 
 <!-- rehearse: window ServeArgs -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $N = Get-Content -LiteralPath "$env:LOCALAPPDATA\leasewise-trial\names.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 Set-Location -LiteralPath $N.Src
 $ServeArgs = @('-m','quota_balancer','--db',$N.Store,'serve','--host','127.0.0.1','--port','8443')
 & $N.Py @ServeArgs
+}
 ```
 
 **Window 2: the reader.** Start it after window 1 has been running for a few seconds. It is **not silent**: it prints one short line per cycle, about once a minute.
 
 <!-- rehearse: window RunArgs -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $N = Get-Content -LiteralPath "$env:LOCALAPPDATA\leasewise-trial\names.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 Set-Location -LiteralPath $N.Src
 $RunArgs = @('-m','quota_balancer','reporter','run','--config',$N.ConfigPath)
 & $N.Py @RunArgs
+}
 ```
 
 A normal line looks like this (the rehearsal printed exactly this):
@@ -318,6 +350,8 @@ In your third window, run this. It asks Leasewise's `status` every few seconds f
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Deadline = (Get-Date).AddSeconds(120)
 do {
     Start-Sleep -Seconds 5
@@ -326,6 +360,8 @@ do {
 } until ($Gateway.evidence -or (Get-Date) -gt $Deadline)
 if (-not $Gateway.evidence) { throw 'No report arrived in two minutes. See "If something goes wrong".' }
 'state={0} latest report number={1}' -f $Gateway.evidence.state, $Gateway.evidence.latest.seq
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints `state=unadopted latest report number=1`. **Unadopted** is right: nothing is trusted until you adopt a report. Leasewise accepted the first
@@ -338,12 +374,16 @@ prints now with what Leasewise holds from the report it received. They must be e
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Rep = (& $GatewayExe @GatewayPre gateway report --json) | ConvertFrom-Json
 $Held = $Gateway.report.policy_hashes
 'price equal: {0}   cap equal: {1}' -f ($Rep.policy_hash -eq $Held.price), ($Rep.child_cap_policy_hash -eq $Held.child_cap)
 if (($Rep.policy_hash -ne $Held.price) -or ($Rep.child_cap_policy_hash -ne $Held.child_cap)) { throw 'The fingerprints differ. Do not approve.' }
 & $Py -m quota_balancer --db $Store gateway-approve --gateway $GatewayAlias --price-hash $Rep.policy_hash --child-cap-hash $Rep.child_cap_policy_hash
 if ($LASTEXITCODE -ne 0) { throw 'gateway-approve failed' }
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints `price equal: True   cap equal: True`, then `{"approved":true}`.
@@ -354,9 +394,13 @@ It prints `price equal: True   cap equal: True`, then `{"approved":true}`.
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 'state={0}  blockers=[{1}]  open items={2}' -f $Gateway.evidence.state, ($Gateway.evidence.adopt_blockers -join ','), @($Gateway.evidence.open_transitions).Count
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 If it prints `blockers=[]`, go on. If it names `not_fresh`, the newest report is older than 120 seconds: wait for the next one and run this block again.
@@ -368,6 +412,8 @@ It adopts **only when there are no open items**. If there are any, it prints eac
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 $OpenItems = @($Gateway.evidence.open_transitions)
@@ -379,6 +425,8 @@ $New = $Gateway.evidence.latest
 'adopting report number {0}, {1} seconds old' -f $New.seq, [math]::Round($New.age_ms / 1000)
 & $Py -m quota_balancer --db $Store gateway-adopt --gateway $GatewayAlias --evidence $New.event_id
 "exit code $LASTEXITCODE"
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 When it works it prints the report number and its age (a few seconds), then `{"adoption_id":1}` (the number grows with each adoption), then `exit code 0`. A refusal prints
@@ -396,6 +444,8 @@ equals the gateway's own. Run this when the gateway has been quiet for a minute 
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 # The month the reader used: the UTC month of its newest report. The gateway's figure for THAT month; 0 when the gateway has no row for it.
@@ -409,6 +459,8 @@ $Settled = if ($Row.Count -eq 1) { $Row[0].committed_micro_eur } else { 0 }
 if ($Gateway.evidence.state -ne 'usable') { throw 'status does not say usable' }
 if ($Gateway.evidence.latest.settled_micro_eur -ne $Settled) { throw 'The settled totals differ.' }
 'PASSED'
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints `state=usable adopted report number=<n> month=<yyyy-mm>`, two equal totals, and `PASSED`. The gateway's figure is the one for **the month the reader used**; a gateway that
@@ -427,7 +479,11 @@ after that.) Then check that no Leasewise process remains:
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + [WildcardPattern]::Escape($Trial) + '*') } | Select-Object ProcessId, Name
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints nothing when everything has stopped. (Your own PowerShell window may show itself: ignore that.)
@@ -440,12 +496,16 @@ the line in step 1 first.) The gateway, agenttalk and the rest of the machine we
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $env:USERPROFILE
 $Marker = Get-Content -LiteralPath (Join-Path $Trial '.owner.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $Here = (Resolve-Path -LiteralPath $Trial).ProviderPath
 if (($Marker.token -ne $Token) -or ($Marker.path -ne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
 Remove-Item -LiteralPath $Trial -Recurse -Force
 Test-Path -LiteralPath $Trial
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 It prints `False`. **What is left behind:** nothing, apart from the archive you were given (delete it if you like) and the variables in your
@@ -460,9 +520,13 @@ and exit code 2, and `status` says why:
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 'state={0}  blockers=[{1}]' -f $Gateway.evidence.state, ($Gateway.evidence.adopt_blockers -join ',')
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 You will see `not_fresh` in the blockers (and the state `stale` if a report was already adopted). **Nothing is broken and nothing needs repair.**
@@ -475,7 +539,11 @@ Everything the reader cannot do ends in **one closed word**, counted in `reporte
 
 <!-- rehearse: run -->
 ```powershell
+. {
+$ErrorActionPreference = 'Stop'
 & $Py -m quota_balancer reporter status --config $ConfigPath --json | ConvertFrom-Json | Select-Object -ExpandProperty money_reader | ConvertTo-Json -Depth 4
+$ErrorActionPreference = 'Continue'
+}
 ```
 
 | What you see | What it means | What to do |

@@ -128,6 +128,24 @@ Codex's read of the first two versions was FIX with two blocking items and four 
 - **C1, the kit's own bounds.** Closed in `rehearse.ps1`: `-MaxMinutes` (default 20) is enforced at every block and wait; the started processes are kept as objects, checked for an early exit while waiting, ended through the
   object, and dropped from the list at once; no saved number is looked up again. Port 8443 is checked free at the start. A fault found on the way and fixed in the kit: `Start-Process` had been given one quoted argument when the
   trial path contained a space (a bare `@()` around a list kept it as one item); it now passes a real list. A stray local server of mine from an isolated test had held the port; the port check now catches that.
+- **P1, a block pasted into a window could go on after a failed check (a lead finding, added after the first read and before the delta read).** In plain words: when someone pastes several lines into a PowerShell window, the
+  window runs them one by one as they arrive; if one line fails, it prints the error in red and **carries on with the next lines**. So the check "this folder already exists, stop" could be followed by the lines that change the
+  folder, and step 12's "this is not our folder, delete nothing" could be followed by the delete. The rehearsal had missed this because it ran each block as one piece. Closed: **every runnable block (all 17: the 15 `run` blocks
+  and the two `window` blocks) is now one unit**, written as `. {` + `$ErrorActionPreference = 'Stop'` + the lines + `}` (the `run` blocks put `$ErrorActionPreference = 'Continue'` back before the closing brace). PowerShell reads the whole
+  braces before running anything, so the block runs only when all of it has arrived, the dot keeps every variable and function in the operator's window as before, and a failed line or a `throw` ends the **whole** block. The two window
+  blocks keep their program call (`& $N.Py @ServeArgs`) as the last line **inside** the braces. A line at the top of the runbook tells the operator: paste each block whole, press Enter once, and if anything is printed in red, stop
+  and tell the lead. The `replace` block (the operator's own names) is left as it was: it only sets variables and checks nothing.
+  Rehearsed, as a **line-by-line drill** in the kit: one live Windows PowerShell process is started with its input redirected (`-Command -`, which, like a window taking a paste, runs each complete line as it arrives and needs
+  a blank line to end a multi-line construct); the step 1 block and the step 12 block are written to it **one line at a time** (100 ms apart, then a blank line). Results, in both runs:
+  (a) step 1 on a folder that already exists and holds a sentinel file, **unwrapped (red first):** the refusal was printed in red and the block went on: the folder's listing and its access list were changed and an ownership marker
+  was written into someone else's folder; **wrapped:** the refusal was printed, the sentinel is intact, the listing and the folder's access list are unchanged, no marker was written. (b) step 12 with a wrong token after a real step 1,
+  **unwrapped (red first):** the refusal was printed in red and the block then **deleted the folder**; **wrapped:** the refusal was printed and the folder and its marker are still there. The unwrapped version of each block is made by the kit
+  from the runbook's own text (the wrapper lines taken off), and the kit stops if the unwrapped version does **not** do the harm, so the drill cannot pass by proving nothing. The two window blocks are also pasted line by line (with the
+  last line swapped for a print of the program and the arguments): they print the same program and arguments the kit starts, with nothing in red.
+  Two changes in the kit follow: window blocks are started from the runbook's text with the wrapper taken off (the program call is run by the kit's own `Start-Process`), and the kit no longer merges the error stream into the block's output
+  (`2>&1`), because a program writing to its error stream under `Stop` would then count as a failure the operator's window does not see; such text now goes to the kit's own error file (the refused adopt's sentence is the example).
+  Faults found on the way, fixed in the kit: the first line written to a redirected input can carry a byte-order mark in front of it (the kit writes a comment line first); a function returning an array of lines through `@()` kept it as one
+  item (the lines were joined into one); error text wraps at the window width, so the kit collapses white space before looking for the sentence.
 
 **Rehearsal runs for this round** (each from a clean start, each with the new drills; logs in the seat's scratch folder, `rehearsal-g1` and `rehearsal-g2`): run 1 started the pretend gateway as `idle-older` and used the
 apostrophe-and-non-ASCII application-data folder (276 s); run 2 started it as `idle-empty` with an ordinary folder (277 s). Both passed, both under the 20-minute bound. In both: the existing-folder refusal kept its sentinel, the privacy
@@ -136,7 +154,14 @@ with a wrong token deleted nothing, the processes ended through their objects (e
 the two windows' output files, the pretend gateway's folder and the fake home folders). The value lives only in `reporter.toml` and the store. After the rollback no new or missing entry in the fake or real top-level
 folders listed, and the repository status stayed empty. Gateway calls, as before: the report command about once a minute and receipts at most twice in any minute (counts include the runbook's own hand checks).
 
+**Rehearsal runs for the wrapping change** (two full runs from a clean start on the committed tree, repository status empty before and after; logs `rehearsal-y1` and `rehearsal-y2` in the seat's scratch folder): run 1 started the pretend
+gateway as `idle-older` with the apostrophe-and-non-ASCII folder (278 s); run 2 as `idle-empty` with an ordinary folder (283 s); both passed under the 20-minute bound. Both ran every earlier drill again (existing-folder refusal with its
+sentinel, the Users-group privacy check, the stale adopt refused with exit 2, the open-item stop, the wrong-token rollback in the main sequence) **and** the new line-by-line drill with the results above, including the red-first failure of the unwrapped
+blocks. The identity value appears in no file outside the trial folder (0 files, both runs); each started process was ended through its own process object. (A third run, made while the record was being edited, failed only the kit's "repository unchanged"
+check because the record itself had changed during the run: not a fault of the runbook.)
+
 ## Gates
 
 Full suite in four chunks, two at a time: 952 + 390 + 616 + 603 = 2561, plus 16 for `test_card4_ops` through `discover -p` = 2577 = `discover` (2576 before the one new test), all green; the kit is not collected.
+Re-run for the wrapping change (no product code or test changed; same counts): 952 + 390 + 616 + 603 + 16 = 2577, all green (the 16 ran alongside the last two chunks).
 Ruff (the operator's command) 74 findings, bandit 5 low, 18 medium, 1 high, same as main; no `nosec` added.

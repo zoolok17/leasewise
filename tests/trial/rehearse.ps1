@@ -6,6 +6,8 @@
 #                          gateway program instead of the real one, a scratch folder instead of the real one);
 #   * `rehearse: window`   the two blocks the operator runs in separate windows are started as hidden background processes (by Start-Process, so the
 #                          process ids are known and the processes can be ended by exact id), with a bounded lifetime;
+#   * every runnable block is wrapped by the runbook as `. { $ErrorActionPreference = 'Stop' ... }` (one unit, however it is pasted); for the two window
+#                          blocks the rehearsal keeps that wrapper but takes the last line (the program call) out and starts the program itself;
 #   * between the runbook's own steps the rehearsal moves the pretend gateway forward, and for the drill it stops the reader and waits.
 # Nothing real is touched: no gateway, no agenttalk, no provider. Run it with Windows PowerShell 5.1 (the desktop's default) or PowerShell 7.
 #
@@ -115,18 +117,18 @@ $RunBlockSb = {
     switch ($Kind) {
         'replace' { $BlockText = $Preamble }
         'window' {
-            $BlockLines = $BlockArg.Text -split "`n"
-            $LastLine = $BlockLines[-1]
-            if ($LastLine -notmatch '^& (\$[\w.]+) @(\w+)$') { throw "window block must end with: & `$Exe @Args  (got: $LastLine)" }
+            $WindowInner = Unwrap-Lines $BlockArg.Text
+            $LastLine = $WindowInner[-1]
+            if ($LastLine -notmatch '^& (\$[\w.]+) @(\w+)$') { throw "window block must end, inside its braces, with: & `$Exe @Args  (got: $LastLine)" }
             $ExeExpression = $Matches[1]; $ArgName = $Matches[2]
-            $BlockText = ($BlockLines[0..($BlockLines.Count - 2)] -join "`n")
+            $BlockText = (@('. {', "`$ErrorActionPreference = 'Stop'") + @($WindowInner[0..($WindowInner.Count - 2)]) + @('}')) -join "`n"
         }
         default { $BlockText = $BlockArg.Text }
     }
     $ErrorActionPreference = 'Continue'                  # the operator's window is not strict either; the blocks check for themselves and throw
     $Collected = New-Object System.Collections.ArrayList
     $BlockStopped = $false
-    try { . { Invoke-Expression $BlockText } 2>&1 | ForEach-Object { [void]$Collected.Add(($_ | Out-String).TrimEnd()) } }
+    try { . { Invoke-Expression $BlockText } | ForEach-Object { [void]$Collected.Add(($_ | Out-String).TrimEnd()) } }
     catch { $BlockStopped = $true; [void]$Collected.Add('STOPPED BY THE BLOCK: ' + $_.Exception.Message) }
     $BlockOutput = ($Collected -join "`n") + "`n"
     $ErrorActionPreference = 'Stop'
@@ -134,6 +136,13 @@ $RunBlockSb = {
         $WindowExe = Invoke-Expression $ExeExpression; $WindowArgs = [string[]](Get-Variable $ArgName -ValueOnly)       # a real list of arguments (a bare @() would keep the list as ONE item)
         $WindowLine = ($WindowArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { [string]$_ } }) -join ' '
         Say ("window command line: " + $WindowLine)
+        # the wrapped block as the operator pastes it (one line at a time), with only the last line swapped for a print of the program and arguments
+        $CheckLines = @($BlockText -split "`n")
+        $CheckLines = @($CheckLines[0..($CheckLines.Count - 2)]) + @("Write-Output ('EXE=' + ($ExeExpression))", "Write-Output ('ARGS=' + (`$$ArgName -join '|'))", '}', '')
+        $Check = Invoke-LineDrill ("window-" + $ArgName) $CheckLines
+        if ($Check.Err.Trim()) { throw "the wrapped window block printed an error when pasted line by line: $($Check.Err.Trim())" }
+        if (($Check.Out -notmatch ('EXE=' + [regex]::Escape([string]$WindowExe))) -or ($Check.Out -notmatch ('ARGS=' + [regex]::Escape(($WindowArgs -join '|'))))) { throw "the wrapped window block pasted line by line does not give the program and arguments that were started" }
+        Say ("drill: the wrapped window block {0} pasted line by line gives the same program and arguments, with nothing in red" -f $ArgName)
         $OutFile = Join-Path $Root ("window-{0}.out.txt" -f $ArgName); $ErrFile = Join-Path $Root ("window-{0}.err.txt" -f $ArgName)
         $Proc = Start-Process -FilePath $WindowExe -ArgumentList $WindowLine -PassThru -WindowStyle Hidden -WorkingDirectory $Src -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
         $null = $Proc.Handle                       # keep the handle, so the exit code can be read after the process ends
@@ -183,6 +192,43 @@ function Stop-Proc($P) {
 }
 function Stop-Background { foreach ($P in @($Background)) { Stop-Proc $P } }
 
+# The runbook wraps every runnable block as `. {`, the Stop line, the lines, an optional `$ErrorActionPreference = 'Continue'`, and `}`. This returns the lines inside.
+function Unwrap-Lines([string]$Text) {
+    $L = @($Text -split "`n")
+    if ($L.Count -lt 4 -or $L[0] -ne '. {' -or $L[1] -ne "`$ErrorActionPreference = 'Stop'" -or $L[-1] -ne '}') { throw 'a runnable block must start with ". {" and the Stop line, and end with "}"' }
+    $Inner = @($L[2..($L.Count - 2)])
+    if ($Inner[-1] -eq "`$ErrorActionPreference = 'Continue'") { $Inner = @($Inner[0..($Inner.Count - 2)]) }
+    return , $Inner
+}
+
+# The line-by-line paste: one live PowerShell process reads its input from a pipe, as if the operator pasted a block into a window and the window took each
+# line as it arrived (`-Command -` runs every complete line at once and needs a blank line to end a multi-line construct, just like a pasted window).
+function Invoke-LineDrill([string]$Name, [string[]]$Lines) {
+    $Psi = New-Object Diagnostics.ProcessStartInfo
+    $Psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $Psi.Arguments = '-NoProfile -NonInteractive -Command -'
+    $Psi.UseShellExecute = $false; $Psi.CreateNoWindow = $true
+    $Psi.RedirectStandardInput = $true; $Psi.RedirectStandardOutput = $true; $Psi.RedirectStandardError = $true
+    $Psi.EnvironmentVariables['PSModulePath'] = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+    $P = New-Object Diagnostics.Process
+    $P.StartInfo = $Psi
+    [void]$P.Start()
+    [void]$Background.Add($P)
+    $OutTask = $P.StandardOutput.ReadToEndAsync(); $ErrTask = $P.StandardError.ReadToEndAsync()
+    $P.StandardInput.WriteLine('# begin')                 # the first line may arrive with a byte-order mark in front of it: let a comment take it
+    foreach ($Line in $Lines) { $P.StandardInput.WriteLine($Line); $P.StandardInput.Flush(); Start-Sleep -Milliseconds 100 }
+    $P.StandardInput.Close()
+    if (-not $P.WaitForExit(120000)) { Stop-Proc $P; throw "line-by-line drill '$Name' did not finish in 120 seconds" }
+    $P.WaitForExit()
+    $Result = [pscustomobject]@{ Out = $OutTask.Result; Err = $ErrTask.Result; ExitCode = $P.ExitCode }
+    $Background.Remove($P)
+    $DrillLogs = Join-Path $Root 'line-drill-logs'
+    New-Item -ItemType Directory -Force -Path $DrillLogs | Out-Null
+    Set-Content -LiteralPath (Join-Path $DrillLogs ($Name + '.out.txt')) -Value $Result.Out -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $DrillLogs ($Name + '.err.txt')) -Value $Result.Err -Encoding UTF8
+    return $Result
+}
+
 try {
     $Number = 0
     # runbook steps 1 to 6 (names, archive, checks, store, identity, start the two windows)
@@ -219,6 +265,45 @@ try {
     try { Assert-Private $AclProbe $true } catch { $Caught = ($_.Exception.Message -like 'Someone else can open*') }
     if (-not $Caught) { throw 'the privacy check did not catch a folder that the Users group can open' }
     Say "drill: the privacy check refused a folder the Users group can open"
+    # drill: step 1 and step 12 pasted ONE LINE AT A TIME into a live PowerShell process; the unwrapped block must fail it (red first), the wrapped block must pass
+    $DrillRoot = Join-Path $Root 'line-drill'
+    New-Item -ItemType Directory -Path $DrillRoot | Out-Null
+    $Step1Block = $Blocks | Where-Object { $_.Text -match 'function Protect-Path' } | Select-Object -First 1
+    $Step12Block = $Blocks | Where-Object { $_.Text -match 'Remove-Item' } | Select-Object -First 1
+    function Block-Lines($Block, [bool]$Wrapped) { if ($Wrapped) { return , @($Block.Text -split "`n") } else { return , (Unwrap-Lines $Block.Text) } }
+    function Prelude-Lines([string]$TrialPath) { $L = @($Preamble -split "`r?`n"); $L[0] = "`$Trial = '$TrialPath'"; return , $L }
+    foreach ($Wrapped in $false, $true) {
+        $Word = if ($Wrapped) { 'WRAPPED' } else { 'UNWRAPPED' }
+        # (a) step 1 on a folder that already exists, holding a sentinel file
+        $T = Join-Path $DrillRoot ("existing-" + $Word)
+        New-Item -ItemType Directory -Path $T | Out-Null
+        $Sentinel = Join-Path $T 'precious.txt'
+        Set-Content -LiteralPath $Sentinel -Value 'do not touch' -Encoding ascii
+        $Pre = Prelude-Lines $T; $One = Block-Lines $Step1Block $Wrapped; $Twelve = Block-Lines $Step12Block $Wrapped
+        $ListBefore = (Names-Under $T) -join ','; $AclBefore = (Get-Acl -LiteralPath $T).Sddl
+        $Run = Invoke-LineDrill ("existing-" + $Word) ($Pre + $One + @(''))
+        $Refused = [bool](($Run.Err -replace '\s+', ' ') -match 'already exists\. Nothing was changed')
+        $SentinelOk = ((Get-Content -LiteralPath $Sentinel -Raw).Trim() -eq 'do not touch')
+        $ListOk = (((Names-Under $T) -join ',') -eq $ListBefore)
+        $AclOk = ((Get-Acl -LiteralPath $T).Sddl -eq $AclBefore)
+        $MarkerOk = -not (Test-Path -LiteralPath (Join-Path $T '.owner.json'))
+        Say ("drill [{0} step 1, line by line, existing folder]: refusal printed={1} sentinel kept={2} listing unchanged={3} folder access list unchanged={4} no marker written={5}" -f $Word, $Refused, $SentinelOk, $ListOk, $AclOk, $MarkerOk)
+        if (-not $Refused) { throw "line drill ($Word step 1): the refusal was not printed" }
+        if ($Wrapped -and -not ($SentinelOk -and $ListOk -and $AclOk -and $MarkerOk)) { throw 'line drill (wrapped step 1): the existing folder was changed' }
+        if (-not $Wrapped -and ($SentinelOk -and $ListOk -and $AclOk -and $MarkerOk)) { throw 'line drill (unwrapped step 1): the unwrapped block did not change the folder, so this drill proves nothing' }
+        # (b) step 12 with a wrong token, after a real step 1
+        $T = Join-Path $DrillRoot ("rollback-" + $Word)
+        $Pre = Prelude-Lines $T
+        $Run = Invoke-LineDrill ("rollback-" + $Word) ($Pre + $One + @('', "`$Token = 'not-the-token'") + $Twelve + @(''))
+        $Refused = [bool](($Run.Err -replace '\s+', ' ') -match 'not the folder this runbook made')
+        $Kept = Test-Path -LiteralPath $T
+        $MarkerKept = Test-Path -LiteralPath (Join-Path $T '.owner.json')
+        Say ("drill [{0} step 12, line by line, wrong token]: refusal printed={1} folder still there={2} marker still there={3}" -f $Word, $Refused, $Kept, $MarkerKept)
+        if (-not $Refused) { throw "line drill ($Word step 12): the refusal was not printed" }
+        if ($Wrapped -and -not ($Kept -and $MarkerKept)) { throw 'line drill (wrapped step 12): a rollback with the wrong token deleted something' }
+        if (-not $Wrapped -and $Kept) { throw 'line drill (unwrapped step 12): the unwrapped block deleted nothing, so this drill proves nothing' }
+        if (-not $Wrapped) { Say 'red first: the UNWRAPPED step 12 block, pasted a line at a time, printed the refusal in red and then went on and DELETED the folder' }
+    }
     # step 7 (wait for the first report), step 8 (compare, approve), step 9 (blockers, helper, adopt), step 10 (passed)
     foreach ($Count in 1..5) { $Block = Next-Block; $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb }
     # (the 5 blocks: wait, approve, blockers, adopt, passed)
