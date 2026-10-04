@@ -31,13 +31,15 @@ You need all of these. If one is missing, stop.
 You will use **two PowerShell windows**, both opened as the gateway user. Window 1 runs the Leasewise server, window 2 runs the reader. Everything else
 (the setup steps) you can run in a third window, or in window 2 before you start the reader.
 
-## Step 1: choose the names
+## Step 1: choose the names, then make the private folder
 
-Edit the lines in angle brackets `<like this>` and run the block. Everything else is derived from them. Use plain letters and digits in aliases.
+Edit the lines in angle brackets `<like this>` and run the block. Everything else is derived from them. Use plain letters and digits in aliases. The folder named
+by `$Trial` **must not exist yet**: the next block refuses an existing folder without changing it, because step 12 deletes this folder and must only ever delete one
+this runbook made. If you want another place, change that line.
 
 <!-- rehearse: replace -->
 ```powershell
-$Trial        = Join-Path $env:LOCALAPPDATA 'leasewise-trial'   # the one folder; deleting it undoes the trial
+$Trial        = Join-Path $env:LOCALAPPDATA 'leasewise-trial'   # the one new folder; deleting it undoes the trial
 $Py           = '<C:\path\to\python.exe>'                       # Python 3.11 or newer
 $GatewayExe   = '<C:\path\to\agenttalk.exe>'                    # the gateway's program, an .exe
 $GatewayPre   = @()                                             # extra leading arguments, if your program needs any (normally none)
@@ -50,7 +52,13 @@ $Archive      = '<C:\path\to\leasewise-COMMIT.zip>'
 $ExpectedSha  = '<the SHA-256 the lead gave you>'
 ```
 
-Then run this block. It makes the folder, works out the other names and saves them all to `names.ps1` so the other windows can load them:
+Then run this block. It does four things, in this order, and stops at the first problem:
+
+1. it refuses a folder that already exists (nothing is changed);
+2. it creates the folder and makes it **private**: only you, SYSTEM and Administrators can open it, nothing is inherited from the folder above, and it reads the access list
+   back and compares the security identifiers (not the names) before anything else is written. This comes before the store, the identity value or any other secret;
+3. it writes a small ownership marker inside (a random token and the folder's full path), which the rollback in step 12 checks before it deletes anything;
+4. it saves all the names to `names.json` (UTF-8) so the two extra windows can load them without running any script.
 
 <!-- rehearse: run -->
 ```powershell
@@ -60,23 +68,69 @@ $StateDir   = Join-Path $Trial 'state'                   # the reader's own stat
 $Journal    = Join-Path $Trial 'journal'                 # an empty folder the reader insists on
 $PolicyIds  = Join-Path $Trial 'policy-ids.json'
 $ConfigPath = Join-Path $Trial 'reporter.toml'           # private: it holds the identity value
-$Names      = Join-Path $Trial 'names.ps1'
+$Names      = Join-Path $Trial 'names.json'
 $BaseUrl    = 'http://127.0.0.1:8443'
 $env:PYTHONDONTWRITEBYTECODE = '1'                       # keeps the source folder clean
+$Utf8 = New-Object System.Text.UTF8Encoding($false)      # UTF-8 without a byte-order mark, for every file written below
 
-New-Item -ItemType Directory -Force $Trial, $StateDir, $Journal, (Split-Path $Store) | Out-Null
-$Saved = foreach ($Name in 'Trial','Py','GatewayExe','GatewayPre','MachineAlias','AccountAlias','GatewayAlias','BudgetMicroEur','ShareMicroEur',
-                  'Archive','ExpectedSha','Src','Store','StateDir','Journal','PolicyIds','ConfigPath','Names','BaseUrl') {
-    $Value = Get-Variable -Name $Name -ValueOnly
-    if ($Value -is [array]) { '${0} = @({1})' -f $Name, (($Value | ForEach-Object { "'$_'" }) -join ',') }
-    else { '${0} = ''{1}''' -f $Name, $Value }
+# Who may open the private things: you (by security identifier), SYSTEM and Administrators. Names are never compared, only identifiers.
+$Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$Allowed = @($Me, 'S-1-5-18', 'S-1-5-32-544')
+function Protect-Path {
+    param([string]$Path, [bool]$Folder)
+    $Acl = Get-Acl -LiteralPath $Path
+    $Acl.SetAccessRuleProtection($true, $false)                          # nothing inherited from the folder above
+    foreach ($Rule in @($Acl.Access)) { [void]$Acl.RemoveAccessRule($Rule) }
+    $Flags = if ($Folder) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+    foreach ($Sid in $Allowed) {
+        $Who = New-Object Security.Principal.SecurityIdentifier($Sid)
+        $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($Who, 'FullControl', $Flags, 'None', 'Allow')))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $Acl
 }
-$Saved += '$env:PYTHONDONTWRITEBYTECODE = ''1'''
-Set-Content -Path $Names -Value $Saved -Encoding ascii
-Test-Path $Names
+function Assert-Private {
+    param([string]$Path, [bool]$OwnList)                                  # $OwnList: the item has its own list and inherits nothing
+    $Acl = Get-Acl -LiteralPath $Path
+    if ($OwnList -and -not $Acl.AreAccessRulesProtected) { throw "$Path still inherits access from its folder. Stop here; nothing secret has been written." }
+    $Seen = @()
+    foreach ($Rule in $Acl.Access) {
+        if ($Rule.AccessControlType -ne 'Allow') { continue }
+        $Sid = $Rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($Allowed -notcontains $Sid) { throw "Someone else can open $Path. Stop here; nothing secret has been written." }
+        if ($OwnList -and $Rule.IsInherited) { throw "$Path inherits an entry from its folder. Stop here; nothing secret has been written." }
+        $Seen += $Sid
+    }
+    if ($Seen -notcontains $Me) { throw "You cannot open $Path. Stop here." }
+}
+
+if (Test-Path -LiteralPath $Trial) { throw "The folder $Trial already exists. Nothing was changed. Choose a new name for `$Trial and start again." }
+New-Item -ItemType Directory -Path $Trial | Out-Null     # no -Force: an existing folder is an error
+Protect-Path $Trial $true
+Assert-Private $Trial $true
+
+$Token = [guid]::NewGuid().ToString('N')                 # random
+$Here = (Resolve-Path -LiteralPath $Trial).ProviderPath
+[IO.File]::WriteAllText((Join-Path $Trial '.owner.json'), (ConvertTo-Json @{ token = $Token; path = $Here }), $Utf8)
+New-Item -ItemType Directory -Path $StateDir, $Journal, (Split-Path $Store) | Out-Null
+
+$Saved = [ordered]@{
+    Trial = $Trial; Token = $Token; Py = $Py; GatewayExe = $GatewayExe; GatewayPre = @($GatewayPre); MachineAlias = $MachineAlias
+    AccountAlias = $AccountAlias; GatewayAlias = $GatewayAlias; BudgetMicroEur = $BudgetMicroEur; ShareMicroEur = $ShareMicroEur
+    Archive = $Archive; ExpectedSha = $ExpectedSha; Src = $Src; Store = $Store; StateDir = $StateDir; Journal = $Journal
+    PolicyIds = $PolicyIds; ConfigPath = $ConfigPath; Names = $Names; BaseUrl = $BaseUrl
+}
+[IO.File]::WriteAllText($Names, ($Saved | ConvertTo-Json -Depth 3), $Utf8)
+Test-Path -LiteralPath $Names
 ```
 
-It prints `True`. In window 1 and window 2 you will start by running `. "<the Trial folder>\names.ps1"` (the dot and the space matter).
+It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": choose another name. If it stops with "Someone else can
+open ...", the folder could not be made private: **stop and tell the lead**, because nothing secret may be written there.
+
+In the two extra windows (step 6) the names are loaded with one line, `$N = Get-Content -LiteralPath <the Trial folder>\names.json -Raw -Encoding UTF8 | ConvertFrom-Json`;
+no script is run, so the machine's script policy does not matter and you must not change it. If you ever close the window you are working in, open a new one and load
+everything back with:
+`$N = Get-Content -LiteralPath '<the Trial folder>\names.json' -Raw -Encoding UTF8 | ConvertFrom-Json; foreach ($P in $N.PSObject.Properties) { Set-Variable -Name $P.Name -Value $P.Value }`
+(the helper functions of the block above are then missing; step 5 and the rollback tell you what to do).
 
 ## Step 2: check the archive, then unpack it
 
@@ -133,73 +187,90 @@ $Inventory = @"
  "project_accounts":[{"project":"trial","account":"$AccountAlias"}],
  "seats":[], "models":[], "profiles":[], "limits":[]}
 "@
-$InventoryFile = Join-Path $Trial 'inventory.json'
-Set-Content -Path $InventoryFile -Value $Inventory -Encoding ascii
+$InventoryFile = Join-Path $Trial 'inventory.json'     # inside the private folder: new files there inherit its private list
+Set-Content -LiteralPath $InventoryFile -Value $Inventory -Encoding ascii
 & $Py -m quota_balancer --db $Store init
 if ($LASTEXITCODE -ne 0) { throw 'init failed' }
 & $Py -m quota_balancer --db $Store config-import --file $InventoryFile
 if ($LASTEXITCODE -ne 0) { throw 'config-import failed' }
-& $Py -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii $PolicyIds
+& $Py -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
 if ($LASTEXITCODE -ne 0) { throw 'policy-ids failed' }
-(Get-Content $PolicyIds -Raw | ConvertFrom-Json).gateways | ForEach-Object { $_.alias }
+(Get-Content -LiteralPath $PolicyIds -Raw | ConvertFrom-Json).gateways | ForEach-Object { $_.alias }
 ```
 
 The first three commands print nothing when they work. The last line prints your gateway alias once. (No seats, models or limits are needed: this trial
 does not make any lease.)
 
-## Step 5: make the identity value and the private file
+## Step 5: make the private file, then the identity value
 
 Leasewise knows the reader by a secret **identity value**. It is made here, on this machine, from the computer's secure random source. **It is never
-printed, never logged and never pasted into any message, to anyone, ever.** It lives in a variable, in Leasewise's store, and in one private file.
+printed, never logged and never pasted into any message, to anyone, ever.** It lives in a variable, in Leasewise's store (inside the private folder of step 1), and in
+one private file.
+
+The order matters: the file that will hold the secret is created **empty**, made private and checked **first**; only then is the value made and written. If any
+check fails the block stops before a secret exists. (If you opened a new window after step 1, run step 1's block 2 again only in a **new** trial folder; do not
+continue in a window that lacks the helper functions.)
 
 <!-- rehearse: run -->
 ```powershell
+New-Item -ItemType File -Path $ConfigPath | Out-Null           # empty: nothing secret yet
+Protect-Path $ConfigPath $false                                # its own list: you, SYSTEM, Administrators; nothing inherited
+Assert-Private $ConfigPath $true                               # read back by identifier; stops here if anything is wrong
+
 $Bytes = New-Object byte[] 24
 $Rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $Rng.GetBytes($Bytes)
 $Id = ($Bytes | ForEach-Object { $_.ToString('x2') }) -join ''
 & $Py -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-ref $Id --enabled true
 if ($LASTEXITCODE -ne 0) { throw 'identity-set failed' }
+Assert-Private $Store $false                                   # the store now holds the value: it must still be private
 
 $GatewayReport  = @($GatewayExe) + $GatewayPre + @('gateway','report','--json')
 $GatewayReceipt = @($GatewayExe) + $GatewayPre + @('gateway','receipts')
-$AsToml = { param($Items) ($Items | ForEach-Object { "'$_'" }) -join ', ' }
+$ToToml = { param($Value) '"' + ([string]$Value).Replace('\', '\\').Replace('"', '\"') + '"' }       # a TOML basic string: only \ and " need escaping
+$ListToml = { param($Items) ($Items | ForEach-Object { & $ToToml $_ }) -join ', ' }
 $ConfigText = @"
 version = 1
-base_url = "$BaseUrl"
-identity = "$Id"
-machine = "$MachineAlias"
-journal_root = '$Journal'
-state_path = '$StateDir\reporter.db'
-policy_ids = '$PolicyIds'
+base_url = $(& $ToToml $BaseUrl)
+identity = $(& $ToToml $Id)
+machine = $(& $ToToml $MachineAlias)
+journal_root = $(& $ToToml $Journal)
+state_path = $(& $ToToml (Join-Path $StateDir 'reporter.db'))
+policy_ids = $(& $ToToml $PolicyIds)
 poll_seconds = 60
 
 [gateway_receipts]
-gateway = "$GatewayAlias"
-admission_store = '$Trial\admission.db'
-command = [$(& $AsToml $GatewayReceipt)]
+gateway = $(& $ToToml $GatewayAlias)
+admission_store = $(& $ToToml (Join-Path $Trial 'admission.db'))
+command = [$(& $ListToml $GatewayReceipt)]
 
 [gateway_receipts.env]
-LOCALAPPDATA = '$env:LOCALAPPDATA'
+LOCALAPPDATA = $(& $ToToml $env:LOCALAPPDATA)
 
 [gateway_report]
-gateway = "$GatewayAlias"
-account = "$AccountAlias"
-command = [$(& $AsToml $GatewayReport)]
+gateway = $(& $ToToml $GatewayAlias)
+account = $(& $ToToml $AccountAlias)
+command = [$(& $ListToml $GatewayReport)]
 
 [gateway_report.env]
-LOCALAPPDATA = '$env:LOCALAPPDATA'
+LOCALAPPDATA = $(& $ToToml $env:LOCALAPPDATA)
 "@
-New-Item -ItemType File -Force $ConfigPath | Out-Null
-icacls $ConfigPath /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):F" | Out-Null
-Set-Content -Path $ConfigPath -Value $ConfigText -Encoding ascii
+[IO.File]::WriteAllText($ConfigPath, $ConfigText, $Utf8)       # UTF-8 without a byte-order mark; the file keeps its private list
+Assert-Private $ConfigPath $true                               # and it is still private after the write
 Remove-Variable Id, Bytes, ConfigText
-(icacls $ConfigPath) -join "`n"
+(Get-Acl -LiteralPath $ConfigPath).Access | ForEach-Object { $_.IdentityReference.Value }
 ```
+
+The last line lists who can open the file: **your** user name, `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`, and nobody else. The reader itself refuses to start if anyone
+else can open the file or if the file inherits access from its folder; it allows you, SYSTEM and Administrators.
+
+Strings in the file are written as TOML **basic strings** with `\` and `"` escaped, and the file is UTF-8 without a byte-order mark, so a folder name with an apostrophe
+or a letter such as `Ü` is safe (the rehearsal used both).
 
 Why `poll_seconds = 60`: **this is a trial setting, not the reporter's default.** The reader looks at everything once per cycle, and the default cycle is 5 seconds; the older
 seat-lease receipt pass would then ask the gateway for receipts every 5 seconds. With 60, the gateway is asked for its report at most once a
-minute and for receipts about once a minute (measured in the rehearsal; see the step card), and a report is never older than about a minute and a half when you adopt it.
+minute and for receipts about once a minute (measured in the rehearsal; see the step card). This does **not** promise how old a report is when you adopt it: Leasewise
+refuses to adopt one older than 120 seconds, and that refusal is the guard (see "If an adopt is refused as too old").
 
 **About the identity value in the command above.** `identity-set` takes the value as a command argument, so for under a second, while that one command runs, the same Windows user and
 administrators can see it in the process list. The same people can already read `reporter.toml`, so this adds no new reader. **Close this PowerShell window when you are done**: the
@@ -209,33 +280,37 @@ Why the `LOCALAPPDATA` lines: the reader starts the gateway commands with almost
 `TEMP` and `TMP`, plus the `env` table you give it). The gateway's program finds the ledger and the user's front-token file under the user's
 application-data folder, so its variable **`LOCALAPPDATA`** is named in both `env` tables. The reporter itself never opens the front-token file.
 
-The last command lists who can open the file: one line with the file and **your** user name and `(F)`, then `Successfully processed 1 files`. If any other name
-appears, delete `reporter.toml`, and do this step again. Leasewise refuses to start with a file anyone else can open.
-
 ## Step 6: start it (two windows)
 
-**Window 1: the Leasewise server.** It prints nothing while it works.
+**Window 1: the Leasewise server.** It prints nothing while it works. (Change the folder in the first line if you did not use the default.)
 
 <!-- rehearse: window ServeArgs -->
 ```powershell
-. "$env:LOCALAPPDATA\leasewise-trial\names.ps1"
-Set-Location $Src
-$ServeArgs = @('-m','quota_balancer','--db',$Store,'serve','--host','127.0.0.1','--port','8443')
-& $Py @ServeArgs
+$N = Get-Content -LiteralPath "$env:LOCALAPPDATA\leasewise-trial\names.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+Set-Location -LiteralPath $N.Src
+$ServeArgs = @('-m','quota_balancer','--db',$N.Store,'serve','--host','127.0.0.1','--port','8443')
+& $N.Py @ServeArgs
 ```
 
-**Window 2: the reader.** Start it after window 1 has been running for a few seconds. It prints nothing either.
+**Window 2: the reader.** Start it after window 1 has been running for a few seconds. It is **not silent**: it prints one short line per cycle, about once a minute.
 
 <!-- rehearse: window RunArgs -->
 ```powershell
-. "$env:LOCALAPPDATA\leasewise-trial\names.ps1"
-Set-Location $Src
-$RunArgs = @('-m','quota_balancer','reporter','run','--config',$ConfigPath)
-& $Py @RunArgs
+$N = Get-Content -LiteralPath "$env:LOCALAPPDATA\leasewise-trial\names.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+Set-Location -LiteralPath $N.Src
+$RunArgs = @('-m','quota_balancer','reporter','run','--config',$N.ConfigPath)
+& $N.Py @RunArgs
 ```
 
-(If you changed the folder in step 1, type its real path instead of `$env:LOCALAPPDATA\leasewise-trial`.) A refusal to start prints one fixed sentence
-and a closed code, for example `CONFIG_INVALID`; it never prints what the file said. See "If something goes wrong".
+A normal line looks like this (the rehearsal printed exactly this):
+
+```
+{"blocked": null, "journal": "ok", "new_events": 0, "sent": 1}
+```
+
+`sent` is how many things were delivered in that cycle (`1` when a report was accepted, `0` when none was due), `blocked` is `null` when Leasewise answered (it says
+`unreachable` when the server in window 1 is not running, and `credential` when Leasewise refused the identity), and `journal` stays `ok`. A refusal to start prints one fixed
+sentence and a closed code, for example `CONFIG_INVALID`; it never prints what the file said. See "If something goes wrong".
 
 ## Step 7: wait for the first report
 
@@ -323,16 +398,22 @@ equals the gateway's own. Run this when the gateway has been quiet for a minute 
 ```powershell
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
+# The month the reader used: the UTC month of its newest report. The gateway's figure for THAT month; 0 when the gateway has no row for it.
+$Month = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$Gateway.evidence.latest.observed_at).UtcDateTime.ToString('yyyy-MM')
 $Rep = (& $GatewayExe @GatewayPre gateway report --json) | ConvertFrom-Json
-$Settled = ($Rep.periods | Select-Object -Last 1).committed_micro_eur
-'state={0}  adopted report number={1}' -f $Gateway.evidence.state, $Gateway.evidence.adopted.seq
+if ([DateTime]::UtcNow.ToString('yyyy-MM') -ne $Month) { throw "The month changed between the two readings ($Month). Wait for the next report and run this block again." }
+$Row = @($Rep.periods | Where-Object { $_.period -eq $Month })
+$Settled = if ($Row.Count -eq 1) { $Row[0].committed_micro_eur } else { 0 }
+'state={0}  adopted report number={1}  month={2}' -f $Gateway.evidence.state, $Gateway.evidence.adopted.seq, $Month
 'Leasewise settled={0}  gateway settled={1}' -f $Gateway.evidence.latest.settled_micro_eur, $Settled
 if ($Gateway.evidence.state -ne 'usable') { throw 'status does not say usable' }
 if ($Gateway.evidence.latest.settled_micro_eur -ne $Settled) { throw 'The settled totals differ.' }
 'PASSED'
 ```
 
-It prints `state=usable adopted report number=<n>`, two equal totals, and `PASSED`. If the gateway spent money between the two readings the totals differ
+It prints `state=usable adopted report number=<n> month=<yyyy-mm>`, two equal totals, and `PASSED`. The gateway's figure is the one for **the month the reader used**; a gateway that
+has spent nothing this month may list an older month only, or no month at all, and then its figure for this month is 0 (the rule the reader itself follows), so a quiet start of the
+month passes. If the gateway spent money between the two readings the totals differ
 by exactly that spending: run the block again when it is quiet. A Leasewise total **above** the gateway's is never right: stop and tell the lead.
 
 Let it keep running for a few minutes while the gateway works normally, then run this block again: new reports keep arriving (the report number grows),
@@ -340,25 +421,31 @@ and the state stays `usable`.
 
 ## Step 11: stop
 
-Press **Ctrl-C** in window 2 (the reader), then in window 1 (the server). Both stop at once; nothing is left running. (The rehearsal ended them by process id instead, which is harsher; the reader restarted cleanly after it.) You can check that no Leasewise
-process remains:
+Press **Ctrl-C** in window 2 (the reader), then in window 1 (the server). Ctrl-C is a **request** to stop: **wait until both windows show their prompt again** before you go
+on to step 12. (Ctrl-C was **not** rehearsed: the rehearsal ended the two processes through the process objects it had started, which is harsher; the reader restarted cleanly
+after that.) Then check that no Leasewise process remains:
 
 <!-- rehearse: run -->
 ```powershell
-Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$Trial*" } | Select-Object ProcessId, Name
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + [WildcardPattern]::Escape($Trial) + '*') } | Select-Object ProcessId, Name
 ```
 
 It prints nothing when everything has stopped. (Your own PowerShell window may show itself: ignore that.)
 
 ## Step 12: roll back
 
-Rolling back is deleting the folder. The gateway, agenttalk and the rest of the machine were never changed.
+Rolling back is deleting the folder, **but only the folder this runbook made**. The block compares the folder's resolved path and the token in its ownership marker with
+the ones saved in step 1, and stops if either differs; it deletes nothing in that case. (`$Token` and `$Trial` come from the window you worked in; in a new window load them with
+the line in step 1 first.) The gateway, agenttalk and the rest of the machine were never changed.
 
 <!-- rehearse: run -->
 ```powershell
-Set-Location $env:USERPROFILE
+Set-Location -LiteralPath $env:USERPROFILE
+$Marker = Get-Content -LiteralPath (Join-Path $Trial '.owner.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$Here = (Resolve-Path -LiteralPath $Trial).ProviderPath
+if (($Marker.token -ne $Token) -or ($Marker.path -ne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
 Remove-Item -LiteralPath $Trial -Recurse -Force
-Test-Path $Trial
+Test-Path -LiteralPath $Trial
 ```
 
 It prints `False`. **What is left behind:** nothing, apart from the archive you were given (delete it if you like) and the variables in your
@@ -380,7 +467,7 @@ $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 
 You will see `not_fresh` in the blockers (and the state `stale` if a report was already adopted). **Nothing is broken and nothing needs repair.**
 Make sure the reader (window 2) is running; it makes a new report at once when it starts and then about every minute. Wait for a report whose age is
-under a minute, then run the Step 9 adopt block again.
+under a minute, then run the Step 9 adopt block again. This refusal is the guard against adopting an old report; the reader's one-minute rhythm does not replace it.
 
 ## If something goes wrong
 

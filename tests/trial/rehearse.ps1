@@ -16,20 +16,24 @@ param(
     [Parameter(Mandatory = $true)][string]$Repo,
     [Parameter(Mandatory = $true)][string]$Python,
     [string]$Runbook = '',
-    [int]$MaxMinutes = 20
+    [int]$MaxMinutes = 20,
+    [ValidateSet('busy', 'idle-older', 'idle-empty')][string]$Start = 'busy',   # how the pretend gateway's ledger starts: spending this month, or a quiet start of a month
+    [switch]$OddHome                                                             # put an apostrophe and non-ASCII letters in the application-data folder name
 )
 
 $ErrorActionPreference = 'Stop'
 $ExpectStop = $false
 $Started = Get-Date
+$Overall = [Diagnostics.Stopwatch]::StartNew()
+function Check-Time { if ($Overall.Elapsed.TotalMinutes -gt $MaxMinutes) { throw "the rehearsal ran longer than its bound of $MaxMinutes minutes" } }
 if (-not $Runbook) { $Runbook = Join-Path $Repo 'docs\TRIAL-R1-READER-4.md' }
 if (Test-Path $Root) { throw "The rehearsal folder must not exist yet: $Root" }
 New-Item -ItemType Directory -Force $Root | Out-Null
 $Log = Join-Path $Root 'rehearsal.log'
 $Timings = New-Object System.Collections.ArrayList
-$Background = New-Object System.Collections.ArrayList        # the process ids this script started, to end by exact id
+$Background = New-Object System.Collections.ArrayList        # the process OBJECTS this script started: never a saved number looked up again
 
-function Say([string]$Text) { Write-Host $Text; Add-Content -Path $Log -Value $Text -Encoding ascii }
+function Say([string]$Text) { Write-Host $Text; Add-Content -LiteralPath $Log -Value $Text -Encoding UTF8 }
 
 function Names-Under([string]$Path) {
     if (-not (Test-Path $Path)) { return @() }
@@ -41,8 +45,10 @@ function Names-Under([string]$Path) {
 # files. The real top-level folders are listed too, before and after.
 $RealLocal = $env:LOCALAPPDATA; $RealRoaming = $env:APPDATA; $RealTemp = $env:TEMP
 $Fake = Join-Path $Root 'home'
-foreach ($Sub in 'Local', 'Roaming', 'Temp') { New-Item -ItemType Directory -Force (Join-Path $Fake $Sub) | Out-Null }
-$env:LOCALAPPDATA = Join-Path $Fake 'Local'; $env:APPDATA = Join-Path $Fake 'Roaming'; $env:TEMP = Join-Path $Fake 'Temp'; $env:TMP = $env:TEMP
+$LocalName = 'Local'
+if ($OddHome) { $LocalName = "Local O'Brien-" + [char]0x00DC + 'n' + [char]0x00EF }     # an apostrophe, U-umlaut and i-diaeresis, built so this file stays ASCII
+foreach ($Sub in $LocalName, 'Roaming', 'Temp') { New-Item -ItemType Directory -Force -Path (Join-Path $Fake $Sub) | Out-Null }
+$env:LOCALAPPDATA = Join-Path $Fake $LocalName; $env:APPDATA = Join-Path $Fake 'Roaming'; $env:TEMP = Join-Path $Fake 'Temp'; $env:TMP = $env:TEMP
 $Before = [ordered]@{
     'fake LOCALAPPDATA'  = Names-Under $env:LOCALAPPDATA
     'fake APPDATA'       = Names-Under $env:APPDATA
@@ -53,11 +59,18 @@ $Before = [ordered]@{
     'repository status'  = @(git -C $Repo status --porcelain)
 }
 
+# --- port 8443 must be free (the runbook's own prerequisite), or the server of the rehearsal could not start ------------------------------------------
+$Probe = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 8443)
+try { $Probe.Start(); $Probe.Stop() } catch { throw 'port 8443 on this machine is already in use: free it first' }
+
 # --- the made-up machine ----------------------------------------------------------------------------------------------------------------------
 $GatewayDir = Join-Path $Root 'pretend-gateway'
 New-Item -ItemType Directory -Force $GatewayDir | Out-Null
 Copy-Item (Join-Path $Repo 'tests\trial\pretend_gateway.py') $GatewayDir
 $Pretend = Join-Path $GatewayDir 'pretend_gateway.py'
+& $Python $Pretend init $Start
+if ($LASTEXITCODE -ne 0) { throw 'the pretend gateway could not start its ledger' }
+Say ("pretend gateway ledger starts as: {0}; odd home folder: {1}" -f $Start, [bool]$OddHome)
 $ArchivePath = Join-Path $Root 'leasewise-rehearsal.zip'
 git -C $Repo archive --format=zip -o $ArchivePath HEAD
 if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
@@ -95,6 +108,7 @@ Say ("runbook: {0} tagged blocks" -f $Blocks.Count)
 # One block is run by this script block, DOT-SOURCED (`. $RunBlockSb`) so that the variables the runbook makes stay in this script's scope, as they
 # would in the operator's window. The caller sets $BlockArg and $NumberArg first.
 $RunBlockSb = {
+    Check-Time
     $Watch = [Diagnostics.Stopwatch]::StartNew()
     $Kind = ($BlockArg.Tag -split ' ')[0]
     Say ("--- block {0} ({1}) ---" -f $NumberArg, $BlockArg.Tag)
@@ -103,8 +117,8 @@ $RunBlockSb = {
         'window' {
             $BlockLines = $BlockArg.Text -split "`n"
             $LastLine = $BlockLines[-1]
-            if ($LastLine -notmatch '^& (\$\w+) @(\w+)$') { throw "window block must end with: & `$Exe @Args  (got: $LastLine)" }
-            $ExeName = $Matches[1].TrimStart('$'); $ArgName = $Matches[2]
+            if ($LastLine -notmatch '^& (\$[\w.]+) @(\w+)$') { throw "window block must end with: & `$Exe @Args  (got: $LastLine)" }
+            $ExeExpression = $Matches[1]; $ArgName = $Matches[2]
             $BlockText = ($BlockLines[0..($BlockLines.Count - 2)] -join "`n")
         }
         default { $BlockText = $BlockArg.Text }
@@ -117,11 +131,13 @@ $RunBlockSb = {
     $BlockOutput = ($Collected -join "`n") + "`n"
     $ErrorActionPreference = 'Stop'
     if ($Kind -eq 'window') {
-        $WindowExe = (Get-Variable $ExeName -ValueOnly); $WindowArgs = @(Get-Variable $ArgName -ValueOnly)
+        $WindowExe = Invoke-Expression $ExeExpression; $WindowArgs = [string[]](Get-Variable $ArgName -ValueOnly)       # a real list of arguments (a bare @() would keep the list as ONE item)
         $WindowLine = ($WindowArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { [string]$_ } }) -join ' '
+        Say ("window command line: " + $WindowLine)
         $OutFile = Join-Path $Root ("window-{0}.out.txt" -f $ArgName); $ErrFile = Join-Path $Root ("window-{0}.err.txt" -f $ArgName)
         $Proc = Start-Process -FilePath $WindowExe -ArgumentList $WindowLine -PassThru -WindowStyle Hidden -WorkingDirectory $Src -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
-        [void]$Background.Add($Proc.Id)
+        $null = $Proc.Handle                       # keep the handle, so the exit code can be read after the process ends
+        [void]$Background.Add($Proc)
         Set-Variable -Name ("Proc_" + $ArgName) -Value $Proc
         $BlockOutput += "started $ArgName as process $($Proc.Id)`n"
         Start-Sleep -Seconds 4
@@ -146,20 +162,26 @@ function Adopted-Seq {
     return 0
 }
 
+function Assert-Alive {
+    foreach ($P in @($Background)) { if ($P.HasExited) { throw "a background process ended early (exit code $($P.ExitCode))" } }
+}
+
 function Wait-NewReport([int]$Than, [int]$Seconds) {
     $Deadline = (Get-Date).AddSeconds($Seconds)
-    do { Start-Sleep -Seconds 5; $Now = Newest-Seq } until ($Now -gt $Than -or (Get-Date) -gt $Deadline)
+    do { Start-Sleep -Seconds 5; Check-Time; Assert-Alive; $Now = Newest-Seq } until ($Now -gt $Than -or (Get-Date) -gt $Deadline)
     if ($Now -le $Than) { throw "no new report within $Seconds seconds" }
     return $Now
 }
 
-function Stop-Background {
-    foreach ($Id in @($Background)) {
-        $P = Get-Process -Id $Id -ErrorAction SilentlyContinue
-        if ($P) { Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue }
-    }
-    $Background.Clear()
+# (Process objects keep their handle, so the exit code can be read after the process ends.)
+# End a process through the object this script started (never a saved number), wait for it, and drop it from the list at once.
+function Stop-Proc($P) {
+    if (-not $P.HasExited) { $P.Kill() }
+    [void]$P.WaitForExit(10000)
+    Say ("process {0} ended, exit code {1}" -f $P.Id, $P.ExitCode)
+    $Background.Remove($P)
 }
+function Stop-Background { foreach ($P in @($Background)) { Stop-Proc $P } }
 
 try {
     $Number = 0
@@ -170,7 +192,33 @@ try {
         $Block = Next-Block
         if ($Block.Tag -ne $WantTag) { throw "runbook order changed: expected '$WantTag', found '$($Block.Tag)'" }
         $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb
+        if ($WantTag -eq 'replace') {
+            # drill: a folder that already exists must be refused without a single change (a sentinel file proves it)
+            New-Item -ItemType Directory -Path $Trial | Out-Null
+            Set-Content -LiteralPath (Join-Path $Trial 'precious.txt') -Value 'do not touch' -Encoding ascii
+            $Listing = @(Get-ChildItem -LiteralPath $Trial -Force | Select-Object -ExpandProperty Name)
+            $ExpectStop = $true; $Number++; $BlockArg = $Blocks[$Index]; $NumberArg = $Number; . $RunBlockSb; $ExpectStop = $false
+            if (-not $BlockStopped) { throw 'an existing folder was not refused' }
+            $ListingAfter = @(Get-ChildItem -LiteralPath $Trial -Force | Select-Object -ExpandProperty Name)
+            if (($Listing -join ',') -ne ($ListingAfter -join ',')) { throw 'the refused folder was changed' }
+            if ((Get-Content -LiteralPath (Join-Path $Trial 'precious.txt') -Raw).Trim() -ne 'do not touch') { throw 'the sentinel file was changed' }
+            Say "drill: the existing folder was refused; its only content, the sentinel file, is untouched ($($Listing -join ', '))"
+            Remove-Item -LiteralPath $Trial -Recurse -Force          # the rehearsal's own scaffolding, made a moment ago by this script
+        }
     }
+    # drill: the privacy check really catches a folder that someone else can open (the runbook's own functions, on a scratch folder)
+    $AclProbe = Join-Path $Root 'acl-probe'
+    New-Item -ItemType Directory -Path $AclProbe | Out-Null
+    Protect-Path $AclProbe $true
+    Assert-Private $AclProbe $true                                  # private: passes
+    $ProbeAcl = Get-Acl -LiteralPath $AclProbe
+    $UsersGroup = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $ProbeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($UsersGroup, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -LiteralPath $AclProbe -AclObject $ProbeAcl
+    $Caught = $false
+    try { Assert-Private $AclProbe $true } catch { $Caught = ($_.Exception.Message -like 'Someone else can open*') }
+    if (-not $Caught) { throw 'the privacy check did not catch a folder that the Users group can open' }
+    Say "drill: the privacy check refused a folder the Users group can open"
     # step 7 (wait for the first report), step 8 (compare, approve), step 9 (blockers, helper, adopt), step 10 (passed)
     foreach ($Count in 1..5) { $Block = Next-Block; $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb }
     # (the 5 blocks: wait, approve, blockers, adopt, passed)
@@ -182,8 +230,9 @@ try {
     $Number++; $BlockArg = $Blocks[$Index - 1]; $NumberArg = $Number; . $RunBlockSb
     # the drill: stop the reader, let the newest report age past 120 seconds, try to adopt, see the refusal, restart, adopt again
     Say "rehearsal drill: stopping the reader (process $($Proc_RunArgs.Id)) and waiting for the newest report to go stale"
-    Stop-Process -Id $Proc_RunArgs.Id -Force
+    Stop-Proc $Proc_RunArgs
     Start-Sleep -Seconds 135
+    Check-Time
     $StaleBlock = $Blocks | Where-Object { $_.Text -match 'blockers=\[\{1\}\]' -and $_.Text -notmatch 'open items' } | Select-Object -First 1
     $Number++; $BlockArg = $StaleBlock; $NumberArg = $Number; . $RunBlockSb                        # what the operator sees: state stale, not_fresh
     $AdoptBlock = $Blocks | Where-Object { $_.Text -match 'gateway-adopt' } | Select-Object -First 1
@@ -220,7 +269,7 @@ try {
     $StatusBlock = $Blocks | Where-Object { $_.Text -match 'reporter status' } | Select-Object -First 1
     $Number++; $BlockArg = $StatusBlock; $NumberArg = $Number; . $RunBlockSb
     # step 11 (stop): end the two background processes by exact id, then run the runbook's own check that nothing remains
-    Say "rehearsal: stopping the two windows by exact process id"
+    Say "rehearsal: stopping the remaining windows through their process objects"
     Stop-Background
     Start-Sleep -Seconds 3
     $StopBlock = $Blocks | Where-Object { $_.Text -match 'Win32_Process' } | Select-Object -First 1
@@ -233,8 +282,15 @@ try {
     Say ("the identity value is inside these files of the trial folder only: " + ($Holders -join ', '))
     # step 12 (roll back)
     $RollBlock = $Blocks | Where-Object { $_.Text -match 'Remove-Item' } | Select-Object -First 1
+    # drill: a rollback whose token does not match deletes nothing
+    $RealToken = $Token; $Token = 'not-the-token'
+    $ExpectStop = $true; $Number++; $BlockArg = $RollBlock; $NumberArg = $Number; . $RunBlockSb; $ExpectStop = $false
+    if (-not $BlockStopped) { throw 'a rollback with the wrong token went on' }
+    if (-not (Test-Path -LiteralPath $Trial)) { throw 'a rollback with the wrong token deleted the folder' }
+    Say "drill: the rollback with a wrong token stopped and deleted nothing"
+    $Token = $RealToken
     $Number++; $BlockArg = $RollBlock; $NumberArg = $Number; . $RunBlockSb
-    if (Test-Path $Trial) { throw 'the trial folder is still there' }
+    if (Test-Path -LiteralPath $Trial) { throw 'the trial folder is still there' }
 }
 finally {
     Stop-Background
@@ -280,4 +336,5 @@ $Total = [math]::Round(((Get-Date) - $Started).TotalSeconds, 0)
 Say ""
 Say "timings:"
 $Timings | ForEach-Object { Say ("  block {0,2}  {1,-24} {2,7} s" -f $_.Block, $_.Tag, $_.Seconds) }
-Say ("REHEARSAL PASSED in {0} seconds" -f $Total)
+Check-Time
+Say ("REHEARSAL PASSED in {0} seconds (bound: {1} minutes)" -f $Total, $MaxMinutes)

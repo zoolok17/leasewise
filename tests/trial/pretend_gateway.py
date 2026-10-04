@@ -9,6 +9,9 @@ carry `charge_period`), from a small made-up ledger file:
     python pretend_gateway.py advance          (rehearsal only: adds one receipt of 450, so the settled money grows and a second report is different;
                                                 the money no lease accounts for does not change, so nothing needs the operator)
     python pretend_gateway.py spend            (rehearsal only: money no lease accounts for goes up by 25, so Leasewise opens an item for a person)
+    python pretend_gateway.py init MODE       (rehearsal only: starts the ledger over. MODE is `busy` (the default: this month already has spending), `idle-older`
+                                                (nothing spent this month, and the report lists only an OLDER month) or `idle-empty` (nothing spent this month
+                                                and the report lists no month at all): the quiet starts of a month a healthy gateway can have)
     python pretend_gateway.py show             (rehearsal only: prints the settled total, for the "passed" comparison)
 
 The ledger file is named by the environment variable PRETEND_LEDGER (a path), or is `pretend-ledger.json` beside this script. It is created on first use.
@@ -36,10 +39,22 @@ def month_now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
 
 
+def month_before():
+    first = datetime.datetime.now(datetime.timezone.utc).replace(day=1)
+    return (first - datetime.timedelta(days=1)).strftime("%Y-%m")
+
+
+INITIAL = {
+    "busy": {"receipts": [{"seq": 1, "actual_micro_eur": 1290}], "other_spend": OPENING_OTHER_SPEND, "previous": None},
+    "idle-older": {"receipts": [], "other_spend": 0, "previous": 5000},
+    "idle-empty": {"receipts": [], "other_spend": 0, "previous": None},
+}
+
+
 def load():
     path = ledger_path()
     if not os.path.exists(path):
-        save({"receipts": [{"seq": 1, "actual_micro_eur": 1290}], "other_spend": OPENING_OTHER_SPEND})
+        save(INITIAL["busy"])
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -53,13 +68,23 @@ def settled(doc):
     return sum(row["actual_micro_eur"] for row in doc["receipts"]) + doc["other_spend"] + UNRECEIPTED
 
 
+def periods(doc, month):
+    """The months with money, oldest first. A month with no spending has no row, as with the real program: a quiet start of a month lists an older month or none."""
+    rows = []
+    if doc.get("previous") is not None:
+        rows.append({"period": month_before(), "committed_micro_eur": doc["previous"]})
+    if settled(doc) > 0:
+        rows.append({"period": month, "committed_micro_eur": settled(doc)})
+    return rows
+
+
 def report(doc):
     month = month_now()
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     return {
         "gateway_report_version": 1, "child_receipt_report_version": 2, "child_cap_ready": True,
         "generation": GENERATION, "policy_hash": PRICE_HASH, "child_cap_policy_hash": CAP_HASH,
-        "periods": [{"period": month, "committed_micro_eur": settled(doc)}],
+        "periods": periods(doc, month),
         "unresolved": [], "child_receipts_through_seq": len(doc["receipts"]),
         "unreceipted_bound_actual": [{"period": month, "micro_eur": UNRECEIPTED}],
         "service_hold": False, "service_hold_reason": None,
@@ -97,6 +122,9 @@ def main(argv):
         return 0
     if args[:2] == ["gateway", "receipts"] and "--after" in args and "--limit" in args and args[-1] == "--json":
         print(json.dumps(receipts(load(), option(args, "--after"), option(args, "--limit")), sort_keys=True, separators=(",", ":")))
+        return 0
+    if len(args) == 2 and args[0] == "init" and args[1] in INITIAL:
+        save(INITIAL[args[1]])
         return 0
     if args == ["advance"]:
         doc = load()

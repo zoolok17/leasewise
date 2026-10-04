@@ -33,7 +33,7 @@ commit's tree except for this record. Logs are kept in the seat's scratch folder
 
 | Runbook step | What was shown | Time (second run) |
 |---|---|---|
-| 1 names, derived names, `names.ps1` | `True` | under 1 s |
+| 1 names, derived names, `names.json` (first version of the table; see fix round 1) | `True` | under 1 s |
 | 2 archive checked with `Get-FileHash`, unpacked | names of the unpacked items | 4.1 s |
 | 3 Python and gateway checks | `3.13.7`, then `1 True 2` | 0.2 s |
 | 4 store: init, config-import, policy-ids | the gateway alias | 0.8 s |
@@ -41,7 +41,7 @@ commit's tree except for this record. Logs are kept in the seat's scratch folder
 | 6 start the server and the reader | two process ids | 8 s (4 s each, a pause for start-up) |
 | 7 wait for the first report | `state=unadopted latest report number=1` | 5.4 s |
 | 8 compare the fingerprints, approve | `True`, `True`, `{"approved":true}` | 0.6 s |
-| 9 blockers, helper, adopt | `blockers=[]`, `{"adoption_id":1}`, exit 0 | 1.5 s in all |
+| 9 blockers, adopt | `blockers=[]`, `{"adoption_id":1}`, exit 0 | 1.5 s in all |
 | 10 passed | `usable`, settled 1330 = 1330, `PASSED` | 0.8 s |
 | the gateway moves forward, then the passed check again | a new report; `usable`, settled 1780 = 1780 | about 60 s to the next report, 0.4 s |
 | drill: reader stopped, report goes stale (waited 135 s), the stale view, the adopt | `state=stale blockers=[not_fresh]`; the adopt printed its fixed sentence `ADOPTION_REFUSED` and exit code 2 | 135 s wait, 1.7 s of commands |
@@ -104,6 +104,37 @@ and a gateway whose settled money moves while the checks run (the runbook says t
    item `unattributed_rose` (nothing in the store was faked), `status` says `transition_open` with `open_transitions_unnamed` among the blockers, the adopt block prints `open item 1: unattributed_rose` and stops,
    and the adopted report number does not change. Run twice from a clean start: both passed (281 s each time); on the final tree, timings as before for the shared steps; the new drill adds about a minute
    (waiting for the next report). The identity value was searched for in everything outside the trial folder (the logs, the window outputs, the gateway folder): 0 files, both runs.
+
+## Fix round 1 (tk-24f9dfbc8a52)
+
+Codex's read of the first two versions was FIX with two blocking items and four smaller ones. Each is closed in the runbook (`docs/TRIAL-R1-READER-4.md`) and in the kit; no product code changed in this round.
+
+- **F1, the secret was written before its storage was proven private.** Closed in steps 1 and 5. Step 1 creates the trial folder, makes it private (you, SYSTEM and Administrators by security identifier; nothing inherited; applied
+  to children), **reads the access list back and compares identifiers, never names**, and stops on any mismatch, all before the store, the identity or any secret exists. Step 5 creates `reporter.toml` **empty** first, gives it its own
+  list the way the reporter requires (no inherited entry, only those three identifiers), verifies it, and only then makes the identity value, runs `identity-set`, verifies the store, writes the file as UTF-8 and verifies it again.
+  The access lists are set with .NET (`Get-Acl`/`Set-Acl`), which throws on failure, instead of `icacls` (whose exit code was never checked). The sentence about who the reporter allows is corrected (you, SYSTEM and Administrators).
+  Rehearsed: the checks pass in every run, and a drill gives a folder to the Users group and shows the check refuses it.
+- **F2, rollback could delete a folder the trial did not create.** Closed in steps 1 and 12. An existing `$Trial` is refused without a single change (no `-Force` on the root); a fresh folder gets an ownership marker (a random token
+  and the resolved full path); step 12 deletes only when both match. Rehearsed: a folder holding a sentinel file is refused and the sentinel and the folder listing are unchanged; a rollback with a wrong token stops and deletes nothing.
+- **B1, step 10 compared the wrong month.** Closed in step 10: the month is the UTC month of the newest Leasewise report (`latest.observed_at`), the gateway's figure is the one for that month and 0 when the month has no row (the
+  reader's own rule), and the block stops and says so if the month changed between the two readings. Rehearsed: the pretend gateway starts a run as `idle-older` (only an older month listed) or `idle-empty` (no month at all), and
+  "passed" passes with settled 0 = 0; after the gateway spends, the current month's row appears and it passes again.
+- **B2, generated files broke on ordinary paths.** Closed in steps 1, 5 and 6. The names are saved as UTF-8 **JSON** (no byte-order mark) and loaded with one `Get-Content ... | ConvertFrom-Json` line: no script is run, so
+  the machine's script policy is not involved and is never changed. The reporter's TOML is written with **basic strings** (only `\` and `"` need escaping, and both are escaped) as UTF-8 without a byte-order mark. Rehearsed:
+  one run used an application-data folder named `Local O'Brien-<U-umlaut>n<i-diaeresis>` (an apostrophe and non-ASCII letters); everything worked, including the reader's configuration, the store and the two windows.
+- **B3, claims the rehearsal did not support.** Closed in steps 5, 6, 11 and the stale section: the reader is not silent (one JSON line per cycle; the runbook shows a normal one); `poll_seconds = 60` does not promise a report
+  age, the 120-second refusal is the guard; Ctrl-C is a request, the operator waits for both prompts before the rollback, and Ctrl-C was not rehearsed. **The secret search** covered the rehearsal root (the log, the two windows'
+  output files, the pretend gateway's folder, the fake home folders) and the listed top-level places; it did **not** cover the whole machine, and the claim is limited to that.
+- **C1, the kit's own bounds.** Closed in `rehearse.ps1`: `-MaxMinutes` (default 20) is enforced at every block and wait; the started processes are kept as objects, checked for an early exit while waiting, ended through the
+  object, and dropped from the list at once; no saved number is looked up again. Port 8443 is checked free at the start. A fault found on the way and fixed in the kit: `Start-Process` had been given one quoted argument when the
+  trial path contained a space (a bare `@()` around a list kept it as one item); it now passes a real list. A stray local server of mine from an isolated test had held the port; the port check now catches that.
+
+**Rehearsal runs for this round** (each from a clean start, each with the new drills; logs in the seat's scratch folder, `rehearsal-g1` and `rehearsal-g2`): run 1 started the pretend gateway as `idle-older` and used the
+apostrophe-and-non-ASCII application-data folder (276 s); run 2 started it as `idle-empty` with an ordinary folder (277 s). Both passed, both under the 20-minute bound. In both: the existing-folder refusal kept its sentinel, the privacy
+drill refused a folder the Users group can open, "passed" passed at settled 0 = 0 and again at 450 = 450 after the gateway spent, the stale adopt was refused (`not_fresh`, exit 2), the open-item adopt stopped and adopted nothing, a rollback
+with a wrong token deleted nothing, the processes ended through their objects (exit code -1 for a killed one), and the identity value appears in **no file outside the trial folder** (the search covered the rehearsal root: the log,
+the two windows' output files, the pretend gateway's folder and the fake home folders). The value lives only in `reporter.toml` and the store. After the rollback no new or missing entry in the fake or real top-level
+folders listed, and the repository status stayed empty. Gateway calls, as before: the report command about once a minute and receipts at most twice in any minute (counts include the runbook's own hand checks).
 
 ## Gates
 
