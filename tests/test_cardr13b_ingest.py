@@ -10,7 +10,7 @@ record (DESIGN-R1-3.md 1.3, 3 and 9).
 * **The collision record:** the same event id with different content is refused as before (`IDEMPOTENCY_CONFLICT`, nothing of the
   refused report stored) but leaves one durable `sequence_conflict`, written inside the store's own write transaction, on both collision
   paths, only for the gateway's real owner, only with provenance, never for a retired reader, and a repeat is a no-op. Nothing in this
-  step resolves or overwrites a transition. Nothing reads the new rows until card R1-3c.
+  step resolves or overwrites a transition. No evidence consumer uses the new rows for status or admission yet (card R1-3c adds the rules).
 
 Synthetic reports only.
 """
@@ -102,8 +102,20 @@ class Version4(unittest.TestCase):
                 with self.subTest(key=key, value=value):
                     item = report()
                     item["payload"][key] = value
-                    item["event_id"] = _eid("any")                      # the validator must refuse the shape, not only the id
+                    # The id stays the one derived from the report's own incarnation, generation and number, so the id rule can
+                    # never be what refuses it: only the check on the field itself can.
+                    body = item["payload"]
+                    item["event_id"] = derive_event_id(body["reader_incarnation"], body["generation"], body["seq"])
                     self.refused(doc4(item))
+
+    def test_the_signed_64_bit_boundary_for_receipts_seq_and_held_over_reservation(self):
+        top = 2 ** 63 - 1
+        for key in ("receipts_seq", "held_over_reservation"):
+            with self.subTest(key=key, value=top):
+                (reading,) = validate(doc4(report(**{key: top})), _now_ms())
+                self.assertEqual(reading[key], top)
+            with self.subTest(key=key, value=top + 1):
+                self.refused(doc4(report(**{key: top + 1})))
 
     def test_an_unknown_key_in_a_version_4_payload_is_refused(self):
         item = report()
@@ -358,9 +370,10 @@ class Collisions(_Store):
     def test_a_retired_incarnation_is_only_counted_never_a_transition(self):
         self.ingest(self.first)
         gateway = self.gateway_id()
+        self.run_sql("DELETE FROM gateway_readers")                                      # R1-3c made it pending; seed it as retired
         self.run_sql("INSERT INTO gateway_readers(gateway_id, reader_incarnation, first_event_id, first_seen_at, state, "
                      "decided_by_adoption, retired_at) VALUES(?,?,?,?,?,?,?)",
-                     (gateway, INC, self.first["event_id"], 1, "retired", 1, 5))        # a seeded row (R1-3c writes them)
+                     (gateway, INC, self.first["event_id"], 1, "retired", 1, 5))        # a seeded row (adoption writes them, R1-3d)
         self.conflict(self.ingest, self.rival, name="r1.json")
         self.assertEqual(self.transitions(), [])
         self.assertEqual(self.rows("SELECT retired_reader_reports FROM gateway_chain_state WHERE gateway_id=?", (gateway,)), [(1,)])

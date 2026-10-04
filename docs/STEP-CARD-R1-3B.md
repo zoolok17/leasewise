@@ -7,7 +7,8 @@ the reviewers. Synthetic reports only.
 ## In plain words
 
 R1-3a made the evidence tables, empty. This step starts **filling two of them** when a gateway report arrives, and makes a report collision
-leave a permanent record. **Nothing reads the new rows until card R1-3c, so no seat or lease decision changes, and no reader sends version 4
+leave a permanent record. **No evidence consumer uses the new rows for status or admission yet (ingest itself reads them for identity checks and diagnostics;
+card R1-3c adds the rules on top), so no seat or lease decision changes, and no reader sends version 4
 live until card R1-READER closes D1 (its start-up and continuity check).**
 
 - **Version 4 of the report** adds five keys and requires both policy fingerprints. Versions 2 and 3 are unchanged.
@@ -77,7 +78,8 @@ now exists, so it uses version 5 (still `SCHEMA_UNSUPPORTED`). No other existing
 
 ## Honest notes
 
-- Nothing reads `gateway_totals`, `gateway_epochs` or the conflict rows until R1-3c, and no reader sends version 4 live until R1-READER closes D1.
+- No evidence consumer uses `gateway_totals`, `gateway_epochs` or the conflict rows for status or admission decisions yet (ingest reads them for
+  identity checks and diagnostics; R1-3c adds the transition rules), and no reader sends version 4 live until R1-READER closes D1.
 - An authenticated owner can send conflicting content on purpose; the protection is ownership plus a durable, idempotent record. No global row bound is
   claimed (a repeated event gives one row; many distinct events give many rows, only for the owner's own gateway).
 - The reading import takes the savepoint for every document, so a refused version-3 collision also rolls back to it (no change in what is stored).
