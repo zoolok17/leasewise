@@ -28,6 +28,15 @@ import time
 from . import cmdline
 
 OK = "ok"
+# The two closed modes (card R1-READER step 1). `receipts` appends `--after N --limit M --json` (the receipt command). `report` appends
+# nothing: `agenttalk gateway report` takes no `--after` or `--limit`, and its required `--json` is part of the mode's fixed command,
+# `REPORT_TAIL`, which the configured command must end with (else nothing is started). Everything else (containment, one deadline, a
+# bounded read, the closed words) is the same for both. The command's failures (`bad_request`, `report_unavailable`, exit code 2) all
+# arrive as `exit_code`: standard error is the NUL device and its text is never read or kept.
+REPORT_TAIL = ("gateway", "report", "--json")
+MODE_RECEIPTS = "receipts"
+MODE_REPORT = "report"
+MODES = (MODE_RECEIPTS, MODE_REPORT)
 # read later (nothing is stored, and it is asked again)
 CANNOT_RUN = "cannot_run"                 # the program could not be started
 CANNOT_CONTAIN = "cannot_contain"         # a containment step failed: it never ran uncontained
@@ -323,10 +332,12 @@ class _Owned:
             self.win.close(handle)
 
 
-def run(command, after, limit, *, timeout_seconds, max_bytes, env=(), stop=None, clock=time.monotonic,
-        sleep=time.sleep, win=None):
+def run(command, after=None, limit=None, *, timeout_seconds, max_bytes, env=(), stop=None, clock=time.monotonic,
+        sleep=time.sleep, win=None, mode=MODE_RECEIPTS):
     """Run `command` (a list: the absolute path of an .exe and its arguments) with `--after N --limit M --json` appended
-    last, under one deadline of `timeout_seconds`, and read at most `max_bytes` of its output. -> Result.
+    last (mode `receipts`, the default) or with nothing appended (mode `report`), under one deadline of `timeout_seconds`, and
+    read at most `max_bytes` of its output. -> Result. An unknown mode, a `receipts` run without whole `after` and `limit`, or a
+    `report` run whose command does not end with `REPORT_TAIL`, is `cannot_run` and nothing is started.
 
     The environment is `environment_block(env)`. The working directory is the folder of the program file. Standard input
     and standard error are the NUL device. `stop` is anything with `is_set()`; when it is set the read ends as
@@ -337,7 +348,14 @@ def run(command, after, limit, *, timeout_seconds, max_bytes, env=(), stop=None,
     program = command[0]
     try:
         block = environment_block(env)
-        line = cmdline.quote_command(list(command) + ["--after", str(after), "--limit", str(limit), "--json"])
+        if mode == MODE_REPORT:
+            if tuple(command[-len(REPORT_TAIL):]) != REPORT_TAIL:
+                return Result(CANNOT_RUN)
+            line = cmdline.quote_command(list(command))
+        elif mode == MODE_RECEIPTS and type(after) is int and type(limit) is int:
+            line = cmdline.quote_command(list(command) + ["--after", str(after), "--limit", str(limit), "--json"])
+        else:
+            return Result(CANNOT_RUN)
     except ValueError:
         return Result(CANNOT_RUN)
     if "\x00" in line or not os.path.isfile(program):
