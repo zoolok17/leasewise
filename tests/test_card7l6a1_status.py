@@ -44,9 +44,9 @@ class _Status(unittest.TestCase):
 
 class Report(_Status):
 
-    def test_the_status_version_is_3_and_the_object_has_a_closed_shape(self):
+    def test_the_status_version_is_4_and_the_object_has_a_closed_shape(self):
         report = self.reporter().report()
-        self.assertEqual(report["status_version"], 3)
+        self.assertEqual(report["status_version"], 4)
         self.assertEqual(set(report["gateway_receipts"]), OBJECT_KEYS)
         self.assertEqual(set(report["gateway_receipts"]["read_later"]), set(receipts.LATER_REASONS))
         self.assertEqual(set(report["gateway_receipts"]["refused"]), set(receipts.REFUSED_REASONS))
@@ -444,7 +444,7 @@ class Command(_Status):
         reporter = self.reporter(count=1)
         reporter.cycle()
         snap = status.read_snapshot(status.snapshot_path(self.rig.state.path))
-        self.assertEqual(snap["status_version"], 3)
+        self.assertEqual(snap["status_version"], 4)
         self.assertEqual(snap["gateway_receipts"]["rows"]["sent"], 1)
         self.assertEqual(snap["gateway_receipts"]["cached_input"], NOTE)
 

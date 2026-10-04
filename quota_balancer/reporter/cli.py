@@ -1,4 +1,4 @@
-"""`python -m quota_balancer reporter run|drain|status|admit --config FILE`.
+"""`python -m quota_balancer reporter run|drain|status|admit|resume|reset --config FILE`.
 
 Exit codes: 0 done; 2 refused to start (configuration, or the state is owned
 by another reporter); 3 Leasewise did not answer or refused the identity, so
@@ -18,6 +18,7 @@ import time
 from . import admit as admit_mod
 from . import admit_wire
 from . import config as cfg
+from . import gwstate
 from . import status as status_mod
 from .client import HttpClient
 from .run import CREDENTIAL, UNREACHABLE, Reporter
@@ -60,6 +61,11 @@ def _parser():
     admit = sub.add_parser("admit", help="the turn admission program: read one request on standard input, "
                                          "answer once on standard output")
     admit.add_argument("--config", required=True, help="the reporter configuration file (a secret)")
+    for name, text in (("resume", "clear the money reader's `send_refused` halt and give its pending report a new retry budget"),
+                       ("reset", "archive the money reader's whole state and start a fresh reader identity")):
+        one = sub.add_parser(name, help=text + " (local and audited; it never talks to Leasewise; needs --confirm)")
+        one.add_argument("--config", required=True, help="the reporter configuration file (a secret)")
+        one.add_argument("--confirm", action="store_true", help="really do it")
     return parser
 
 
@@ -73,6 +79,8 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
             return _status(config, args)
         if args.verb == "admit":
             return _admit(config, transport, admit_seams or {})
+        if args.verb in ("resume", "reset"):
+            return _operator(config, args, clock)
         snapshot = cfg.load_snapshot(config.policy_ids_path)
         agents = cfg.resolve_agents(config, snapshot)
         limit_sources = cfg.resolve_limit_sources(config, snapshot)
@@ -101,6 +109,55 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
                             limit_sources=limit_sources,
                             gateway_receipts=gateway_receipts, **kwargs)
         return _go(reporter, args.verb)
+    except Exception:
+        _error(INTERNAL, MSG_INTERNAL)
+        return EXIT_INTERNAL
+    finally:
+        state.close()
+
+
+MSG_CONFIRM = "this changes the money reader's state: run it again with --confirm"
+MSG_NOT_RESUMABLE = ("only a reader stopped by repeated definitive refusals (send_refused) can be resumed; after a collision or a damaged state "
+                     "use `reset`")
+MSG_RESET_TOO_LARGE = ("the old state is too large to archive for the reset; nothing was changed: move the reporter's state file aside "
+                       "and keep it, then start the reporter again (an absent state is a first start)")
+CONFIRM_CODE = "CONFIRM_REQUIRED"
+NOT_RESUMABLE_CODE = "NOT_RESUMABLE"
+RESET_TOO_LARGE_CODE = "RESET_TOO_LARGE"
+
+
+def _operator(config, args, clock):
+    """`reporter resume --confirm` and `reporter reset --confirm` (card R1-READER step 3a): local, audited, never talk to Leasewise. Without
+    --confirm nothing is opened or changed. A state owned by a running reporter is refused (stop it first). Every message is a fixed sentence."""
+    if not args.confirm:
+        _error(CONFIRM_CODE, MSG_CONFIRM)
+        return EXIT_REFUSED
+    now = int((clock or (lambda: int(time.time() * 1000)))())
+    try:
+        os.makedirs(os.path.dirname(config.state_path), exist_ok=True)
+        state = State(config.state_path)
+    except StateOwned:
+        _error(STATE_OWNED, MSG_OWNED)
+        return EXIT_REFUSED
+    except (OSError, StateError):
+        _error(STATE_FAILED, MSG_STATE)
+        return EXIT_REFUSED
+    try:
+        if args.verb == "resume":
+            gwstate.resume(state, now)
+            print(json.dumps({"resumed": True}, separators=(",", ":")))
+        else:
+            fresh = gwstate.reset(state, now)
+            print(json.dumps({"reset": True, "reader_incarnation": fresh}, separators=(",", ":")))
+        return EXIT_OK
+    except gwstate.Refused as exc:
+        if exc.word == gwstate.NOT_RESUMABLE:
+            _error(NOT_RESUMABLE_CODE, MSG_NOT_RESUMABLE)
+        elif exc.word == gwstate.RESET_TOO_LARGE:
+            _error(RESET_TOO_LARGE_CODE, MSG_RESET_TOO_LARGE)
+        else:
+            _error(INTERNAL, MSG_INTERNAL)
+        return EXIT_REFUSED
     except Exception:
         _error(INTERNAL, MSG_INTERNAL)
         return EXIT_INTERNAL

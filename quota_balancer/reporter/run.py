@@ -14,7 +14,7 @@ import random
 import threading
 import time
 
-from . import admission_store, capture, decisions, events, receipts, rounds, status
+from . import admission_store, capture, decisions, events, gwsend, gwstate, receipts, rounds, status
 from . import state as state_mod
 
 # What a cycle ended with.
@@ -272,9 +272,34 @@ class Reporter:
         the next. Each pass stops on its own wall. `result.blocked` combines the outcomes by RANK, so
         the summary never depends on which pass ran last: a credential refusal (401) from any pass
         shows as CREDENTIAL, above UNREACHABLE (no answer, 5xx, 429), above nothing."""
+        self._send_report(result)
         self._send_pass(result, self.state.next_limit_item)
         self._send_pass(result, self.state.next_receipt_item)
         self._send_pass(result, lambda now: self.state.next_item(now, self.gateway_agents))
+
+    def _send_report(self, result):
+        """The money reader's pending report (card R1-READER step 3a), in its OWN lane: it is sent here, first, and an answer that needs a retry
+        stops nothing else; the other passes run whatever happened here, and a retry in any of them never stops this one. At most one report is
+        pending (the state allows no second row), and a new one is minted only after this one is accepted. With nothing pending this is one
+        cheap read and nothing else."""
+        if self.stop.is_set():
+            return
+        try:
+            outcome = gwsend.send_pending(self.state, self.client, self.clock())
+        except Exception:    # noqa: BLE001 - the money reader's lane boundary: nothing in this lane may stop the reporter or the other lanes
+            self._count_lane_failure()                  # only a closed word is kept: no message, no value, no trace
+            return
+        result.sent += outcome.sent
+        if outcome.word == gwsend.SEND_FAILED:
+            result.blocked = _worse(result.blocked, CREDENTIAL if outcome.unauthorized else UNREACHABLE)
+
+    def _count_lane_failure(self):
+        """Count one `state_unavailable` for the money reader's lane. If even that cannot be written, it is dropped: the lane never ends the cycle."""
+        try:
+            with self.state.txn():
+                self.state.bump(gwstate.READER_AGENT, gwstate.STATE_UNAVAILABLE)
+        except Exception:    # noqa: BLE001 - same boundary
+            return
 
     def _send_pass(self, result, pick):
         """Send what `pick` offers, one request at a time. True if the pass ran out of due items;

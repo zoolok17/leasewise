@@ -193,7 +193,35 @@ class HttpClient:
         return status, doc, code
 
 
+    def post_reading(self, key, body_bytes):
+        """POST the stored bytes of the money reader's pending report, exactly as they are, to `/v1/readings` (card R1-READER step 3a).
+        -> (status or None, the answer as a dict or None, the closed error word or None). Never raises, keeps no text from a fault, and treats
+        an answer that echoes the identity, an empty or oversize body, or text that is not a JSON object as unreadable (a None dict): the
+        caller then keeps the report and tries again."""
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body_bytes)),
+                   "Accept": "application/json", "Connection": "close",
+                   IDENTITY_HEADER: self._identity, IDEMPOTENCY_HEADER: key}
+        try:
+            status, raw = self._transport("POST", READINGS_PATH, headers, body_bytes, self._timeout)
+        except Exception:               # no text is kept: see the module note
+            return None, None, None
+        if type(status) is not int or isinstance(status, bool):
+            return None, None, None
+        if not raw or len(raw) > MAX_ANSWER_BYTES:
+            return status, None, None
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except Exception:               # ValueError, UnicodeError, RecursionError...
+            return status, None, None
+        if not isinstance(doc, dict) or (self._identity and self._identity in json.dumps(doc)):
+            return status, None, None
+        error = doc.get("error")
+        code = decisions.closed_code(error.get("code")) if isinstance(error, dict) else None
+        return status, doc, code
+
+
 LIMIT_PATH = "/v1/limit-events"
+READINGS_PATH = "/v1/readings"
 
 
 def _numeric(host):

@@ -90,7 +90,7 @@ largest numbers halt instead of overflowing, and the fault test now fails every 
   list or object) from 1 to 2^63-1; every type is checked before any comparison or lookup. A malformed report given to the mint is `bad_report` (nothing written);
   malformed stored bytes halt the start-up as `state_unavailable` with no exception. A complete valid wire report goes through Leasewise's real receiving path
   (`http_api._wire_to_reading`, then `validate_readings`) and is accepted, while every malformed variant is refused there too and by the reader. One known
-  difference, in the safe direction: Leasewise accepts an epoch of 0, the reader requires at least 1 (it never makes a 0).
+  difference, in the safe direction: Leasewise accepts 0 for both `seq` and `ledger_epoch`; the reader requires both to be at least 1 (it never makes a 0).
 - **B1 (lead decision): the largest numbers.** A `minted_seq` already at 2^63-1, or a needed new epoch when the newest epoch is already at 2^63-1, halts as
   `state_unavailable`: nothing is numbered, saved or created, no new word is added, and `reset` recovers. The only write is the halt itself. The largest number
   itself can still be minted; the same generation reuses the largest epoch.
