@@ -40,7 +40,7 @@ EMPTY_REPORT = (
 )
 
 EXPECTED_STATUS = (
-    '{"schema_version":10,"accounts":[{"alias":"meter","kind":"metered",'
+    '{"schema_version":11,"accounts":[{"alias":"meter","kind":"metered",'
     '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
     '"coverage_complete":false,"windows":[]}],'
     '"machines":["desktop","worker"],"gateways":[{"alias":"g1","account":"meter",'
@@ -112,7 +112,7 @@ class Card1Tests(_Base):
             }
         finally:
             conn.close()
-        self.assertEqual(version, 10)
+        self.assertEqual(version, 11)
         self.assertEqual(
             tables,
             {"accounts", "machines", "gateways", "readings", "windows",
@@ -206,7 +206,7 @@ class Card1Tests(_Base):
         # The status is exactly the documented projection: nothing beyond the
         # approved aliases and the static schema/field names may appear.
         expected = (
-            '{"schema_version":10,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
+            '{"schema_version":11,"accounts":[{"alias":"priv-acct-7","kind":"metered",'
             '"budget_micro_eur":100000000,"allocated_micro_eur":100000000,'
             '"coverage_complete":false,"windows":[]}],'
             '"machines":["priv-mach-3","worker"],"gateways":[{"alias":"g2",'
@@ -310,7 +310,7 @@ class Card1CarryOverTests(_Base):
             }
         finally:
             conn.close()
-        self.assertEqual(version, 10)
+        self.assertEqual(version, 11)
         self.assertEqual(journal.lower(), "wal")
         self.assertEqual(
             tables,
@@ -337,11 +337,11 @@ class Card1FixRoundTests(_Base):
         # A store at a newer, unknown user_version must be rejected by every
         # verb and left byte-for-byte unchanged: no header rewrite, no
         # -wal/-shm side files (the tool never modifies a rejected store).
-        # Version 11 is one newer than the current version (10).
+        # Version 12 is one newer than the current version (11).
         run_cli("--db", self.db, "init")
         _import(self.db, self.tmp, copy.deepcopy(VALID_DOC))
         conn = sqlite3.connect(self.db)
-        conn.execute("PRAGMA user_version=11")
+        conn.execute("PRAGMA user_version=12")
         # Downgrade to delete journal mode: the tool must not switch a
         # rejected store to WAL either (that rewrites the file header).
         conn.execute("PRAGMA journal_mode=DELETE")
@@ -459,7 +459,7 @@ class Card1FixRoundTests(_Base):
         ok = _import(self.db, self.tmp, doc)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         expected = (
-            '{"schema_version":10,"accounts":['
+            '{"schema_version":11,"accounts":['
             '{"alias":"meter","kind":"metered","budget_micro_eur":100000000,'
             '"allocated_micro_eur":100000000,"coverage_complete":false,"windows":[]},'
             '{"alias":"seat","kind":"subscription","budget_micro_eur":null,'

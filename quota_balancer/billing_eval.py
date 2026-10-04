@@ -279,8 +279,11 @@ def _validate_reading(reading, account):
     if kind == KIND_PROVIDER_BILLING:
         norm = _validate_provider_billing(payload, observed_at)
     elif kind == KIND_GATEWAY_SNAPSHOT:
-        billing = "settled_micro_eur" in payload
-        norm = _validate_gateway_snapshot(payload, billing)
+        # A payload that names a reader incarnation is a version-4 report and must have EXACTLY the version-4 keys (card R1-3d:
+        # the evaluator's own reading check used to refuse every version-4 payload, so the real path could never reach it).
+        v4 = "reader_incarnation" in payload
+        billing = v4 or "settled_micro_eur" in payload
+        norm = _validate_gateway_snapshot(payload, billing, v4)
         if not billing:
             # A legacy (money-less) snapshot carries no settled figure for
             # L_now; mark it unusable for the ledger floor.

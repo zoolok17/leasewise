@@ -48,7 +48,7 @@ from .errors import (
     QuotaError,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # The WAL switch (set_wal) takes a brief exclusive lock on the database file
 # and, unlike ordinary statements, does not wait through the busy handler:
@@ -639,16 +639,25 @@ _DDL_V10 = (
     " CHECK((last_quiet_event_id IS NULL) = (last_quiet_unattributed IS NULL))) STRICT;",
 )
 
+# Version 11 (card R1-3d, fix round 1): ingest's own verdict is kept with each report. `in_order` is 1 exactly when `evidence.assess` treated
+# the report as an in-order report of its chain when it arrived (not from a retired reader, not late, not a duplicate or a collision, not an
+# older epoch or month). Existing rows get 0 (not in order: conservative; no live version-4 report existed). The usable chain reads this
+# column and never decides order again from arrival order, which a rowid or a clock reading cannot carry.
+_DDL_V11 = (
+    "ALTER TABLE gateway_totals ADD COLUMN in_order INTEGER NOT NULL DEFAULT 0 CHECK(in_order IN (0,1));",
+)
+
 # The tables of the evidence history, in creation order (the removal guards and the tests read this list).
 EVIDENCE_TABLES = ("gateway_epochs", "gateway_totals", "gateway_approvals", "gateway_adoptions", "gateway_readers",
                    "gateway_transitions", "gateway_chain_state")
 
 # The canonical version-10 migration script, kept for comparison (the tests build stores from the scripts).
 MIGRATION_V10 = "\n".join(_DDL_V10) + "\nPRAGMA user_version=10;\n"
+MIGRATION_V11 = "\n".join(_DDL_V11) + "\nPRAGMA user_version=11;\n"
 
 # Step N upgrades a store from version N-1 to version N.
 _STEPS = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
-          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8, 9: _DDL_V9, 10: _DDL_V10}
+          6: _DDL_V6, 7: _DDL_V7, 8: _DDL_V8, 9: _DDL_V9, 10: _DDL_V10, 11: _DDL_V11}
 
 
 def schema_version(conn):

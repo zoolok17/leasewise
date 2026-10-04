@@ -15,18 +15,23 @@ rejected is left byte-identical.
 
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
 
 from .errors import (
+    CODE_ADOPTION_REFUSED,
     CODE_BILLING_SCOPE_MISMATCH,
     CODE_CAP_BASIS_CONFLICT,
+    CODE_EVIDENCE_REQUIRED,
     CODE_IDEMPOTENCY_CONFLICT,
     CODE_INVALID_CONFIG,
     CODE_STORE_ERROR,
+    MSG_ADOPTION_REFUSED,
     MSG_BILLING_SCOPE_MISMATCH,
     MSG_CAP_BASIS_CONFLICT,
+    MSG_EVIDENCE_REQUIRED,
     MSG_IDEMPOTENCY_CONFLICT,
     MSG_INVALID_CONFIG,
     MSG_STORE_FAILED,
@@ -46,7 +51,7 @@ from .reduce import (
     reduce_window,
     window_freshness,
 )
-from . import evidence, money
+from . import evidence, evidence_view, money
 from .policy_config import apply_policy
 from .validate import validate
 from .validate_config_v2 import VERSION as CONFIG_V2, validate_v2
@@ -67,6 +72,11 @@ from .validate_readings import (
 # out for a bounded, documented duration instead of the driver's implicit
 # default, and then surfaces as STORE_ERROR rather than a raw driver fault.
 BUSY_TIMEOUT_S = 30.0
+
+
+def _now_ms():
+    """The wall clock in milliseconds. One place, so a test can move it."""
+    return int(time.time() * 1000)
 
 
 def _connect(path, must_exist):
@@ -1002,13 +1012,14 @@ def _record_report_v4(conn, reading, gateway_id, now_ms):
     conn.execute(
         "INSERT INTO gateway_totals(event_id, gateway_id, reader_incarnation, ledger_epoch, generation, seq, period_start, "
         "period_end, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, receipts_seq, quiet, "
-        "held_over_reservation, price_hash, child_cap_hash, gateway_flag, observed_at, received_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "held_over_reservation, price_hash, child_cap_hash, gateway_flag, observed_at, received_at, in_order) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (event_id, gateway_id, incarnation, epoch, generation, reading["seq"], reading["period_start"], reading["period_end"],
          reading["settled_micro_eur"], reading["reserved_micro_eur"], reading["uncertain_micro_eur"],
          reading["unattributed_micro_eur"], reading["receipts_seq"], 1 if reading["quiet"] else 0,
          reading["held_over_reservation"], hashes["price"], hashes["child_cap"],
-         1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms))
+         1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms,
+         1 if assessment.standing == evidence.STANDING_IN_ORDER else 0))        # ingest's verdict, kept with the report (never recomputed)
     _apply_assessment(conn, gateway_id, report, assessment, now_ms)
 
 
@@ -1167,28 +1178,161 @@ def set_machine_identity(path, machine, identity_ref, enabled):
 
 
 def reconcile(path, gateway):
-    """Clear a gateway's reconciliation_required state (operator-only).
+    """Refused (card R1-3d, DESIGN-R1-3.md 8.1 and F10): clearing a gateway's problems without naming any evidence is gone.
 
-    A ledger-epoch or policy-hash change sets reconciliation_required, which
-    is sticky: it is NOT cleared by the next matching report. Only this
-    explicit operator verb clears it (back to ok), adopting the current
-    report as the trusted baseline. Unknown gateway -> INVALID_CONFIG.
-    """
+    The old command set `gateways.state` back to `ok` for any alias, with no report named and nothing resolved. It is kept only so that
+    an old script gets the fixed sentence that points to `gateway-adopt --evidence`. It does not open the store, so it changes nothing,
+    whatever the alias is."""
+    raise QuotaError(CODE_EVIDENCE_REQUIRED, MSG_EVIDENCE_REQUIRED)
+
+
+_HASH64 = re.compile(r"[0-9a-f]{64}")
+
+
+def gateway_approve(path, gateway, price_hash, child_cap_hash, now_ms=None):
+    """Record that the operator has seen a gateway's PAIR of policy fingerprints and accepts it (DESIGN-R1-3.md 2.1), audited.
+
+    An unknown gateway, or a hash that is not 64 lowercase hex characters (a missing child-cap fingerprint included: the feature is not
+    installed, so there is nothing to approve), is the existing INVALID_CONFIG sentence and writes nothing. Approving a pair that is
+    already approved changes nothing and writes no second audit row. An approval is for the pair: a change of either hash is a new,
+    unapproved pair."""
+    if not all(type(h) is str and _HASH64.fullmatch(h) for h in (price_hash, child_cap_hash)):
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
-            row = conn.execute(
-                "SELECT id FROM gateways WHERE alias = ?", (gateway,)
-            ).fetchone()
+            now_ms = _now_ms() if now_ms is None else now_ms                  # read after the lock, like every check against the clock
+            row = conn.execute("SELECT id FROM gateways WHERE alias = ?", (gateway,)).fetchone()
             if row is None:
                 raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
-            conn.execute(
-                "UPDATE gateways SET state=? WHERE id=?",
-                (GATEWAY_STATE_OK, row[0]),
-            )
+            added = conn.execute("INSERT OR IGNORE INTO gateway_approvals(gateway_id, price_hash, child_cap_hash, approved_at, operator) "
+                                 "VALUES(?,?,?,?,?)", (row[0], price_hash, child_cap_hash, now_ms, "operator")).rowcount
+            if added:
+                conn.execute("INSERT INTO audit(actor_alias, action, object_id, at, redacted_details) VALUES(?,?,?,?,?)",
+                             ("operator", "gateway_approved", row[0], now_ms, json.dumps({})))
             conn.execute("COMMIT")
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def _after_adopt_step(conn, step):
+    """The fault-injection point of `gateway_adopt`: called after each step of the transaction (DESIGN-R1-3.md 2.3), so a test can stop the
+    adoption between any two steps and see that nothing stayed."""
+
+
+_MAX_ID_DIGITS = 19                      # the digits of 2^63-1, the largest number a SQLite integer holds
+
+
+def _item_id(item):
+    """One `--resolve` value as a whole number that fits a SQLite integer, or INVALID_CONFIG with nothing echoed. A text is bounded by its
+    LENGTH before any conversion (a very long run of digits makes the conversion itself fail)."""
+    if type(item) is bool:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if isinstance(item, str):
+        if not (item.isascii() and item.isdigit()) or len(item) > _MAX_ID_DIGITS:
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        item = int(item)
+    if not isinstance(item, int) or not 0 <= item <= money.INT64_MAX:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    return item
+
+
+def gateway_adopt(path, gateway, event_id, resolve, now_ms=None):
+    """Adopt a quiet report as the gateway's trusted baseline, choose its reader and clear the open items the operator names
+    (DESIGN-R1-3.md 2.3). Returns the new adoption id.
+
+    BEGIN IMMEDIATE, then every item of the predicate is read again inside the transaction (`evidence_view.adopt_blockers`); one
+    failure is ADOPTION_REFUSED with its fixed sentence, the reason is only in `status`, and nothing was written. Then, in order and all
+    or nothing: record the report's (reader, epoch, generation) if it is new; the adoption row; the reader made `current` and every other
+    one retired (the retired reader's `reader_changed` is resolved as retired, not as approved: its reader row says which); the named
+    transitions resolved; the chain state and `gateways.state`; one audit row with the incarnations and ids and no amount; COMMIT.
+    `resolve` is the list of transition ids as the operator typed them (strings or whole numbers)."""
+    ids = set()
+    for item in resolve:
+        ids.add(_item_id(item))
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            require_supported(conn)
+            # The clock is read AFTER the write lock is held: waiting for the lock can take up to the busy timeout, and a report that was
+            # fresh when the command started must not be adopted if it has expired by the time the predicate is read (lesson
+            # lw.freshness-clock-after-write-lock). An explicit time is used as given (tests).
+            now_ms = _now_ms() if now_ms is None else now_ms
+            row = conn.execute("SELECT id FROM gateways WHERE alias = ?", (gateway,)).fetchone()
+            if row is None:
+                raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+            gateway_id = row[0]
+            if evidence_view.adopt_blockers(conn, gateway_id, event_id, ids, now_ms):             # step 1
+                raise QuotaError(CODE_ADOPTION_REFUSED, MSG_ADOPTION_REFUSED)
+            report = evidence_view.stored_report(conn, gateway_id, event_id)
+            inc = report["reader_incarnation"]
+            conn.execute("INSERT OR IGNORE INTO gateway_epochs(gateway_id, reader_incarnation, ledger_epoch, generation, first_event_id) "
+                         "VALUES(?,?,?,?,?)", (gateway_id, inc, report["ledger_epoch"], report["generation"], event_id))
+            _after_adopt_step(conn, 2)
+            previous = conn.execute("SELECT current_adoption_id FROM gateway_chain_state WHERE gateway_id=?", (gateway_id,)).fetchone()
+            adoption_id = conn.execute(
+                "INSERT INTO gateway_adoptions(gateway_id, event_id, reader_incarnation, ledger_epoch, generation, period_start, seq, "
+                "settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, price_hash, child_cap_hash, "
+                "adopted_at, operator, kind, prev_adoption_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'operator',?)",
+                (gateway_id, event_id, inc, report["ledger_epoch"], report["generation"], report["period_start"], report["seq"],
+                 report["settled_micro_eur"], report["reserved_micro_eur"], report["uncertain_micro_eur"],
+                 report["unattributed_micro_eur"], report["price_hash"], report["child_cap_hash"], now_ms, "operator",
+                 None if previous is None else previous[0])).lastrowid
+            _after_adopt_step(conn, 3)
+            conn.execute("INSERT OR IGNORE INTO gateway_readers(gateway_id, reader_incarnation, first_event_id, first_seen_at, state) "
+                         "VALUES(?,?,?,?,'pending')", (gateway_id, inc, event_id, now_ms))
+            retired = [r[0] for r in conn.execute(
+                "SELECT reader_incarnation FROM gateway_readers WHERE gateway_id=? AND reader_incarnation<>? AND state IN "
+                "('current','pending') ORDER BY reader_incarnation", (gateway_id, inc))]
+            _promote_reader(conn, gateway_id, inc, adoption_id, now_ms)
+            _after_adopt_step(conn, 4)
+            conn.executemany("UPDATE gateway_transitions SET resolved_by_adoption=? WHERE id=? AND gateway_id=? "
+                             "AND resolved_by_adoption IS NULL", [(adoption_id, i, gateway_id) for i in sorted(ids)])
+            _after_adopt_step(conn, 5)
+            conn.execute("INSERT OR IGNORE INTO gateway_chain_state(gateway_id) VALUES(?)", (gateway_id,))
+            conn.execute("UPDATE gateway_chain_state SET current_adoption_id=?, last_quiet_event_id=?, last_quiet_unattributed=? "
+                         "WHERE gateway_id=?", (adoption_id, event_id, report["unattributed_micro_eur"], gateway_id))
+            left = conn.execute("SELECT COUNT(*) FROM gateway_transitions WHERE gateway_id=? AND resolved_by_adoption IS NULL",
+                                (gateway_id,)).fetchone()[0]
+            conn.execute("UPDATE gateways SET state=? WHERE id=?",
+                         (GATEWAY_STATE_RECONCILE if left else GATEWAY_STATE_OK, gateway_id))
+            _after_adopt_step(conn, 6)
+            conn.execute("INSERT INTO audit(actor_alias, action, object_id, at, redacted_details) VALUES(?,?,?,?,?)",
+                         ("operator", "gateway_adopted", event_id, now_ms,
+                          json.dumps({"adoption_id": adoption_id, "chosen": inc, "retired": retired, "resolved": sorted(ids)})))
+            _after_adopt_step(conn, 7)
+            conn.execute("COMMIT")
+            return adoption_id
+        except BaseException:
+            rollback_quietly(conn)
+            raise
+    except sqlite3.Error as exc:
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED) from exc
+    finally:
+        conn.close()
+
+
+def evidence_inputs(path, account, now_ms=None):
+    """The evaluator's gateway input for one account, built from the usable chain of each of its gateways (card R1-3d, DESIGN-R1-3.md
+    2.4): `{"gateways", "readings", "unresolved_event_ids", "states"}`. One read transaction; nothing is written. Nothing in the grant
+    path calls it before card R1-5."""
+    conn = _connect(path, must_exist=True)
+    try:
+        conn.execute("BEGIN")
+        try:
+            require_supported(conn)                                           # the first read: the snapshot starts here
+            now_ms = _now_ms() if now_ms is None else now_ms
+            result = evidence_view.inputs(conn, account, now_ms)
+            conn.execute("COMMIT")
+            return result
         except BaseException:
             rollback_quietly(conn)
             raise
@@ -1364,12 +1508,12 @@ def status(path):
     state, and the billing total's age against its policy's max_age) is
     evaluated against the wall clock at read time.
     """
-    now_ms = int(time.time() * 1000)
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN")
         try:
-            require_supported(conn)
+            require_supported(conn)                                           # the first read: the snapshot starts here
+            now_ms = _now_ms()
             accounts = []
             for account_id, alias, kind, budget, coverage in conn.execute(
                 "SELECT a.id, a.alias, a.kind, a.budget_micro_eur, a.coverage_complete "
@@ -1394,10 +1538,10 @@ def status(path):
                 for row in conn.execute("SELECT alias FROM machines ORDER BY alias")
             ]
             gateways = []
-            for (alias, account, machine, share, last_report_at, ledger_epoch,
+            for (gateway_id, alias, account, machine, share, last_report_at, ledger_epoch,
                  last_seq, period_start, period_end, policy_hashes, sized_ready,
                  state) in conn.execute(
-                    "SELECT g.alias, a.alias, m.alias, g.share_micro_eur, "
+                    "SELECT g.id, g.alias, a.alias, m.alias, g.share_micro_eur, "
                     "g.last_report_at, g.ledger_epoch, g.last_seq, g.period_start, "
                     "g.period_end, g.policy_hashes, g.sized_ready, g.state "
                     "FROM gateways g "
@@ -1422,6 +1566,11 @@ def status(path):
                         "sized_ready": bool(sized_ready),
                     },
                 })
+                # Card R1-3d: the evidence block, from the stored version-4 reports and the adoption chain (never from the legacy
+                # columns above). Absent for a gateway with no version-4 report, like `allocated_above_int64`.
+                evidence_block = evidence_view.project(conn, gateway_id, now_ms)
+                if evidence_block is not None:
+                    gateways[-1]["evidence"] = evidence_block
             result = {
                 "schema_version": SCHEMA_VERSION,
                 "accounts": accounts,

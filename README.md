@@ -79,7 +79,7 @@ python -m quota_balancer --db quota.db init
 python -m quota_balancer --db quota.db config-import --file docs/fixtures/card1-inventory.json
 python -m quota_balancer --db quota.db reading-import --file readings.json
 python -m quota_balancer --db quota.db set-coverage --account meter --complete true
-python -m quota_balancer --db quota.db reconcile --gateway g1
+python -m quota_balancer --db quota.db gateway-adopt --gateway g1 --evidence EVENT_ID --resolve 1
 python -m quota_balancer --db quota.db status --json
 ```
 
@@ -100,14 +100,17 @@ python -m quota_balancer --db quota.db status --json
   preserved), and advance the gateway report (the snapshot must bind to
   the gateway's own machine and account; monotonic `seq`; an epoch or
   policy-hash change needs reconciliation, which stays set until the
-  operator's `reconcile` verb). An ambiguous source (no account) is
+  operator adopts a named report with `gateway-adopt`, card R1-3d). An
+  ambiguous source (no account) is
   recorded but reduced into no account.
 - `set-coverage --account A --complete {true,false}` — operator-only; the
   only thing that ever writes `coverage_complete`. Telemetry never sets
   it.
-- `reconcile --gateway G` — operator-only; clears a gateway's
-  `reconciliation_required` state. Telemetry never clears it (an epoch or
-  policy-hash change re-raises it on the next report).
+- `reconcile --gateway G` — **refused since card R1-3d** (exit 2,
+  `EVIDENCE_REQUIRED`, nothing changed): a gateway's `reconciliation_required`
+  state is cleared by `gateway-adopt --evidence`, which names a report (see
+  "Card R1-3d" below). Telemetry never clears it (an epoch or policy-hash
+  change re-raises it on the next report).
 - `status --json` — the card-1 inventory plus, per account,
   `coverage_complete` and its windows (window key, `used_bps`,
   `resets_at`, `confidence`, `source_stale`, `observed_at`, `age_ms`,
@@ -770,6 +773,56 @@ every row from that day on. That is safe, but it would have gone blind. **Now it
 `_take_pages` passes `month_rows=receipts.EITHER`; `fold_page` (the R1 reader) still needs month rows. `_ISO`, `parkreader._PARKED_AT` and
 `config._SID_TEXT` use `[0-9]`, and `events.take_snapshot` takes a segment number only if it is ASCII digits. Tests: `tests/test_cardr1rc_either.py`.
 Record: `docs/STEP-CARD-R1-RC.md`.
+
+## Card R1-3d - the operator's commands over a gateway's evidence
+
+In plain words: Leasewise judges every gateway money report and writes down problems as open items (card R1-3c). This card gives the **operator**
+the commands to act on them, and shows the result in `status`. **No seat, lease or admission decision changes:** nothing in the grant path reads
+the evidence until card R1-5.
+
+What exists now:
+
+- **`gateway-approve`** records that you have seen a gateway's pair of price and child-cap fingerprints and accept them. A change of either one is a
+  new pair that you have not approved.
+- **`gateway-adopt`** makes one **quiet** report the trusted starting point. In one step, or not at all, it also **chooses the one reader to trust**
+  (every other waiting reader is retired for good), closes the open items you name, and writes an audit line with no amounts. If the report cannot be
+  adopted it says so in one fixed sentence; **the reason is shown by `status`**, never in the sentence.
+- **`reconcile`** no longer clears anything. It refuses and points to `gateway-adopt`, because clearing a problem now means naming a report.
+- **`status`** has an `evidence` block per gateway that has a version-4 report: its state (`unadopted`, `unapproved`, `usable`, `stale`,
+  `period_mismatch` or `transition_open`), the adopted report, the newest report, the readers and which one is current, the open items with their
+  ids, **`adopt_blockers`** (every reason the newest report cannot be adopted yet), the counters, and `action` (a fixed sentence while something needs
+  your decision). Only local ids, random reader identities, numbers and closed words appear.
+- **A read-only builder** turns the usable chain into the input of the billing evaluator. It reads the adopted chain only, never the older report
+  columns of `gateways`. Nothing calls it yet.
+
+**The workflow:** approve the pair; read `status` and look at `adopt_blockers`; when the newest report is quiet and fresh, adopt it and name **every**
+open item with `--resolve ID` (one left out is refused). A mistaken reader choice is permanent for that identity: the way back is to give the intended
+reader a new state (a new identity) and adopt that.
+
+Limits: the evidence of a gateway that is busy all day is judged only when it next goes quiet; whether a report that is not quiet may support enforced
+admission is a gate of card R1-5; the unowned-spend comparison with receipts (`unreceipted_micro_eur`, `receipts_exceed_settled`) is card R1-3e.
+
+```console
+python -m quota_balancer --db quota.db gateway-approve --gateway g1 --price-hash H64 --child-cap-hash H64
+python -m quota_balancer --db quota.db status --json
+python -m quota_balancer --db quota.db gateway-adopt --gateway g1 --evidence EVENT_ID --resolve 1 --resolve 2
+```
+
+**Fix round 1 (migration 11).** Each version-4 report is now stored with ingest's own verdict, `in_order`: 1 only if, when it arrived, it was an in-order
+report of its chain (not from a retired reader, not late, not a duplicate or a collision, not an older epoch or month). The trusted chain is the adopted
+report plus the later reports of the same reader, epoch, generation and month that carry `in_order = 1`; it never decides order again, because arrival
+order cannot be rebuilt from a row number or a clock reading. Existing rows read 0. The schema version is now 11, and an older program refuses a version-11
+store. `gateway-adopt` also reads the clock only after it holds the write lock, bounds `--resolve` to a whole number that fits a database integer, and
+refuses (rather than fails on) a report that another operator has just adopted.
+
+### Technical detail (R1-3d)
+
+`store.gateway_approve`, `store.gateway_adopt` (`BEGIN IMMEDIATE`; `evidence_view.adopt_blockers` re-reads the ten items inside it; steps 2.3 with
+the fault-injection point `store._after_adopt_step`; `store._promote_reader` retires before it promotes), `store.reconcile` (raises
+`EVIDENCE_REQUIRED` before opening the store), `store.evidence_inputs` (a read transaction). `quota_balancer/evidence_view.py` holds the reads:
+`adopt_blockers`, `usable_chain`, `usable`, `project` (the `status` block) and `inputs` (the evaluator's gateway input). `billing_eval._validate_reading`
+now accepts a payload that names a reader incarnation if it has exactly the version-4 keys. Two new closed words, `ADOPTION_REFUSED` and
+`EVIDENCE_REQUIRED` (exit 2, no HTTP route). Tests: `tests/test_cardr13d_operator.py`. Record: `docs/STEP-CARD-R1-3D.md`.
 
 ## Card 7a-2 - the reporter core
 

@@ -114,7 +114,7 @@ class OrderOfTheChecks(unittest.TestCase):
         self.assertEqual((result.standing, result.counter, result.transitions), (STANDING_OLD_PERIOD, "old_chain_reports", ()))
         self.assertFalse(result.roll)
 
-    def test_a_generation_that_differs_from_the_recorded_one_is_an_identity_conflict_and_stops_the_chain_rules(self):
+    def test_a_generation_that_differs_from_the_recorded_one_shows_the_identity_mismatch_and_no_roll(self):
         result = assess(R(generation=GEN2, settled=1), S(previous=None))
         self.assertEqual(kinds(result), [evidence.KIND_EPOCH_GENERATION_MISMATCH])
         self.assertEqual(result.transitions[0][1], (INC, 1, 2))
