@@ -13,6 +13,7 @@ One pass, in the money reader's own lane (`Reporter._send_report`):
 8. Build the version-4 bytes (`gwwire.build_report`) and, in one transaction, number and save them (`gwstate.mint`).
 9. Send the new report.
 
+A new report is made at most once per `interval_seconds` (lead decision D-217, `Pacer`); inside the interval only a waiting report is sent.
 Any failure of steps 4 to 8 means NO report, never a partial one, and ONE closed word, counted. A word never carries a value from the report.
 Nothing here replaces, rebuilds or drops an unaccepted report: a pending report is always sent first, as the same bytes.
 """
@@ -24,6 +25,20 @@ STATE_UNAVAILABLE = gwstate.STATE_UNAVAILABLE
 
 # The closed words this pass can add to the money reader's counts (the others belong to the send side, `gwsend`).
 CYCLE_WORDS = (STATUS_FAILED,) + gwreport.WORDS
+
+
+class Pacer:
+    """At most one new report per `interval` seconds (lead decision D-217), on a monotonic clock kept in memory only: a new process reports at once.
+    It is told when a report was made, not when one was tried, so a failed read is tried again at the next cycle."""
+
+    def __init__(self, interval, monotonic):
+        self.interval, self.monotonic, self.last = interval, monotonic, None
+
+    def due(self):
+        return self.last is None or self.monotonic() - self.last >= self.interval
+
+    def made(self):
+        self.last = self.monotonic()
 
 
 def count(state, word):
@@ -77,11 +92,13 @@ def make_report(state, report, source, clock, stop):
     return None
 
 
-def run_lane(state, client, report, source, clock, stop):
+def run_lane(state, client, report, source, clock, stop, pacer):
     """One pass of the money reader -> `gwsend.Outcome` (the same value the send side gives, so the lane ranks it the same way)."""
     first = gwsend.send_pending(state, client, clock())
     if first.word not in (None, gwsend.ACCEPTED) or stop.is_set():
         return first                                  # steps 1 and 3: halted, or the waiting report was not accepted: stop here
+    if not pacer.due():
+        return first                                  # not yet time for a new report: nothing is written and no word is counted
     started = gwstate.start(state, clock())
     if started.halt is not None:
         word = STATE_UNAVAILABLE if started.halt == STATE_UNAVAILABLE else gwsend.READER_HALTED
@@ -91,5 +108,6 @@ def run_lane(state, client, report, source, clock, stop):
     if word is not None:
         count(state, word)
         return gwsend.Outcome(word, first.sent, False)
+    pacer.made()
     second = gwsend.send_pending(state, client, clock())             # step 9: the saved bytes, as the send side always sends them
     return gwsend.Outcome(second.word, first.sent + second.sent, second.unauthorized)

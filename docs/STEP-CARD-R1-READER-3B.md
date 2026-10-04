@@ -28,11 +28,15 @@ first, and the gateway is not run while one waits. **Nothing here runs against a
 
 ## Choices made (each tested), and two things for the lead
 
-- **`account` is a key the design does not name** (the one addition to the table of design 13). Leasewise accepts a gateway's report only from the machine **and
+- **Both points below are now lead decision D-217** (`DESIGN-R1-READER.md`, just before section 1, SHA-256 `fa05155a...5abe`). It is built as follows.
+- **`account` is a key the design did not name** (the one addition to the table of design 13). Leasewise accepts a gateway's report only from the machine **and
   the account** that own the gateway (`store._reduce_gateway_snapshot`: an account of null is "INVALID_CONFIG"), and the policy-ids snapshot lists accounts and gateways
   separately, so the reader cannot learn it by itself. It is resolved against the snapshot like the gateway. Found when the first end-to-end send was refused.
-- **One report per cycle.** Design 8 builds a report each cycle and design 13 has no interval setting, so the time between reports is `poll_seconds` (default 5 s).
-  An operator who wants fewer reports raises it. If a separate report interval is wanted, it is a small later addition.
+  **A wrong value** gives a definitive refusal from Leasewise for every report; after five in a row the reader stops as `send_refused` (`resume` after the value is fixed).
+- **`interval_seconds`** (`[gateway_report]`, a whole number, default 60, 30 to 100): a new report is made at most once per interval, measured on a monotonic clock
+  kept in memory (`gwcycle.Pacer`, set when a report is made, not when one is tried). A restart reports at once. A waiting report is still sent every cycle under the
+  existing back-off; a cycle that skips because of the interval writes nothing and counts no word. The ceiling keeps a report well inside Leasewise's 120-second freshness
+  window (`evidence_view.FRESH_MS`); raising `poll_seconds` instead would not work, because the same cycle carries the other uploads.
 - **The month and the observed time** are both taken from the reader's clock at the moment it has the snapshot (after the command returned).
 - **A mint that is refused** (`gwstate.Refused`: halted, a pending row, a bad report or receipts) is counted as `state_unavailable`; design 9 has no other word for it.
 - **The gateway is not run while a report waits**, and also not while the reader is halted or its state is damaged (a halted reader with nothing waiting is found
@@ -40,7 +44,12 @@ first, and the gateway is not run while one waits. **Nothing here runs against a
 - **Receipt reading has no per-cycle page budget:** each page read is bounded by the command's own time-out, the saved position moves only after every page up to `N`
   was read (design 7), so a long backlog is read in one cycle. The stop signal ends it between pages.
 
-## Tests (`tests/test_cardr1reader3b_cycle.py`, 33)
+## Tests (`tests/test_cardr1reader3b_cycle.py`, 41)
+
+The first 33 are listed below; the interval adds 8: the default and the bounds (29, 101, 0, a negative, a string, a float and a boolean are refused; 30 and 100 are
+accepted), two cycles inside the interval make one report, a waiting cycle writes nothing and counts nothing, the first cycle at the interval makes the next report, a waiting
+report is resent inside the interval, a restart reports at once, a failed read does not use up the interval, and the configured interval is the one used. The test clock
+drives the monotonic clock. Red first against `ecef117`: 6 of the 8 fail (the restart and failed-read tests describe behaviour that did not change).
 
 End to end with a REAL in-process Leasewise and a fake runner returning agenttalk's documented report and page byte for byte: a cycle sends report 1 (unowned money
 670, N 1, quiet); `gateway-approve` then `gateway-adopt` naming the open items; the evidence block says `usable`; a restart keeps the identity and numbers; a second

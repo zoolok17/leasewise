@@ -291,13 +291,17 @@ def _gateway_receipts(table):
 # own the gateway (`store._reduce_gateway_snapshot`), and the reader has no other way to learn it (the policy-ids snapshot lists accounts
 # and gateways separately). DESIGN-R1-READER.md 13 does not name it; it is the one key added to that table.
 _REPORT_KEYS = ("gateway", "account", "command")
-_REPORT_OPTIONAL = ("timeout_seconds", "env", "max_bytes")
+_REPORT_OPTIONAL = ("timeout_seconds", "env", "max_bytes", "interval_seconds")
+# Lead decision D-217: a new report is made at most once per `interval_seconds`. The ceiling keeps a report well inside Leasewise's 120-second
+# freshness window (`evidence_view.FRESH_MS`), so the newest report can always be adopted.
+DEFAULT_REPORT_INTERVAL = 60
+MIN_REPORT_INTERVAL, MAX_REPORT_INTERVAL = 30, 100
 
 
 class GatewayReport:
     """The money reader's report command. The repr hides everything (a path can name a deployment)."""
 
-    __slots__ = ("gateway", "account", "gateway_id", "account_id", "command", "timeout_seconds", "env", "max_bytes")
+    __slots__ = ("gateway", "account", "gateway_id", "account_id", "command", "timeout_seconds", "env", "max_bytes", "interval_seconds")
 
     def __repr__(self):
         return "GatewayReport(<hidden>)"
@@ -331,6 +335,9 @@ def _gateway_report(table):
     row.max_bytes = table.get("max_bytes", 1024 * 1024)
     if type(row.max_bytes) is not int or not 1024 <= row.max_bytes <= 4 * 1024 * 1024:
         _invalid("%s: max_bytes must be a whole number from 1024 to 4194304" % where)
+    row.interval_seconds = table.get("interval_seconds", DEFAULT_REPORT_INTERVAL)
+    if type(row.interval_seconds) is not int or not MIN_REPORT_INTERVAL <= row.interval_seconds <= MAX_REPORT_INTERVAL:
+        _invalid("%s: interval_seconds must be a whole number from %d to %d" % (where, MIN_REPORT_INTERVAL, MAX_REPORT_INTERVAL))
     return row
 
 

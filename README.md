@@ -845,8 +845,9 @@ purpose) and for step 4, the live trial. A reporter without the new table in its
 3. If a report is waiting to be sent, it sends exactly those saved bytes first. The gateway is **not** run while a report waits. Only when Leasewise accepted
 it does the cycle go on. 4. It runs the gateway's `report` command. 5. It reads the answer strictly. 6. It reads the receipts after the last one it has,
 up to exactly the number the report names. 7. It works out the figures. 8. It numbers and saves the new report in one step. 9. It sends it.
-Any failure in steps 4 to 8 means **no report at all**, one closed word, and a count in `status`. It tries again next cycle. **One report is made per
-cycle**, so the time between reports is the reporter's `poll_seconds`.
+Any failure in steps 4 to 8 means **no report at all**, one closed word, and a count in `status`. It tries again next cycle. **A new report is made at most
+once per `interval_seconds`** (default 60; lead decision D-217): a cycle inside the interval only resends a waiting report, if there is one, and writes nothing
+else. The interval is kept in memory, so a restart makes a report at once.
 
 **The configuration** (Windows only, like the receipt command). It needs `gateway_receipts` to be read by a **command** for the **same gateway**:
 
@@ -863,11 +864,20 @@ command = ["C:\path\to\agenttalk.exe", "gateway", "report", "--json"]
 timeout_seconds = 20          # optional, 1 to 60
 max_bytes = 1048576           # optional, 1024 to 4194304
 env = { SOME_SETTING = "value" }   # optional, at most 8
+interval_seconds = 60         # optional, 30 to 100, a whole number; the default is 60
 ```
 
 The command is an absolute path to an `.exe` and its arguments, as a list (no shell). It **must end with** `gateway report --json`: the reporter adds nothing to
-it. `--after`, `--limit` and `--json` may not appear anywhere else. `account` is the one key beyond the original design: Leasewise takes a gateway's report
-only from the machine **and** the account that own the gateway, and the reporter has no other way to learn the account.
+it. `--after`, `--limit` and `--json` may not appear anywhere else.
+
+- **`account`** is the gateway's own metered account in Leasewise. Leasewise takes a gateway's report only from the machine **and** the account that own the
+  gateway, and the reporter has no other way to learn the account. **A wrong value** makes Leasewise refuse every report (a definitive refusal); after five in a
+  row the reader stops as `send_refused`, and it never sends a report under another owner. Fix the value, then run `reporter resume --confirm`.
+- **`interval_seconds`** is the shortest time between two new reports (30 to 100, default 60). It stays below Leasewise's 120-second freshness window
+  (`evidence_view.FRESH_MS`), so the newest report is always fresh enough to adopt. Raising `poll_seconds` would not do this, because the same cycle carries the
+  other uploads.
+
+Both come from lead decision D-217 (`DESIGN-R1-READER.md`, just before section 1).
 
 **What each word means and what to do** (they are counts in `status` under `money_reader.counts`; each counts cycles; none holds a value from a report):
 

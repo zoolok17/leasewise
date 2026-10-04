@@ -100,14 +100,19 @@ class Env(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.admission = l6a1_env.make_store(os.path.join(self.rig.ws.dir, "admission.db"))
+        self.mono = [0.0]                                   # the reporter's monotonic clock, driven by the test
         self.write_config()
-        self.reporter = self.rig.open()
+        self.reporter = self.attach(self.rig.open())
+
+    def attach(self, reporter):
+        reporter.monotonic = lambda: self.mono[0]
+        return reporter
 
     def write_config(self, **kw):
         self.rig.ws.write_config(self.rig.lw.url, self.rig.agents_cfg, extra=toml_blocks(self.admission, **kw))
 
     def restart(self):
-        self.reporter = self.rig.restart()
+        self.reporter = self.attach(self.rig.restart())
 
     # --- what the real Leasewise holds -------------------------------------------------------------------------------------------
     def rows(self, sql, params=()):
@@ -123,10 +128,12 @@ class Env(unittest.TestCase):
     def counts(self):
         return {name: self.rig.state.counter(gwstate.READER_AGENT, name) for name in status.MONEY_READER_COUNTS}
 
-    def lane(self):
-        """One cycle of the reporter; the clock moves a little so a second report is a different instant."""
+    def lane(self, wait=100):
+        """One cycle of the reporter; then the clock moves a little (so a second report is a different instant) and the monotonic clock moves by
+        `wait` seconds (the default is past the report interval, so every cycle is due unless a test says otherwise)."""
         result = self.reporter.cycle()
         self.rig.clock.advance(1)
+        self.mono[0] += wait
         return result
 
     def evidence(self):
@@ -386,12 +393,71 @@ class Lane(Env):
         self.rig.ws.write_config(self.rig.lw.url, self.rig.agents_cfg,
                                  extra="[gateway_receipts]\ngateway = \"g1\"\nadmission_store = %s\ncommand = %s\n" % (
                                      json.dumps(self.admission), json.dumps([EXE, "gateway", "receipts"])))
-        self.reporter = self.rig.restart()
+        self.reporter = self.attach(self.rig.restart())
         self.lane()
         self.assertEqual(self.gateway.reports(), [])
         self.assertEqual(self.reader("SELECT * FROM gwr_identity"), [])
         self.assertEqual(self.rows("SELECT COUNT(*) FROM readings"), [(0,)])
         self.assertEqual(self.reporter.report()["money_reader"]["halt"], None)
+
+
+class Interval(Env):
+    """Lead decision D-217: a new report at most once per `interval_seconds` (default 60), on a monotonic clock kept in memory."""
+
+    def minted(self):
+        return self.reader("SELECT minted_seq FROM gwr_seq")
+
+    def test_two_cycles_inside_the_interval_make_one_report(self):
+        self.lane(wait=10)
+        self.lane(wait=10)
+        self.assertEqual(len(self.gateway.reports()), 1)
+        self.assertEqual(self.minted(), [(1,)])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM readings"), [(1,)])
+
+    def test_a_cycle_that_waits_for_the_interval_writes_nothing_and_counts_no_word(self):
+        self.lane(wait=10)
+        before = ({name: self.reader("SELECT * FROM " + name) for name in gwstate.TABLES}, self.counts())      # fixed names
+        self.lane(wait=10)
+        self.assertEqual(({name: self.reader("SELECT * FROM " + name) for name in gwstate.TABLES}, self.counts()), before)
+
+    def test_the_next_cycle_after_the_interval_makes_a_report(self):
+        self.lane(wait=59)
+        self.lane(wait=1)                                                       # 59 s since the first: not yet
+        self.assertEqual(len(self.gateway.reports()), 1)
+        self.lane(wait=0)                                                       # 60 s: due
+        self.assertEqual(len(self.gateway.reports()), 2)
+        self.assertEqual(self.minted(), [(2,)])
+
+    def test_a_waiting_report_is_resent_inside_the_interval_and_no_new_one_is_made(self):
+        self.rig.net.down = True
+        self.lane(wait=5)
+        self.rig.net.down = False
+        result = self.lane(wait=5)                                              # 5 s later: the same bytes go out, nothing new is read
+        self.assertEqual((result.sent, len(self.gateway.reports())), (1, 1))
+        self.assertEqual(self.reader("SELECT minted_seq, acked_seq FROM gwr_seq"), [(1, 1)])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM readings"), [(1,)])
+
+    def test_a_restart_makes_a_report_at_once(self):
+        self.lane(wait=1)
+        self.restart()
+        self.lane(wait=1)
+        self.assertEqual(len(self.gateway.reports()), 2)
+        self.assertEqual(self.minted(), [(2,)])
+
+    def test_a_failed_read_does_not_start_the_interval(self):
+        self.gateway.report_word = runner.TIMEOUT
+        self.lane(wait=1)
+        self.gateway.report_word = runner.OK
+        self.lane(wait=1)                                                       # one second later: the failure did not use up the interval
+        self.assertEqual(self.minted(), [(1,)])
+
+    def test_the_configured_interval_is_the_one_used(self):
+        self.write_config(report_extra="interval_seconds = 30\n")
+        self.reporter = self.attach(self.rig.restart())
+        self.assertEqual(self.reporter.pacer.interval, 30)
+        self.lane(wait=30)
+        self.lane(wait=0)
+        self.assertEqual(self.minted(), [(2,)])
 
 
 def receipts_page():
@@ -495,6 +561,16 @@ class Configuration(unittest.TestCase):
                          ("g1", "meter", (EXE, "gateway", "report", "--json"), 30, 2048, (("A_B", "1"),)))
         self.assertEqual(repr(row), "GatewayReport(<hidden>)")
         self.assertEqual(cfg.parse_config(minimal_text(RECEIPTS)).gateway_report, None)         # without the table the reader does nothing
+
+    def test_the_interval_defaults_to_60_and_takes_30_to_100(self):
+        def interval(extra=""):
+            return cfg.parse_config(minimal_text(RECEIPTS + report_table(extra=extra))).gateway_report.interval_seconds
+        self.assertEqual(interval(), 60)
+        self.assertEqual((interval("interval_seconds = 30\n"), interval("interval_seconds = 100\n")), (30, 100))
+        for label, value in (("29", "29"), ("101", "101"), ("0", "0"), ("negative", "-60"), ("a string", '"60"'), ("a float", "60.0"), ("a boolean", "true")):
+            with self.subTest(label):
+                message = self.refused(RECEIPTS + report_table(extra="interval_seconds = %s\n" % value), "interval_seconds")
+                self.assertNotIn("60", message.replace("30 to 100", ""))
 
     def test_the_receipt_commands_refusals_apply(self):
         for label, command in (("a relative path", ["agenttalk.exe", "gateway", "report", "--json"]),

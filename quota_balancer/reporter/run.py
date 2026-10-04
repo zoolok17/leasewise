@@ -72,6 +72,8 @@ class Reporter:
         # Card R1-READER step 3b: the money reader's report command. It works only with a command receipt source of the same gateway
         # (the configuration refuses anything else); without the table the reader does nothing and the lane only sends a waiting report.
         self.gateway_report = gateway_report if gateway_receipts is not None else None
+        # Lead decision D-217: a new report at most once per `interval_seconds`, counted on the monotonic clock in memory (a restart reports at once).
+        self.pacer = None if self.gateway_report is None else gwcycle.Pacer(self.gateway_report.interval_seconds, lambda: self.monotonic())
         # Card L6a-2 (DESIGN-6A 8.5): the agents whose turns the gateway admits. The journal pipeline never acquires
         # or reports for them (their journal observations are still kept).
         admission = getattr(config, "admission", None)
@@ -291,7 +293,7 @@ class Reporter:
             if self.gateway_report is None:
                 outcome = gwsend.send_pending(self.state, self.client, self.clock())
             else:
-                outcome = gwcycle.run_lane(self.state, self.client, self.gateway_report, self.gateway_receipts, self.clock, self.stop)
+                outcome = gwcycle.run_lane(self.state, self.client, self.gateway_report, self.gateway_receipts, self.clock, self.stop, self.pacer)
         except Exception:    # noqa: BLE001 - the money reader's lane boundary: nothing in this lane may stop the reporter or the other lanes
             self._count_lane_failure()                  # only a closed word is kept: no message, no value, no trace
             return
