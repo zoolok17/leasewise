@@ -72,6 +72,7 @@ def fixture_source(path, store=None, **over):
     row.fixture = path
     row.max_bytes, row.page_limit = 1024 * 1024, 100
     row.command, row.timeout_seconds, row.env = None, None, ()
+    row.waiting_interval_seconds = row.idle_interval_seconds = None
     for key, value in over.items():
         setattr(row, key, value)
     return row

@@ -243,10 +243,7 @@ def _awaiting(state, source, now_ms):
     seconds (since this reporter first copied it), and how many of them are past the lease's own expiry."""
     if source is None:
         return {"count": 0, "oldest_age_seconds": None}, 0
-    count, oldest, overdue = state.one(
-        "SELECT COUNT(*), MIN(copied_ms), COALESCE(SUM(expires_ms < ?), 0) FROM receipt_binding b"
-        " WHERE b.gateway_id=? AND NOT EXISTS (SELECT 1 FROM receipt_capture c WHERE c.ref_sha256=b.ref_sha256)",
-        (now_ms, source.gateway_id))
+    count, oldest, overdue = state.awaiting_receipts(source.gateway_id, now_ms)
     age = None if oldest is None else max(0, (now_ms - oldest) // 1000)
     return {"count": count, "oldest_age_seconds": age}, overdue
 
