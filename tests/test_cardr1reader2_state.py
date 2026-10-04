@@ -254,7 +254,8 @@ class StartUpCheck(_State):
     def test_zero_over_zero_is_valid(self):
         self.started()
         self.forced(("INSERT INTO gwr_epoch(ledger_epoch, generation) VALUES(1,?)", (GEN,)),
-                    ("INSERT INTO gwr_seq(generation, minted_seq, acked_seq) VALUES(?,0,0)", (GEN,)))
+                    ("INSERT INTO gwr_seq(generation, minted_seq, acked_seq) VALUES(?,0,0)", (GEN,)),
+                    ("INSERT INTO gwr_receipts(generation, read_through_seq, no_month) VALUES(?,0,0)", (GEN,)))
         self.assertIsNone(gwstate.inconsistency(self.state))
         self.assertIsNone(self.run_start().halt)
 

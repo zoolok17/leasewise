@@ -764,7 +764,9 @@ What exists now (the reporter's own database, schema version 5; `reporter/gwstat
   **archive** that `reset` fills and never erases.
 - **The start-up check:** the state is accepted only as `minted == acked` with no pending report, or `minted == acked + 1` with a pending report of exactly
   that number, and the pending bytes, their event id, the identity and the epoch mapping must agree. Anything else halts the reader as `state_unavailable`.
-- **A complete absence of state is a first start** (a fresh identity). An absent identity with any surviving row is not: it halts.
+- **A complete absence of state is a first start** (a fresh identity). An absent identity with any surviving row is not: it halts. Every relationship of the state
+  is checked in both directions (an epoch without progress, or progress without its receipts, halts too), and a saved report's identity facts must have exactly
+  the types Leasewise accepts. The largest report or epoch number cannot be incremented: it halts, and `reset` recovers.
 - **Mint** (number, save and keep the next report, together with the receipts read, in one transaction) and **acceptance** (only for HTTP 202 with
   `accepted` exactly `true` and the same event id; it deletes the pending report and moves `acked_seq`, in one transaction). **Reset** archives the old
   state and starts a fresh one in one transaction.

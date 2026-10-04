@@ -145,9 +145,18 @@ def _survivors(state):
     return any(state.one(statement) is not None for statement in _SURVIVOR_QUERIES)
 
 
+def _exact_int(value):
+    """A whole number exactly (not a boolean, not a float, not a text), from 1 to 2^63-1 (the range Leasewise's own validator accepts)."""
+    return type(value) is int and 1 <= value <= INT64_MAX
+
+
 def report_facts(body):
-    """The facts a pending report states about itself: (event_id, incarnation, generation, seq, epoch), or None when the bytes are not a report
-    document of the expected shape. The ONE place that knows where they sit in the bytes the sender will post (step 3 builds them)."""
+    """The facts a saved report states about itself: (event_id, incarnation, generation, seq, epoch), or None when the bytes are not a report
+    document of the expected shape OR any of the five is not exactly what it must be: `event_id` a text in the form `derive_event_id` makes,
+    the incarnation and the generation exactly 32 lowercase hex characters, `seq` and `ledger_epoch` exactly integers (a JSON `true` or `1.0` is
+    not the number 1) from 1 to 2^63-1. Every type is checked BEFORE any comparison or lookup, so no value can raise. The ONE checker, used by
+    the mint (a malformed report is `bad_report`, nothing written) and by the start-up check (malformed stored bytes halt as
+    `state_unavailable`). It is also the one place that knows where the facts sit in the bytes the sender will post (step 3 builds them)."""
     try:
         doc = json.loads(bytes(body).decode("utf-8"))
     except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -157,8 +166,12 @@ def report_facts(body):
     payload = doc.get("payload")
     if type(payload) is not dict:
         return None
-    facts = (doc.get("event_id"), payload.get("reader_incarnation"), payload.get("generation"), payload.get("seq"), payload.get("ledger_epoch"))
-    return facts if all(value is not None for value in facts) else None
+    event_id, incarnation = doc.get("event_id"), payload.get("reader_incarnation")
+    generation, seq, epoch = payload.get("generation"), payload.get("seq"), payload.get("ledger_epoch")
+    if not (type(event_id) is str and _UUID.fullmatch(event_id) and type(incarnation) is str and _HEX32.fullmatch(incarnation)
+            and type(generation) is str and _HEX32.fullmatch(generation) and _exact_int(seq) and _exact_int(epoch)):
+        return None
+    return event_id, incarnation, generation, seq, epoch
 
 
 def _int(value, low=0):
@@ -190,6 +203,9 @@ def inconsistency(state):
         epochs[epoch] = generation
     if any(generation not in epochs.values() for generation in progress):
         return "epoch_mapping"                                                   # a generation with progress must have been given an epoch
+    if any(generation not in progress for generation in epochs.values()):
+        return "orphan_epoch"                                                    # ...and an epoch must belong to a generation with progress
+                                                                                 # (the mint creates both in one transaction: one alone is damage)
     unfinished = [g for g, (minted, acked) in progress.items() if minted != acked]
     pending = state.all("SELECT generation, seq, body, event_id, idempotency_key, made_ms, refusals FROM gwr_pending")
     if len(pending) > 1:
@@ -219,6 +235,8 @@ def _receipts_inconsistency(state, progress):
         if generation not in progress or not _int(through) or not _int(no_month):
             return "bad_receipts"
     known = {row[0] for row in rows}
+    if any(generation not in known for generation in progress):
+        return "progress_without_receipts"                                       # the mint writes a generation's progress and receipts together
     for generation, period, count, total in state.all("SELECT generation, period, receipts, total_micro_eur FROM gwr_receipt_months"):
         if generation not in known or type(period) is not str or _PERIOD.fullmatch(period) is None or not _int(count) or not _int(total):
             return "bad_receipts"
@@ -286,6 +304,7 @@ def mint(state, generation, build, totals, now_ms):
     numbers of a generation keep growing."""
     if type(generation) is not str or _HEX32.fullmatch(generation) is None:
         raise Refused(BAD_GENERATION)
+    exhausted = False
     with state.txn():
         identity = _identity(state)
         if identity is None or identity[1] is not None or inconsistency(state) is not None:
@@ -295,32 +314,46 @@ def mint(state, generation, build, totals, now_ms):
             raise Refused(PENDING_EXISTS)
         row = state.one("SELECT minted_seq, acked_seq FROM gwr_seq WHERE generation=?", (generation,))
         # (No pending row and a consistent state mean `minted_seq == acked_seq` here: any other pair was refused above as inconsistent.)
-        if row is None:
-            state.conn.execute("INSERT INTO gwr_seq(generation, minted_seq, acked_seq) VALUES(?,0,0)", (generation,))
-            row = (0, 0)
-            _fault("seq_row")
         latest = state.one("SELECT ledger_epoch, generation FROM gwr_epoch ORDER BY ledger_epoch DESC LIMIT 1")
-        if latest is None or latest[1] != generation:
-            epoch = 1 if latest is None else latest[0] + 1
-            state.conn.execute("INSERT INTO gwr_epoch(ledger_epoch, generation) VALUES(?,?)", (epoch, generation))
-            _fault("epoch")
+        needs_epoch = latest is None or latest[1] != generation
+        # The largest number cannot be incremented: the next report number (or the next epoch number) would leave the range Leasewise accepts.
+        # That halts as `state_unavailable` (the operator's `reset` recovers); nothing is numbered, saved or created.
+        if (row is not None and row[0] >= INT64_MAX) or (needs_epoch and latest is not None and latest[0] >= INT64_MAX):
+            state.conn.execute("UPDATE gwr_identity SET halt=? WHERE id=1", (STATE_UNAVAILABLE,))
+            exhausted = True
         else:
-            epoch = latest[0]
-        seq = row[0] + 1
-        event_id = derive_event_id(incarnation, generation, seq)
-        body = build(incarnation, epoch, seq)
-        if not isinstance(body, (bytes, bytearray)) or not 0 < len(body) <= MAX_BODY_BYTES:
-            raise Refused(BAD_REPORT)
-        body = bytes(body)
-        facts = report_facts(body)
-        if facts is None or facts != (event_id, incarnation, generation, seq, epoch):
-            raise Refused(BAD_REPORT)                         # the bytes must state the number, identity and epoch the state gives them
-        state.conn.execute("INSERT INTO gwr_pending(id, generation, seq, body, event_id, idempotency_key, made_ms, refusals) VALUES(1,?,?,?,?,?,?,0)",
-                           (generation, seq, body, event_id, event_id, now_ms))
-        _fault("pending")
-        _store_receipts(state, generation, totals)
-        state.conn.execute("UPDATE gwr_seq SET minted_seq=? WHERE generation=?", (seq, generation))
-        _fault("minted")
+            seq, event_id, body = _mint_next(state, generation, incarnation, row, latest, needs_epoch, build, totals, now_ms)
+    if exhausted:
+        raise Refused(HALTED)
+    return seq, event_id, body
+
+
+def _mint_next(state, generation, incarnation, row, latest, needs_epoch, build, totals, now_ms):
+    """The writes of a mint, inside its transaction."""
+    if row is None:
+        state.conn.execute("INSERT INTO gwr_seq(generation, minted_seq, acked_seq) VALUES(?,0,0)", (generation,))
+        row = (0, 0)
+        _fault("seq_row")
+    if needs_epoch:
+        epoch = 1 if latest is None else latest[0] + 1
+        state.conn.execute("INSERT INTO gwr_epoch(ledger_epoch, generation) VALUES(?,?)", (epoch, generation))
+        _fault("epoch")
+    else:
+        epoch = latest[0]
+    seq = row[0] + 1
+    event_id = derive_event_id(incarnation, generation, seq)
+    body = build(incarnation, epoch, seq)
+    if not isinstance(body, (bytes, bytearray)) or not 0 < len(body) <= MAX_BODY_BYTES:
+        raise Refused(BAD_REPORT)
+    body = bytes(body)
+    if report_facts(body) != (event_id, incarnation, generation, seq, epoch):
+        raise Refused(BAD_REPORT)                             # the bytes must state the number, identity and epoch the state gives them, exactly
+    state.conn.execute("INSERT INTO gwr_pending(id, generation, seq, body, event_id, idempotency_key, made_ms, refusals) VALUES(1,?,?,?,?,?,?,0)",
+                       (generation, seq, body, event_id, event_id, now_ms))
+    _fault("pending")
+    _store_receipts(state, generation, totals)
+    state.conn.execute("UPDATE gwr_seq SET minted_seq=? WHERE generation=?", (seq, generation))
+    _fault("minted")
     return seq, event_id, body
 
 
