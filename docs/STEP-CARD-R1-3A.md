@@ -10,7 +10,8 @@ Leasewise will keep every report a paid gateway sends, let an operator adopt one
 a decision. This first step only creates the **empty tables** for that, and makes the configuration import forget a gateway's approvals and
 adoption when the gateway is moved to another machine or account.
 
-**Nothing reads or writes these tables until cards R1-3b (ingest) and R1-3c (the rules).** No seat, lease, report or answer changes. An older
+**No report ingest or admission code uses these tables, except the import effect and the removal guard.** (Card R1-3b then starts filling
+two of them at ingest; nothing reads them until R1-3c.) No seat, lease, report or answer changes. An older
 Leasewise refuses the new store instead of misreading it.
 
 **What revision 2 changed in the tables.** Every reader of a gateway keeps its memory under a random identity (a *reader incarnation*). The
@@ -75,6 +76,6 @@ build's tables (no `gateway_readers`, no `reader_incarnation`).
 
 ## Honest notes
 
-- Nothing reads these tables yet, so the schema is proved by its own tests only; the first real use is R1-3b.
+- No report ingest or admission code used these tables in this card, so the schema was proved by its own tests only; the first real use is R1-3b.
 - The table definitions are in one place (`_DDL_V10`); a later change from Codex's reads is that place plus the tests of this file.
 - The reading source (the program that sends the reports) is not part of this card or of R1-3: it is the separate card R1-READER.

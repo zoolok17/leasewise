@@ -1,7 +1,8 @@
 """Card R1-3a: migration 10, the seven evidence tables (DESIGN-R1-3.md sections 3 and 7, revision 2).
 
 This step only creates the EMPTY tables that cards R1-3b and R1-3c will fill, and makes the configuration import forget a gateway's
-approvals and adoption when the gateway moves to another machine or account. Nothing reads or writes the tables yet.
+approvals and adoption when the gateway moves to another machine or account. No report ingest or admission code uses the tables in
+this step, except that import effect and the removal guard.
 
 * the seven tables exist with their columns, checks and indexes, and a fresh store and a migrated version-9 store end with the same schema;
 * the migration is tables only: atomic (a failure part-way leaves version 9 and no new table), idempotent, and it invents no row;

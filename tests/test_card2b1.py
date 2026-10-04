@@ -1693,7 +1693,7 @@ class BillingOutputErrors(_Base):
         # An unknown reading document version: exit 2, SCHEMA_UNSUPPORTED.
         result = _readings_import(
             self.db, self.tmp,
-            {"version": 4, "readings": [good]})
+            {"version": 5, "readings": [good]})
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), ERROR_SCHEMA_UNSUPPORTED)
 

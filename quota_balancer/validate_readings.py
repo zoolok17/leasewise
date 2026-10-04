@@ -12,6 +12,7 @@ This module only validates the self-contained shape and types.
 
 import datetime
 import re
+import uuid
 
 from .errors import (
     CODE_INVALID_CONFIG,
@@ -35,6 +36,18 @@ from .validate import ALIAS_RE
 # zero).
 DOC_VERSION = 2
 DOC_VERSION_BILLING = 3
+# Card R1-3b (DESIGN-R1-3.md 1.3): version 4 keeps every version-3 rule and adds, to the gateway snapshot, five keys (the ledger's
+# `generation`, the receipt watermark `receipts_seq`, `quiet`, `held_over_reservation` and the sender's random `reader_incarnation`),
+# and REQUIRES both policy hashes. Its event id is derived from the incarnation, the generation and the number (`derive_event_id`).
+DOC_VERSION_V4 = 4
+# A fixed namespace for the event ids of version-4 gateway reports (a random constant, never changed).
+GATEWAY_REPORT_NAMESPACE = uuid.UUID("5b6f0c7e-3a54-4d57-9a61-2f0a7b3d8c19")
+
+
+def derive_event_id(reader_incarnation, generation, seq):
+    """The event id of a version-4 gateway report: a UUID derived from the reader incarnation, the generation and the report number
+    together. A new incarnation can therefore never collide with an old report, and a resend of the same bytes is a replay."""
+    return str(uuid.uuid5(GATEWAY_REPORT_NAMESPACE, "%s:%s:%d" % (reader_incarnation, generation, seq)))
 
 MAX_BPS = 10_000  # basis points; 10000 == 100%
 
@@ -56,6 +69,10 @@ _GATEWAY_SNAPSHOT_KEYS = frozenset(
 _GATEWAY_SNAPSHOT_KEYS_V3 = _GATEWAY_SNAPSHOT_KEYS | frozenset(
     {"settled_micro_eur", "reserved_micro_eur",
      "uncertain_micro_eur", "unattributed_micro_eur"}
+)
+# Version 4 (card R1-3b): the five new keys of a gateway snapshot.
+_GATEWAY_SNAPSHOT_KEYS_V4 = _GATEWAY_SNAPSHOT_KEYS_V3 | frozenset(
+    {"generation", "receipts_seq", "quiet", "held_over_reservation", "reader_incarnation"}
 )
 _POLICY_HASH_KEYS = frozenset({"price", "child_cap"})
 # Closed provider_billing payload (section 11): numbers and local aliases
@@ -90,6 +107,7 @@ INT64_MAX = 2 ** 63 - 1
 # A policy hash is a fixed-length hex digest (SHA-256-style, 64 lowercase hex
 # chars): free text and paths cannot masquerade as one (privacy).
 _POLICY_HASH_RE = re.compile(r"[0-9a-f]{64}")
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
 
 # Section 7: IDs are local UUIDs (operator aliases are the exception) -
 # canonical lowercase form.
@@ -119,6 +137,10 @@ def _is_alias(value):
 
 def _is_policy_hash(value):
     return isinstance(value, str) and _POLICY_HASH_RE.fullmatch(value) is not None
+
+
+def _is_hex32(value):
+    return isinstance(value, str) and _HEX32_RE.fullmatch(value) is not None
 
 
 def _is_uuid(value):
@@ -231,8 +253,9 @@ def _is_one_utc_month_period(start, end):
             and _next_utc_month_start(start) == end)
 
 
-def _validate_gateway_snapshot(payload, billing):
-    keys = _GATEWAY_SNAPSHOT_KEYS_V3 if billing else _GATEWAY_SNAPSHOT_KEYS
+def _validate_gateway_snapshot(payload, billing, v4=False):
+    keys = (_GATEWAY_SNAPSHOT_KEYS_V4 if v4
+            else _GATEWAY_SNAPSHOT_KEYS_V3 if billing else _GATEWAY_SNAPSHOT_KEYS)
     if not isinstance(payload, dict) or frozenset(payload) != keys:
         _invalid()
     gateway = payload["gateway"]
@@ -278,6 +301,16 @@ def _validate_gateway_snapshot(payload, billing):
     if not _is_bool(sized_ready) or not _is_bool(reconciliation_required):
         _invalid()
     policy_hashes = _validate_policy_hashes(payload["policy_hashes"])
+    if v4:
+        # Version 4 requires BOTH policy hashes (no hash is ever made up), and the five new keys are closed and exact.
+        if policy_hashes is None:
+            _invalid()
+        if (not _is_hex32(payload["generation"]) or not _is_hex32(payload["reader_incarnation"])
+                or not _is_bool(payload["quiet"]) or not _is_nonneg_int(payload["held_over_reservation"])):
+            _invalid()
+        receipts_seq = payload["receipts_seq"]
+        if receipts_seq is not None and not _is_nonneg_int(receipts_seq):
+            _invalid()
     result = {
         "gateway": gateway,
         "ledger_epoch": ledger_epoch,
@@ -290,6 +323,14 @@ def _validate_gateway_snapshot(payload, billing):
     }
     if normalized is not None:
         result.update(normalized)
+    if v4:
+        result.update({
+            "generation": payload["generation"],
+            "reader_incarnation": payload["reader_incarnation"],
+            "receipts_seq": payload["receipts_seq"],
+            "quiet": payload["quiet"],
+            "held_over_reservation": payload["held_over_reservation"],
+        })
     return result
 
 
@@ -359,11 +400,13 @@ def validate_readings(doc, now_ms):
     if "version" in doc:
         version = doc["version"]
         if not _is_int(version) or version not in (
-                DOC_VERSION, DOC_VERSION_BILLING):
+                DOC_VERSION, DOC_VERSION_BILLING, DOC_VERSION_V4):
             raise QuotaError(CODE_SCHEMA_UNSUPPORTED, MSG_SCHEMA_UNSUPPORTED)
     # Version 3 documents carry the money fields and the provider_billing
-    # kind; version 2 (or an absent version, as in card 2) does not.
-    billing = version == DOC_VERSION_BILLING
+    # kind; version 2 (or an absent version, as in card 2) does not. Version
+    # 4 keeps every version-3 rule and extends the gateway snapshot.
+    v4 = version == DOC_VERSION_V4
+    billing = version in (DOC_VERSION_BILLING, DOC_VERSION_V4)
 
     if frozenset(doc) != _TOP_KEYS:
         _invalid()
@@ -409,7 +452,10 @@ def validate_readings(doc, now_ms):
             reading.update(_validate_cli_window(item["payload"]))
         elif kind == KIND_GATEWAY_SNAPSHOT:
             reading.update(_validate_gateway_snapshot(item["payload"],
-                                                      billing))
+                                                      billing, v4))
+            if v4 and event_id != derive_event_id(
+                    reading["reader_incarnation"], reading["generation"], reading["seq"]):
+                _invalid()                  # the event id must be the one derived from the report's own identity
         elif kind == KIND_PROVIDER_BILLING:
             # The provider billing kind exists in version-3 documents only,
             # and a billing reading is attributed to an account (the
