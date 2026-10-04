@@ -7,8 +7,9 @@ mode too, and for money limits only. An account with no billing policy, or whose
 accepted fallback). The requester counts even with no spending yet. Neither the requester's basis is picked nor any account's
 spending dropped.
 
-The case is Codex's, through the public imports (`import_config`, `billing_policy_import`) and the public `grant` and `settle`.
-Synthetic data only.
+The case is Codex's, through the public `grant` and `settle`. The mixed set-up is a store made BEFORE the import check (card R1-M
+follow-up), so it is built in two steps: the public imports (`import_config`, `billing_policy_import`) with ONE cap basis, then one
+account's declaration is changed directly in the store. Synthetic data only.
 """
 
 import contextlib

@@ -1,10 +1,12 @@
 """Card R1-M follow-up: mismatched cap bases refused at import, `saturate` keeps unknown, one account listing per scope.
 
-1. **Refusal at import.** Accounts that share a money cap (a team, project, seat or platform cap) must declare the same known cap
-   basis. The lease check already refuses such a grant (`CAP_BASIS_CONFLICT`); both imports (`import_config`, `billing_policy_import`)
-   now refuse the set-up straight away, on the state the import would leave, and write nothing. The word is reused because it means
-   the same and asks the same of the operator. Accounts with no policy or an `unknown` basis do not take part. A store that already
-   holds a mismatch (made before) is refused on every import until the bases are aligned.
+1. **Refusal at import, of a NEW conflict only.** Accounts that share a money cap (a team, project, seat or platform cap) must declare
+   the same known cap basis. The lease check already refuses such a grant (`CAP_BASIS_CONFLICT`); both imports (`import_config`,
+   `billing_policy_import`) refuse an import that ADDS a conflicting scope (one that was not conflicting before the import and is on the
+   state it would leave) and write nothing. The word is reused because it means the same and asks the same of the operator. Accounts with
+   no policy or an `unknown` basis do not take part. A store that already holds a mismatch (made before; once billing history exists a cap
+   basis is frozen, so it may not be repairable by import) stays importable: an unrelated import is accepted, a repairing one is accepted,
+   and the lease check keeps refusing leases in the conflicting scope.
 2. **`saturate` keeps unknown.** `money.saturate(UNKNOWN)` is UNKNOWN, not an error.
 3. **One listing per scope per request.** A grant lists the accounts of a scope, and reads each account's policy, once, however many
    times the guard and the two totals need them. No answer changes.
@@ -23,7 +25,7 @@ from unittest import mock
 from quota_balancer import errors, lease, money, store
 from quota_balancer.errors import QuotaError
 
-from tests.test_card2b1 import _billing_policy, _policy_doc
+from tests.test_card2b1 import _billing, _billing_policy, _doc_v3, _eid, _month_bounds_of, _now_ms, _policy_doc
 from tests.test_card4_seat_kind_fix import NOW
 from tests.test_cardl1a import _model, base_doc
 from tests.test_cardr1_money_capbasis import _Case
@@ -89,10 +91,25 @@ class _Imports(unittest.TestCase):
         self.assertEqual(caught.exception.message, errors.MSG_CAP_BASIS_CONFLICT)       # fixed; names no account
 
     def state(self):
-        """Every table the two imports can write, as plain rows (so 'nothing written' is checked, not assumed)."""
+        """A complete logical dump of the store (every table, every row, the schema), so 'nothing written' is checked, not assumed."""
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
-            return {table: conn.execute("SELECT * FROM " + table + " ORDER BY 1, 2").fetchall()         # fixed names
-                    for table in ("accounts", "gateways", "project_accounts", "limits", "billing_policies", "seats", "models")}
+            return list(conn.iterdump())
+
+    def add_billing_history(self):
+        """Provider billing readings for both accounts, through the public reading import: after them a cap basis is frozen."""
+        start, end = _month_bounds_of(_now_ms())
+        now = _now_ms()
+        readings = [_billing(_eid("fu-history-" + account), "desktop", account, "proj-ai", 1, start, end, 100, False, now)
+                    for account in ("meter", "other")]
+        store.reading_import(self.db, self.write("history.json", _doc_v3(readings)))
+
+    def older_store(self, limit):
+        """A store that already holds a mismatch, made the way an older version allowed it: aligned policies through the public
+        imports, then B's cap basis changed in the store directly, then billing history for both accounts."""
+        self.import_config(self.doc(limit=limit))
+        self.import_policies(self.policies(INV, INV))
+        self.force("other", EX)
+        self.add_billing_history()
 
     def force(self, account_alias, cap_basis):
         """Change an account's declared cap basis in the store directly: a store made before the import check."""
@@ -170,15 +187,102 @@ class Refusal(_Imports):
         self.import_config(doc)
         self.import_policies(self.policies(INV, EX))                              # mismatched, but no money cap is shared
 
-    def test_a_store_that_already_holds_a_mismatch_is_refused_on_every_import_until_the_bases_are_aligned(self):
+    def test_a_repairing_import_is_accepted(self):
         self.setUp()
         self.import_config(self.doc(limit="team"))
         self.import_policies(self.policies(INV, INV))
-        self.force("other", EX)                                                   # a store made before the import check
-        self.refused(self.import_config, self.doc(limit="team"))                  # even an unrelated re-import
-        self.refused(self.import_policies, self.policies(INV, EX))
-        self.import_policies(self.policies(INV, INV))                             # aligning is the way out, and is accepted
+        self.force("other", EX)                                                   # a store made before: one conflicting scope
+        self.import_policies(self.policies(INV, INV))                             # aligning shrinks the set: accepted
         self.import_config(self.doc(limit="team"))
+        self.setUp()
+        self.import_config(self.doc(limit="team"))
+        self.import_policies(self.policies(INV, INV))
+        self.force("other", EX)
+        self.import_config(self.doc(members=("meter",), limit="team"))            # dropping the mismatched member shrinks it too
+
+    def test_an_unrelated_import_of_an_older_store_that_holds_a_mismatch_is_accepted(self):
+        for scope in ("team", "project", "seat", "platform"):
+            with self.subTest(scope=scope):
+                self.setUp()
+                self.import_config(self.doc(limit=scope))
+                self.import_policies(self.policies(INV, INV))
+                self.force("other", EX)                                           # the conflict was there before
+                self.import_config(self.doc(limit=scope))                         # the same document: accepted
+                changed = self.doc(limit=scope)
+                changed["gateways"][0]["share_micro_eur"] = 2000                  # an unrelated change: accepted
+                self.import_config(changed)
+                self.import_policies(self.policies(INV, EX))                      # the same mismatched policies again: accepted
+
+    def test_a_version_1_import_of_an_older_store_that_holds_a_mismatch_is_accepted(self):
+        self.setUp()
+        self.import_config(self.doc(limit="platform"))
+        self.import_policies(self.policies(INV, INV))
+        self.force("other", EX)
+        doc = self.doc(limit="platform")
+        old = {key: doc[key] for key in ("accounts", "machines", "gateways")}
+        old["version"] = 1
+        self.import_config(old)
+
+    def test_a_second_conflicting_scope_added_to_an_older_store_is_refused(self):
+        self.setUp()
+        self.import_config(self.doc(limit="team"))
+        self.import_policies(self.policies(INV, INV))
+        self.force("other", EX)                                                   # the team scope already conflicts
+        before = self.state()
+        self.refused(self.import_config, self.doc(limit="platform"))              # a platform cap would be a NEW conflicting scope
+        self.assertEqual(self.state(), before)
+
+
+class WithBillingHistory(_Imports):
+    """Once both accounts have billing history, a cap basis is frozen: the conflict of an older store cannot be repaired by import."""
+
+    def test_both_alignment_directions_are_refused_invalid_config_and_an_unrelated_import_is_accepted(self):
+        self.setUp()
+        self.older_store("platform")
+        before = self.state()
+        for basis in (INV, EX):
+            with self.assertRaises(QuotaError) as caught:
+                self.import_policies(self.policies(basis, basis))
+            self.assertEqual(caught.exception.code, errors.CODE_INVALID_CONFIG)    # frozen, as before
+            self.assertEqual(self.state(), before)
+        self.import_config(self.doc(limit="platform"))                            # an unrelated import: now ACCEPTED
+        changed = self.doc(limit="platform")
+        changed["gateways"][0]["share_micro_eur"] = 2000
+        self.import_config(changed)
+
+    def test_the_old_cap_can_still_be_removed_and_a_version_1_import_is_accepted(self):
+        self.setUp()
+        self.older_store("platform")
+        self.import_config(self.doc(limit=None))                                  # the cap goes: the conflicting scope goes with it
+        doc = self.doc(limit=None)
+        self.import_config({key: doc[key] for key in ("accounts", "machines", "gateways")} | {"version": 1})
+
+
+class HistoricalHold(_Case):
+    """A platform cap that a past hold still refers to cannot be removed, and a basis cannot be changed after billing history."""
+
+    def test_an_unrelated_import_is_accepted_and_the_lease_guard_still_refuses(self):
+        self.build("platform", a_cap="invoice_total", b_cap="invoice_total", hard=100_000_000)      # aligned, so a lease can be made
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE seats SET enforcement='metered' WHERE alias='s2'")
+            conn.execute("UPDATE gateways SET sized_ready=1, state='ok' WHERE alias='g2'")
+            conn.commit()
+        with mock.patch.object(lease, "METERED_ENFORCEMENT_ACTIVATED", True):
+            self.settle_other(1000)                                               # a historical metered hold exists
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertGreater(conn.execute("SELECT COUNT(*) FROM holds h JOIN limits l ON l.id=h.limit_id").fetchone()[0], 0)
+        self.set_b_policy(cap_basis="ex_vat")                                     # the older store now holds the mismatch
+        start, end = _month_bounds_of(_now_ms())
+        rows = [_billing(_eid("held-fu-" + account), "desktop", account, "proj-ai", 1, start, end, 100, False, _now_ms())
+                for account in ("meter", "other")]
+        path = os.path.join(self.root, "history.json")
+        self.write(path, _doc_v3(rows))
+        store.reading_import(self.db, path)
+        config = os.path.join(self.root, "config.json")
+        store.import_config(self.db, config)                                      # an unrelated import: accepted
+        with self.assertRaises(QuotaError) as caught:
+            self.grant("meter", NOW + 2000)
+        self.assertEqual(caught.exception.code, WORD)                             # and the lease guard still refuses
 
 
 class Saturate(unittest.TestCase):

@@ -8,7 +8,8 @@ R1-M part 2 merged (M-018; `docs/STEP-CARD-R1-M2.md`, "Stated limits").
 
 - **Tell the operator earlier.** When accounts that share a spending limit declare different tax bases, a lease was refused
   (`CAP_BASIS_CONFLICT`), but only when someone asked for one. The configuration import and the billing-policy import now refuse such a
-  set-up straight away, with the same word and nothing written. The lease check stays: it protects stores made before.
+  set-up straight away if it would ADD a conflict, with the same word and nothing written. A store that already holds a mismatch stays
+  importable (fix round 1). The lease check stays: it protects stores made before.
 - **"Unknown" survives one more step.** `money.saturate` turned an unknown total into an error. It now returns unknown.
 - **Fewer queries.** A lease request listed a scope's accounts, and read each account's policy, again for every use. It now does each
   once per request. No answer changes.
@@ -31,9 +32,16 @@ Nothing changes for any lease decision, except that the first item refuses earli
      lease today); the **platform**, every account. Seat limits are included for parity with the lease check, which guards every scope.
      Only accounts with a billing policy whose cap basis is known (`ex_vat` or `invoice_total`) take part; an account with no policy or an
      `unknown` basis does not, as at lease time.
-   - **Re-importing an already mismatched store is refused until the bases are aligned.** A store made before this check can hold a mismatch.
-     Every import (even an unrelated re-import of the configuration) is then refused. The way out is a billing-policy import that aligns the
-     bases, which is accepted because the check sees the aligned result.
+   - **Only a NEW conflict is refused (fix round 1, D-188).** The first version refused every import while a mismatch remained, which could
+     lock an older store for good: once both accounts have billing history a `cap_basis` is frozen (`INVALID_CONFIG`, so aligning by policy
+     import is refused), and a platform cap that a past hold still refers to cannot be removed, so no supported import could bring the store
+     back. The check now compares the set of conflicting money-limit scopes **before** the import's changes with the set on the state it
+     would leave (`store._conflicting_cap_scopes`, `store._refuse_new_cap_basis_conflicts`), and refuses only a scope that was not
+     conflicting before. An unrelated import leaves the set the same and is accepted; a repairing import shrinks it and is accepted; an import
+     that adds a second conflicting scope to an already mismatched store is refused. The same word, and still nothing written on a refusal.
+   - **Stated limit:** once billing history exists, an older store's conflict may not be repairable by import. Such a store stays usable for
+     imports, and leases in the conflicting scope are refused (`CAP_BASIS_CONFLICT`, unchanged). Nothing is deleted and no protection is
+     removed. An audited basis correction would be a later card, only if it is ever needed.
    - The lease-time check is unchanged.
 2. **`money.saturate(UNKNOWN)` returns `UNKNOWN`.** Callers checked: `lease._in_cap` (a plain number), `lease._scope_total` (a sum of numbers
    from `_in_cap`) and `money.convert_total` (which already returns UNKNOWN before it saturates). None passes UNKNOWN today, so nothing changes;
@@ -45,7 +53,7 @@ Nothing changes for any lease decision, except that the first item refuses earli
    statements that read a policy, 8 before and 2 after (one per account). **The wording is corrected:** the number of queries grows with the
    accounts that have leases in a scope (one policy read per such account, once per request), not "one query per account" for every use.
 
-## Tests (`tests/test_cardr1_money_fu.py`, 12)
+## Tests (`tests/test_cardr1_money_fu.py`, 18)
 
 - `Refusal`: `test_the_policy_import_refuses_a_mismatch_for_every_scope_and_writes_nothing` (team, project, seat, platform),
   `test_the_config_import_refuses_a_membership_change_that_creates_a_mismatch_and_writes_nothing`,
@@ -53,26 +61,40 @@ Nothing changes for any lease decision, except that the first item refuses earli
   `test_the_platform_cap_spans_every_account_even_outside_the_project`, `test_an_aligned_set_up_is_accepted_by_both_imports`,
   `test_an_account_with_no_policy_or_an_unknown_basis_never_triggers_the_refusal`,
   `test_a_cap_on_another_metric_never_triggers_the_refusal`,
-  `test_a_store_that_already_holds_a_mismatch_is_refused_on_every_import_until_the_bases_are_aligned`. "Writes nothing" compares every table the
-  imports can write before and after, and the fixed message is checked.
+  `test_a_repairing_import_is_accepted` (aligning, and dropping the mismatched member),
+  `test_an_unrelated_import_of_an_older_store_that_holds_a_mismatch_is_accepted` (all four scopes; the same document, an unrelated change, the
+  same mismatched policies),
+  `test_a_version_1_import_of_an_older_store_that_holds_a_mismatch_is_accepted`,
+  `test_a_second_conflicting_scope_added_to_an_older_store_is_refused`. **"Writes nothing" compares a complete logical dump of the store**
+  (every table, every row and the schema, `iterdump`) before and after, and the fixed message is checked.
+- `WithBillingHistory` (provider readings for both accounts through the public reading import, reaching the mismatched state as Codex did):
+  `test_both_alignment_directions_are_refused_invalid_config_and_an_unrelated_import_is_accepted`,
+  `test_the_old_cap_can_still_be_removed_and_a_version_1_import_is_accepted`.
+- `HistoricalHold` (a metered hold that refers to a platform cap, built with the existing fixtures as Codex did):
+  `test_an_unrelated_import_is_accepted_and_the_lease_guard_still_refuses`.
 - `Saturate`: `test_saturate_keeps_unknown_and_changes_nothing_else` (including `saturate(add(1, UNKNOWN))`),
   `test_a_converted_total_that_cannot_be_converted_stays_unknown_through_both_helpers`.
 - `OneListing`: `test_a_grant_lists_each_scope_once_and_reads_each_policy_once_and_answers_as_before` (counts the statements of one grant),
   `test_the_answers_are_the_same_with_the_shared_listing`.
 
-**Red first:** against the previous code, 8 of the 12 methods fail (14 failures and 2 errors, counting subtests): all five refusal tests that
-describe a refusal, both `Saturate` tests, and the query count (7 listings against 4). The other four describe behaviour that does not change
-and pass before and after (an aligned set-up, no policy or an unknown basis, another metric, and the answers).
+**Red first:** against the original follow-up (first build), the 12 methods of that build fail 8 (14 failures and 2 errors, counting subtests):
+all five refusal tests that describe a refusal, both `Saturate` tests, and the query count (7 listings against 4). For the fix round, **4 of the
+7 new methods fail against the always-refuse check (7 errors, counting subtests):** the unrelated-import test (all four scopes), the version-1 test,
+the billing-history alignment-and-unrelated test and the historical-hold case. The other three (a repairing import, a second conflicting scope,
+and the old cap can still be removed) describe behaviour that is the same before and after.
 
 ## Existing tests
 
 **One file moved, for a stated reason.** `tests/test_cardr1_money_capbasis.py` built its mixed set-up through the public imports, which now
 refuse it. It now builds the set-up in two steps: the public imports with ONE cap basis (including the configuration import "after the
 policies exist"), then B's declaration changed directly in the store, which is exactly a store made before the check. Every assertion in it
-is unchanged. All other existing tests pass unchanged.
+is unchanged, and its opening sentence now says so (fix round 1: it had still said the mixed set-up comes through the public imports). All
+other existing tests pass unchanged.
 
 ## Honest notes
 
 - Team and seat limits use the accounts of the project, a superset of the accounts that lease today, so the import can refuse a set-up in
   which the mismatched account has not leased yet. That is the point of refusing earlier.
-- The check reads the whole `limits` table once per import; a store with no mixed known bases returns immediately.
+- The check reads the whole `limits` table twice per import (before and after); a store with no mixed known bases returns immediately.
+- A scope is identified by its kind and id. An import that deletes a conflicting team and creates a new conflicting one gives the new team a
+  new id, so it counts as a new conflict and is refused.
