@@ -52,9 +52,9 @@ class _Status(unittest.TestCase):
 
 class Report(_Status):
 
-    def test_the_status_version_is_3_and_the_object_has_a_closed_shape(self):
+    def test_the_status_version_is_4_and_the_object_has_a_closed_shape(self):
         report = self.reporter().report()
-        self.assertEqual(report["status_version"], 3)
+        self.assertEqual(report["status_version"], 4)
         self.assertEqual(set(report["limit_events"]), OBJECT_KEYS)
 
     def test_without_limit_sources_it_says_not_configured_and_carries_no_gap(self):
@@ -171,7 +171,7 @@ class Command(_Status):
         self.park()
         reporter.cycle()
         snap = status.read_snapshot(status.snapshot_path(self.rig.state.path))
-        self.assertEqual(snap["status_version"], 3)
+        self.assertEqual(snap["status_version"], 4)
         self.assertEqual(snap["limit_events"]["gap"], GAP)
         self.assertEqual(snap["limit_events"]["captured"], 1)
 

@@ -780,6 +780,34 @@ place that knows where a report states its own number, incarnation, generation a
 `gwr_receipts`, `gwr_receipt_months`, `gwr_archive`. The reporter state moves from schema version 4 to 5 (older files are migrated; a reporter that knows less
 refuses a newer file). Tests: `tests/test_cardr1reader2_state.py`. Record: `docs/STEP-CARD-R1-READER-2.md`.
 
+## Card R1-READER, step 3a - the money reader's send side (nothing reads a gateway yet)
+
+In plain words: the money reader keeps at most one report waiting, saved as exact bytes. This step sends it and reads Leasewise's answer, and gives the
+operator two commands to recover it. **Nothing reads a gateway yet** (step 3b builds the cycle and the report itself); the sender simply sends whatever is
+pending, and with nothing pending it does nothing.
+
+- **Only an exact acceptance clears the report:** HTTP 202, `accepted` exactly `true`, and the same event id. Anything else keeps the same saved bytes.
+- **A collision** (409 `IDEMPOTENCY_CONFLICT`) stops the reader for good (`continuity_conflict`) until the operator runs `reset`.
+- **A definitive refusal** (400 with `INVALID_CONFIG` or `SCHEMA_UNSUPPORTED`) is counted on the pending report. **Five in a row** (the named constant
+  `REFUSAL_THRESHOLD`) stop the reader (`send_refused`). A retry in between does not reset the count; an acceptance clears it with the report.
+- **Everything else is a retry:** 401, 429, 5xx, no answer, a timeout, an unreadable answer, even an unreadable success. The report is kept and tried again.
+- **The report has its own lane:** its retry never stops the other uploads of the cycle, and their retries never stop it.
+- **`reporter resume --confirm`** (local, audited, never talks to Leasewise) works only after `send_refused`: it clears the stop and gives the report a new
+  retry budget, keeping the cumulative counts. **`reporter reset --confirm`** archives the reader's whole state and starts a fresh identity (which Leasewise
+  must then be told to adopt). Without `--confirm` nothing is opened or changed.
+- **If the old state is damaged** so that it cannot be archived normally (for example a report id that is not an id), `reset` keeps the whole old state as raw
+  evidence in a bounded quarantine column (**256 KiB**) and discards nothing. A state too large for that is refused (`RESET_TOO_LARGE`) with nothing
+  changed; then stop the reporter, **move the reporter's state file aside and keep it**, and start again: a complete absence of state is a first start.
+- **`status`** gains a `money_reader` block (status version 4): whether a report is pending, how many refusals in a row, the stop word, and counts of
+  `send_failed`, `send_refused`, `continuity_conflict`, `reader_halted`, `state_unavailable` and the totals. Numbers and closed words only.
+
+### Technical detail (R1-READER step 3a)
+
+`gwsend.classify` / `gwsend.send_pending` (the four answer classes; `client.post_reading` posts the stored bytes to `/v1/readings` and never raises);
+`gwstate.note_refusal`, `note_conflict`, `resume`, `reset` (with `_quarantine`), `REFUSAL_THRESHOLD`, `QUARANTINE_MAX_BYTES`; the lane is `Reporter._send_report`, run
+first in `_send`. New tables part of the same schema version 5: the archive's `quarantine` column and `gwr_audit`. Tests: `tests/test_cardr1reader3a_send.py`.
+Record: `docs/STEP-CARD-R1-READER-3A.md`.
+
 ## Card R1-RC - the receipt path reads pages with or without the month
 
 In plain words: when the operator upgrades the live gateway (agenttalk `921c82d4` or later), every receipt on a page carries a new field, the month

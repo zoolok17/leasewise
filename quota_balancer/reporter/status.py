@@ -10,10 +10,10 @@ import datetime
 import json
 import os
 
-from . import capture, decisions, receipts, rounds
+from . import capture, decisions, gwstate, receipts, rounds
 from . import state as state_mod
 
-STATUS_VERSION = 3          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`
+STATUS_VERSION = 4          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`; 4: card R1-READER step 3a added `money_reader`
 
 # Said by `status` and the README, word for word (claude-agenttalk-lead approved it; DESIGN-7B 13.12):
 # capture of limit events is best effort, and this is what closes the gap.
@@ -305,6 +305,31 @@ def _journal_suppression(state, gateway_agents):
             "superseded": total("superseded"), "superseded_after_send": total("superseded_after_send")}
 
 
+# The sentences `status` says for a halted money reader, one per halt word (fixed text: no value from a report or an answer).
+MONEY_READER_ACTIONS = {
+    gwstate.SEND_REFUSED: ("the money reader stopped sending after repeated definitive refusals: fix the cause (for example the clock), then "
+                           "run `reporter resume --confirm`, or `reporter reset --confirm`"),
+    gwstate.CONTINUITY_CONFLICT: ("Leasewise holds different bytes for a report number this reader saved: the money reader has stopped for "
+                                  "good until the operator runs `reporter reset --confirm`, and the new reader must then be adopted"),
+    gwstate.STATE_UNAVAILABLE: ("the money reader's memory is damaged or inconsistent and it sends nothing: run `reporter reset --confirm` "
+                                "(the old state is kept in the archive), then adopt the new reader"),
+}
+MONEY_READER_COUNTS = ("send_failed", "send_refused", "continuity_conflict", "reader_halted", "state_unavailable", "refused_answers",
+                       "resumed", "resets")
+
+
+def _money_reader(state):
+    """Numbers and closed words only (card R1-READER step 3a): whether a report is pending, how many definitive refusals in a row it has had, the
+    halt word, and the counts of the closed outcomes. Nothing from a report or an answer."""
+    pending = state.one("SELECT refusals FROM gwr_pending")
+    identity = state.one("SELECT halt FROM gwr_identity WHERE id=1")
+    return {"pending": 0 if pending is None else 1,
+            "consecutive_refusals": 0 if pending is None else pending[0],
+            "refusal_threshold": gwstate.REFUSAL_THRESHOLD,
+            "halt": None if identity is None else identity[0],
+            "counts": {name: state.counter(gwstate.READER_AGENT, name) for name in MONEY_READER_COUNTS}}
+
+
 def _gateway_receipts(state, source, now_ms, gateway_agents=()):
     """The `gateway_receipts` object (card L6a-1): closed words and counts only. Never a path, a
     command, a lease id, a reference, a figure from a receipt or the text of a fault. `gateway` is the
@@ -389,6 +414,7 @@ def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=
         "active": state.note(_NOTE_CREDENTIAL) is not None}
     report["limit_events"] = _limit_events(state, limit_sources)
     report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts, now_ms, gateway_agents)
+    report["money_reader"] = _money_reader(state)
     report["silent_configured_seats"] = sorted(
         n for n, a in report["agents"].items() if a["silent"])
     report["operator_actions"] = _actions(report, gateway_agents)
@@ -397,6 +423,9 @@ def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=
 
 def _actions(report, gateway_agents=()):
     actions = []
+    halted = report["money_reader"]["halt"]
+    if halted:
+        actions.append(MONEY_READER_ACTIONS[halted])
     if report["journal_refused"]:
         actions.append("the journal is refused: see journal_refused")
     if report["last_401"] and report["last_401"]["active"]:

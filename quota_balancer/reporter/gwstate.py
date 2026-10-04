@@ -24,6 +24,7 @@ Classifying refusals, counting them, the cycle and the operator commands are ste
 import json
 import re
 import secrets
+import sqlite3
 from collections import namedtuple
 
 from ..validate_readings import derive_event_id
@@ -34,6 +35,13 @@ STATE_UNAVAILABLE = "state_unavailable"
 HALT_WORDS = (CONTINUITY_CONFLICT, SEND_REFUSED, STATE_UNAVAILABLE)
 
 INT64_MAX = 2 ** 63 - 1
+# How many definitive refusals IN A ROW (HTTP 400 `INVALID_CONFIG` or `SCHEMA_UNSUPPORTED`) the reader endures for one pending report before it
+# stops sending and halts as `send_refused`. A small positive number: a refusal that repeats this often is a defect or a wrong clock, not bad luck.
+# The count lives on the pending row, so a restart keeps it. A retry answer does not reset it; only an acceptance clears it (with the row).
+REFUSAL_THRESHOLD = 5
+# The most raw evidence a reset keeps in the archive's quarantine column when the old state cannot be archived under the normal constraints.
+QUARANTINE_MAX_BYTES = 256 * 1024
+READER_AGENT = "_money_reader"                # the counters' agent word: starts with an underscore, so it can never be an agent's name
 MAX_BODY_BYTES = 1024 * 1024
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -91,13 +99,22 @@ GWR_DDL = (
     " pending_seq INTEGER CHECK(pending_seq IS NULL OR (pending_seq>=1 AND pending_seq<=9223372036854775807)),"
     " pending_event_id TEXT CHECK(pending_event_id IS NULL OR (" + _UUID_SQL.format(c="pending_event_id") + ")),"
     " pending_body BLOB CHECK(pending_body IS NULL OR (length(pending_body)>0 AND length(pending_body)<=1048576)),"
+    " quarantine TEXT CHECK(quarantine IS NULL OR length(quarantine)<=262144),"
     " archived_ms INTEGER NOT NULL CHECK(" + _BOUND.format(c="archived_ms") + "),"
     " CHECK((pending_generation IS NULL) = (pending_seq IS NULL) AND (pending_seq IS NULL) = (pending_event_id IS NULL)"
     " AND (pending_event_id IS NULL) = (pending_body IS NULL))) STRICT",
     "CREATE TRIGGER gwr_archive_immutable BEFORE UPDATE ON gwr_archive BEGIN SELECT RAISE(ABORT, 'the reader archive is immutable'); END",
     "CREATE TRIGGER gwr_archive_keep BEFORE DELETE ON gwr_archive BEGIN SELECT RAISE(ABORT, 'the reader archive is immutable'); END",
+    # The operator's acts (card R1-READER step 3a), numbers and one closed word each; never changed, never erased.
+    "CREATE TABLE gwr_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " act TEXT NOT NULL CHECK(act IN ('resume','reset')),"
+    " at_ms INTEGER NOT NULL CHECK(" + _BOUND.format(c="at_ms") + "),"
+    " quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)),"
+    " refusals_total INTEGER NOT NULL CHECK(" + _BOUND.format(c="refusals_total") + ")) STRICT",
+    "CREATE TRIGGER gwr_audit_immutable BEFORE UPDATE ON gwr_audit BEGIN SELECT RAISE(ABORT, 'the reader audit is immutable'); END",
+    "CREATE TRIGGER gwr_audit_keep BEFORE DELETE ON gwr_audit BEGIN SELECT RAISE(ABORT, 'the reader audit is immutable'); END",
 )
-TABLES = ("gwr_identity", "gwr_epoch", "gwr_seq", "gwr_pending", "gwr_receipts", "gwr_receipt_months", "gwr_archive")
+TABLES = ("gwr_identity", "gwr_epoch", "gwr_seq", "gwr_pending", "gwr_receipts", "gwr_receipt_months", "gwr_archive", "gwr_audit")
 
 # --- results ----------------------------------------------------------------------------------------------------------------------
 # `halt` is None when the reader may go on, else a closed word. `persisted` is False only when there was no identity row to keep the halt in
@@ -119,6 +136,8 @@ PENDING_EXISTS = "pending_exists"
 BAD_REPORT = "bad_report"
 BAD_RECEIPTS = "bad_receipts"
 BAD_GENERATION = "bad_generation"
+NOT_RESUMABLE = "not_resumable"               # `resume` is offered only after `send_refused`
+RESET_TOO_LARGE = "reset_too_large"           # the old state is too large for the quarantine form: nothing was changed
 
 
 def _fault(step):
@@ -382,25 +401,124 @@ def accept(state, status, answer):
 
 # --- reset --------------------------------------------------------------------------------------------------------------------------
 
+_RAW = (("identity", "SELECT * FROM gwr_identity"), ("epoch", "SELECT * FROM gwr_epoch"), ("seq", "SELECT * FROM gwr_seq"),
+        ("pending", "SELECT * FROM gwr_pending"), ("receipts", "SELECT * FROM gwr_receipts"),
+        ("receipt_months", "SELECT * FROM gwr_receipt_months"))
+
+
+def _raw_value(value):
+    return {"hex": bytes(value).hex()} if isinstance(value, (bytes, bytearray)) else value
+
+
+def _quarantine(state):
+    """The whole old state as raw evidence (JSON text), or `Refused(RESET_TOO_LARGE)` when it does not fit `QUARANTINE_MAX_BYTES`. Nothing is
+    discarded or repaired: every column of every row is kept as it is (bytes as hex)."""
+    evidence, size = {}, 2
+    for name, statement in _RAW:
+        rows = []
+        for row in state.all(statement):
+            rows.append([_raw_value(value) for value in row])
+            size += len(json.dumps(rows[-1], default=repr)) + 2
+            if size > QUARANTINE_MAX_BYTES:
+                raise Refused(RESET_TOO_LARGE)
+        evidence[name] = rows
+    text = json.dumps(evidence, sort_keys=True, default=repr)
+    if len(text.encode("utf-8")) > QUARANTINE_MAX_BYTES:
+        raise Refused(RESET_TOO_LARGE)
+    return text
+
+
 def reset(state, now_ms, new_incarnation=None):
-    """The operator's reset, as ONE transaction (the command itself is step 3) -> the new incarnation. The old incarnation, its halt and its
-    pending bytes go to `gwr_archive` (never erased); then every progress, epoch, pending and receipt row is emptied and a fresh identity
-    replaces the old one. A crash at any point leaves the old state or the new one, never a mix. Leasewise sees a new reader that must be
-    chosen by adoption."""
-    fresh = new_incarnation or secrets.token_hex(16)
+    """The operator's reset, as ONE transaction (the command is `reporter reset --confirm`) -> the new incarnation. The old incarnation, its halt
+    and its pending bytes go to `gwr_archive` (never erased); then every progress, epoch, pending and receipt row is emptied, a fresh identity
+    replaces the old one and an audit row is written. A crash at any point leaves the old state or the new one, never a mix. Leasewise sees a
+    new reader that must be chosen by adoption; nothing of the old sequence is carried over.
+
+    **Quarantine form.** If an old value cannot be archived under the archive's normal constraints (a damaged pending `event_id`, a damaged
+    incarnation...), the archive instead keeps the whole old state as raw evidence in its bounded `quarantine` column, never discarding it. A
+    state too large for `QUARANTINE_MAX_BYTES` is refused as `reset_too_large` with nothing changed (the file-level recovery is in the step
+    record)."""
+    fresh = secrets.token_hex(16) if new_incarnation is None else new_incarnation
     with state.txn():
         identity = _identity(state)
         pending = state.one("SELECT generation, seq, event_id, body FROM gwr_pending")
-        state.conn.execute(
-            "INSERT INTO gwr_archive(reader_incarnation, halt, pending_generation, pending_seq, pending_event_id, pending_body, archived_ms)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (None if identity is None else identity[0], None if identity is None else identity[1],
-             None if pending is None else pending[0], None if pending is None else pending[1],
-             None if pending is None else pending[2], None if pending is None else pending[3], now_ms))
+        quarantined = 0
+        try:
+            state.conn.execute(
+                "INSERT INTO gwr_archive(reader_incarnation, halt, pending_generation, pending_seq, pending_event_id, pending_body, archived_ms)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (None if identity is None else identity[0], None if identity is None else identity[1],
+                 None if pending is None else pending[0], None if pending is None else pending[1],
+                 None if pending is None else pending[2], None if pending is None else pending[3], now_ms))
+        except sqlite3.IntegrityError:
+            evidence = _quarantine(state)                           # or Refused(RESET_TOO_LARGE): nothing has changed
+            state.conn.execute("INSERT INTO gwr_archive(quarantine, archived_ms) VALUES(?,?)", (evidence, now_ms))
+            quarantined = 1
         _fault("archived")
         for step, statement in _CLEAR:
             state.conn.execute(statement)
             _fault(step)
         state.conn.execute("INSERT INTO gwr_identity(id, reader_incarnation, halt, created_ms) VALUES(1,?,NULL,?)", (fresh, now_ms))
         _fault("created")
+        state.conn.execute("INSERT INTO gwr_audit(act, at_ms, quarantined, refusals_total) VALUES('reset',?,?,?)",
+                           (now_ms, quarantined, state.counter(READER_AGENT, "refused_answers")))
+        state.bump(READER_AGENT, "resets")
+        _fault("audited")
     return fresh
+
+
+# --- the send side (card R1-READER step 3a): what an answer does to the state --------------------------------------------------------
+
+def pending(state):
+    """The pending report as (generation, seq, body, event_id, key, refusals), or None."""
+    row = state.one("SELECT generation, seq, body, event_id, idempotency_key, refusals FROM gwr_pending")
+    return None if row is None else (row[0], row[1], bytes(row[2]), row[3], row[4], row[5])
+
+
+def halt_word(state):
+    """The halt that is set, or None."""
+    row = _identity(state)
+    return None if row is None else row[1]
+
+
+def note_conflict(state):
+    """Leasewise answered `IDEMPOTENCY_CONFLICT`: the reader halts (`continuity_conflict`) until the operator resets it. Counted. This holds even
+    if Leasewise could not record a `sequence_conflict`."""
+    with state.txn():
+        state.conn.execute("UPDATE gwr_identity SET halt=? WHERE id=1", (CONTINUITY_CONFLICT,))
+        state.bump(READER_AGENT, CONTINUITY_CONFLICT)
+        state.bump(READER_AGENT, "refused_answers")
+        _fault("conflict")
+
+
+def note_refusal(state):
+    """A definitive refusal of the pending report: the count on the pending row goes up (one transaction with the counters). Reaching
+    `REFUSAL_THRESHOLD` in a row halts the reader as `send_refused`. -> the new consecutive count."""
+    with state.txn():
+        state.conn.execute("UPDATE gwr_pending SET refusals=refusals+1 WHERE id=1")
+        count = state.one("SELECT refusals FROM gwr_pending")[0]
+        state.bump(READER_AGENT, "refused_answers")
+        if count >= REFUSAL_THRESHOLD and _identity(state)[1] is None:
+            state.conn.execute("UPDATE gwr_identity SET halt=? WHERE id=1", (SEND_REFUSED,))
+            state.bump(READER_AGENT, SEND_REFUSED)
+        _fault("refusal")
+    return count
+
+
+def resume(state, now_ms):
+    """The operator's `resume`, ONE transaction. Offered only after `send_refused` (`Refused(NOT_RESUMABLE)` otherwise, never after
+    `continuity_conflict` or `state_unavailable`; nothing changed). It clears the halt and gives the pending report a NEW retry budget (the
+    consecutive count goes back to 0) while the cumulative diagnostics (`refused_answers`, the other counters) are kept; one audit row is written.
+    The next send resends the same saved bytes."""
+    with state.txn():
+        identity = _identity(state)
+        if identity is None or identity[1] != SEND_REFUSED:
+            raise Refused(NOT_RESUMABLE)
+        state.conn.execute("UPDATE gwr_identity SET halt=NULL WHERE id=1")
+        _fault("halt_cleared")
+        state.conn.execute("UPDATE gwr_pending SET refusals=0")
+        _fault("budget_renewed")
+        state.conn.execute("INSERT INTO gwr_audit(act, at_ms, quarantined, refusals_total) VALUES('resume',?,0,?)",
+                           (now_ms, state.counter(READER_AGENT, "refused_answers")))
+        state.bump(READER_AGENT, "resumed")
+        _fault("audited")
