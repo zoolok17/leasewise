@@ -307,8 +307,9 @@ def _journal_suppression(state, gateway_agents):
 
 # The sentences `status` says for a halted money reader, one per halt word (fixed text: no value from a report or an answer).
 MONEY_READER_ACTIONS = {
-    gwstate.SEND_REFUSED: ("the money reader stopped sending after repeated definitive refusals: fix the cause (for example the clock), then "
-                           "run `reporter resume --confirm`, or `reporter reset --confirm`"),
+    gwstate.SEND_REFUSED: ("the money reader stopped sending after repeated definitive refusals: if the cause was on Leasewise's side and is "
+                           "fixed, run `reporter resume --confirm` (the same saved report is sent again); if the report itself is wrong, "
+                           "run `reporter reset --confirm`"),
     gwstate.CONTINUITY_CONFLICT: ("Leasewise holds different bytes for a report number this reader saved: the money reader has stopped for "
                                   "good until the operator runs `reporter reset --confirm`, and the new reader must then be adopted"),
     gwstate.STATE_UNAVAILABLE: ("the money reader's memory is damaged or inconsistent and it sends nothing: run `reporter reset --confirm` "

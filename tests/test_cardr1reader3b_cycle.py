@@ -378,6 +378,61 @@ class Generations(Env):
         self.assertEqual(sorted(self.rows("SELECT ledger_epoch, generation, seq FROM gateway_totals")), [(1, GEN, 1), (2, GEN2, 1), (3, GEN, 2)])
 
 
+class WrongAccount(Env):
+    """Review follow-up B1: a waiting report is fixed bytes. Fixing the configured account does not change them, `resume` only sends them again, and the
+    two real ways out are to correct Leasewise's side (then `resume`) or to `reset` the reader."""
+
+    def other_account(self):
+        return self.rows("SELECT id FROM accounts WHERE id != ? ORDER BY id LIMIT 1", (self.reporter.gateway_report.account_id,))[0][0]
+
+    def halt_on_the_wrong_account(self):
+        right = self.reporter.gateway_report.account_id
+        wrong = self.other_account()
+        self.reporter.gateway_report.account_id = wrong
+        for _ in range(gwstate.REFUSAL_THRESHOLD):
+            self.lane()
+        self.assertEqual(gwstate.halt_word(self.rig.state), gwstate.SEND_REFUSED)
+        saved = self.reader("SELECT seq, event_id, body FROM gwr_pending")
+        self.assertEqual(json.loads(bytes(saved[0][2]))["account_id"], wrong)       # the waiting bytes name the wrong account
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM gateway_totals"), [(0,)])
+        return right, wrong, saved
+
+    def test_fixing_the_value_and_resuming_sends_the_identical_bytes_and_they_are_refused_again(self):
+        right, _wrong, saved = self.halt_on_the_wrong_account()
+        self.reporter.gateway_report.account_id = right
+        gwstate.resume(self.rig.state, self.rig.clock.ms)
+        for _ in range(gwstate.REFUSAL_THRESHOLD):
+            self.lane()
+        self.assertEqual(self.reader("SELECT seq, event_id, body FROM gwr_pending"), saved)          # same number, same event id, same body
+        self.assertEqual(gwstate.halt_word(self.rig.state), gwstate.SEND_REFUSED)
+        self.assertEqual(self.counts()["refused_answers"], 2 * gwstate.REFUSAL_THRESHOLD)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM gateway_totals"), [(0,)])
+        self.assertEqual(len(self.gateway.reports()), 1)                                              # never rebuilt
+
+    def test_correcting_leasewises_side_and_resuming_gets_the_same_bytes_accepted(self):
+        _right, wrong, saved = self.halt_on_the_wrong_account()
+        with contextlib.closing(sqlite3.connect(self.rig.lw.db)) as conn:                            # the owner account registered correctly at last
+            conn.execute("UPDATE gateways SET account_id=? WHERE alias='g1'", (wrong,))
+            conn.commit()
+        gwstate.resume(self.rig.state, self.rig.clock.ms)
+        self.lane()
+        self.assertEqual(self.rows("SELECT event_id FROM gateway_totals WHERE seq=?", (saved[0][0],)), [(saved[0][1],)])    # Leasewise stored exactly the saved report
+        self.assertEqual(self.reader("SELECT minted_seq = acked_seq FROM gwr_seq"), [(1,)])                                 # (and the cycle went on to the next one)
+        self.assertEqual(len(self.gateway.reports()), 2)
+
+    def test_a_reset_with_the_value_fixed_starts_a_new_reader_whose_report_is_accepted(self):
+        right, _wrong, saved = self.halt_on_the_wrong_account()
+        old_incarnation = self.reader("SELECT reader_incarnation FROM gwr_identity")[0][0]
+        self.reporter.gateway_report.account_id = right
+        gwstate.reset(self.rig.state, self.rig.clock.ms)
+        self.assertEqual(self.reader("SELECT * FROM gwr_pending"), [])
+        self.assertEqual(self.reader("SELECT pending_event_id FROM gwr_archive"), [(saved[0][1],)])   # the old report is kept in the archive
+        self.lane()
+        new_incarnation = self.reader("SELECT reader_incarnation FROM gwr_identity")[0][0]
+        self.assertNotEqual(new_incarnation, old_incarnation)
+        self.assertEqual(self.rows("SELECT reader_incarnation FROM gateway_totals"), [(new_incarnation,)])
+
+
 class Lane(Env):
 
     def test_an_unexpected_failure_of_the_gateway_program_call_never_stops_the_other_uploads(self):
@@ -571,6 +626,23 @@ class Configuration(unittest.TestCase):
             with self.subTest(label):
                 message = self.refused(RECEIPTS + report_table(extra="interval_seconds = %s\n" % value), "interval_seconds")
                 self.assertNotIn("60", message.replace("30 to 100", ""))
+
+    def test_the_bound_covers_the_whole_list_the_fixed_ending_included(self):
+        tail = ["gateway", "report", "--json"]
+        for items in (16, 17, 30):
+            command = [EXE] + ["a"] * (items - 1 - len(tail)) + tail
+            self.assertEqual(len(command), items)
+            if items <= 16:
+                self.assertEqual(cfg.parse_config(minimal_text(RECEIPTS + report_table(command))).gateway_report.command, tuple(command))
+            else:
+                message = self.refused(RECEIPTS + report_table(command), "at most 16")
+                self.assertNotIn("aaa", message)                                                       # nothing from the file is echoed
+        def receipt(n):
+            lines = ['[gateway_receipts]', 'gateway = "g1"', 'admission_store = "C:/a.db"', 'command = ' + json.dumps([EXE] + ['a'] * (n - 1))]
+            return chr(10).join(lines) + chr(10)
+        self.assertEqual(len(cfg.parse_config(minimal_text(receipt(16))).gateway_receipts.command), 16)
+        with self.assertRaises(cfg.ConfigError):
+            cfg.parse_config(minimal_text(receipt(17)))
 
     def test_the_receipt_commands_refusals_apply(self):
         for label, command in (("a relative path", ["agenttalk.exe", "gateway", "report", "--json"]),

@@ -32,11 +32,12 @@ first, and the gateway is not run while one waits. **Nothing here runs against a
 - **`account` is a key the design did not name** (the one addition to the table of design 13). Leasewise accepts a gateway's report only from the machine **and
   the account** that own the gateway (`store._reduce_gateway_snapshot`: an account of null is "INVALID_CONFIG"), and the policy-ids snapshot lists accounts and gateways
   separately, so the reader cannot learn it by itself. It is resolved against the snapshot like the gateway. Found when the first end-to-end send was refused.
-  **A wrong value** gives a definitive refusal from Leasewise for every report; after five in a row the reader stops as `send_refused` (`resume` after the value is fixed).
+  **A wrong value** gives a definitive refusal from Leasewise for every report; after five in a row the reader stops as `send_refused`. (The first version of this
+  record said to fix the value and run `resume`; that was wrong, see "Review follow-up".)
 - **`interval_seconds`** (`[gateway_report]`, a whole number, default 60, 30 to 100): a new report is made at most once per interval, measured on a monotonic clock
   kept in memory (`gwcycle.Pacer`, set when a report is made, not when one is tried). A restart reports at once. A waiting report is still sent every cycle under the
-  existing back-off; a cycle that skips because of the interval writes nothing and counts no word. The ceiling keeps a report well inside Leasewise's 120-second freshness
-  window (`evidence_view.FRESH_MS`); raising `poll_seconds` instead would not work, because the same cycle carries the other uploads.
+  existing back-off; a cycle that skips because of the interval writes nothing and counts no word. The interval is a speed limit, not a freshness promise (see
+  "Review follow-up"); raising `poll_seconds` instead would not work, because the same cycle carries the other uploads.
 - **The month and the observed time** are both taken from the reader's clock at the moment it has the snapshot (after the command returned).
 - **A mint that is refused** (`gwstate.Refused`: halted, a pending row, a bad report or receipts) is counted as `state_unavailable`; design 9 has no other word for it.
 - **The gateway is not run while a report waits**, and also not while the reader is halted or its state is damaged (a halted reader with nothing waiting is found
@@ -64,6 +65,27 @@ and equal bytes, the hold / busy / over-limit mapping, and nothing named in the 
 string and every missing or misplaced tail; the receipt source rules; closed keys and bounds; no value in a message; the snapshot resolution.
 
 **Red first.** The cycle, the builder and the table are new, so on the previous head the whole file fails at import (33 tests).
+
+## Review follow-up (tk-d5813e24387d, card R1-READER-3b-tidy)
+
+In plain words: codex's read of this step found one real mistake in the advice and two smaller points. All three are fixed in the follow-up card; the code's behaviour
+changes only in the third.
+
+- **B1, the wrong-account advice was wrong.** The record, the README and the `send_refused` sentence in `status` said to fix a wrong `account` and run `resume`. A
+  waiting report is saved as fixed bytes that already name the old account, and `resume` only renews its retry budget and sends the same bytes: five more refusals.
+  The advice now has two cases. If the mistake is on Leasewise's side (the gateway's owner account registered wrongly), correct it there and `resume`: the same bytes
+  are accepted. If the reader's own `account` was wrong, the saved report can never be accepted: fix the value, run `reporter reset --confirm` (step 3a's archive and
+  fresh identity) and approve and adopt the new reader again. The waiting report is never rebuilt or edited. Changed: this record, the README (the `account` bullet and
+  the table row for `send_refused`) and `status.MONEY_READER_ACTIONS["send_refused"]`. Pinned by tests that drive the real receiving path: wrong account, five
+  refusals, `send_refused`; the value fixed and `resume`: the identical bytes are refused again; the account corrected on Leasewise's side and `resume`: the same bytes
+  are accepted; `reset` with the value fixed: a new reader's report is accepted.
+- **N1, the interval is a speed limit, not a freshness promise.** The comment in `config.py`, the README and this record claimed the newest report "can always be
+  adopted". A slow receipt catch-up, the other uploads and the delivery all add age, and Leasewise rightly refuses a report that is too old. Only the words changed;
+  the receiver's check is untouched.
+- **N2, the two command lists differed by one in length.** The report command's checker removed the final `--json` before applying the receipt command's length bound,
+  so a 17-item report command passed while a 17-item receipt command was refused. The bound now covers the complete configured list, the fixed ending included
+  (`gateway_report: the command may have at most 16 items, the fixed ending included`). The receipt command is unchanged. Tests: 17 refused (red first), 16 accepted,
+  the receipt command at 16 and 17.
 
 ## Limits and notes
 
