@@ -250,9 +250,10 @@ class ResolveBound(_Fix):
 class TwoOperators(_Fix):
 
     def test_the_second_operator_waits_for_the_first_then_re_reads_under_the_lock_and_is_refused(self):
-        """A holds the write lock; B's `gateway-adopt` is inside its `BEGIN IMMEDIATE`; A commits; B re-reads under the lock and is refused.
-        No sleep: the evidence is a REAL database signal (a probe connection with no busy timeout gets 'database is locked' while A holds the lock)
-        and a causal order of B's own call (it entered before A let go and returned only after), taken from a monotonic clock."""
+        """A holds the write lock; B's `gateway-adopt` calls `BEGIN IMMEDIATE`; A commits; B re-reads under the lock and is refused.
+        No sleep. What the test OBSERVES: a probe connection with no busy timeout meets A's lock ('database is locked'), and B's own call began before
+        A let go and returned only after, so B's call overlaps A's hold (monotonic clock). What it does NOT observe is the instant B waits inside
+        SQLite: that B was blocked there is inferred from the overlap."""
         self.approve()
         newest = self.send(rep(seq=2))
         results, entered, at_step = {}, threading.Event(), threading.Event()

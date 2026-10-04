@@ -10,6 +10,7 @@ Synthetic values only.
 
 import json
 import os
+import sqlite3
 import unittest
 from unittest import mock
 
@@ -158,6 +159,31 @@ class StatusFigures(op._Op):
         self.assertIsNone(block["unreceipted_micro_eur"])
         self.assertIs(block["receipts_exceed_settled"], False)
 
+    def test_status_does_not_read_the_receipt_history_while_the_answer_is_known_to_be_unknown(self):
+        self.first()
+        for n in range(1, 61):
+            self.final_receipt(f"r{n}", n, 5)
+        statements = []
+        conn = sqlite3.connect(self.db)
+        conn.set_trace_callback(statements.append)
+        try:
+            block = evidence_view.project(conn, self.gateway_id(), op.NOW)
+        finally:
+            conn.close()
+        self.assertEqual((block["unreceipted_micro_eur"], block["receipts_exceed_settled"]), (None, False))      # the same two values as before
+        self.assertFalse([sql for sql in statements if "FROM receipts" in sql], "the receipts were read")
+        # the check is sensitive: with a source that could carry a generation, the history IS read
+        statements.clear()
+        conn = sqlite3.connect(self.db)
+        conn.set_trace_callback(statements.append)
+        try:
+            with mock.patch.object(evidence_view, "RECEIPTS_CARRY_GENERATION", True):
+                evidence_view.project(conn, self.gateway_id(), op.NOW)
+        finally:
+            conn.close()
+        self.assertTrue([sql for sql in statements if "FROM receipts" in sql])
+        self.assertFalse(evidence_view.RECEIPTS_CARRY_GENERATION)
+
     def test_the_receipts_table_still_has_no_generation_so_the_caller_still_says_so(self):
         """When a later card adds a generation to the receipts, this fails and `evidence_view.coverage` must start passing it."""
         columns = [r[1] for r in self.rows("PRAGMA table_info(receipts)")]
@@ -191,6 +217,12 @@ class StatusFigures(op._Op):
         (r, rows, kw) = seen[-1]
         self.assertEqual(kw, {"receipts_carry_generation": False})
         self.assertEqual((r.gateway_id, r.receipts_seq, r.month, r.settled), (self.gateway_id(), 4, op.SEP, 5100))      # the newest report: seq 2
+        self.assertEqual(rows, [])                                    # while the source cannot carry a generation, no receipt is read or handed over
+        seen.clear()                                                  # ...and with a source that could, the history is handed over in this shape
+        with mock.patch.object(rc, "compare", lambda r, rows, **kw: seen.append((r, list(rows), kw)) or real(r, rows, **kw)),                 mock.patch.object(evidence_view, "RECEIPTS_CARRY_GENERATION", True):
+            self.evidence()
+        (r, rows, kw) = seen[-1]
+        self.assertEqual(kw, {"receipts_carry_generation": True})
         self.assertEqual([(x.seq, x.amount, x.generation, x.month) for x in rows], [(1, 60, None, None)])
 
     def test_no_sentence_or_message_carries_a_value(self):
@@ -200,13 +232,14 @@ class StatusFigures(op._Op):
             self.assertFalse(any(ch.isdigit() for ch in text))
 
     def test_no_grant_admission_or_reporter_path_reads_the_comparison_or_its_keys(self):
+        """A guard for THESE named modules (every file of `reporter/` included), not a proof of the whole dependency graph: a named file that is missing
+        is a failure (a rename must update this list), and the check looks for the spellings of the comparison and its two keys."""
         root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "quota_balancer")
         names = ["lease.py", "http_api.py", "money.py", "reduce.py", "billing_eval.py", "store.py", "policy.py"]
         names += [os.path.join("reporter", n) for n in os.listdir(os.path.join(root, "reporter")) if n.endswith(".py")]
         for name in names:
             path = os.path.join(root, name)
-            if not os.path.isfile(path):
-                continue
+            self.assertTrue(os.path.isfile(path), name + " is named in this guard but does not exist: update the list")
             with open(path, encoding="utf-8") as handle:
                 text = handle.read()
             for needle in ("receipt_coverage", "unreceipted_micro_eur", "receipts_exceed_settled"):
