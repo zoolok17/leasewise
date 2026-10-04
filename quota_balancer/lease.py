@@ -556,6 +556,45 @@ def _annotations(conn, chain, account_id, enforcement, now_ms):
     return windows, warnings
 
 
+class _RequestFacts:
+    """What one grant request reads about the scopes it checks, read ONCE and shared (card R1-M follow-up).
+
+    The accounts that have a lease in a scope, and each account's billing policy, are needed by the cap-basis guard and by both
+    scope totals (receipts and holds), for every scope of the request. Listing them again for each use made the number of queries
+    grow with the uses. They are read here the first time and kept for the request, which holds one write lock, so what was read
+    cannot change under it. The number of queries still grows with the accounts that have leases in a scope (one policy read per
+    such account, once per request), not with the number of times a scope is used."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._accounts = {}
+        self._policies = {}
+
+    def accounts(self, scope, scope_id):
+        key = (scope, scope_id)
+        if key not in self._accounts:
+            self._accounts[key] = _scope_accounts(self.conn, scope, scope_id)
+        return self._accounts[key]
+
+    def policy(self, account_id):
+        """(ledger_basis, cap_basis, vat_bps) of the account's billing policy, or None when it has none."""
+        if account_id not in self._policies:
+            row = self.conn.execute("SELECT ledger_basis, cap_basis, vat_bps FROM billing_policies WHERE account_id=?",
+                                    (account_id,)).fetchone()
+            self._policies[account_id] = None if row is None else tuple(row)
+        return self._policies[account_id]
+
+    def basis(self, account_id):
+        return _convertible(self.policy(account_id))
+
+
+def _convertible(policy_row):
+    """The policy row when it can convert, else None (see `_lease_basis`)."""
+    if policy_row is None or money.convert_total(0, policy_row[0], policy_row[1], policy_row[2], money.EXPOSURE) is money.UNKNOWN:
+        return None
+    return policy_row
+
+
 def _lease_basis(conn, account_id):
     """The conversion the lease books need for this account (card R1-M4), or None for "compare the books as they are".
 
@@ -567,9 +606,7 @@ def _lease_basis(conn, account_id):
     nothing to convert with, and the books are compared as they always were (stated in the README)."""
     row = conn.execute("SELECT ledger_basis, cap_basis, vat_bps FROM billing_policies WHERE account_id=?",
                        (account_id,)).fetchone()
-    if row is None or money.convert_total(0, row[0], row[1], row[2], money.EXPOSURE) is money.UNKNOWN:
-        return None
-    return tuple(row)
+    return _convertible(None if row is None else tuple(row))
 
 
 def _in_cap(amount, basis):
@@ -587,23 +624,24 @@ def _scope_accounts(conn, scope, scope_id):
         _chain_bind(scope, scope_id))]
 
 
-def _require_one_cap_basis(conn, scope, scope_id, requester):
+def _require_one_cap_basis(conn, scope, scope_id, requester, facts=None):
     """A money cap shared by several accounts has no tax basis of its own; each account declares the basis its caps are counted
     in (card R1-M part 2, fix round 2, D-177). Spending counted with VAT cannot be added to spending counted without it, so when
     the accounts that take part in this scope (the requester, even with no spending yet, and every account that has a lease in the
     scope) declare more than one KNOWN cap basis, the grant is refused CAP_BASIS_CONFLICT. An account with no billing policy, or
     whose cap basis is `unknown`, does not take part (the accepted fallback). Neither the requester's basis is picked nor any
     account's spending dropped. This is the one place that decides it, before any scope total is compared."""
+    facts = facts or _RequestFacts(conn)
     bases = set()
-    for account in set(_scope_accounts(conn, scope, scope_id)) | {requester}:
-        row = conn.execute("SELECT cap_basis FROM billing_policies WHERE account_id=?", (account,)).fetchone()
-        if row is not None and row[0] in (reduce.BASIS_EX_VAT, reduce.BASIS_INVOICE_TOTAL):
-            bases.add(row[0])
+    for account in set(facts.accounts(scope, scope_id)) | {requester}:
+        row = facts.policy(account)
+        if row is not None and row[1] in (reduce.BASIS_EX_VAT, reduce.BASIS_INVOICE_TOTAL):
+            bases.add(row[1])
     if len(bases) > 1:
         raise QuotaError(errors.CODE_CAP_BASIS_CONFLICT, errors.MSG_CAP_BASIS_CONFLICT)
 
 
-def _scope_total(conn, scope, scope_id, is_money, fetch, requester, requester_basis):
+def _scope_total(conn, scope, scope_id, is_money, fetch, requester, requester_basis, facts=None):
     """The exact total of one scope's lease-book amounts, as the number the pure admission rule compares (card R1-M, D-172).
 
     `fetch(extra_tail, extra_params)` reads the exact total for the scope's leases, narrowed by `extra_tail`. A tax-free number
@@ -615,9 +653,10 @@ def _scope_total(conn, scope, scope_id, is_money, fetch, requester, requester_ba
     account's cap basis, so accounts that share a cap are expected to declare the same cap basis."""
     if not is_money:
         return money.saturate(fetch("", ()))
+    facts = facts or _RequestFacts(conn)
     terms = []
-    for account in _scope_accounts(conn, scope, scope_id):
-        basis = requester_basis if account == requester else _lease_basis(conn, account)
+    for account in facts.accounts(scope, scope_id):
+        basis = requester_basis if account == requester else facts.basis(account)
         terms.append(_in_cap(fetch(" AND l.account_id = ?", (account,)), basis))
     return money.saturate(money.add(*terms))
 
@@ -667,7 +706,7 @@ def _hold_exposure(conn, tail, params):
 
 def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                  input_cap, hold_sized, concurrency_new, now_ms,
-                 shadow=False, basis=None):
+                 shadow=False, basis=None, facts=None):
     """Enforce one (metric, period[, window_key]) group through the
     card-3 admission rule; a POLICY_DENIED maps to the group's 429 code.
     A non-metered lease admits with zero new hold (advisory: no
@@ -721,7 +760,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                 and (scope == "platform" or r["scope_id"] == scope_id)
                 for r in limit_rows)
             if metric == "money_micro_eur" and has_limit_here:
-                _require_one_cap_basis(conn, scope, scope_id, account_id)
+                _require_one_cap_basis(conn, scope, scope_id, account_id, facts)
             settled = _scope_total(
                 conn, scope, scope_id, metric == "money_micro_eur",
                 lambda extra, more, scope=scope, scope_id=scope_id: _money_sums(
@@ -733,7 +772,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                     "l.enforcement <> 'shadow' AND "
                     + settled_bucket + "=? AND " + _chain_pred(scope) + extra,
                     (ps,) + _chain_bind(scope, scope_id) + more, [column])[0],
-                account_id, basis)
+                account_id, basis, facts)
             # The platform singleton matches every platform row loaded
             # for this group (the query only selects the singleton).
             limit_ids = [r["id"] for r in limit_rows
@@ -776,7 +815,7 @@ def _admit_group(conn, key, limit_rows, chain, account_id, budget, metered,
                         "l.state IN ('active','uncertain') AND "
                         + _chain_pred(scope) + extra,
                         (ps, *limit_ids) + _chain_bind(scope, scope_id) + more),
-                    account_id, basis)
+                    account_id, basis, facts)
             usage[(scope, scope_id)] = (settled, holds)
     # The account budget: the one mandatory (money, month) cap, enforced
     # against the account's own settled charges and synthetic holds.
@@ -1079,7 +1118,8 @@ def _grant(conn, request, now_ms, wire_identity=None):
         if metered and budget is not None:
             groups.setdefault(("money_micro_eur", "month", None), [])
         concurrency_new = 0 if enforcement == "shadow" else 1
-        basis = _lease_basis(conn, account_id)
+        facts = _RequestFacts(conn)
+        basis = facts.basis(account_id)
         if enforcement == "metered_advisory" and budget is not None:
             _advisory_budget_check(conn, account_id, budget, now_ms, basis)
         windows, warnings = [], []
@@ -1094,7 +1134,7 @@ def _grant(conn, request, now_ms, wire_identity=None):
                 continue
             _admit_group(conn, key, limit_rows, chain, account_id, budget,
                          metered, input_cap, hold_sized, concurrency_new,
-                         now_ms, shadow=enforcement == "shadow", basis=basis)
+                         now_ms, shadow=enforcement == "shadow", basis=basis, facts=facts)
 
         # One live slot per (seat, turn): the lease_live partial index.
         # Checked explicitly so the refusal is a typed conflict, not a
