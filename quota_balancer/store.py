@@ -870,14 +870,18 @@ def _evidence_state(conn, gateway_id, report):
             "WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? AND seq=?", (gateway_id, inc, epoch, report.seq)))
     max_seq = conn.execute("SELECT MAX(seq) FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=?",
                            (gateway_id, inc, epoch)).fetchone()[0]
-    previous = None
+    # The highest `settled` already seen in this report's own month (same reader, epoch, generation and month): `settled` is cumulative
+    # within every month, also before that month's adoption, so a fall is caught before any roll adopts the lower figure. In the adopted
+    # chain the adopted report itself is the floor; in any other month the first report is compared with nothing (the month reset).
+    floor, adopted = 0, None
     if adoption is not None and (inc, epoch, report.generation, report.period_start) == (
             adoption.incarnation, adoption.epoch, adoption.generation, adoption.period_start):
-        row = conn.execute(
-            "SELECT settled_micro_eur FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? "
-            "AND generation=? AND period_start=? AND seq>=? AND seq<? ORDER BY seq DESC LIMIT 1",
-            (gateway_id, inc, epoch, adoption.generation, adoption.period_start, adoption.seq, report.seq)).fetchone()
-        previous = adoption.settled if row is None else row[0]       # the chain starts at the adopted report itself
+        floor, adopted = adoption.seq, adoption.settled
+    row = conn.execute(
+        "SELECT MAX(settled_micro_eur) FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? "
+        "AND generation=? AND period_start=? AND seq>=? AND seq<?",
+        (gateway_id, inc, epoch, report.generation, report.period_start, floor, report.seq)).fetchone()[0]
+    previous = max((v for v in (adopted, row) if v is not None), default=None)
     open_kinds = frozenset(r[0] for r in conn.execute(
         "SELECT DISTINCT kind FROM gateway_transitions WHERE gateway_id=? AND resolved_by_adoption IS NULL", (gateway_id,)))
     approved = conn.execute("SELECT 1 FROM gateway_approvals WHERE gateway_id=? AND price_hash=? AND child_cap_hash=?",

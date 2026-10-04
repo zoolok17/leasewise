@@ -73,7 +73,8 @@ Adoption = namedtuple("Adoption", "incarnation epoch generation period_start seq
 #   generation    the generation recorded for the report's (incarnation, epoch), or None if that pair is new
 #   same_seq      the contents of the stored reports with the report's own (incarnation, epoch, number)
 #   max_seq       the highest number stored for the report's (incarnation, epoch), or None
-#   previous      the settled figure of the previous in-order report of the chain (the adoption's own baseline if none), or None
+#   previous      the highest `settled` already seen in the report's own month (same reader, epoch and generation; in the adopted chain the
+#                 adoption's own baseline counts), or None for the first report of a month
 #   last_quiet    `unattributed` of the previous quiet report of the chain, or None
 #   open_kinds    the kinds of every transition of the gateway that is still open
 #   approved      whether the report's pair of fingerprints is approved
@@ -164,10 +165,10 @@ def assess(report, state):
 
     same_chain = (report.epoch == adoption.epoch and report.generation == adoption.generation
                   and report.period_start == adoption.period_start)
+    if _fell(state.previous, report.settled):                            # `settled` only grows within a month, on every report,
+        raise_(KIND_FIGURE_FELL)                                         # also before that month is adopted (so before any roll)
     remember_quiet = False
     if same_chain:
-        if _fell(state.previous, report.settled):                        # `settled` only grows, so this is checked on every report
-            raise_(KIND_FIGURE_FELL)
         if report.quiet:
             remember_quiet = True
             if _fell(state.last_quiet, report.unattributed):             # `unattributed` is compared on quiet reports only

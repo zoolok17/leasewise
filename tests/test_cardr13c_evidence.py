@@ -115,7 +115,7 @@ class OrderOfTheChecks(unittest.TestCase):
         self.assertFalse(result.roll)
 
     def test_a_generation_that_differs_from_the_recorded_one_is_an_identity_conflict_and_stops_the_chain_rules(self):
-        result = assess(R(generation=GEN2, settled=1), S())
+        result = assess(R(generation=GEN2, settled=1), S(previous=None))
         self.assertEqual(kinds(result), [evidence.KIND_EPOCH_GENERATION_MISMATCH])
         self.assertEqual(result.transitions[0][1], (INC, 1, 2))
         self.assertFalse(result.roll)
@@ -173,8 +173,8 @@ class Monotonic(unittest.TestCase):
                 self.assertEqual(kinds(assess(R(), S(previous=bad, last_quiet=bad))), [])
 
     def test_a_new_month_is_not_a_fall_and_a_rise_is_not_compared_across_chains(self):
-        result = assess(R(period_start=2000, period_end=3000, settled=1, unattributed=900, quiet=False), S())
-        self.assertEqual(result.transitions, ())
+        result = assess(R(period_start=2000, period_end=3000, settled=1, unattributed=900, quiet=False), S(previous=None))
+        self.assertEqual(result.transitions, ())                              # the first report of a month has nothing to fall from
 
     def test_each_state_change_raises_its_own_kind_and_is_latched_while_open(self):
         cases = ((dict(flag=True), evidence.KIND_REPORTED_BY_GATEWAY), (dict(price_hash=PRICE2), evidence.KIND_PRICE_HASH_CHANGED),
@@ -198,8 +198,14 @@ class MonthRoll(unittest.TestCase):
         self.assertEqual((result.standing, result.transitions, result.roll), (STANDING_IN_ORDER, (), True))
 
     def test_a_new_month_rolls_even_when_its_figures_are_lower_or_higher(self):
-        self.assertTrue(assess(self.new_month(settled=1, unattributed=0), S()).roll)
+        self.assertTrue(assess(self.new_month(settled=1, unattributed=0), S(previous=None)).roll)
         self.assertTrue(assess(self.new_month(settled=90000, unattributed=80000), S()).roll)
+
+    def test_a_fall_of_settled_in_a_new_month_is_caught_before_the_roll_and_blocks_it(self):
+        # The store supplies the highest `settled` already seen in the new month (100) before this month's adoption exists.
+        result = assess(self.new_month(settled=50), S(previous=100))
+        self.assertEqual((kinds(result), result.roll), ([evidence.KIND_FIGURE_FELL], False))
+        self.assertTrue(assess(self.new_month(settled=100), S(previous=100)).roll)       # equal is not a fall
 
     def test_each_condition_of_4_4_is_needed(self):
         state_over = {
@@ -619,6 +625,42 @@ class MonthRollAtIngest(_Ingest):
         self.send("open", seq=2, settled_micro_eur=7)                             # a fall: open
         self.send("n", seq=3, period_start=start, period_end=end)
         self.assertEqual(len(self.rolled()), 1)
+
+    def new_month_sends(self, *sends):
+        """Adopt a quiet report of this month, approve the pair, then send (seq, settled, quiet) reports of the NEXT month."""
+        self.first()
+        self.approve()
+        start, end = self.next_month()
+        return [self.send("m%d" % seq, seq=seq, period_start=start, period_end=end, settled_micro_eur=settled, quiet=quiet)
+                for seq, settled, quiet in sends]
+
+    def test_a_fall_of_settled_in_a_new_month_before_its_first_quiet_report_is_caught_and_blocks_the_roll(self):
+        busy, quiet = self.new_month_sends((2, 100, False), (3, 50, True))
+        self.assertEqual(self.rows("SELECT kind, event_id FROM gateway_transitions"), [("figure_fell", quiet["event_id"])])
+        self.assertEqual(len(self.rolled()), 1)                                    # the lower figure is not adopted
+
+    def test_a_fall_between_two_busy_reports_is_raised_there_and_the_later_quiet_report_does_not_roll(self):
+        _, fell, later = self.new_month_sends((2, 100, False), (3, 50, False), (4, 60, True))
+        # The baseline is the HIGHEST earlier figure (100), so 60 is also below it: one `figure_fell` for each of the two reports.
+        self.assertEqual(self.rows("SELECT kind, event_id FROM gateway_transitions ORDER BY id"),
+                         [("figure_fell", fell["event_id"]), ("figure_fell", later["event_id"])])
+        self.assertEqual(len(self.rolled()), 1)
+
+    def test_the_highest_figure_is_the_baseline_so_a_missing_report_in_between_hides_nothing(self):
+        # seq 3 never arrives; the quiet report 4 is compared with the highest earlier figure (100), not only with a neighbour.
+        _, fell = self.new_month_sends((2, 100, False), (4, 90, True))
+        self.assertEqual(self.kinds(), ["figure_fell"])
+        self.assertEqual(len(self.rolled()), 1)
+
+    def test_the_first_report_of_a_new_month_is_never_compared_with_the_old_month(self):
+        self.new_month_sends((2, 1000, False), (3, 1200, True))                    # last month ended at 5000
+        self.assertEqual(self.transitions(), [])
+        self.assertEqual([row[0] for row in self.rolled()], ["operator", "period_roll"])
+
+    def test_a_late_lower_numbered_report_in_the_new_month_is_counted_and_ignored_not_a_fall(self):
+        self.new_month_sends((3, 100, False), (2, 50, False))                      # seq 2 arrives after seq 3
+        self.assertEqual(self.transitions(), [])
+        self.assertEqual(self.counters()[0][0], 1)
 
     def test_an_earlier_month_arriving_late_is_ignored_and_never_rolls(self):
         self.first()

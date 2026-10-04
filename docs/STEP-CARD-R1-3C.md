@@ -50,7 +50,22 @@ will see the result, and that block is card R1-3d's.** No seat, lease or admissi
 - **The roll** needs the new month to be later than the adoption's, from the same reader, epoch, generation and the adopted pair, with that pair
   approved and nothing open, after the report's own transitions were written.
 
-## Tests (`tests/test_cardr13c_evidence.py`, 62)
+## Fix round 1: `settled` is cumulative in every month, also before that month's adoption
+
+Codex found a gap: in a new month, before its first quiet report, a fall of `settled` went unnoticed, and the automatic month roll then adopted the
+lower figure as the baseline (busy 100, then quiet 50). Now **`settled` is checked on every report, in every month**:
+
+- `store._evidence_state` supplies, for the incoming report, the **highest `settled` already stored** for the same gateway, reader, epoch, generation
+  and month (from `gateway_totals`). In the adopted chain the adopted report is the floor. The first report of a month has nothing to compare with
+  (the month reset), and the first report of a new month is never compared with the old month's figure.
+- `evidence.assess` raises `figure_fell` whenever `settled` is below that figure, for a busy and a quiet report alike, and no longer limits the check to
+  the adopted month. An open `figure_fell` blocks the roll like every open transition, so the operator must look.
+- The highest figure (not the previous report) also catches a fall past a missing or late report. Because the baseline is the highest figure, a report
+  after a fall that is still below the highest is a fall too (100, then 50, then 60 gives two rows). A late, lower-numbered report is still counted and
+  ignored before any fall is checked. `unattributed` is unchanged: quiet reports only, against the adopted report.
+- Limit: a stored report that is itself wrong (a conflicting one) can raise the highest figure, which only makes a fall more likely (the safe side).
+
+## Tests (`tests/test_cardr13c_evidence.py`, 68)
 
 Pure rules as a table (`Purity`, `OrderOfTheChecks`, `Monotonic`, `MonthRoll`, `Readers`): retired first; identity before order in both arrival orders;
 duplicate, late, old chain and old period; `settled` on every report; `unattributed` on quiet reports only; unknown never zero; each condition of the roll;
