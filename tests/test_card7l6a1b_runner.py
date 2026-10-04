@@ -153,7 +153,9 @@ class Probe:
         self.watches = {}
         self.fired = False
 
-    def is_set(self):
+    def look(self):
+        """Take a handle on every marked process whose marker can be read now. The runner reaches this through `is_set`, at its own pace; a
+        test that must have the handle before it acts (a deliberate fault) calls it itself."""
         for path in self.markers:
             if path not in self.watches and os.path.exists(path):
                 try:
@@ -165,6 +167,18 @@ class Probe:
                     watch = Watch(int(text))
                     if watch.opened:                            # a failed open is unknown, never "gone": try again next look
                         self.watches[path] = watch
+
+    def hold(self, path, seconds=10.0):
+        """Look until the process named in `path` is held (it is alive: the marker names it and the test has not ended it yet)."""
+        end = time.monotonic() + seconds
+        while path not in self.watches:
+            self.look()
+            if time.monotonic() > end:
+                raise AssertionError("the marker never named a process we could hold")
+            time.sleep(0.01)
+
+    def is_set(self):
+        self.look()
         if self.ready and not self.fired and all(self._is_ready(path) for path in self.ready):
             self.fired = True
             if self.then:
@@ -452,6 +466,7 @@ class Deadlines(_Case):
         def boom(*_args):
             calls["n"] += 1
             if calls["n"] > 3 and os.path.exists(marker):
+                probe.hold(marker)          # the fault must not outrun the probe's first look: the program is held before the runner fails
                 raise RuntimeError("synthetic fault")
             return ("empty", 0)
         spy = Spy(fail={"peek": boom})
