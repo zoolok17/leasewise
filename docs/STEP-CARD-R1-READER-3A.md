@@ -40,7 +40,11 @@ sends whatever is pending, and with nothing pending it does one cheap read and n
   with an underscore so it can never be an agent's name). The cumulative total of refusals survives `resume` there.
 - **`state_unavailable` is counted by the sender** each time a pending report meets a damaged state, and a halted reader counts `reader_halted` each cycle.
 - **The audit** is a new immutable table `gwr_audit` (act `resume` or `reset`, time, whether the reset was quarantined, the cumulative refusals at the time).
-  The archive's `quarantine` column and this table are added to the same schema version 5 (step 2 is not merged, so no file of an earlier layout exists).
+- **Reporter schema version 6 (a step of its own).** The archive's `quarantine` column and `gwr_audit` are NOT part of version 5: step 2 is merged on main
+  (`c163535`) with version 5 and neither of them, and a version number is a promise that every file at that version has the same tables. So version 5's definitions
+  are exactly main's, and a step 5 to 6 adds the column (bounded to 256 KiB) and the table with its two immutability triggers, in one transaction (a fresh file
+  runs the version-5 definitions and then the same step, so a fresh file equals an upgraded one). A reporter that knows only version 5 refuses a version-6 file. My
+  earlier note that these were added to version 5 "because step 2 is not merged" was wrong.
 - **An exact acceptance the state will not take** (damage that appears while the request is out) keeps the report, runs the start-up check (which halts) and
   counts `state_unavailable`.
 - **A reporter with no money reader is unchanged:** with nothing pending the sender reads one row and creates nothing (a test shows the identity table stays empty).
@@ -63,6 +67,21 @@ a reporter with no money reader.
 ## Existing tests that changed (the version number or a closed key list only)
 
 The status version is 4 now: `test_card7c2_status`, `test_card7l6a1_status` (the number), and `test_card7a3_commands` (the top-level key list gains `money_reader`).
+
+## Accepted notes (the lead accepted all three)
+
+- **The report's retry counts toward the cycle's back-off rank** (a 401 as credential, the rest as unreachable). It still stops nothing else.
+- **`state_unavailable` and `reader_halted` count cycles, not events:** the count goes up once per cycle in which a pending report meets a damaged or halted state.
+- **The text view of `status` does not print the new `money_reader` block.** The JSON does, and so do the operator-action sentences.
+
+## Schema step tests (`tests/test_cardr1reader3a_schema6.py`, 7)
+
+A version-5 file made by the version-5 definitions, with rows in the reader's tables, upgrades to 6 with every old row unchanged (the old archive row gains a NULL
+quarantine); a fresh file at 6 equals an upgraded one (the schema compared); a fault inside the step, and a fault after its first statement, leave version 5 whole
+(no new table or column); a version-5 reader refuses a version-6 file and changes nothing; files of versions 3 and 4 reach 6 in one step and equal a fresh file; the
+version-5 definitions contain neither addition. Red first: all 7 fail on the previous head. The "newer unknown version" tests of `test_card7c2_state` and
+`test_card7l6a1_state` now use 7, and the version expectations of `test_card7c2_state`, `test_card7l6a1_state`, `test_card7l6a2_fix1b` and
+`test_cardr1reader2_state` say 6.
 
 ## Limits and notes
 

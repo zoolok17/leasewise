@@ -755,7 +755,7 @@ In plain words: the money reader must never skip or replace a report number. It 
 it saved for n. This step builds the **memory** that makes that rule hold. **Nothing here reads a gateway or sends anything**; it is state and the rules
 over it, with tests, and no seat, lease or admission decision changes.
 
-What exists now (the reporter's own database, schema version 5; `reporter/gwstate.py`):
+What exists now (the reporter's own database, schema version 5, and 6 since step 3a; `reporter/gwstate.py`):
 
 - **An identity** (a random value) that never changes, with a halt that is empty or one of three words (`continuity_conflict`, `send_refused`,
   `state_unavailable`).
@@ -805,7 +805,7 @@ pending, and with nothing pending it does nothing.
 
 `gwsend.classify` / `gwsend.send_pending` (the four answer classes; `client.post_reading` posts the stored bytes to `/v1/readings` and never raises);
 `gwstate.note_refusal`, `note_conflict`, `resume`, `reset` (with `_quarantine`), `REFUSAL_THRESHOLD`, `QUARANTINE_MAX_BYTES`; the lane is `Reporter._send_report`, run
-first in `_send`. New tables part of the same schema version 5: the archive's `quarantine` column and `gwr_audit`. Tests: `tests/test_cardr1reader3a_send.py`.
+first in `_send`. The archive's `quarantine` column and `gwr_audit` are reporter schema version 6, a step of its own from the version 5 that step 2 put on main. Tests: `tests/test_cardr1reader3a_send.py`.
 Record: `docs/STEP-CARD-R1-READER-3A.md`.
 
 ## Card R1-RC - the receipt path reads pages with or without the month

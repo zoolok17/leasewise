@@ -11,7 +11,8 @@ What is here (pure state functions over the reporter's own database; **nothing r
 * `start`    the start-up check, and the first start (a complete absence of state creates a fresh incarnation, D-203). Anything inconsistent
              sets the halt `state_unavailable`; nothing may then be minted or sent.
 * `mint`     in ONE transaction: the next number's exact bytes as the pending row, `minted_seq` + 1, the receipts already read, and a new
-             epoch if the generation changed. Refused (nothing changed) while halted, while a pending row exists, or when the numbers differ.
+             epoch if the generation changed. Refused (nothing changed) while halted, while a pending row exists, or when the state is inconsistent. One exception:
+             a number already at the largest possible value halts the reader (the halt itself is committed, nothing else is written).
 * `accept`   in ONE transaction, only for HTTP 202 with `accepted` exactly `true` and the same `event_id`: the pending row is deleted and
              `acked_seq` advances to its number. Anything else changes nothing here.
 * `reset`    in ONE transaction: the old incarnation, its halt and its pending bytes go to the archive (never erased), then a fresh
@@ -99,13 +100,17 @@ GWR_DDL = (
     " pending_seq INTEGER CHECK(pending_seq IS NULL OR (pending_seq>=1 AND pending_seq<=9223372036854775807)),"
     " pending_event_id TEXT CHECK(pending_event_id IS NULL OR (" + _UUID_SQL.format(c="pending_event_id") + ")),"
     " pending_body BLOB CHECK(pending_body IS NULL OR (length(pending_body)>0 AND length(pending_body)<=1048576)),"
-    " quarantine TEXT CHECK(quarantine IS NULL OR length(quarantine)<=262144),"
     " archived_ms INTEGER NOT NULL CHECK(" + _BOUND.format(c="archived_ms") + "),"
     " CHECK((pending_generation IS NULL) = (pending_seq IS NULL) AND (pending_seq IS NULL) = (pending_event_id IS NULL)"
     " AND (pending_event_id IS NULL) = (pending_body IS NULL))) STRICT",
     "CREATE TRIGGER gwr_archive_immutable BEFORE UPDATE ON gwr_archive BEGIN SELECT RAISE(ABORT, 'the reader archive is immutable'); END",
     "CREATE TRIGGER gwr_archive_keep BEFORE DELETE ON gwr_archive BEGIN SELECT RAISE(ABORT, 'the reader archive is immutable'); END",
-    # The operator's acts (card R1-READER step 3a), numbers and one closed word each; never changed, never erased.
+)
+# Version 6 (card R1-READER step 3a): a step of its own, applied to a file at version 5 in one transaction. The archive gains a bounded quarantine
+# column (a reset that cannot archive a damaged old state under the normal constraints keeps its raw evidence there), and the operator's acts get
+# an immutable audit table.
+GWR_V6_DDL = (
+    "ALTER TABLE gwr_archive ADD COLUMN quarantine TEXT CHECK(quarantine IS NULL OR length(quarantine)<=262144)",
     "CREATE TABLE gwr_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,"
     " act TEXT NOT NULL CHECK(act IN ('resume','reset')),"
     " at_ms INTEGER NOT NULL CHECK(" + _BOUND.format(c="at_ms") + "),"
@@ -114,7 +119,8 @@ GWR_DDL = (
     "CREATE TRIGGER gwr_audit_immutable BEFORE UPDATE ON gwr_audit BEGIN SELECT RAISE(ABORT, 'the reader audit is immutable'); END",
     "CREATE TRIGGER gwr_audit_keep BEFORE DELETE ON gwr_audit BEGIN SELECT RAISE(ABORT, 'the reader audit is immutable'); END",
 )
-TABLES = ("gwr_identity", "gwr_epoch", "gwr_seq", "gwr_pending", "gwr_receipts", "gwr_receipt_months", "gwr_archive", "gwr_audit")
+TABLES_V5 = ("gwr_identity", "gwr_epoch", "gwr_seq", "gwr_pending", "gwr_receipts", "gwr_receipt_months", "gwr_archive")
+TABLES = TABLES_V5 + ("gwr_audit",)
 
 # --- results ----------------------------------------------------------------------------------------------------------------------
 # `halt` is None when the reader may go on, else a closed word. `persisted` is False only when there was no identity row to keep the halt in
@@ -141,8 +147,9 @@ RESET_TOO_LARGE = "reset_too_large"           # the old state is too large for t
 
 
 def _fault(step):
-    """The fault-injection point: called after each statement of `mint`, `accept` and `reset`, so a test can stop between any two of them
-    and see that the transaction left nothing behind."""
+    """The fault-injection hook: called at HOOK POINTS of `mint`, `accept`, `resume` and `reset`, not after every SQL statement (the several
+    writes of the receipt months share one later hook). A test stops at a hook point to see that the transaction left nothing behind; the
+    complete evidence of atomicity is the test that fails each real SQL write (`tests/test_cardr1reader2_fix1.py`, `EveryWrite`)."""
 
 
 # --- reading the state ------------------------------------------------------------------------------------------------------------
@@ -165,7 +172,8 @@ def _survivors(state):
 
 
 def _exact_int(value):
-    """A whole number exactly (not a boolean, not a float, not a text), from 1 to 2^63-1 (the range Leasewise's own validator accepts)."""
+    """A whole number exactly (not a boolean, not a float, not a text), from 1 to 2^63-1 (Leasewise's validator also accepts 0 for both `seq` and `ledger_epoch`;
+    the reader never makes a 0 and requires at least 1)."""
     return type(value) is int and 1 <= value <= INT64_MAX
 
 
@@ -312,8 +320,9 @@ def _store_receipts(state, generation, totals):
 
 
 def mint(state, generation, build, totals, now_ms):
-    """Number, save and keep the next report of `generation`, in ONE transaction -> the pending row as (seq, event_id, body). A failure
-    changes nothing.
+    """Number, save and keep the next report of `generation`, in ONE transaction -> the pending row as (seq, event_id, body). A refusal or a
+    failure changes nothing, with ONE exception: a `minted_seq` (or a needed new epoch) already at 2^63-1 cannot be incremented, so the mint
+    commits the halt `state_unavailable` first (that single write) and then refuses with `halted`; no number, epoch or report is written.
 
     Allowed only when the state is consistent, no halt is set and no pending row exists; that is exactly `acked_seq == minted_seq` for the
     generation (a consistent state with the two numbers apart always has a pending row; without one it is refused as inconsistent). The
