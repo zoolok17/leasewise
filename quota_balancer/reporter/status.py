@@ -10,7 +10,7 @@ import datetime
 import json
 import os
 
-from . import capture, decisions, gwstate, receipts, rounds
+from . import capture, decisions, gwcycle, gwstate, receipts, rounds
 from . import state as state_mod
 
 STATUS_VERSION = 4          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`; 4: card R1-READER step 3a added `money_reader`
@@ -314,8 +314,9 @@ MONEY_READER_ACTIONS = {
     gwstate.STATE_UNAVAILABLE: ("the money reader's memory is damaged or inconsistent and it sends nothing: run `reporter reset --confirm` "
                                 "(the old state is kept in the archive), then adopt the new reader"),
 }
+# Card R1-READER step 3b added the closed words of the cycle (`gwcycle.CYCLE_WORDS`): each counts the cycles that ended with it.
 MONEY_READER_COUNTS = ("send_failed", "send_refused", "continuity_conflict", "reader_halted", "state_unavailable", "refused_answers",
-                       "resumed", "resets")
+                       "resumed", "resets") + gwcycle.CYCLE_WORDS
 
 
 def _money_reader(state):

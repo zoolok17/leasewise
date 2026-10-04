@@ -85,6 +85,7 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
         agents = cfg.resolve_agents(config, snapshot)
         limit_sources = cfg.resolve_limit_sources(config, snapshot)
         gateway_receipts = cfg.resolve_gateway_receipts(config, snapshot)
+        gateway_report = cfg.resolve_gateway_report(config, snapshot)
     except cfg.ConfigError as exc:
         _error(exc.code, exc.message)
         return EXIT_REFUSED
@@ -107,7 +108,7 @@ def main(argv=None, *, permissions=None, transport=None, clock=None,
         reporter = Reporter(config, agents, state, client,
                             stop=stop or threading.Event(),
                             limit_sources=limit_sources,
-                            gateway_receipts=gateway_receipts, **kwargs)
+                            gateway_receipts=gateway_receipts, gateway_report=gateway_report, **kwargs)
         return _go(reporter, args.verb)
     except Exception:
         _error(INTERNAL, MSG_INTERNAL)

@@ -831,6 +831,68 @@ pending, and with nothing pending it does nothing.
 first in `_send`. The archive's `quarantine` column and `gwr_audit` are reporter schema version 6, a step of its own from the version 5 that step 2 put on main. Tests: `tests/test_cardr1reader3a_send.py`.
 Record: `docs/STEP-CARD-R1-READER-3A.md`.
 
+## Card R1-READER, step 3b - the money reader's whole cycle (live use still waits)
+
+In plain words: the money reader now does its whole job. Each cycle it asks the gateway's program for one **report** of the month's money and for the
+**receipts** that explain part of it, works out how much money no lease accounts for, saves the result as one numbered report, and sends it to Leasewise.
+The operator then approves the gateway's price and cap pair and adopts a report in Leasewise (card R1-3d), and Leasewise's `status` says the gateway's figures
+are usable. **Nothing here runs against a live gateway.** Live use waits for the maintenance window (the live gateway still runs an older agenttalk on
+purpose) and for step 4, the live trial. A reporter without the new table in its configuration does nothing new.
+
+**What a cycle does**, in order, and stops at the first thing that stops it:
+
+1. If the reader is stopped, it does nothing (`reader_halted`). 2. It checks its own saved state (a damaged one is `state_unavailable`).
+3. If a report is waiting to be sent, it sends exactly those saved bytes first. The gateway is **not** run while a report waits. Only when Leasewise accepted
+it does the cycle go on. 4. It runs the gateway's `report` command. 5. It reads the answer strictly. 6. It reads the receipts after the last one it has,
+up to exactly the number the report names. 7. It works out the figures. 8. It numbers and saves the new report in one step. 9. It sends it.
+Any failure in steps 4 to 8 means **no report at all**, one closed word, and a count in `status`. It tries again next cycle. **One report is made per
+cycle**, so the time between reports is the reporter's `poll_seconds`.
+
+**The configuration** (Windows only, like the receipt command). It needs `gateway_receipts` to be read by a **command** for the **same gateway**:
+
+```toml
+[gateway_receipts]
+gateway = "gw-alias"
+admission_store = "C:\path\to\admission.db"
+command = ["C:\path\to\agenttalk.exe", "gateway", "receipts"]
+
+[gateway_report]
+gateway = "gw-alias"          # the same gateway as above
+account = "account-alias"     # the gateway's own metered account in Leasewise
+command = ["C:\path\to\agenttalk.exe", "gateway", "report", "--json"]
+timeout_seconds = 20          # optional, 1 to 60
+max_bytes = 1048576           # optional, 1024 to 4194304
+env = { SOME_SETTING = "value" }   # optional, at most 8
+```
+
+The command is an absolute path to an `.exe` and its arguments, as a list (no shell). It **must end with** `gateway report --json`: the reporter adds nothing to
+it. `--after`, `--limit` and `--json` may not appear anywhere else. `account` is the one key beyond the original design: Leasewise takes a gateway's report
+only from the machine **and** the account that own the gateway, and the reporter has no other way to learn the account.
+
+**What each word means and what to do** (they are counts in `status` under `money_reader.counts`; each counts cycles; none holds a value from a report):
+
+| Word | What happened | What the operator does |
+|---|---|---|
+| `status_failed` | the gateway program could not run, ran too long, exited with an error, printed too much, or left something running | check the path, that the program runs, and the time-out; nothing was sent |
+| `status_shape` | the report is not in the form this reader knows (including a newer version) | nothing to do locally; the reader needs updating |
+| `child_cap_not_ready` | the gateway has no lease binding or its caps are not ready | finish the gateway's setup; nothing was sent |
+| `receipts_failed` | the receipts could not be read up to the report's number (the command failed, or a page had a gap, a repeat, a wrong key or version) | check the receipt command; it is retried |
+| `receipts_rolled_back` | the same ledger now reports a lower receipt number than the reader already added | the ledger went back (for example a restored copy). Saved sums cannot be taken back: investigate, then `reporter reset --confirm` to start a fresh reader, which Leasewise must be told to adopt |
+| `generation_changed` | a receipt page named another ledger than the report | usually passes by itself next cycle; if it repeats, check the gateway |
+| `period_mismatch` | the gateway reports a month later than this computer's clock | fix the clock |
+| `receipts_exceed_settled` | the receipts add up to more than the gateway says it settled | the gateway's figures are damaged; nothing is sent |
+| `amount_invalid` | a sum was not a valid amount | the gateway's figures are damaged; nothing is sent |
+| `unattributed_unavailable` | the report lacks the figure the computation needs | the gateway program is too old; nothing is sent |
+| `state_unavailable`, `reader_halted`, `send_failed`, `send_refused`, `continuity_conflict` | the saved state, or sending (step 3a) | see the step 3a section: `reporter resume --confirm` or `reporter reset --confirm` |
+
+### Technical detail (R1-READER step 3b)
+
+`gwcycle.run_lane` (steps 1 to 9; the lane is `Reporter._send_report`, which calls it only when `gateway_report` and a command `gateway_receipts` are both configured);
+`gwcycle.make_report` (steps 4 to 8); `gwwire.build_report` (the one pure builder of the version-4 bytes; tested through `http_api._wire_to_reading` and
+`validate_readings`); `gwstate.saved_totals`; `config.GatewayReport`, `parse_config`'s `gateway_report` table and `resolve_gateway_report`. The words are
+`gwcycle.CYCLE_WORDS`, added to `status.MONEY_READER_COUNTS` (status version stays 4; the new keys are additions inside `money_reader.counts`). No schema
+change (reporter schemas 5 and 6 are untouched). Tests: `tests/test_cardr1reader3b_cycle.py`. Record: `docs/STEP-CARD-R1-READER-3B.md`.
+
 ## Card R1-RC - the receipt path reads pages with or without the month
 
 In plain words: when the operator upgrades the live gateway (agenttalk `921c82d4` or later), every receipt on a page carries a new field, the month
