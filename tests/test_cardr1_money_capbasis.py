@@ -7,8 +7,9 @@ mode too, and for money limits only. An account with no billing policy, or whose
 accepted fallback). The requester counts even with no spending yet. Neither the requester's basis is picked nor any account's
 spending dropped.
 
-The case is Codex's, through the public imports (`import_config`, `billing_policy_import`) and the public `grant` and `settle`.
-Synthetic data only.
+The case is Codex's, through the public `grant` and `settle`. The mixed set-up is a store made BEFORE the import check (card R1-M
+follow-up), so it is built in two steps: the public imports (`import_config`, `billing_policy_import`) with ONE cap basis, then one
+account's declaration is changed directly in the store. Synthetic data only.
 """
 
 import contextlib
@@ -63,11 +64,14 @@ class _Case(unittest.TestCase):
         path = os.path.join(self.root, "config.json")
         self.write(path, doc)
         store.import_config(self.db, path)
+        # The imports now refuse a mismatched set-up (card R1-M follow-up), so a store "made before" is built in two steps: the
+        # public imports with ONE cap basis, then B's declaration changed in the store directly, as an older version allowed.
         self.policies = _policy_doc([
             _billing_policy(account="meter", cap_basis=a_cap, ledger_basis="ex_vat", vat_bps=2000),
-            _billing_policy(account="other", cap_basis=b_cap, ledger_basis=b_ledger, vat_bps=2000)])
+            _billing_policy(account="other", cap_basis=a_cap, ledger_basis="ex_vat", vat_bps=2000)])
         self.import_policies()
         store.import_config(self.db, path)                        # the configuration reconciled after the policies exist
+        self.set_b_policy(cap_basis=b_cap, ledger_basis=b_ledger)
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             self.ids = {table: dict(conn.execute("SELECT alias,id FROM " + table)) for table in ("seats", "models", "gateways")}
 
@@ -101,8 +105,12 @@ class _Case(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
 
     def set_b_policy(self, **changes):
-        self.policies["policies"][1].update(changes)
-        self.import_policies()
+        """Change B's declaration directly in the store (the way a store made before the import check could hold it)."""
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for column, value in changes.items():
+                conn.execute("UPDATE billing_policies SET " + column + "=? WHERE account_id="           # fixed column names
+                             "(SELECT id FROM accounts WHERE alias='other')", (value,))
+            conn.commit()
 
 
 class Conflict(_Case):

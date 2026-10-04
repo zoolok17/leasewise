@@ -84,8 +84,9 @@ def check(value, maximum=INT64_MAX):
 
 
 def saturate(value):
-    """An exact total, made safe for the pure admission rule: any total above the largest cap becomes `SATURATION`."""
-    return min(value, SATURATION)
+    """An exact total, made safe for the pure admission rule: any total above the largest cap becomes `SATURATION`.
+    UNKNOWN stays UNKNOWN: it is never turned into a number here (the caller decides what an unknown total means)."""
+    return value if value is UNKNOWN else min(value, SATURATION)
 
 
 def _terms(terms):

@@ -557,8 +557,18 @@ part will:
     different cap bases; give them all the same cap basis"). This holds in advisory mode too, for team, project and platform caps,
     and for money limits only. An account with no billing policy, or whose cap basis is `unknown`, does not take part (the
     fallback below). **What to do:** give every account that shares the cap the same `cap_basis` in its billing policy.
-    Stated limits, not built: the configuration is not refused when it is imported (the conflict shows only when a lease is
-    asked for), and a shared cap costs one query per account.
+    **The imports refuse a NEW conflict straight away:** `import_config` and `billing_policy_import` compare the conflicting
+    scopes before and after the import and refuse, with the same word `CAP_BASIS_CONFLICT` and nothing written, an import that
+    **adds** a scope in which accounts that share a money cap (a team, project, seat or platform cap; the accounts of a scope are
+    the accounts of its project, and the platform spans every account) would declare different known cap bases. Accounts with no
+    policy or an `unknown` basis do not take part. The lease check stays, for stores made before. **A store that already holds a
+    mismatch stays importable:** an unrelated import is accepted, and so is one that repairs the mismatch (aligning the bases, or
+    dropping the mismatched account from the scope). **Stated limit:** once an account has billing history its `cap_basis` is
+    frozen (`INVALID_CONFIG`), so the conflict of an older store may not be repairable by import; such a store stays usable for
+    imports, and leases in the conflicting scope are refused (`CAP_BASIS_CONFLICT`). An audited basis correction would be a later
+    card, only if it is ever needed. A grant lists a scope's
+    accounts and reads their policies once per request, so the number of queries grows with the accounts that have leases in a
+    scope.
   - An account with **no billing policy** compares the lease books as they are.
   - A policy that **cannot convert** (a basis is `unknown`, or the bases differ and no VAT rate is given) leaves that account's
     lease books compared as they always were: there is nothing to convert with, and nothing is guessed. In a shared cap this

@@ -206,4 +206,6 @@ A's next advisory grant was admitted; with B switched to `invoice_total` the sam
   1. the conflicting configuration is not refused when it is imported (`validate_policies`, `import_config`,
      `billing_policy_import`); it shows only when a lease is asked for;
   2. `money.saturate(UNKNOWN)` raises `TypeError` (Codex L1, latent: no current caller passes UNKNOWN);
-  3. a shared scope costs one query per contributing account (Codex's cost note).
+  3. a shared scope costs one query per contributing account (Codex's cost note: the number of queries grows with the accounts that
+     have leases in a scope, and the accounts and policies were read again for each use).
+  All three are done by the follow-up card R1-M-FU (`docs/STEP-CARD-R1-M-FU.md`).

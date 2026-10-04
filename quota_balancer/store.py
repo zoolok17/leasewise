@@ -21,10 +21,12 @@ import uuid
 
 from .errors import (
     CODE_BILLING_SCOPE_MISMATCH,
+    CODE_CAP_BASIS_CONFLICT,
     CODE_IDEMPOTENCY_CONFLICT,
     CODE_INVALID_CONFIG,
     CODE_STORE_ERROR,
     MSG_BILLING_SCOPE_MISMATCH,
+    MSG_CAP_BASIS_CONFLICT,
     MSG_IDEMPOTENCY_CONFLICT,
     MSG_INVALID_CONFIG,
     MSG_STORE_FAILED,
@@ -33,6 +35,8 @@ from .errors import (
 )
 from .migrate import SCHEMA_VERSION, migrate, require_supported, rollback_quietly
 from .reduce import (
+    BASIS_EX_VAT,
+    BASIS_INVOICE_TOTAL,
     GATEWAY_STATE_OK,
     GATEWAY_STATE_RECONCILE,
     billing_freshness,
@@ -151,7 +155,9 @@ def import_config(path, file):
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
+            conflicts_before = _conflicting_cap_scopes(conn)
             _upsert(conn, accounts, machines, gateways, policy_doc)
+            _refuse_new_cap_basis_conflicts(conn, conflicts_before)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -351,6 +357,48 @@ def _forget_evidence(conn, gateway_id):
                  "VALUES(?, 'owner_changed', NULL, NULL, ?, NULL)", (gateway_id, int(time.time() * 1000)))
 
 
+def _conflicting_cap_scopes(conn):
+    """The money-limit scopes whose accounts declare more than one known cap basis, as a set of (scope, scope id) (card R1-M follow-up).
+
+    A team, project, seat or platform cap has no tax basis of its own; each account declares the basis its caps are counted in, and
+    spending counted with VAT cannot be added to spending counted without it. The accounts of a scope are the accounts of its project
+    (a team or a seat belongs to a project; the platform spans every account). Only accounts with a billing policy whose cap basis is
+    known (`ex_vat` or `invoice_total`) take part; an account with no policy or an `unknown` basis does not. Read on the state the
+    connection sees, so it can be asked before an import's changes and again on the state the import would leave."""
+    known = {account_id: basis for account_id, basis in conn.execute(
+        "SELECT account_id, cap_basis FROM billing_policies WHERE cap_basis IN (?, ?)", (BASIS_EX_VAT, BASIS_INVOICE_TOTAL))}
+    if len(set(known.values())) < 2:
+        return set()                                        # nothing can conflict
+    accounts_of = {
+        "platform": "SELECT id FROM accounts",
+        "project": "SELECT account_id FROM project_accounts WHERE project_id=?",
+        "team": "SELECT pa.account_id FROM project_accounts pa JOIN teams t ON t.project_id=pa.project_id WHERE t.id=?",
+        "seat": "SELECT pa.account_id FROM project_accounts pa JOIN teams t ON t.project_id=pa.project_id "
+                "JOIN seats s ON s.team_id=t.id WHERE s.id=?",
+    }
+    conflicting = set()
+    for scope, scope_id in conn.execute(
+            "SELECT DISTINCT scope, scope_id FROM limits WHERE metric='money_micro_eur'").fetchall():
+        query = accounts_of[scope]
+        found = conn.execute(query, () if scope == "platform" else (scope_id,)).fetchall()
+        if len({known[row[0]] for row in found if row[0] in known}) > 1:
+            conflicting.add((scope, scope_id))
+    return conflicting
+
+
+def _refuse_new_cap_basis_conflicts(conn, before):
+    """Refuse an import that ADDS a conflicting money-limit scope (card R1-M follow-up, fix round 1, D-188).
+
+    `before` is `_conflicting_cap_scopes` taken before the import's changes. It is compared with the same set on the state the
+    import would leave, INSIDE the import's transaction, so a refusal rolls everything back and writes nothing. Only a scope that was
+    not conflicting before and is now is a new conflict: an unrelated import leaves the set the same and is accepted, and a repairing
+    import shrinks it and is accepted. So a store that already holds a mismatch (made before this check, and possibly not
+    repairable by import once billing history freezes a cap basis) stays importable. The lease check keeps refusing leases in a
+    conflicting scope. The message is fixed and names no account."""
+    if _conflicting_cap_scopes(conn) - before:
+        raise QuotaError(CODE_CAP_BASIS_CONFLICT, MSG_CAP_BASIS_CONFLICT)
+
+
 def _refuse_if_referenced(conn, target, entity_id):
     for table, column in REMOVAL_GUARDS[target]:
         if _references(conn, table, column, entity_id):
@@ -403,7 +451,9 @@ def billing_policy_import(path, file):
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
+            conflicts_before = _conflicting_cap_scopes(conn)
             _apply_billing_policies(conn, policies)
+            _refuse_new_cap_basis_conflicts(conn, conflicts_before)
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
