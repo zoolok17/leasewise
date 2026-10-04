@@ -158,6 +158,12 @@ def _identity(state):
     return state.one("SELECT reader_incarnation, halt FROM gwr_identity WHERE id=1")
 
 
+def closed_halt(value):
+    """A stored halt value as one of the closed words: None stays None, a known word stays itself, ANY other value (a damaged file) reads as
+    `state_unavailable`. The stored value is never changed or shown; `reset` keeps it in the quarantine."""
+    return value if value is None or value in HALT_WORDS else STATE_UNAVAILABLE
+
+
 _SURVIVOR_QUERIES = ("SELECT 1 FROM gwr_pending LIMIT 1", "SELECT 1 FROM gwr_seq LIMIT 1", "SELECT 1 FROM gwr_epoch LIMIT 1",
                      "SELECT 1 FROM gwr_receipts LIMIT 1", "SELECT 1 FROM gwr_receipt_months LIMIT 1")
 # Children first, one fixed statement each (no table name is ever built into SQL text).
@@ -215,6 +221,8 @@ def inconsistency(state):
     incarnation = identity[0]
     if type(incarnation) is not str or _HEX32.fullmatch(incarnation) is None:
         return "bad_incarnation"
+    if identity[1] is not None and identity[1] not in HALT_WORDS:
+        return "bad_halt"                                                         # not one of the closed words (it bypassed the CHECK)
     rows = state.all("SELECT generation, minted_seq, acked_seq FROM gwr_seq")
     progress = {}
     for generation, minted, acked in rows:
@@ -291,7 +299,7 @@ def start(state, now_ms, new_incarnation=None):
             state.conn.execute("INSERT INTO gwr_identity(id, reader_incarnation, halt, created_ms) VALUES(1,?,NULL,?)", (fresh, now_ms))
             return Start(None, fresh, True, True)
         why = inconsistency(state)
-        halt = identity[1]
+        halt = closed_halt(identity[1])                                           # a damaged word reads as `state_unavailable` and is left as it is
         if why is not None and halt is None:
             state.conn.execute("UPDATE gwr_identity SET halt=? WHERE id=1", (STATE_UNAVAILABLE,))
             halt = STATE_UNAVAILABLE
@@ -443,8 +451,10 @@ def reset(state, now_ms, new_incarnation=None):
     replaces the old one and an audit row is written. A crash at any point leaves the old state or the new one, never a mix. Leasewise sees a
     new reader that must be chosen by adoption; nothing of the old sequence is carried over.
 
-    **Quarantine form.** If an old value cannot be archived under the archive's normal constraints (a damaged pending `event_id`, a damaged
-    incarnation...), the archive instead keeps the whole old state as raw evidence in its bounded `quarantine` column, never discarding it. A
+    **Quarantine form.** The normal archive is used only for a state `inconsistency` calls consistent (it holds one incarnation, one halt and
+    one pending report). For any other picture (two pending rows, damaged progress numbers, a damaged halt word, a damaged `event_id` or
+    incarnation...) the archive instead keeps the whole old state, every column of every row of every reader table, as raw evidence in its
+    bounded `quarantine` column, never discarding any of it. A
     state too large for `QUARANTINE_MAX_BYTES` is refused as `reset_too_large` with nothing changed (the file-level recovery is in the step
     record)."""
     fresh = secrets.token_hex(16) if new_incarnation is None else new_incarnation
@@ -452,17 +462,23 @@ def reset(state, now_ms, new_incarnation=None):
         identity = _identity(state)
         pending = state.one("SELECT generation, seq, event_id, body FROM gwr_pending")
         quarantined = 0
-        try:
-            state.conn.execute(
-                "INSERT INTO gwr_archive(reader_incarnation, halt, pending_generation, pending_seq, pending_event_id, pending_body, archived_ms)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (None if identity is None else identity[0], None if identity is None else identity[1],
-                 None if pending is None else pending[0], None if pending is None else pending[1],
-                 None if pending is None else pending[2], None if pending is None else pending[3], now_ms))
-        except sqlite3.IntegrityError:
+        # The normal archive keeps one incarnation, one halt and ONE pending report, so it is used only for a state the start-up check finds
+        # consistent. Anything else is kept whole (every row of every reader table) in the quarantine; the decision is never "the insert worked".
+        if inconsistency(state) is None:
+            try:
+                state.conn.execute(
+                    "INSERT INTO gwr_archive(reader_incarnation, halt, pending_generation, pending_seq, pending_event_id, pending_body, archived_ms)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (None if identity is None else identity[0], None if identity is None else identity[1],
+                     None if pending is None else pending[0], None if pending is None else pending[1],
+                     None if pending is None else pending[2], None if pending is None else pending[3], now_ms))
+            except sqlite3.IntegrityError:                          # a consistent state the archive still refuses: keep it whole, too
+                quarantined = 1
+        else:
+            quarantined = 1
+        if quarantined:
             evidence = _quarantine(state)                           # or Refused(RESET_TOO_LARGE): nothing has changed
             state.conn.execute("INSERT INTO gwr_archive(quarantine, archived_ms) VALUES(?,?)", (evidence, now_ms))
-            quarantined = 1
         _fault("archived")
         for step, statement in _CLEAR:
             state.conn.execute(statement)
@@ -485,9 +501,9 @@ def pending(state):
 
 
 def halt_word(state):
-    """The halt that is set, or None."""
+    """The halt that is set (always a closed word: a damaged stored value reads as `state_unavailable`), or None."""
     row = _identity(state)
-    return None if row is None else row[1]
+    return None if row is None else closed_halt(row[1])
 
 
 def note_conflict(state):

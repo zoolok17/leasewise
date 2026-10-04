@@ -83,6 +83,28 @@ version-5 definitions contain neither addition. Red first: all 7 fail on the pre
 `test_card7l6a1_state` now use 7, and the version expectations of `test_card7c2_state`, `test_card7l6a1_state`, `test_card7l6a2_fix1b` and
 `test_cardr1reader2_state` say 6.
 
+## Fix round 1 (Codex's two blocking items)
+
+In plain words: a reset no longer loses part of a damaged file, and a damaged "stopped because" word can no longer stop the reporter.
+
+- **Reset keeps every row.** The normal archive can hold one incarnation, one halt and ONE waiting report. It is now used only for a state that the
+  start-up check (`gwstate.inconsistency`) calls consistent. Any other picture (two waiting reports, progress numbers out of order, a damaged halt
+  word, and every other word the check can return) is kept whole in the quarantine: every column of every row of every reader table. Over the
+  256 KiB bound the reset is refused as `reset_too_large` with nothing changed. Whether one insert happened to succeed no longer decides anything.
+- **Halt words are closed.** A stored halt that is not one of the three words reads as `state_unavailable` in `status`, in the send lane and at
+  start-up (`gwstate.closed_halt`; the check gained the word `bad_halt`). Nothing is sent, the action sentence for `state_unavailable` is shown, the
+  stored value is left as it is (so a reset keeps it in the quarantine) and it is never shown.
+- **Lane isolation.** An unexpected failure in the money reader's send pass is caught at that lane only (`Reporter._send_report`) and counted as
+  `state_unavailable`; the other uploads go on and `run` keeps cycling. The money reader's part of `status` does the same: on any failure the block
+  says `state_unavailable` with zeros and the rest of `status` is built. The catch keeps no message and no value. `status` itself writes nothing,
+  so a failure there is shown but not counted; the send lane counts.
+- **Tests** (`tests/test_cardr1reader3a_fix1.py`, 19): both pending bodies survive; damaged progress survives; every inconsistency word (a table checked
+  against the words in the code) quarantines the whole state, row for row; an ordinary reset and a halted but consistent one still use the normal
+  archive; a large VALID report archives normally (the older large-body test now uses a real report, not `{ ... }`); a damaged state over the bound
+  is refused with nothing changed; the damaged halt in start, send, mint, resume and `status`; a real reporter cycle with the damaged halt (no report
+  call, the limit upload still succeeds); an injected failure in the send pass (the cycle completes, `run` keeps cycling, even when the count cannot
+  be written); a failure inside the status block. Red first against `1e120e2`: 13 of the 19 fail there.
+
 ## Limits and notes
 
 - Nothing reads a gateway, builds a report or sends one that was not minted by a test: step 3b.

@@ -354,7 +354,9 @@ class Reset(_Send):
         self.assertEqual(self.state.all("SELECT * FROM gwr_archive"), [])
 
     def test_a_large_but_healthy_pending_report_archives_normally(self):
-        self.forced(("UPDATE gwr_pending SET body=?", (b"{" + b" " * (gwstate.QUARANTINE_MAX_BYTES + 10) + b"}",)))
+        padded = bytes(self.state.one("SELECT body FROM gwr_pending")[0]) + b" " * (gwstate.QUARANTINE_MAX_BYTES + 10)      # a VALID report, with real identity facts
+        self.forced(("UPDATE gwr_pending SET body=?", (padded,)))
+        self.assertIsNone(gwstate.inconsistency(self.state))
         gwstate.reset(self.state, NOW, "e" * 32)
         self.assertEqual(self.state.one("SELECT quarantine IS NULL, pending_body IS NOT NULL FROM gwr_archive"), (1, 1))
 

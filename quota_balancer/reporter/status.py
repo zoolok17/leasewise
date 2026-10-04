@@ -320,14 +320,20 @@ MONEY_READER_COUNTS = ("send_failed", "send_refused", "continuity_conflict", "re
 
 def _money_reader(state):
     """Numbers and closed words only (card R1-READER step 3a): whether a report is pending, how many definitive refusals in a row it has had, the
-    halt word, and the counts of the closed outcomes. Nothing from a report or an answer."""
-    pending = state.one("SELECT refusals FROM gwr_pending")
-    identity = state.one("SELECT halt FROM gwr_identity WHERE id=1")
-    return {"pending": 0 if pending is None else 1,
-            "consecutive_refusals": 0 if pending is None else pending[0],
-            "refusal_threshold": gwstate.REFUSAL_THRESHOLD,
-            "halt": None if identity is None else identity[0],
-            "counts": {name: state.counter(gwstate.READER_AGENT, name) for name in MONEY_READER_COUNTS}}
+    halt word, and the counts of the closed outcomes. Nothing from a report or an answer. A stored halt that is not a closed word shows as
+    `state_unavailable` (the damaged value itself is never shown). This part of `status` can never stop the rest of it: if reading the money
+    reader's tables fails in any way, the block says `state_unavailable` with zeros and the other parts are built as usual."""
+    try:
+        pending = state.one("SELECT refusals FROM gwr_pending")
+        identity = state.one("SELECT halt FROM gwr_identity WHERE id=1")
+        return {"pending": 0 if pending is None else 1,
+                "consecutive_refusals": pending[0] if pending is not None and type(pending[0]) is int else 0,
+                "refusal_threshold": gwstate.REFUSAL_THRESHOLD,
+                "halt": None if identity is None else gwstate.closed_halt(identity[0]),
+                "counts": {name: state.counter(gwstate.READER_AGENT, name) for name in MONEY_READER_COUNTS}}
+    except Exception:    # noqa: BLE001 - the lane boundary: this block only, and only a closed word comes out (no message, no value kept)
+        return {"pending": 0, "consecutive_refusals": 0, "refusal_threshold": gwstate.REFUSAL_THRESHOLD,
+                "halt": gwstate.STATE_UNAVAILABLE, "counts": {name: 0 for name in MONEY_READER_COUNTS}}
 
 
 def _gateway_receipts(state, source, now_ms, gateway_agents=()):
