@@ -772,6 +772,37 @@ generation to the receipts; until then the figures stay null. The figures descri
 passes `receipts_carry_generation=False` because the `receipts` table has no generation column (a test fails the day one is added). Tests:
 `tests/test_cardr13e_coverage.py`. Record: `docs/STEP-CARD-R1-3E.md`.
 
+## Card R1-READER, step 2 - the money reader's memory (nothing live yet)
+
+In plain words: the money reader must never skip or replace a report number. It moves past number n only after Leasewise has accepted exactly the bytes
+it saved for n. This step builds the **memory** that makes that rule hold. **Nothing here reads a gateway or sends anything**; it is state and the rules
+over it, with tests, and no seat, lease or admission decision changes.
+
+What exists now (the reporter's own database, schema version 5; `reporter/gwstate.py`):
+
+- **An identity** (a random value) that never changes, with a halt that is empty or one of three words (`continuity_conflict`, `send_refused`,
+  `state_unavailable`).
+- **Two progress numbers per generation:** `minted_seq` (the highest number saved) and `acked_seq` (the highest accepted), the ledger epochs (a new epoch
+  whenever the generation changes, a return to an earlier one included), **at most one pending report** (its exact bytes), the receipts already read, and an
+  **archive** that `reset` fills and never erases.
+- **The start-up check:** the state is accepted only as `minted == acked` with no pending report, or `minted == acked + 1` with a pending report of exactly
+  that number, and the pending bytes, their event id, the identity and the epoch mapping must agree. Anything else halts the reader as `state_unavailable`.
+- **A complete absence of state is a first start** (a fresh identity). An absent identity with any surviving row is not: it halts. Every relationship of the state
+  is checked in both directions (an epoch without progress, or progress without its receipts, halts too), and a saved report's identity facts must have exactly
+  the types Leasewise accepts. The largest report or epoch number cannot be incremented: it halts, and `reset` recovers.
+- **Mint** (number, save and keep the next report, together with the receipts read, in one transaction) and **acceptance** (only for HTTP 202 with
+  `accepted` exactly `true` and the same event id; it deletes the pending report and moves `acked_seq`, in one transaction). **Reset** archives the old
+  state and starts a fresh one in one transaction.
+
+What is not here yet (step 3): the cycle, sending, the client's answers, counting refusals, the `resume` and `reset` commands and the status words.
+
+### Technical detail (R1-READER step 2)
+
+`gwstate.start`, `mint(state, generation, build, totals, now_ms)`, `accept(state, status, answer)`, `reset`, `inconsistency` (reads only), `report_facts` (the one
+place that knows where a report states its own number, incarnation, generation and epoch). Tables: `gwr_identity`, `gwr_epoch`, `gwr_seq`, `gwr_pending`,
+`gwr_receipts`, `gwr_receipt_months`, `gwr_archive`. The reporter state moves from schema version 4 to 5 (older files are migrated; a reporter that knows less
+refuses a newer file). Tests: `tests/test_cardr1reader2_state.py`. Record: `docs/STEP-CARD-R1-READER-2.md`.
+
 ## Card R1-RC - the receipt path reads pages with or without the month
 
 In plain words: when the operator upgrades the live gateway (agenttalk `921c82d4` or later), every receipt on a page carries a new field, the month

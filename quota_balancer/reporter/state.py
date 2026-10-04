@@ -10,10 +10,10 @@ import json
 import re
 import sqlite3
 
-from . import decisions, mapper
+from . import decisions, gwstate, mapper
 
-SCHEMA_VERSION = 4       # 2: card 7c-2 added limit_event; 3: card L6a-1 added the receipt custody tables;
-#                          4: card L6a-2 added the superseded record
+SCHEMA_VERSION = 5       # 2: card 7c-2 added limit_event; 3: card L6a-1 added the receipt custody tables;
+#                          4: card L6a-2 added the superseded record; 5: card R1-READER step 2 added the money reader's memory (`gwstate`)
                          # (older files are migrated; a reporter that knows less refuses a newer file)
 
 # The agent word on a limit item. Real agent names start with a letter or a digit, so this can
@@ -201,7 +201,10 @@ _SUPERSEDED_DDL = (
     " SELECT RAISE(ABORT, 'a superseded record is immutable'); END",
 )
 
-_DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL + _SUPERSEDED_DDL
+# Version 5 (card R1-READER step 2, DESIGN-R1-READER.md 7): the money reader's memory. Tables only; the rules are in `gwstate.py`.
+_GWR_DDL = gwstate.GWR_DDL
+
+_DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL + _SUPERSEDED_DDL + _GWR_DDL
 
 
 # The column that names a row in each outbox table (every table but the receipt state is keyed by `id`).
@@ -256,9 +259,10 @@ class State:
             for statement in _DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
-        elif version in (1, 2, 3):
-            # Version 1, 2 or 3 -> 4, inside the caller's transaction: all or nothing, nothing deleted. Version 3 is
-            # L6a-1's final layout and only gains `superseded`; 1 and 2 pass through the earlier steps first.
+        elif version in (1, 2, 3, 4):
+            # Version 1, 2, 3 or 4 -> 5, inside the caller's transaction: all or nothing, nothing deleted. Version 3 is
+            # L6a-1's final layout and gains `superseded`; 1 and 2 pass through the earlier steps first; every one gains the
+            # money reader's tables (version 4 gains only those).
             if version == 1:
                 self.conn.execute(_NOTE_DDL)        # a file made before card 7a-3
                 for statement in _LIMIT_DDL:
@@ -266,7 +270,10 @@ class State:
             if version < 3:
                 for statement in _RECEIPT_DDL:
                     self.conn.execute(statement)
-            for statement in _SUPERSEDED_DDL:
+            if version < 4:
+                for statement in _SUPERSEDED_DDL:
+                    self.conn.execute(statement)
+            for statement in _GWR_DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:

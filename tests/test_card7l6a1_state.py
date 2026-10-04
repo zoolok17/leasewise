@@ -92,7 +92,7 @@ class Schema(_Tmp):
 
     def test_a_fresh_file_has_the_custody_tables_and_triggers(self):
         state = self.open()
-        self.assertEqual(state.one("PRAGMA user_version")[0], 4)
+        self.assertEqual(state.one("PRAGMA user_version")[0], 5)
         names = {r[0] for r in state.all("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"receipt_source", "receipt_cursor", "receipt_binding", "receipt_capture",
                          "receipt_delivery", "receipt_state"} <= names)
@@ -137,7 +137,7 @@ class Schema(_Tmp):
                 before = self.snapshot()
                 self.assertEqual(self.raw("PRAGMA user_version"), [(version,)])
                 state = self.open()
-                self.assertEqual(state.one("PRAGMA user_version")[0], 4)
+                self.assertEqual(state.one("PRAGMA user_version")[0], 5)
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(self.raw("SELECT * FROM receipt_capture"), [])
                 self.assertEqual(len(self.raw("SELECT name FROM sqlite_master WHERE name IN ('limit_event',"
@@ -151,7 +151,7 @@ class Schema(_Tmp):
         schema = self.raw("SELECT type, name, sql FROM sqlite_master ORDER BY name")
         State(self.path).close()
         self.assertEqual(self.raw("SELECT type, name, sql FROM sqlite_master ORDER BY name"), schema)
-        self.assertEqual(self.raw("PRAGMA user_version"), [(4,)])
+        self.assertEqual(self.raw("PRAGMA user_version"), [(5,)])
 
     def test_a_migration_that_fails_leaves_the_file_at_its_version_whole(self):
         for version in (1, 2):
@@ -173,7 +173,7 @@ class Schema(_Tmp):
                 self.assertEqual(self.snapshot(), before)
                 self.open().close()                                   # and the good code still migrates it
                 self.current = None
-                self.assertEqual(self.raw("PRAGMA user_version"), [(4,)])
+                self.assertEqual(self.raw("PRAGMA user_version"), [(5,)])
 
     def _fingerprint(self):
         with open(self.path, "rb") as handle:
@@ -192,7 +192,7 @@ class Schema(_Tmp):
     def test_a_newer_unknown_version_is_refused_and_changes_nothing(self):
         State(self.path).close()
         conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA user_version=5")
+        conn.execute("PRAGMA user_version=6")
         conn.commit()
         conn.close()
         before = self._fingerprint()
