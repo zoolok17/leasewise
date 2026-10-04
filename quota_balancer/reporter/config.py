@@ -292,8 +292,9 @@ def _gateway_receipts(table):
 # and gateways separately). DESIGN-R1-READER.md 13 does not name it; it is the one key added to that table.
 _REPORT_KEYS = ("gateway", "account", "command")
 _REPORT_OPTIONAL = ("timeout_seconds", "env", "max_bytes", "interval_seconds")
-# Lead decision D-217: a new report is made at most once per `interval_seconds`. The ceiling keeps a report well inside Leasewise's 120-second
-# freshness window (`evidence_view.FRESH_MS`), so the newest report can always be adopted.
+# Lead decision D-217: a new report is made at most once per `interval_seconds`. This is a speed limit, not a freshness promise: the ceiling keeps the
+# interval well below Leasewise's 120-second age limit (`evidence_view.FRESH_MS`), but a slow receipt catch-up, the other uploads and the delivery add
+# age too, and Leasewise refuses to adopt a report that arrives too old (which is safe).
 DEFAULT_REPORT_INTERVAL = 60
 MIN_REPORT_INTERVAL, MAX_REPORT_INTERVAL = 30, 100
 
@@ -315,6 +316,8 @@ def _report_command(value, where):
     tail = list(runner.REPORT_TAIL)
     if not isinstance(value, list) or value[-len(tail):] != tail or len(value) <= len(tail):
         _invalid("%s: the command must be a program path followed by its arguments and end with: %s" % (where, " ".join(tail)))
+    if len(value) > MAX_COMMAND_ARGS:
+        _invalid("%s: the command may have at most %d items, the fixed ending included" % (where, MAX_COMMAND_ARGS))
     return _receipt_command(value[:-1], where) + (tail[-1],)
 
 

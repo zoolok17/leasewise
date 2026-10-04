@@ -868,14 +868,20 @@ interval_seconds = 60         # optional, 30 to 100, a whole number; the default
 ```
 
 The command is an absolute path to an `.exe` and its arguments, as a list (no shell). It **must end with** `gateway report --json`: the reporter adds nothing to
-it. `--after`, `--limit` and `--json` may not appear anywhere else.
+it. `--after`, `--limit` and `--json` may not appear anywhere else. The whole list, that fixed ending included, has **at most 16 items**, like the receipt command.
 
 - **`account`** is the gateway's own metered account in Leasewise. Leasewise takes a gateway's report only from the machine **and** the account that own the
   gateway, and the reporter has no other way to learn the account. **A wrong value** makes Leasewise refuse every report (a definitive refusal); after five in a
-  row the reader stops as `send_refused`, and it never sends a report under another owner. Fix the value, then run `reporter resume --confirm`.
-- **`interval_seconds`** is the shortest time between two new reports (30 to 100, default 60). It stays below Leasewise's 120-second freshness window
-  (`evidence_view.FRESH_MS`), so the newest report is always fresh enough to adopt. Raising `poll_seconds` would not do this, because the same cycle carries the
-  other uploads.
+  row the reader stops as `send_refused`, and it never sends a report under another owner. **Fixing the value does not rescue the report that is already
+  waiting:** it was saved as fixed bytes that name the old account, and `resume` only gives it a new retry budget and sends the same bytes again. What to do depends
+  on where the mistake is. If Leasewise has the gateway's owner account registered wrongly, correct it in Leasewise and then run `reporter resume --confirm`: the
+  same bytes are accepted. If the reader's own `account` was wrong, the saved report can never be accepted: fix the value, then run `reporter reset --confirm`
+  (it archives the old state and starts a fresh reader identity), and approve and adopt the new reader in Leasewise again. The waiting report is never edited or
+  rebuilt.
+- **`interval_seconds`** is the shortest time between two new reports (30 to 100, default 60): a speed limit, not a promise about freshness. Leasewise refuses to
+  adopt a report that is too old (120 seconds, `evidence_view.FRESH_MS`), which is safe. The interval stays below that so a report is made often enough, but a slow
+  receipt catch-up, the other uploads and the delivery all add age, so a report can still arrive too old. Raising `poll_seconds` would not set the interval, because
+  the same cycle carries the other uploads.
 
 Both come from lead decision D-217 (`DESIGN-R1-READER.md`, just before section 1).
 
@@ -893,7 +899,7 @@ Both come from lead decision D-217 (`DESIGN-R1-READER.md`, just before section 1
 | `receipts_exceed_settled` | the receipts add up to more than the gateway says it settled | the gateway's figures are damaged; nothing is sent |
 | `amount_invalid` | a sum was not a valid amount | the gateway's figures are damaged; nothing is sent |
 | `unattributed_unavailable` | the report lacks the figure the computation needs | the gateway program is too old; nothing is sent |
-| `state_unavailable`, `reader_halted`, `send_failed`, `send_refused`, `continuity_conflict` | the saved state, or sending (step 3a) | see the step 3a section: `reporter resume --confirm` or `reporter reset --confirm` |
+| `state_unavailable`, `reader_halted`, `send_failed`, `send_refused`, `continuity_conflict` | the saved state, or sending (step 3a) | see the step 3a section. For `send_refused`: `reporter resume --confirm` only helps when the cause was on Leasewise's side and is now fixed (the same saved bytes are sent again); if the report itself is wrong (for example the configured `account`), run `reporter reset --confirm` |
 
 ### Technical detail (R1-READER step 3b)
 
