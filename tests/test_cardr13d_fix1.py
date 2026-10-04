@@ -18,6 +18,7 @@ import io
 import json
 import sqlite3
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -249,22 +250,39 @@ class ResolveBound(_Fix):
 class TwoOperators(_Fix):
 
     def test_the_second_operator_waits_for_the_first_then_re_reads_under_the_lock_and_is_refused(self):
+        """A holds the write lock; B's `gateway-adopt` is inside its `BEGIN IMMEDIATE`; A commits; B re-reads under the lock and is refused.
+        No sleep: the evidence is a REAL database signal (a probe connection with no busy timeout gets 'database is locked' while A holds the lock)
+        and a causal order of B's own call (it entered before A let go and returned only after), taken from a monotonic clock."""
         self.approve()
         newest = self.send(rep(seq=2))
-        results, waiting, at_step = {}, threading.Event(), threading.Event()
+        results, entered, at_step = {}, threading.Event(), threading.Event()
+        seen = {"probe": None, "b_returned_while_a_held": None, "b_entered": None, "b_returned": None, "a_released": None}
         real_connect = store._connect
 
         def connect(path, must_exist):
             conn = real_connect(path, must_exist)
             if threading.current_thread().name != "B":
                 return conn
-            return _Waiting(conn, waiting)
+            return _Waiting(conn, entered, seen)
+
+        def probe():
+            """A second connection that does not wait for a lock: while A holds the write lock it is refused at once."""
+            other = sqlite3.connect(self.db, timeout=0, isolation_level=None)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                return str(exc)
+            finally:
+                other.close()
+            return "acquired"
 
         def hook(conn, step):
             if threading.current_thread().name == "A" and step == 2:             # A holds the write lock here
                 at_step.set()
-                self.assertTrue(waiting.wait(30))                              # B is about to ask for the lock...
-                threading.Event().wait(0.3)                                    # ...and is now blocked in it, behind A
+                self.assertTrue(entered.wait(30))                              # B is about to call `BEGIN IMMEDIATE`...
+                seen["probe"] = probe()                                        # ...and the lock is really held by A
+                seen["b_returned_while_a_held"] = seen["b_returned"] is not None
+                seen["a_released"] = time.monotonic_ns()                       # A lets go (its commit follows this line)
 
         def run(name):
             try:
@@ -281,6 +299,10 @@ class TwoOperators(_Fix):
             a.join(60)
             b.join(60)
         self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertIn("locked", seen["probe"])                                  # a database-level contention signal, not a guess
+        self.assertFalse(seen["b_returned_while_a_held"])                       # B had not got the lock while A held it
+        self.assertLessEqual(seen["b_entered"], seen["a_released"])             # B was already inside its call when A let go...
+        self.assertLess(seen["a_released"], seen["b_returned"])                 # ...and the call returned only after that
         self.assertEqual(results, {"A": 1, "B": errors.CODE_ADOPTION_REFUSED})
         self.assertEqual(self.rows("SELECT id, event_id FROM gateway_adoptions"), [(1, newest["event_id"])])
         self.assertEqual(self.rows("SELECT COUNT(*) FROM audit WHERE action='gateway_adopted'"), [(1,)])
@@ -295,15 +317,20 @@ class TwoOperators(_Fix):
 
 
 class _Waiting:
-    """A connection that tells a test it is about to ask for the write lock."""
+    """A connection that tells a test it is about to ask for the write lock, and when that call started and returned (monotonic clock)."""
 
-    def __init__(self, conn, event):
-        self._conn, self._event = conn, event
+    def __init__(self, conn, event, seen):
+        self._conn, self._event, self._seen = conn, event, seen
 
     def execute(self, sql, *args):
-        if sql == "BEGIN IMMEDIATE":
-            self._event.set()
-        return self._conn.execute(sql, *args)
+        if sql != "BEGIN IMMEDIATE":
+            return self._conn.execute(sql, *args)
+        self._seen["b_entered"] = time.monotonic_ns()
+        self._event.set()
+        try:
+            return self._conn.execute(sql, *args)                              # blocks inside SQLite while A holds the lock
+        finally:
+            self._seen["b_returned"] = time.monotonic_ns()
 
     def __getattr__(self, name):
         return getattr(self._conn, name)

@@ -752,6 +752,26 @@ the report command (exit code 2) arrive as the runner's `exit_code`. `receipts.p
 the envelope is always version 1; `month_rows=True` returns `MonthReceipt` rows. `gwreport.parse_snapshot`, `fold_page`, `compute` and the `Totals`,
 `Snapshot` and `Figures` values are pure. Tests: `tests/test_cardr1reader1_report.py`.
 
+## Card R1-3e - receipts against a report: two figures in `status` (information only)
+
+In plain words: a gateway report's `settled` covers all settled spend: the receipts Leasewise holds for that gateway and month, plus spend that has no
+receipt yet. This card adds a small pure comparison of the two and shows two figures in the `evidence` block of `status`:
+
+- `unreceipted_micro_eur`: the spend in the gateway's books that has no receipt yet. It is **null when coverage cannot be proven**, and it is never shown as 0
+  for "unknown";
+- `receipts_exceed_settled`: true when the receipts counted as covered claim more than the gateway's own month total (that should be impossible).
+
+**Both are information only:** never an error, never a transition, and no effect on usability, `adopt_blockers` or any decision; nothing in the grant or
+admission path reads them. **Today everything is "mode C"**: Leasewise's receipts carry no ledger generation, so nothing can be proven covered, the first
+figure is null and the second is false. Mode C counts a settled lease twice in the admission arithmetic, by design and on the safe side. A later card adds the
+generation to the receipts; until then the figures stay null. The figures describe the newest report, which is the one the block already describes.
+
+### Technical detail (R1-3e)
+
+`receipt_coverage.compare(report, receipts, receipts_carry_generation)` is pure (no I/O). `evidence_view.coverage` feeds it the gateway's final receipts and
+passes `receipts_carry_generation=False` because the `receipts` table has no generation column (a test fails the day one is added). Tests:
+`tests/test_cardr13e_coverage.py`. Record: `docs/STEP-CARD-R1-3E.md`.
+
 ## Card R1-RC - the receipt path reads pages with or without the month
 
 In plain words: when the operator upgrades the live gateway (agenttalk `921c82d4` or later), every receipt on a page carries a new field, the month

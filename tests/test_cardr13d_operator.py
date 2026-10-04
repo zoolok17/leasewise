@@ -544,12 +544,10 @@ class Status(_Op):
         self.assertIn("evidence", by_alias["g1"])
         self.assertNotIn("evidence", by_alias["g2"])
 
-    def test_the_keys_are_closed_and_the_two_keys_of_r1_3e_are_not_there_yet(self):
+    def test_the_keys_are_closed_and_include_the_two_information_figures_of_r1_3e(self):
         self.send(rep(seq=1))
         block = self.evidence()
-        self.assertEqual(set(block), self.KEYS)
-        self.assertNotIn("unreceipted_micro_eur", block)
-        self.assertNotIn("receipts_exceed_settled", block)
+        self.assertEqual(set(block), self.KEYS | {"unreceipted_micro_eur", "receipts_exceed_settled"})
         self.assertIn(block["state"], evidence_view.STATES)
 
     def test_the_states_in_the_order_an_operator_meets_them(self):
