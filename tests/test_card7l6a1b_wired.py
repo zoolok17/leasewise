@@ -305,7 +305,7 @@ class Budget(_Wired):
         reads = []
         reporter.monotonic = lambda: now["t"]
 
-        def fake(source, after, stop=None):
+        def fake(source, after, stop=None, month_rows=False):          # the real read_page now also takes the row shape (card R1-RC)
             reads.append(after)
             now["t"] += per_read                                    # this read takes `per_read` virtual seconds
             doc = page([receipt(self.leases[after], after + 1)], after=after, has_more=True)

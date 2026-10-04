@@ -51,7 +51,7 @@ KEYS = frozenset({"schema_version", "agent", "state", "provider", "window", "res
                   "message_id", "parked_at", "wrapper_generation", "updated_at_epoch"})
 _REPARSE_POINT = 0x400
 _TEXT = re.compile(r"[0-9A-Za-z._:-]{1,64}")
-_PARKED_AT = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z")
+_PARKED_AT = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,6}))?Z")
 
 
 class Marker:

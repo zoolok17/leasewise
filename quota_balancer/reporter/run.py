@@ -241,7 +241,9 @@ class Reporter:
             if budget_end is not None and self.monotonic() >= budget_end:
                 break
             generation, after = self.state.current_cursor(source_id)
-            read = receipts.read_page(source, after, self.stop)
+            # Card R1-RC: a gateway at agenttalk 921c82d4 or later prints the month on every row, an older one does not; this path reads
+            # both and keeps neither the month nor any other new field (`state.capture_page` stores the same fields as before).
+            read = receipts.read_page(source, after, self.stop, month_rows=receipts.EITHER)
             now = self.clock()
             if source.command is not None:
                 self.state.note_receipt_cleanup(read.cleanup_confirmed, now)

@@ -314,7 +314,7 @@ def take_snapshot(root, agents=None):
                 continue
             base = name[:-len(".jsonl")]
             generation, _dash, number = base.rpartition("-")
-            if not generation or not number.isdigit() or int(number) < 1:
+            if not generation or not (number.isascii() and number.isdigit()) or int(number) < 1:
                 continue
             path = os.path.join(directory, name)
             try:
