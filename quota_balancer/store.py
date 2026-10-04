@@ -74,6 +74,11 @@ from .validate_readings import (
 BUSY_TIMEOUT_S = 30.0
 
 
+def _now_ms():
+    """The wall clock in milliseconds. One place, so a test can move it."""
+    return int(time.time() * 1000)
+
+
 def _connect(path, must_exist):
     """Open the store with foreign_keys=ON. Never raises sqlite3.Error."""
     if must_exist and not os.path.isfile(path):
@@ -1007,13 +1012,14 @@ def _record_report_v4(conn, reading, gateway_id, now_ms):
     conn.execute(
         "INSERT INTO gateway_totals(event_id, gateway_id, reader_incarnation, ledger_epoch, generation, seq, period_start, "
         "period_end, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, receipts_seq, quiet, "
-        "held_over_reservation, price_hash, child_cap_hash, gateway_flag, observed_at, received_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "held_over_reservation, price_hash, child_cap_hash, gateway_flag, observed_at, received_at, in_order) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (event_id, gateway_id, incarnation, epoch, generation, reading["seq"], reading["period_start"], reading["period_end"],
          reading["settled_micro_eur"], reading["reserved_micro_eur"], reading["uncertain_micro_eur"],
          reading["unattributed_micro_eur"], reading["receipts_seq"], 1 if reading["quiet"] else 0,
          reading["held_over_reservation"], hashes["price"], hashes["child_cap"],
-         1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms))
+         1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms,
+         1 if assessment.standing == evidence.STANDING_IN_ORDER else 0))        # ingest's verdict, kept with the report (never recomputed)
     _apply_assessment(conn, gateway_id, report, assessment, now_ms)
 
 
@@ -1192,12 +1198,12 @@ def gateway_approve(path, gateway, price_hash, child_cap_hash, now_ms=None):
     unapproved pair."""
     if not all(type(h) is str and _HASH64.fullmatch(h) for h in (price_hash, child_cap_hash)):
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
-    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
+            now_ms = _now_ms() if now_ms is None else now_ms                  # read after the lock, like every check against the clock
             row = conn.execute("SELECT id FROM gateways WHERE alias = ?", (gateway,)).fetchone()
             if row is None:
                 raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
@@ -1221,6 +1227,23 @@ def _after_adopt_step(conn, step):
     adoption between any two steps and see that nothing stayed."""
 
 
+_MAX_ID_DIGITS = 19                      # the digits of 2^63-1, the largest number a SQLite integer holds
+
+
+def _item_id(item):
+    """One `--resolve` value as a whole number that fits a SQLite integer, or INVALID_CONFIG with nothing echoed. A text is bounded by its
+    LENGTH before any conversion (a very long run of digits makes the conversion itself fail)."""
+    if type(item) is bool:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if isinstance(item, str):
+        if not (item.isascii() and item.isdigit()) or len(item) > _MAX_ID_DIGITS:
+            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+        item = int(item)
+    if not isinstance(item, int) or not 0 <= item <= money.INT64_MAX:
+        raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    return item
+
+
 def gateway_adopt(path, gateway, event_id, resolve, now_ms=None):
     """Adopt a quiet report as the gateway's trusted baseline, choose its reader and clear the open items the operator names
     (DESIGN-R1-3.md 2.3). Returns the new adoption id.
@@ -1233,15 +1256,16 @@ def gateway_adopt(path, gateway, event_id, resolve, now_ms=None):
     `resolve` is the list of transition ids as the operator typed them (strings or whole numbers)."""
     ids = set()
     for item in resolve:
-        if type(item) is bool or not (isinstance(item, int) or (isinstance(item, str) and item.isascii() and item.isdigit())):
-            raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
-        ids.add(int(item))
-    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        ids.add(_item_id(item))
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             require_supported(conn)
+            # The clock is read AFTER the write lock is held: waiting for the lock can take up to the busy timeout, and a report that was
+            # fresh when the command started must not be adopted if it has expired by the time the predicate is read (lesson
+            # lw.freshness-clock-after-write-lock). An explicit time is used as given (tests).
+            now_ms = _now_ms() if now_ms is None else now_ms
             row = conn.execute("SELECT id FROM gateways WHERE alias = ?", (gateway,)).fetchone()
             if row is None:
                 raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
@@ -1300,12 +1324,12 @@ def evidence_inputs(path, account, now_ms=None):
     """The evaluator's gateway input for one account, built from the usable chain of each of its gateways (card R1-3d, DESIGN-R1-3.md
     2.4): `{"gateways", "readings", "unresolved_event_ids", "states"}`. One read transaction; nothing is written. Nothing in the grant
     path calls it before card R1-5."""
-    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN")
         try:
-            require_supported(conn)
+            require_supported(conn)                                           # the first read: the snapshot starts here
+            now_ms = _now_ms() if now_ms is None else now_ms
             result = evidence_view.inputs(conn, account, now_ms)
             conn.execute("COMMIT")
             return result
@@ -1484,12 +1508,12 @@ def status(path):
     state, and the billing total's age against its policy's max_age) is
     evaluated against the wall clock at read time.
     """
-    now_ms = int(time.time() * 1000)
     conn = _connect(path, must_exist=True)
     try:
         conn.execute("BEGIN")
         try:
-            require_supported(conn)
+            require_supported(conn)                                           # the first read: the snapshot starts here
+            now_ms = _now_ms()
             accounts = []
             for account_id, alias, kind, budget, coverage in conn.execute(
                 "SELECT a.id, a.alias, a.kind, a.budget_micro_eur, a.coverage_complete "

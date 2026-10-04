@@ -746,6 +746,13 @@ python -m quota_balancer --db quota.db status --json
 python -m quota_balancer --db quota.db gateway-adopt --gateway g1 --evidence EVENT_ID --resolve 1 --resolve 2
 ```
 
+**Fix round 1 (migration 11).** Each version-4 report is now stored with ingest's own verdict, `in_order`: 1 only if, when it arrived, it was an in-order
+report of its chain (not from a retired reader, not late, not a duplicate or a collision, not an older epoch or month). The trusted chain is the adopted
+report plus the later reports of the same reader, epoch, generation and month that carry `in_order = 1`; it never decides order again, because arrival
+order cannot be rebuilt from a row number or a clock reading. Existing rows read 0. The schema version is now 11, and an older program refuses a version-11
+store. `gateway-adopt` also reads the clock only after it holds the write lock, bounds `--resolve` to a whole number that fits a database integer, and
+refuses (rather than fails on) a report that another operator has just adopted.
+
 ### Technical detail (R1-3d)
 
 `store.gateway_approve`, `store.gateway_adopt` (`BEGIN IMMEDIATE`; `evidence_view.adopt_blockers` re-reads the ten items inside it; steps 2.3 with

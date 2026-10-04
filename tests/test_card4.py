@@ -143,7 +143,7 @@ class _Base(unittest.TestCase):
         conn = sqlite3.connect(db)
         try:
             self.assertEqual(conn.execute(
-                "PRAGMA user_version").fetchone()[0], 10)
+                "PRAGMA user_version").fetchone()[0], 11)
         finally:
             conn.close()
         return db
@@ -330,7 +330,7 @@ class SchemaV5Migration(_Base):
         conn = self._connect(db)
         try:
             self.assertEqual(conn.execute(
-                "PRAGMA user_version").fetchone()[0], 10)
+                "PRAGMA user_version").fetchone()[0], 11)
             self._assert_v5_shape(conn)
             # The v4 rows survive the upgrade: one row per earlier card's
             # table, IDs intact.
@@ -376,7 +376,7 @@ class SchemaV5Migration(_Base):
         db = self._v5_store("newer.db")
         conn = self._connect(db)
         try:
-            conn.execute("PRAGMA user_version=11")
+            conn.execute("PRAGMA user_version=12")
             conn.commit()
         finally:
             conn.close()

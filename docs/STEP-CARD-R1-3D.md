@@ -110,3 +110,40 @@ through the real path).
 - The 120-second freshness uses the report's own time against Leasewise's clock; there is no skew compensation.
 - The CLI tests that need the real clock (`test_the_command_prints_the_adoption_id...`) send a report stamped at the time of the test.
 - The comparison of receipts with the report (`unreceipted_micro_eur`, `receipts_exceed_settled`) is card R1-3e.
+
+## Fix round 1 (Codex's read of `eeb4d72`)
+
+In plain words: the trusted chain now keeps the verdict that arrival gave each report, instead of working it out again later; `gateway-adopt` reads the
+clock after it holds the lock; a very long `--resolve` number is bad input; and the "two operators at once" test is now a real race.
+
+- **F1 (blocking): the chain keeps ingest's verdict (migration 11).** `gateway_totals.in_order` (0 or 1, default 0) is written in the same transaction as the
+  report: 1 exactly when `evidence.assess` returned the standing "in order" (so not retired, late, duplicate, colliding, unchained, or from an older epoch
+  or month). `evidence_view.usable_chain` is the adopted report plus the reports of the same reader, epoch, generation and month with a higher number and
+  `in_order = 1`, by number. The running maximum by row number is gone: arrival order cannot be rebuilt from a row number (SQLite may renumber it on
+  `VACUUM`) or from a clock reading. Existing rows get 0 (conservative; no live version-4 report existed). The version is 11; the old reader refuses it.
+  Codex's case (adopt September 1, August 10 arrives, September 2 arrives with a hold) is a test through the real path: report 2 is not in the chain, the
+  evaluator receives only report 1, and `status` rests on report 1.
+- **F2 (blocking): the clock after the lock.** `gateway_adopt` reads the production clock after `BEGIN IMMEDIATE` returns (`store._now_ms`); an explicit
+  time is still used as given. Tests move the clock at the moment the lock is granted: age 119 999 ms before and 120 001 ms after is refused with an
+  unchanged dump; the boundary (120 000) is adopted; a report of the month that ends while the command waits is refused.
+  **The sweep** (lesson `lw.freshness-clock-after-write-lock`), every place in `store.py` that reads the clock:
+  `store.py` `import_config` (owner-changed stamp, read inside the transaction, a stamp only: fine); `reading_import` (read before the lock; it is used for the
+  30-second future refusal and as the `received_at` stamp: the early reading only makes the refusal stricter and the stamp earlier, no freshness decision
+  rests on it, so the gap does not matter, and it is not changed); `gateway_approve` (a stamp only, now read after the lock); `gateway_adopt` (fixed);
+  `evidence_inputs` and `status` (read transactions: the clock is now read after the first read of the snapshot, not before the connection). Callers of the
+  other modules (`lease.py` and the rest) pass their own time and are outside this card.
+- **B1: `--resolve` is bounded.** A text is checked for ASCII digits and at most 19 characters BEFORE any conversion; a number must be 0 to 2^63-1; anything
+  else is the existing `INVALID_CONFIG` sentence (exit 2) and nothing is echoed. The 4 301-digit case runs through `cli.main` and leaves the store unchanged.
+- **N1: a real race.** The old test (one call after the other) is renamed to what it proves. The new test starts two threads on two connections: A holds the
+  write lock (paused at step 2) until B has asked for it and is blocked; A commits; B then re-reads under the lock and is refused. The store shows exactly A's
+  adoption.
+- **Found by that race:** if the second operator names the SAME report the first just adopted, the predicate used to pass and the second insert hit the
+  database's unique key on the event id, which surfaced as a store error. An already adopted report is now a clean `ADOPTION_REFUSED`, with the existing word
+  `not_newest` in `status` (nothing newer to adopt). A test pins it.
+- **Changed existing tests:** the schema-version expectations (10 to 11) in `test_card1`, `test_card2b1`, `test_card4`, `test_cardr13a_schema`; the store builders
+  that run the migration scripts in order now include `MIGRATION_V11` (`test_card5`, `test_card4_seat_kind_fix`); `test_cardr13a_schema` lists the new column, its row inserts carry the new value (0), and
+  its older-reader test patches version 10. Nothing was weakened.
+- **Tests:** `tests/test_cardr13d_fix1.py` (14). Red first against `eeb4d72`: all 14 fail (12 failures and 8 errors counting subtests; the clock and
+  migration tests cannot even start there).
+- **Noticed, not changed:** `evidence_view.newest_report` ("the last report that arrived", used by `status` and its blockers) orders by row number, which has the
+  same renumbering limit as the chain had. It only chooses which report `status` talks about; it decides no trust. A stable order would need its own column.

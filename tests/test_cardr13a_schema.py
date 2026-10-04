@@ -79,8 +79,8 @@ class _Schema(_Base):
         first, second = self.reading(alias + "-1", alias), self.reading(alias + "-2", alias)
         self.run_sql("INSERT INTO gateway_epochs VALUES(?,?,?,?,?)", (gateway, INC, 1, GENERATION, first))
         for event, seq in ((first, 1), (second, 2)):
-            self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                event, gateway, INC, 1, GENERATION, seq, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10))
+            self.run_sql("INSERT INTO gateway_totals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                event, gateway, INC, 1, GENERATION, seq, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10, 0))
         self.run_sql("INSERT INTO gateway_approvals VALUES(?,?,?,?,?)", (gateway, PRICE, CAP, 5, "operator"))
         self.run_sql("INSERT INTO gateway_adoptions(gateway_id, event_id, reader_incarnation, ledger_epoch, generation, "
                      "period_start, seq, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, "
@@ -102,7 +102,7 @@ class Tables(_Schema):
         "gateway_totals": ["event_id", "gateway_id", "reader_incarnation", "ledger_epoch", "generation", "seq", "period_start",
                            "period_end", "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur",
                            "unattributed_micro_eur", "receipts_seq", "quiet", "held_over_reservation", "price_hash",
-                           "child_cap_hash", "gateway_flag", "observed_at", "received_at"],
+                           "child_cap_hash", "gateway_flag", "observed_at", "received_at", "in_order"],
         "gateway_approvals": ["gateway_id", "price_hash", "child_cap_hash", "approved_at", "operator"],
         "gateway_adoptions": ["id", "gateway_id", "event_id", "reader_incarnation", "ledger_epoch", "generation", "period_start",
                               "seq", "settled_micro_eur", "reserved_micro_eur", "uncertain_micro_eur", "unattributed_micro_eur",
@@ -115,9 +115,9 @@ class Tables(_Schema):
                                 "late_reports", "old_chain_reports", "duplicate_reports", "retired_reader_reports"],
     }
 
-    def test_the_version_is_ten_and_the_seven_tables_exist_with_their_columns(self):
-        self.assertEqual(migrate.SCHEMA_VERSION, 10)
-        self.assertEqual(self.one("PRAGMA user_version"), [(10,)])
+    def test_the_version_is_eleven_and_the_seven_tables_exist_with_their_columns(self):
+        self.assertEqual(migrate.SCHEMA_VERSION, 11)
+        self.assertEqual(self.one("PRAGMA user_version"), [(11,)])
         self.assertEqual(set(EVIDENCE_TABLES), set(self.EXPECTED))
         for table, columns in self.EXPECTED.items():
             with self.subTest(table=table):
@@ -133,7 +133,7 @@ class Tables(_Schema):
     def test_the_checks_refuse_what_a_later_card_must_never_write(self):
         gateway = self.gateway_id("g1")
         event = self.reading("check")
-        totals = (event, gateway, INC, 1, GENERATION, 1, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10)
+        totals = (event, gateway, INC, 1, GENERATION, 1, 1000, 2000, 500, 20, 5, 1, 1, 0, 0, PRICE, CAP, 0, 10, 10, 0)
         bad = {
             "a hash that is not 64 lowercase hex": totals[:15] + ("A" * 64,) + totals[16:],
             "a generation that is not 32 hex": totals[:4] + ("c" * 31,) + totals[5:],
@@ -144,7 +144,7 @@ class Tables(_Schema):
             "a period that ends before it starts": totals[:6] + (2000, 1000) + totals[8:],
             "a negative held-over count": totals[:14] + (-1,) + totals[15:],
         }
-        marks = ",".join("?" * 20)
+        marks = ",".join("?" * 21)
         for label, row in bad.items():
             with self.subTest(label):
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -260,7 +260,7 @@ class Migration(_Schema):
         self.downgrade_to_nine()
         self.assertEqual(self.one("PRAGMA user_version"), [(9,)])
         self.assertEqual(run_cli("--db", self.db, "init").returncode, 0)
-        self.assertEqual(self.one("PRAGMA user_version"), [(10,)])
+        self.assertEqual(self.one("PRAGMA user_version"), [(11,)])
         self.assertEqual(self.schema(), fresh)
 
     def test_the_migration_is_tables_only_and_invents_no_row(self):
@@ -285,7 +285,7 @@ class Migration(_Schema):
         names = {row[0] for row in self.one("SELECT name FROM sqlite_master")}
         self.assertEqual(names & set(EVIDENCE_TABLES), set())
         self.assertEqual(run_cli("--db", self.db, "init").returncode, 0)                 # and a later run completes it
-        self.assertEqual(self.one("PRAGMA user_version"), [(10,)])
+        self.assertEqual(self.one("PRAGMA user_version"), [(11,)])
 
     def test_the_migration_is_idempotent(self):
         self.run_sql("INSERT INTO gateway_approvals VALUES(?,?,?,1,'operator')", (self.gateway_id("g1"), PRICE, CAP))
@@ -295,10 +295,10 @@ class Migration(_Schema):
         self.assertEqual(run_cli("--db", self.db, "init").returncode, 0)
         self.assertEqual((self.schema(), self.counts()), before)
 
-    def test_the_older_reader_refuses_a_version_ten_store_before_touching_it(self):
+    def test_the_older_reader_refuses_a_version_eleven_store_before_touching_it(self):
         self.seed("g1")
         before = _bytes_of(self.db)
-        with mock.patch.object(migrate, "SCHEMA_VERSION", 9):
+        with mock.patch.object(migrate, "SCHEMA_VERSION", 10):
             conn = self.conn()
             try:
                 with self.assertRaises(errors.QuotaError) as caught:

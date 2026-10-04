@@ -136,6 +136,8 @@ def adopt_blockers(conn, gateway_id, event_id, named, now_ms):
                            (gateway_id, report["reader_incarnation"], report["ledger_epoch"])).fetchone()[0]
     if highest is not None and highest > report["seq"]:
         failed.add(NOT_NEWEST)
+    elif conn.execute("SELECT 1 FROM gateway_adoptions WHERE event_id=?", (event_id,)).fetchone() is not None:
+        failed.add(NOT_NEWEST)                                            # already adopted (by another operator): nothing newer to adopt
     contested = conn.execute(
         "SELECT MAX(conflict_seq) FROM gateway_transitions WHERE gateway_id=? AND resolved_by_adoption IS NULL "
         "AND kind IN ('sequence_conflict','epoch_generation_mismatch') AND conflict_incarnation=? AND conflict_epoch=?",
@@ -153,9 +155,9 @@ def adopt_blockers(conn, gateway_id, event_id, named, now_ms):
 
 def usable_chain(conn, gateway_id):
     """The adoption's chain as stored reports, oldest first: the adopted report itself and every later report of the same reader,
-    epoch, generation and month that arrived IN ORDER (a number higher than every earlier one of the chain; a late, repeated or
-    colliding report is left out). Empty when the gateway has no adoption or the adopted reader is not the current one. Nothing is
-    recomputed from history: this reads the stored rows and the adoption row, and nothing else."""
+    epoch, generation and month that INGEST judged in order when it arrived (`gateway_totals.in_order`, written in the same transaction
+    as the report and never recomputed: arrival order cannot be rebuilt from a rowid or a clock reading), by number. Empty when the
+    gateway has no adoption or the adopted reader is not the current one."""
     chain = conn.execute("SELECT g.current_adoption_id FROM gateway_chain_state g WHERE g.gateway_id=?", (gateway_id,)).fetchone()
     if chain is None or chain[0] is None:
         return []
@@ -168,15 +170,10 @@ def usable_chain(conn, gateway_id):
     base = stored_report(conn, gateway_id, adoption[0])
     if reader is None or reader[0] != "current" or base is None:
         return []
-    reports, highest = [base], base["seq"]
     later = _rows(conn.execute(
         "SELECT * FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? AND generation=? "
-        "AND period_start=? AND seq>? ORDER BY rowid", (gateway_id,) + tuple(adoption[1:5]) + (adoption[5],)))
-    for report in later:
-        if report["seq"] > highest:
-            reports.append(report)
-            highest = report["seq"]
-    return reports
+        "AND period_start=? AND seq>? AND in_order=1 ORDER BY seq", (gateway_id,) + tuple(adoption[1:5]) + (adoption[5],)))
+    return [base] + later
 
 
 def usable(conn, gateway_id, now_ms):

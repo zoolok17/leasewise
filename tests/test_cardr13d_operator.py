@@ -482,7 +482,7 @@ class Adoption(_Op):
         self.assertEqual(bad.returncode, 2)
         self.assertNotIn("secret-value", bad.stderr + bad.stdout)
 
-    def test_two_operators_adopting_at_once_one_wins_and_the_other_is_refused_cleanly(self):
+    def test_an_older_report_is_refused_after_a_newer_one_was_adopted_in_a_row(self):          # one call after the other: the real race is in test_cardr13d_fix1
         self.approve()
         first = self.send(rep(seq=1))
         second = self.send(rep(seq=2))
