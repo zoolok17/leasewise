@@ -380,7 +380,25 @@ class Generations(Env):
 
 class WrongAccount(Env):
     """Review follow-up B1: a waiting report is fixed bytes. Fixing the configured account does not change them, `resume` only sends them again, and the
-    two real ways out are to correct Leasewise's side (then `resume`) or to `reset` the reader."""
+    two real ways out are to correct Leasewise's side (then `resume`) or to `reset` the reader.
+
+    "The identical bytes" is proved where it matters: at the transport boundary. Every request the reader sends to the real loopback Leasewise is recorded as
+    (path, `Idempotency-Key`, exact body bytes, status) just before it goes out through the real HTTP client, and compared with the saved report. Comparing only the
+    stored row or the event ids would not do: a sender could change a field that is not part of the identity and keep both."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        real = self.rig.net.real
+
+        def record(method, path, headers, body, timeout):
+            status, raw = real(method, path, headers, body, timeout)
+            self.sent.append((path, headers.get("Idempotency-Key"), bytes(body), status))
+            return status, raw
+        self.rig.net.real = record
+
+    def reports_sent(self):
+        return [one for one in self.sent if one[0] == "/v1/readings"]
 
     def other_account(self):
         return self.rows("SELECT id FROM accounts WHERE id != ? ORDER BY id LIMIT 1", (self.reporter.gateway_report.account_id,))[0][0]
@@ -393,44 +411,131 @@ class WrongAccount(Env):
             self.lane()
         self.assertEqual(gwstate.halt_word(self.rig.state), gwstate.SEND_REFUSED)
         saved = self.reader("SELECT seq, event_id, body FROM gwr_pending")
-        self.assertEqual(json.loads(bytes(saved[0][2]))["account_id"], wrong)       # the waiting bytes name the wrong account
+        body = bytes(saved[0][2])
+        self.assertEqual(json.loads(body)["account_id"], wrong)                      # the waiting bytes name the wrong account
         self.assertEqual(self.rows("SELECT COUNT(*) FROM gateway_totals"), [(0,)])
-        return right, wrong, saved
+        sent = self.reports_sent()
+        self.assert_wire(sent, saved[0][1], body, expect_count=gwstate.REFUSAL_THRESHOLD, expect_status=400)       # the five refused requests are the saved bytes
+        return right, wrong, saved, body
 
+    # --- the assertions, as methods so that the mutation test below can show each one fails on a changed body -----------------------------------
+    def assert_wire(self, sent, key, body, expect_count=None, expect_status=None):
+        """Every request in `sent` has the saved key and a body byte-identical to the saved report (and, when asked, a count and a status)."""
+        if expect_count is not None:
+            self.assertEqual(len(sent), expect_count)
+        self.assertTrue(sent)
+        for _path, sent_key, sent_body, sent_status in sent:
+            self.assertEqual(sent_key, key)
+            self.assertEqual(sent_body, body)
+            if expect_status is not None:
+                self.assertEqual(sent_status, expect_status)
+
+    def expected_stored_payload(self, body, gateway_alias="g1"):
+        """What Leasewise keeps of a received report: `store._apply_reading` stores `json.dumps(payload, sort_keys=True)`, where the payload is the wire payload
+        after the receiving path translated the wire's `gateway_id` into the gateway's alias (`http_api._translate_gateway_snapshot_payload`). Leasewise does not
+        keep the request bytes, so this derived payload is the strictest thing to compare: it holds every field of the report."""
+        payload = dict(json.loads(body)["payload"])
+        del payload["gateway_id"]
+        payload["gateway"] = gateway_alias
+        return json.dumps(payload, sort_keys=True)
+
+    def assert_stored(self, event_id, body, account_id):
+        row = self.rows("SELECT payload, observed_at, account_id FROM readings WHERE event_id=?", (event_id,))
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0][0], self.expected_stored_payload(body))
+        self.assertEqual((row[0][1], row[0][2]), (json.loads(body)["observed_at"], account_id))
+
+    def assert_archived(self, archived_body, before_body):
+        self.assertEqual(bytes(archived_body), before_body)
+
+    @staticmethod
+    def tweak(body):
+        """The same report with ONE field that is not part of its identity changed (the settled money), and the same event id, key, number and incarnation."""
+        document = json.loads(body)
+        document["payload"]["settled_micro_eur"] += 1
+        changed = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assert changed != body
+        return changed
+
+    # --- the three ways out ---------------------------------------------------------------------------------------------------------------------
     def test_fixing_the_value_and_resuming_sends_the_identical_bytes_and_they_are_refused_again(self):
-        right, _wrong, saved = self.halt_on_the_wrong_account()
+        right, _wrong, saved, body = self.halt_on_the_wrong_account()
         self.reporter.gateway_report.account_id = right
         gwstate.resume(self.rig.state, self.rig.clock.ms)
         for _ in range(gwstate.REFUSAL_THRESHOLD):
             self.lane()
-        self.assertEqual(self.reader("SELECT seq, event_id, body FROM gwr_pending"), saved)          # same number, same event id, same body
+        self.assertEqual(self.reader("SELECT seq, event_id, body FROM gwr_pending"), saved)          # the stored row is unchanged...
+        self.assert_wire(self.reports_sent(), saved[0][1], body, expect_count=2 * gwstate.REFUSAL_THRESHOLD, expect_status=400)   # ...and so is every request on the wire
         self.assertEqual(gwstate.halt_word(self.rig.state), gwstate.SEND_REFUSED)
         self.assertEqual(self.counts()["refused_answers"], 2 * gwstate.REFUSAL_THRESHOLD)
         self.assertEqual(self.rows("SELECT COUNT(*) FROM gateway_totals"), [(0,)])
         self.assertEqual(len(self.gateway.reports()), 1)                                              # never rebuilt
 
     def test_correcting_leasewises_side_and_resuming_gets_the_same_bytes_accepted(self):
-        _right, wrong, saved = self.halt_on_the_wrong_account()
+        _right, wrong, saved, body = self.halt_on_the_wrong_account()
+        before = len(self.reports_sent())
         with contextlib.closing(sqlite3.connect(self.rig.lw.db)) as conn:                            # the owner account registered correctly at last
             conn.execute("UPDATE gateways SET account_id=? WHERE alias='g1'", (wrong,))
             conn.commit()
         gwstate.resume(self.rig.state, self.rig.clock.ms)
         self.lane()
-        self.assertEqual(self.rows("SELECT event_id FROM gateway_totals WHERE seq=?", (saved[0][0],)), [(saved[0][1],)])    # Leasewise stored exactly the saved report
-        self.assertEqual(self.reader("SELECT minted_seq = acked_seq FROM gwr_seq"), [(1,)])                                 # (and the cycle went on to the next one)
+        accepted = [one for one in self.reports_sent()[before:] if one[3] == 202 and one[1] == saved[0][1]]
+        self.assertEqual(len(accepted), 1)
+        self.assert_wire(accepted, saved[0][1], body, expect_status=202)                               # the accepted request is the saved report, byte for byte
+        self.assert_stored(saved[0][1], body, wrong)                                                  # and what Leasewise holds is exactly what those bytes say
+        self.assertEqual(self.reader("SELECT minted_seq = acked_seq FROM gwr_seq"), [(1,)])           # (the cycle then went on to the next report)
         self.assertEqual(len(self.gateway.reports()), 2)
 
     def test_a_reset_with_the_value_fixed_starts_a_new_reader_whose_report_is_accepted(self):
-        right, _wrong, saved = self.halt_on_the_wrong_account()
+        right, _wrong, saved, body = self.halt_on_the_wrong_account()
         old_incarnation = self.reader("SELECT reader_incarnation FROM gwr_identity")[0][0]
+        before = len(self.reports_sent())
         self.reporter.gateway_report.account_id = right
         gwstate.reset(self.rig.state, self.rig.clock.ms)
         self.assertEqual(self.reader("SELECT * FROM gwr_pending"), [])
-        self.assertEqual(self.reader("SELECT pending_event_id FROM gwr_archive"), [(saved[0][1],)])   # the old report is kept in the archive
+        self.assertEqual(self.reader("SELECT pending_event_id FROM gwr_archive"), [(saved[0][1],)])
+        self.assert_archived(self.reader("SELECT pending_body FROM gwr_archive")[0][0], body)         # the old report is kept in the archive, byte for byte
         self.lane()
         new_incarnation = self.reader("SELECT reader_incarnation FROM gwr_identity")[0][0]
         self.assertNotEqual(new_incarnation, old_incarnation)
+        first = self.reports_sent()[before]                                                           # the new reader's first request on the wire
+        document = json.loads(first[2])
+        self.assertNotEqual(first[1], saved[0][1])                                                    # another key...
+        self.assertEqual(first[1], document["event_id"])                                              # ...which is its own event id
+        self.assertEqual(document["payload"]["reader_incarnation"], new_incarnation)                  # ...from another identity
+        self.assertNotEqual(first[2], body)
+        self.assertEqual(first[3], 202)
         self.assertEqual(self.rows("SELECT reader_incarnation FROM gateway_totals"), [(new_incarnation,)])
+
+    # --- mutation check: each byte assertion must fail on a changed body that keeps every identity field -----------------------------------------
+    def test_the_byte_assertions_fail_when_one_field_that_is_not_an_identity_is_changed(self):
+        _right, wrong, saved, body = self.halt_on_the_wrong_account()
+        changed = self.tweak(body)
+        document, original = json.loads(changed), json.loads(body)
+        for path in (("event_id",), ("payload", "seq"), ("payload", "reader_incarnation"), ("payload", "ledger_epoch"), ("payload", "generation")):
+            a, b = document, original
+            for step in path:
+                a, b = a[step], b[step]
+            self.assertEqual(a, b)                                                                    # every identity field is untouched by the change
+        key = saved[0][1]
+        one = self.reports_sent()[0]
+        # 1. the wire assertion (tests 1 and 2): same key, same ids, one field different
+        self.assert_wire([one], key, body)
+        with self.assertRaises(AssertionError):
+            self.assert_wire([(one[0], one[1], changed, one[3])], key, body)
+        # 2. the stored comparison (test 2): Leasewise would hold a different payload than the saved bytes say
+        with contextlib.closing(sqlite3.connect(self.rig.lw.db)) as conn:
+            conn.execute("UPDATE gateways SET account_id=? WHERE alias='g1'", (wrong,))
+            conn.commit()
+        gwstate.resume(self.rig.state, self.rig.clock.ms)
+        self.lane()
+        self.assert_stored(key, body, wrong)
+        with self.assertRaises(AssertionError):
+            self.assert_stored(key, changed, wrong)
+        # 3. the archive comparison (test 3)
+        self.assert_archived(saved[0][2], body)
+        with self.assertRaises(AssertionError):
+            self.assert_archived(saved[0][2], changed)
 
 
 class Lane(Env):
