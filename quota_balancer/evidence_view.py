@@ -195,14 +195,23 @@ def usable(conn, gateway_id, now_ms):
     return STATE_USABLE, chain
 
 
+# Whether Leasewise's `receipts` table records a ledger generation. It does not (a later card adds the column), so the answer of the comparison is
+# fixed before any receipt is read: mode C. A test fails the day the column exists, which forces this line to be revisited.
+RECEIPTS_CARRY_GENERATION = False
+
+
 def coverage(conn, gateway_id, latest):
     """The C3 comparison (card R1-3e) for the report `status` describes: the report against this gateway's FINAL receipts. Information only.
-    Leasewise's receipts carry no ledger generation and no month, so today every receipt is mode C: the answer is (None, False)."""
-    receipts = [receipt_coverage.Receipt(gateway_id, None, seq, None, amount) for seq, amount in conn.execute(
-        "SELECT seq, actual_micro_eur FROM receipts WHERE gateway_id=? AND final=1 ORDER BY seq", (gateway_id,))]
+    Leasewise's receipts carry no ledger generation and no month, so today every receipt is mode C: the answer is (None, False). Because that is
+    known before reading anything, the receipt history is NOT read while it holds (it only grows); the comparison is given no receipts and the
+    flag that says the source cannot carry a generation, and returns the same two values."""
+    receipts = []
+    if RECEIPTS_CARRY_GENERATION:
+        receipts = [receipt_coverage.Receipt(gateway_id, None, seq, None, amount) for seq, amount in conn.execute(
+            "SELECT seq, actual_micro_eur FROM receipts WHERE gateway_id=? AND final=1 ORDER BY seq", (gateway_id,))]
     result = receipt_coverage.compare(
         receipt_coverage.Report(gateway_id, latest["generation"], latest["receipts_seq"], latest["period_start"], latest["settled_micro_eur"]),
-        receipts, receipts_carry_generation=False)                  # the `receipts` table has no generation column (a later card adds it)
+        receipts, receipts_carry_generation=RECEIPTS_CARRY_GENERATION)
     return result.unreceipted_micro_eur, result.receipts_exceed_settled
 
 
