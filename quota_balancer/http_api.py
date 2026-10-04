@@ -72,6 +72,7 @@ from .errors import QuotaError
 from .validate_readings import (
     DOC_VERSION,
     DOC_VERSION_BILLING,
+    DOC_VERSION_V4,
     KIND_CLI_WINDOW,
     KIND_GATEWAY_SNAPSHOT,
     KIND_PROVIDER_BILLING,
@@ -537,6 +538,9 @@ def _wire_to_reading(body, identity, conn):
             kind == KIND_GATEWAY_SNAPSHOT and isinstance(payload, dict)
             and "settled_micro_eur" in payload):
         version = DOC_VERSION_BILLING
+    if (kind == KIND_GATEWAY_SNAPSHOT and isinstance(payload, dict)
+            and "reader_incarnation" in payload):
+        version = DOC_VERSION_V4                # card R1-3b: a version-4 report names its reader
     reading = {
         "event_id": body["event_id"], "machine": alias, "account": account_alias,
         "kind": kind, "observed_at": body["observed_at"], "payload": payload}

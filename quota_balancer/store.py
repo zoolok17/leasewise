@@ -564,15 +564,27 @@ def reading_import(path, file, wire_identity=None):
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            _check_http_identity(conn, wire_identity)
-            require_supported(conn)
-            machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
-            account_ids = dict(conn.execute("SELECT alias, id FROM accounts"))
-            gateway_ids = dict(conn.execute("SELECT alias, id FROM gateways"))
-            for reading in readings:
-                _apply_reading(conn, reading, machine_ids, account_ids,
-                               gateway_ids, now_ms)
-            _record_http_identity(conn, wire_identity, now_ms)
+            conn.execute("SAVEPOINT batch")
+            try:
+                _check_http_identity(conn, wire_identity)
+                require_supported(conn)
+                machine_ids = dict(conn.execute("SELECT alias, id FROM machines"))
+                account_ids = dict(conn.execute("SELECT alias, id FROM accounts"))
+                gateway_ids = dict(conn.execute("SELECT alias, id FROM gateways"))
+                for reading in readings:
+                    _apply_reading(conn, reading, machine_ids, account_ids,
+                                   gateway_ids, now_ms)
+                _record_http_identity(conn, wire_identity, now_ms)
+            except QuotaError as exc:
+                if exc.code == CODE_IDEMPOTENCY_CONFLICT:
+                    # Card R1-3b (DESIGN-R1-3.md 3, "the durable collision record"): the refusal leaves a permanent record, written
+                    # INSIDE this write transaction (a follow-on transaction after the rollback could be lost to a stop in between).
+                    # Roll back to the start so no rejected reading data is kept, write the record, commit, then return the conflict.
+                    conn.execute("ROLLBACK TO batch")
+                    _record_collisions(conn, readings, now_ms)
+                    _after_collision_record(conn)
+                    conn.execute("COMMIT")
+                raise
             conn.execute("COMMIT")
         except BaseException:
             rollback_quietly(conn)
@@ -630,7 +642,7 @@ def _apply_reading(conn, reading, machine_ids, account_ids, gateway_ids, now_ms)
     if kind == KIND_CLI_WINDOW:
         _reduce_cli_window(conn, reading, account_id)
     elif kind == KIND_GATEWAY_SNAPSHOT:
-        _reduce_gateway_snapshot(conn, reading, gateway_ids)
+        _reduce_gateway_snapshot(conn, reading, gateway_ids, now_ms)
     else:  # KIND_PROVIDER_BILLING
         _reduce_provider_billing(conn, reading, account_id, machine_id)
 
@@ -787,7 +799,91 @@ def _reduce_cli_window(conn, reading, account_id):
             )
 
 
-def _reduce_gateway_snapshot(conn, reading, gateway_ids):
+def _after_collision_record(conn):
+    """A fault-injection point (a test replaces it): after the collision record is written and before it is committed."""
+
+
+def _note_transition(conn, gateway_id, kind, event_id, now_ms, conflict=(None, None, None)):
+    """Write one transition row (card R1-3b), once: the unique key (gateway, kind, event) makes a repeat a no-op. Nothing here
+    resolves or overwrites a transition. `conflict` is the incarnation, epoch and seq that collided (a conflict kind only)."""
+    chain = conn.execute("SELECT current_adoption_id FROM gateway_chain_state WHERE gateway_id=?", (gateway_id,)).fetchone()
+    conn.execute(
+        "INSERT OR IGNORE INTO gateway_transitions(gateway_id, kind, event_id, adoption_id, conflict_incarnation, "
+        "conflict_epoch, conflict_seq, detected_at) VALUES(?,?,?,?,?,?,?,?)",
+        (gateway_id, kind, event_id, None if chain is None else chain[0], conflict[0], conflict[1], conflict[2], now_ms))
+
+
+def _record_report_v4(conn, reading, gateway_id, now_ms):
+    """Keep a version-4 gateway report (card R1-3b): record its (reader incarnation, epoch) with its generation, and copy it into
+    `gateway_totals`. The same (gateway, incarnation, epoch) with another generation is the identity conflict of the design
+    (`epoch_generation_mismatch`): it is recorded as such and the first mapping stays. Nothing reads these rows until R1-3c."""
+    event_id = reading["event_id"]
+    incarnation, epoch, generation = reading["reader_incarnation"], reading["ledger_epoch"], reading["generation"]
+    known = conn.execute(
+        "SELECT generation FROM gateway_epochs WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=?",
+        (gateway_id, incarnation, epoch)).fetchone()
+    if known is None:
+        conn.execute("INSERT INTO gateway_epochs(gateway_id, reader_incarnation, ledger_epoch, generation, first_event_id) "
+                     "VALUES(?,?,?,?,?)", (gateway_id, incarnation, epoch, generation, event_id))
+    elif known[0] != generation:
+        _note_transition(conn, gateway_id, "epoch_generation_mismatch", event_id, now_ms, (incarnation, epoch, reading["seq"]))
+    hashes = reading["policy_hashes"]
+    conn.execute(
+        "INSERT INTO gateway_totals(event_id, gateway_id, reader_incarnation, ledger_epoch, generation, seq, period_start, "
+        "period_end, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, receipts_seq, quiet, "
+        "held_over_reservation, price_hash, child_cap_hash, gateway_flag, observed_at, received_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, gateway_id, incarnation, epoch, generation, reading["seq"], reading["period_start"], reading["period_end"],
+         reading["settled_micro_eur"], reading["reserved_micro_eur"], reading["uncertain_micro_eur"],
+         reading["unattributed_micro_eur"], reading["receipts_seq"], 1 if reading["quiet"] else 0,
+         reading["held_over_reservation"], hashes["price"], hashes["child_cap"],
+         1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms))
+
+
+def _record_collisions(conn, readings, now_ms):
+    """After a refused collision (the same event id with different content), leave a durable `sequence_conflict` (card R1-3b).
+
+    Run INSIDE the write transaction, after the rollback to its start, so the state read here is the store's own and no rejected
+    reading data exists. For each version-4 gateway report of the refused batch whose event id is already stored with DIFFERENT
+    content: the authenticated sender (the reading's machine and account) must be the gateway's CURRENT owner, re-checked here
+    under the lock (the payload's gateway name alone, and any authorization from before the rollback, are never trusted); and the
+    stored report must belong to the same gateway, incarnation and epoch (provenance). A sender that is not the owner, or a
+    collision without that provenance, writes nothing. A collision from an incarnation that `gateway_readers` marks retired is only
+    counted (`retired_reader_reports`), never a transition. A repeat of the same collision is a no-op."""
+    for reading in readings:
+        if reading["kind"] != KIND_GATEWAY_SNAPSHOT or "reader_incarnation" not in reading:
+            continue
+        stored = conn.execute("SELECT kind, machine_id, account_id, observed_at, payload FROM readings WHERE event_id=?",
+                              (reading["event_id"],)).fetchone()
+        gateway = conn.execute(
+            "SELECT g.id, m.alias, a.alias, g.machine_id, g.account_id FROM gateways g JOIN machines m ON m.id=g.machine_id "
+            "JOIN accounts a ON a.id=g.account_id WHERE g.alias=?", (reading["gateway"],)).fetchone()
+        if stored is None or gateway is None:
+            continue
+        gateway_id, owner_machine, owner_account = gateway[0], gateway[1], gateway[2]
+        if owner_machine != reading["machine"] or owner_account != reading["account"]:
+            continue                                                   # not the gateway's owner: nothing is written
+        signature = (reading["kind"], gateway[3], gateway[4], reading["observed_at"],
+                     json.dumps(reading["payload"], sort_keys=True))
+        if tuple(stored) == signature:
+            continue                                                   # the same content: not a collision of content
+        report = conn.execute("SELECT gateway_id, reader_incarnation, ledger_epoch, seq FROM gateway_totals WHERE event_id=?",
+                              (reading["event_id"],)).fetchone()
+        if (report is None or report[0] != gateway_id or report[1] != reading["reader_incarnation"]
+                or report[2] != reading["ledger_epoch"]):
+            continue                                                   # no provenance: the stored report is not this reader's
+        reader = conn.execute("SELECT state FROM gateway_readers WHERE gateway_id=? AND reader_incarnation=?",
+                              (gateway_id, reading["reader_incarnation"])).fetchone()
+        if reader is not None and reader[0] == "retired":
+            conn.execute("INSERT OR IGNORE INTO gateway_chain_state(gateway_id) VALUES(?)", (gateway_id,))
+            conn.execute("UPDATE gateway_chain_state SET retired_reader_reports = retired_reader_reports + 1 WHERE gateway_id=?",
+                         (gateway_id,))
+            continue
+        _note_transition(conn, gateway_id, "sequence_conflict", reading["event_id"], now_ms,
+                         (report[1], report[2], report[3]))
+
+
+def _reduce_gateway_snapshot(conn, reading, gateway_ids, now_ms=0):
     """Reduce a gateway_snapshot reading into the gateway's report columns.
 
     Section 5: both sources bind seat/machine/account explicitly. A snapshot
@@ -807,6 +903,8 @@ def _reduce_gateway_snapshot(conn, reading, gateway_ids):
     ).fetchone()
     if owner[0] != reading["machine"] or owner[1] != reading["account"]:
         raise QuotaError(CODE_INVALID_CONFIG, MSG_INVALID_CONFIG)
+    if "reader_incarnation" in reading:
+        _record_report_v4(conn, reading, gateway_id, now_ms)           # card R1-3b: a version-4 report is also kept as a typed row
     row = conn.execute(
         "SELECT ledger_epoch, last_seq, period_start, period_end, policy_hashes, "
         "sized_ready, state FROM gateways WHERE id = ?",

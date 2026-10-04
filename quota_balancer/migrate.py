@@ -530,7 +530,7 @@ MIGRATION_V9 = "\n".join(_DDL_V9) + "\nPRAGMA user_version=9;\n"
 
 # Card R1-3a (migration version 10): the seven tables that keep a gateway's evidence (DESIGN-R1-3.md section 3, revision 2). TABLES ONLY: no
 # ALTER, no rebuild, and no row of any kind (no approval, adoption, transition or chain state, and no backfill from old readings).
-# Nothing reads or writes them until cards R1-3b and R1-3c. Money columns are whole numbers >= 0; a hash is 64 lowercase hex
+# No report ingest or admission code used them in this card (the import effect and the removal guard aside); R1-3b fills two of them. Money columns are whole numbers >= 0; a hash is 64 lowercase hex
 # characters; a generation is 32. The definitions live here, in one place.
 _HEX64 = "length({c})=64 AND {c} NOT GLOB '*[^0-9a-f]*'"
 _HEX32 = "length({c})=32 AND {c} NOT GLOB '*[^0-9a-f]*'"

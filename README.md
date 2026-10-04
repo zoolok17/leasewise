@@ -617,7 +617,7 @@ What is new:
   `owner_changed` transition is written. It must be approved and adopted again. Changing only its share changes none of this.
 - **A gateway that has evidence rows cannot be removed** by a configuration import, like a gateway with receipts today.
 
-Not built yet: reading document version 4, ingest into these tables, the rules that decide what is a change, the operator commands
+Not built yet in this card: reading document version 4, ingest into these tables (card R1-3b), the rules that decide what is a change, the operator commands
 `gateway-approve` and `gateway-adopt`, and the reading source (cards R1-3b to R1-3e, and the separate card R1-READER).
 
 ### Technical detail (R1-3a)
@@ -627,6 +627,37 @@ money column a whole number >= 0, a hash 64 lowercase hex characters, a generati
 and closed words for a transition's kind, an adoption's kind and a reader's state (at most one `current` reader per gateway, and one
 `reader_changed` row per incarnation). `store._forget_evidence` is the `import_config` effect; `store.REMOVAL_GUARDS["gateways"]`
 lists the seven new tables. Tests: `tests/test_cardr13a_schema.py`. Record: `docs/STEP-CARD-R1-3A.md`.
+
+## Card R1-3b - gateway report version 4, kept at ingest
+
+In plain words: a gateway report can now say who is sending it and what ledger it is about, and Leasewise keeps each such report as its own
+row. **A new report format, "version 4", adds five facts:** `generation` (which ledger the figures come from), `receipts_seq` (how far the
+receipts go, or null when that is not claimed), `quiet` (whether nothing was in flight), `held_over_reservation` (how many settled calls went
+over their reservation) and `reader_incarnation` (the random identity of the program that sent it). A version-4 report must carry **both**
+policy fingerprints (a version-3 report may still carry none), and its event id is **derived** from the incarnation, the generation and the
+report number, so a new sender can never collide with an old report. Versions 2 and 3 are accepted exactly as before.
+
+What is new:
+
+- **Each accepted version-4 report is copied into `gateway_totals`**, joined to its stored reading, and its (sender identity, epoch number) is
+  recorded with its generation in `gateway_epochs`. If the same (sender identity, epoch) later arrives with a different generation, it is
+  recorded as an `epoch_generation_mismatch` transition and the first mapping stays. Versions 2 and 3 never reach these tables.
+- **A report that collides with one already stored leaves a permanent record.** "Collides" means the same event id with different content. It is
+  refused as before (`IDEMPOTENCY_CONFLICT`, nothing of the refused report stored), but a `sequence_conflict` transition is written **inside the
+  store's own write transaction**, on both collision paths (the HTTP identity check and the reading idempotency check). Only the gateway's real
+  owner (re-checked under the lock) can create one, only when the stored report belongs to the same gateway, incarnation and epoch, and a repeat
+  adds nothing. A collision from a reader marked `retired` is only counted. Nothing in this step resolves or overwrites a transition.
+
+**Nothing reads these rows until card R1-3c, so no seat, lease or admission decision changes. No reader sends version 4 live until card
+R1-READER closes its start-up and continuity check (D1).** Design note: `DESIGN-R1-3.md`, revision 2, sections 1.3 and 3.
+
+### Technical detail (R1-3b)
+
+`validate_readings`: `DOC_VERSION_V4`, `derive_event_id` (a UUID version 5 over `incarnation:generation:seq` in a fixed namespace), the five keys, the
+required hashes. `http_api._wire_to_reading` marks a snapshot that names a `reader_incarnation` as version 4. `store._record_report_v4` writes the
+totals and epoch rows; `store._record_collisions` (after a `ROLLBACK TO` the savepoint taken at the start of the import, inside the same
+transaction) writes the record, and `store._after_collision_record` is the fault-injection point. Tests: `tests/test_cardr13b_ingest.py`.
+Record: `docs/STEP-CARD-R1-3B.md`.
 
 ## Card 7a-2 - the reporter core
 
