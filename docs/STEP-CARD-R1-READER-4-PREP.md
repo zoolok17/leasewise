@@ -16,7 +16,7 @@ passed twice from a clean start, and after the rollback nothing was left behind.
 1. `docs/TRIAL-R1-READER-4.md`: the operator's runbook (how-to, plain words first, exact PowerShell, what each command prints, a table of the reader's closed words, and the corrected
    advice for `send_refused`: `resume` only when Leasewise's side was wrong and is fixed; `reset` when the reader's own configuration was wrong). The commit to install is the
    placeholder `<COMMIT>` until the lead fills it at the merge.
-2. `tests/trial/` (file names do not start with `test_`, so `discover` does not collect them: the suite still counts 2572 tests, as on main):
+2. `tests/trial/` (file names do not start with `test_`, so `discover` does not collect them: the suite counts the same tests with or without them):
    - `pretend_gateway.py`: a pretend gateway program (a Python script run by `python.exe`). It answers `gateway report --json` and `gateway receipts --after N --limit M --json` in agenttalk's documented
      shapes (report version 1, receipt envelope 1, rows with `charge_period`), from a made-up ledger file; `advance` adds one receipt of 450 so a second report differs; every call is noted
      in a log so the rehearsal can count them. Made-up values only; it is not named like agenttalk.
@@ -27,9 +27,9 @@ passed twice from a clean start, and after the rollback nothing was left behind.
 
 ## Result
 
-Four runs, each from a clean start, all passed (`REHEARSAL PASSED`), under Windows PowerShell 5.1 (the desktop's default) with Python 3.13 from `C:\lw\venv`: two on the
-tree before `main` moved (225 s and 228 s), and two again after `main` took in the 3b-tidy card (`d5078b5`), on the merged tree (228 s and 227 s). The tested trees are identical to this
-commit's tree except for this record. Logs are kept in the seat's scratch folder (`rehearsal-final1`, `-final2`, `-merged1`, `-merged2`). The timings below are from the second run.
+Six runs, each from a clean start, all passed (`REHEARSAL PASSED`), under Windows PowerShell 5.1 (the desktop's default) with Python 3.13 from `C:\lw\venv`: two on the
+tree before `main` moved (225 s and 228 s), and two again after `main` took in the 3b-tidy card (`d5078b5`), on the merged tree (228 s and 227 s); and two more after the changes of "Lead decisions before the read" (281 s each, including the open-item drill). The tested trees are identical to this
+commit's tree except for this record. Logs are kept in the seat's scratch folder (`rehearsal-final1`, `-final2`, `-merged1`, `-merged2`, `-od1`, `-od2`). The step table below is from the second run of the first version; the shared steps took the same in the last two.
 
 | Runbook step | What was shown | Time (second run) |
 |---|---|---|
@@ -69,8 +69,8 @@ gateway's folder): 0 files, both runs. The log was searched for the value itself
   5 seconds (measured: 13 receipt calls in one minute). The calls are read-only, but the plan said once per report. **Fix, in the runbook only:** `poll_seconds = 60` in the reporter
   configuration. Measured afterwards: at most 2 receipt calls in any minute, and the report command about once a minute (the runs' counts also include the runbook's own hand checks).
   Whether a code change is wanted (the older pass need not read at all when no seat is gateway-bound) is the lead's decision; none was made here.
-- **Found: `status` shows neither a report's event id nor its settled total**, and `gateway-adopt` needs the event id. **Fix, in the runbook only:** a small read-only script the runbook writes
-  (`newest-report.py`; it opens the store read-only) prints the newest report's id, number, settled total and age. A `status` field would remove the need; no code was changed.
+- **Found: `status` showed neither a report's event id nor its settled total**, and `gateway-adopt` needs the event id. The first version of the runbook worked around it with a read-only
+  script; the lead decided against reading the database behind `status`'s back (see "Lead decisions before the read").
 - **Confirmed as planned:** one folder under `%LOCALAPPDATA%`; no `pip` (Leasewise runs from the extracted source; `PYTHONDONTWRITEBYTECODE` keeps the folder clean); a `git archive` zip checked
   with `Get-FileHash` before extracting; `serve` on `127.0.0.1` only; the fingerprints compare against `status`'s `report.policy_hashes` (what Leasewise holds); adopt within 120 seconds; the env
   table needs the user's application-data variable, named exactly **`LOCALAPPDATA`** (agenttalk's own path code reads it); the reader never opens the front-token file.
@@ -86,7 +86,26 @@ The real agenttalk program and its two commands (only their documented shapes we
 user's front-token file, the agenttalk version check after the window, **Ctrl-C** (the rehearsal ended the two background processes by process id, which is harsher; the reader restarted cleanly after it),
 and a gateway whose settled money moves while the checks run (the runbook says to compare when it has been quiet for a minute).
 
+## Lead decisions before the read (a change on top of the first version, before Codex's read)
+
+1. **`status` shows the newest report's id and settled total.** `status` already showed other report ids (the adopted report's, `last_quiet`'s, each open item's); only `latest` lacked them, which was
+   an omission. `evidence_view.project`'s `latest` now has **`event_id`** and **`settled_micro_eur`** (the newest report's, as stored). The runbook uses `status` for both and the helper script and its step
+   are gone: step 9 adopts `latest.event_id` and shows `latest.age_ms` in seconds, step 10 compares `latest.settled_micro_eur` with the gateway's own figure. Tests: the test that pins the evidence shape and the
+   test that nothing secret is echoed were updated (the settled total is now shown once, in `latest`; reserved and uncertain still never appear), and one new test checks that the newest report's id and
+   total appear and that `gateway-adopt --evidence <that id>` accepts it. README "Card R1-3d" names the two fields. This is the only product change on this branch.
+2. **The adopt block never resolves open items by itself.** The first version passed `--resolve` for every open item. Now, if `status` lists any open item, the block prints each one's id and kind,
+   says do not adopt and tell the lead, and stops (an error in the operator's window); nothing is adopted. The operator adopts only with no open items, or after the lead has answered for the items named.
+   The step 9 text, the `open_transitions_unnamed` sentence and the `transition_open` row of the table say the same.
+3. **`poll_seconds = 60` is a trial setting, not the reporter's default.** The reason is the older seat-lease receipt pass, which asks the gateway for receipts once per reporter cycle (every 5 seconds
+   by default). The runbook says so. **Backlog for later (no code change now):** that pass need not read at all when no seat is gateway-bound.
+4. **The identity value is passed to `identity-set` as a command argument.** It is visible to the same Windows user and administrators for under a second while that one command runs; the same people can
+   already read `reporter.toml`, so this adds no new reader. The runbook says to close the window afterwards.
+5. **The rehearsal follows the changed blocks and has a new drill: an open item.** The pretend gateway has a `spend` command that raises the money no lease accounts for; Leasewise's real ingest then opens the
+   item `unattributed_rose` (nothing in the store was faked), `status` says `transition_open` with `open_transitions_unnamed` among the blockers, the adopt block prints `open item 1: unattributed_rose` and stops,
+   and the adopted report number does not change. Run twice from a clean start: both passed (281 s each time); on the final tree, timings as before for the shared steps; the new drill adds about a minute
+   (waiting for the next report). The identity value was searched for in everything outside the trial folder (the logs, the window outputs, the gateway folder): 0 files, both runs.
+
 ## Gates
 
-Full suite in four chunks, two at a time: 952 + 390 + 616 + 598 = 2556, plus 16 for `test_card4_ops` through `discover -p` = 2572 = `discover`, all green; the kit is not collected.
+Full suite in four chunks, two at a time: 952 + 390 + 616 + 603 = 2561, plus 16 for `test_card4_ops` through `discover -p` = 2577 = `discover` (2576 before the one new test), all green; the kit is not collected.
 Ruff (the operator's command) 74 findings, bandit 5 low, 18 medium, 1 high, same as main; no `nosec` added.

@@ -8,6 +8,7 @@ carry `charge_period`), from a small made-up ledger file:
     python pretend_gateway.py gateway receipts --after N --limit M --json
     python pretend_gateway.py advance          (rehearsal only: adds one receipt of 450, so the settled money grows and a second report is different;
                                                 the money no lease accounts for does not change, so nothing needs the operator)
+    python pretend_gateway.py spend            (rehearsal only: money no lease accounts for goes up by 25, so Leasewise opens an item for a person)
     python pretend_gateway.py show             (rehearsal only: prints the settled total, for the "passed" comparison)
 
 The ledger file is named by the environment variable PRETEND_LEDGER (a path), or is `pretend-ledger.json` beside this script. It is created on first use.
@@ -100,6 +101,11 @@ def main(argv):
     if args == ["advance"]:
         doc = load()
         doc["receipts"].append({"seq": len(doc["receipts"]) + 1, "actual_micro_eur": 450})      # money a lease accounts for: the unowned part stays the same
+        save(doc)
+        return 0
+    if args == ["spend"]:
+        doc = load()
+        doc["other_spend"] += 25                       # money no lease accounts for goes up: Leasewise opens an item that a person must look at
         save(doc)
         return 0
     if args == ["show"]:

@@ -946,7 +946,7 @@ What exists now:
   adopted it says so in one fixed sentence; **the reason is shown by `status`**, never in the sentence.
 - **`reconcile`** no longer clears anything. It refuses and points to `gateway-adopt`, because clearing a problem now means naming a report.
 - **`status`** has an `evidence` block per gateway that has a version-4 report: its state (`unadopted`, `unapproved`, `usable`, `stale`,
-  `period_mismatch` or `transition_open`), the adopted report, the newest report, the readers and which one is current, the open items with their
+  `period_mismatch` or `transition_open`), the adopted report, the newest report (its id `event_id`, number, age, `quiet` flag and its settled total `settled_micro_eur`, which you compare with the gateway's own figure and whose id is the one `gateway-adopt --evidence` takes), the readers and which one is current, the open items with their
   ids, **`adopt_blockers`** (every reason the newest report cannot be adopted yet), the counters, and `action` (a fixed sentence while something needs
   your decision). Only local ids, random reader identities, numbers and closed words appear.
 - **A read-only builder** turns the usable chain into the input of the billing evaluator. It reads the adopted chain only, never the older report

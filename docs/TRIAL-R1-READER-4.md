@@ -60,14 +60,13 @@ $StateDir   = Join-Path $Trial 'state'                   # the reader's own stat
 $Journal    = Join-Path $Trial 'journal'                 # an empty folder the reader insists on
 $PolicyIds  = Join-Path $Trial 'policy-ids.json'
 $ConfigPath = Join-Path $Trial 'reporter.toml'           # private: it holds the identity value
-$Helper     = Join-Path $Trial 'newest-report.py'
 $Names      = Join-Path $Trial 'names.ps1'
 $BaseUrl    = 'http://127.0.0.1:8443'
 $env:PYTHONDONTWRITEBYTECODE = '1'                       # keeps the source folder clean
 
 New-Item -ItemType Directory -Force $Trial, $StateDir, $Journal, (Split-Path $Store) | Out-Null
 $Saved = foreach ($Name in 'Trial','Py','GatewayExe','GatewayPre','MachineAlias','AccountAlias','GatewayAlias','BudgetMicroEur','ShareMicroEur',
-                  'Archive','ExpectedSha','Src','Store','StateDir','Journal','PolicyIds','ConfigPath','Helper','Names','BaseUrl') {
+                  'Archive','ExpectedSha','Src','Store','StateDir','Journal','PolicyIds','ConfigPath','Names','BaseUrl') {
     $Value = Get-Variable -Name $Name -ValueOnly
     if ($Value -is [array]) { '${0} = @({1})' -f $Name, (($Value | ForEach-Object { "'$_'" }) -join ',') }
     else { '${0} = ''{1}''' -f $Name, $Value }
@@ -198,8 +197,13 @@ Remove-Variable Id, Bytes, ConfigText
 (icacls $ConfigPath) -join "`n"
 ```
 
-Why `poll_seconds = 60`: the reader looks at everything once per cycle, and the default cycle is 5 seconds. With 60, the gateway is asked for its report at most once a
+Why `poll_seconds = 60`: **this is a trial setting, not the reporter's default.** The reader looks at everything once per cycle, and the default cycle is 5 seconds; the older
+seat-lease receipt pass would then ask the gateway for receipts every 5 seconds. With 60, the gateway is asked for its report at most once a
 minute and for receipts about once a minute (measured in the rehearsal; see the step card), and a report is never older than about a minute and a half when you adopt it.
+
+**About the identity value in the command above.** `identity-set` takes the value as a command argument, so for under a second, while that one command runs, the same Windows user and
+administrators can see it in the process list. The same people can already read `reporter.toml`, so this adds no new reader. **Close this PowerShell window when you are done**: the
+value stays in the window's memory until then (the block removes its variables, but closing the window is the sure way).
 
 Why the `LOCALAPPDATA` lines: the reader starts the gateway commands with almost no environment (it passes only `SYSTEMROOT`, `SYSTEMDRIVE`, `PATH`,
 `TEMP` and `TMP`, plus the `env` table you give it). The gateway's program finds the ledger and the user's front-token file under the user's
@@ -281,40 +285,34 @@ $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
 ```
 
 If it prints `blockers=[]`, go on. If it names `not_fresh`, the newest report is older than 120 seconds: wait for the next one and run this block again.
-If it names `open_transitions_unnamed`, the adopt command below names every open item for you.
+If it names `open_transitions_unnamed`, Leasewise has **open items** that a person must look at. The adopt block below stops when there are any, prints them, and does not adopt:
+see "Open items" at the end of this step.
 
-Now the helper that finds the newest report's id. Leasewise's `status` deliberately shows no report id, so this tiny read-only script reads it from the
-store. It changes nothing.
-
-<!-- rehearse: run -->
-```powershell
-$HelperText = @'
-import json, sqlite3, sys, time
-db, alias = sys.argv[1], sys.argv[2]
-conn = sqlite3.connect("file:" + db.replace("\\", "/") + "?mode=ro", uri=True)
-row = conn.execute("SELECT t.event_id, t.seq, t.settled_micro_eur, t.observed_at FROM gateway_totals t JOIN gateways g ON g.id = t.gateway_id "
-                   "WHERE g.alias = ? ORDER BY t.observed_at DESC, t.seq DESC LIMIT 1", (alias,)).fetchone()
-print(json.dumps({"event_id": row[0], "seq": row[1], "settled_micro_eur": row[2], "age_seconds": round(time.time() - row[3] / 1000.0)}))
-'@
-Set-Content -Path $Helper -Value $HelperText -Encoding ascii
-```
-
-Adopt the newest report. **It must be done within 120 seconds of that report**, so this block fetches it and adopts it straight away:
+Adopt the newest report. **It must be done within 120 seconds of that report**, so this block reads the newest report from `status` and adopts it straight away.
+It adopts **only when there are no open items**. If there are any, it prints each one's id and kind and stops without adopting anything.
 
 <!-- rehearse: run -->
 ```powershell
-$New = (& $Py $Helper $Store $GatewayAlias) | ConvertFrom-Json
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
-$Open = @($Gateway.evidence.open_transitions | ForEach-Object { '--resolve'; [string]$_.id })
-"adopting report number $($New.seq), $($New.age_seconds) seconds old"
-& $Py -m quota_balancer --db $Store gateway-adopt --gateway $GatewayAlias --evidence $New.event_id @Open
+$OpenItems = @($Gateway.evidence.open_transitions)
+if ($OpenItems.Count -gt 0) {
+    $OpenItems | ForEach-Object { 'open item {0}: {1}' -f $_.id, $_.kind }
+    throw 'There are open items. Do not adopt. Tell the lead what is listed above.'
+}
+$New = $Gateway.evidence.latest
+'adopting report number {0}, {1} seconds old' -f $New.seq, [math]::Round($New.age_ms / 1000)
+& $Py -m quota_balancer --db $Store gateway-adopt --gateway $GatewayAlias --evidence $New.event_id
 "exit code $LASTEXITCODE"
 ```
 
 When it works it prints the report number and its age (a few seconds), then `{"adoption_id":1}` (the number grows with each adoption), then `exit code 0`. A refusal prints
 one fixed sentence (`ADOPTION_REFUSED ... This report cannot be adopted now. Run status for the reason`; PowerShell may show it in red with extra lines about the
 command: the sentence inside is the message) and `exit code 2`; the **reason** is in `status` (see "If an adopt is refused as too old").
+
+**Open items.** An open item is something Leasewise noticed that a person must decide about (for example, money that no lease accounts for went up). The block never
+resolves one for you, because that is the one place where Leasewise wants a person to look. If the block stops: **do not adopt, and tell the lead what it listed.** You adopt only
+when there are no open items, or after the lead has answered for the items named (the lead will give you the exact command, which names those items on purpose).
 
 ## Step 10: check that it passed
 
@@ -325,13 +323,12 @@ equals the gateway's own. Run this when the gateway has been quiet for a minute 
 ```powershell
 $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
 $Gateway = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
-$New = (& $Py $Helper $Store $GatewayAlias) | ConvertFrom-Json
 $Rep = (& $GatewayExe @GatewayPre gateway report --json) | ConvertFrom-Json
 $Settled = ($Rep.periods | Select-Object -Last 1).committed_micro_eur
 'state={0}  adopted report number={1}' -f $Gateway.evidence.state, $Gateway.evidence.adopted.seq
-'Leasewise settled={0}  gateway settled={1}' -f $New.settled_micro_eur, $Settled
+'Leasewise settled={0}  gateway settled={1}' -f $Gateway.evidence.latest.settled_micro_eur, $Settled
 if ($Gateway.evidence.state -ne 'usable') { throw 'status does not say usable' }
-if ($New.settled_micro_eur -ne $Settled) { throw 'The settled totals differ.' }
+if ($Gateway.evidence.latest.settled_micro_eur -ne $Settled) { throw 'The settled totals differ.' }
 'PASSED'
 ```
 
@@ -404,7 +401,7 @@ Everything the reader cannot do ends in **one closed word**, counted in `reporte
 | `receipts_rolled_back` | the same ledger now reports a lower receipt number than the reader already added (for example a restored ledger copy) | **stop and tell the lead.** Saved sums cannot be taken back; the way out is `reporter reset --confirm` and a new adoption |
 | `period_mismatch` | the gateway reports a month later than this computer's clock | check the clock |
 | `receipts_exceed_settled`, `amount_invalid`, `unattributed_unavailable` | the gateway's figures are damaged or incomplete | nothing is sent; stop; tell the lead |
-| `status` shows `transition_open` | Leasewise saw something change that it wants a person to look at (for example money no lease accounts for went up). Open items are listed in `status` under `open_transitions` | it is not a failure of the reader; do not adopt blindly; tell the lead what `status` lists. An adopt names every open item with `--resolve` (the Step 9 block does this) |
+| `status` shows `transition_open`, or the adopt block stops and lists open items | Leasewise saw something change that it wants a person to look at (for example money no lease accounts for went up). The items are listed in `status` under `open_transitions`, and the adopt block prints them | it is not a failure of the reader. **Do not adopt; tell the lead what is listed.** The adopt block never resolves an item by itself; you adopt only with no open items, or after the lead has answered for the items named |
 | `send_failed` | Leasewise did not answer (is window 1 running?) | the same saved report is sent again; nothing is lost |
 | **`send_refused`** (the reader stopped itself) | Leasewise refused the waiting report five times in a row | see the next paragraph |
 | `continuity_conflict`, `state_unavailable`, `reader_halted` | the saved state is damaged or the reader stopped for good | run `reporter reset --confirm` (it archives the old state and starts a fresh reader identity), then approve and adopt again |

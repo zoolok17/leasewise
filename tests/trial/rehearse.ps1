@@ -20,6 +20,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ExpectStop = $false
 $Started = Get-Date
 if (-not $Runbook) { $Runbook = Join-Path $Repo 'docs\TRIAL-R1-READER-4.md' }
 if (Test-Path $Root) { throw "The rehearsal folder must not exist yet: $Root" }
@@ -109,7 +110,11 @@ $RunBlockSb = {
         default { $BlockText = $BlockArg.Text }
     }
     $ErrorActionPreference = 'Continue'                  # the operator's window is not strict either; the blocks check for themselves and throw
-    $BlockOutput = (. { Invoke-Expression $BlockText } 2>&1 | Out-String)
+    $Collected = New-Object System.Collections.ArrayList
+    $BlockStopped = $false
+    try { . { Invoke-Expression $BlockText } 2>&1 | ForEach-Object { [void]$Collected.Add(($_ | Out-String).TrimEnd()) } }
+    catch { $BlockStopped = $true; [void]$Collected.Add('STOPPED BY THE BLOCK: ' + $_.Exception.Message) }
+    $BlockOutput = ($Collected -join "`n") + "`n"
     $ErrorActionPreference = 'Stop'
     if ($Kind -eq 'window') {
         $WindowExe = (Get-Variable $ExeName -ValueOnly); $WindowArgs = @(Get-Variable $ArgName -ValueOnly)
@@ -123,6 +128,7 @@ $RunBlockSb = {
     }
     $Watch.Stop()
     Say $BlockOutput.TrimEnd()
+    if ($BlockStopped -and -not $ExpectStop) { throw "block $NumberArg stopped, and the rehearsal did not expect it" }
     [void]$Timings.Add([pscustomobject]@{ Block = $NumberArg; Tag = $BlockArg.Tag; Seconds = [math]::Round($Watch.Elapsed.TotalSeconds, 1) })
 }
 
@@ -130,6 +136,13 @@ function Newest-Seq {
     $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
     $G = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
     if ($G.evidence) { return [int]$G.evidence.latest.seq }
+    return 0
+}
+
+function Adopted-Seq {
+    $Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json
+    $G = $Status.gateways | Where-Object { $_.alias -eq $GatewayAlias }
+    if ($G.evidence.adopted) { return [int]$G.evidence.adopted.seq }
     return 0
 }
 
@@ -159,8 +172,8 @@ try {
         $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb
     }
     # step 7 (wait for the first report), step 8 (compare, approve), step 9 (blockers, helper, adopt), step 10 (passed)
-    foreach ($Count in 1..6) { $Block = Next-Block; $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb }
-    # (the 6 blocks: wait, approve, blockers, helper file, adopt, passed)
+    foreach ($Count in 1..5) { $Block = Next-Block; $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb }
+    # (the 5 blocks: wait, approve, blockers, adopt, passed)
     $SeqAfterFirstAdopt = Newest-Seq
     Say "rehearsal: the pretend gateway moves forward (one more receipt, more settled money); waiting for the next report"
     & $Python $Pretend advance
@@ -188,6 +201,21 @@ try {
     if ($global:LASTEXITCODE -ne 0) { throw 'the adopt after waiting for the next report did not work' }
     $PassBlock = $Blocks | Where-Object { $_.Text -match "PASSED" } | Select-Object -First 1
     $Number++; $BlockArg = $PassBlock; $NumberArg = $Number; . $RunBlockSb
+    # the open-item drill: the money no lease accounts for goes up, so Leasewise opens an item; the adopt block must stop, print it and adopt nothing
+    $AdoptedBefore = Adopted-Seq
+    $SeqNow = Newest-Seq
+    Say "rehearsal drill: the pretend gateway's unowned spending goes up; waiting for a report that shows it"
+    & $Python $Pretend spend
+    $Null = Wait-NewReport $SeqNow 150
+    $OpenView = $Blocks | Where-Object { $_.Text -match 'open items=' } | Select-Object -First 1
+    $Number++; $BlockArg = $OpenView; $NumberArg = $Number; . $RunBlockSb          # what the operator sees: transition_open, open items=1 (or more)
+    $ExpectStop = $true
+    $Number++; $BlockArg = $AdoptBlock; $NumberArg = $Number; . $RunBlockSb
+    $ExpectStop = $false
+    if (-not $BlockStopped) { throw 'the adopt block did not stop on an open item' }
+    if ((Adopted-Seq) -ne $AdoptedBefore) { throw 'something was adopted while an open item existed' }
+    if ($BlockOutput -notmatch 'open item \d+: \w+') { throw 'the adopt block did not print the open item' }
+    Say "drill: the adopt block stopped on the open item, printed it, and adopted nothing (adopted report number stayed $AdoptedBefore)"
     # "if something goes wrong": the closed-word view of the reader
     $StatusBlock = $Blocks | Where-Object { $_.Text -match 'reporter status' } | Select-Object -First 1
     $Number++; $BlockArg = $StatusBlock; $NumberArg = $Number; . $RunBlockSb

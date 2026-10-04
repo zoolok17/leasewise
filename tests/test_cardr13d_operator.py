@@ -544,6 +544,17 @@ class Status(_Op):
         self.assertIn("evidence", by_alias["g1"])
         self.assertNotIn("evidence", by_alias["g2"])
 
+    def test_the_newest_reports_id_and_settled_total_are_shown_and_adopt_accepts_that_id(self):
+        self.approve()
+        item = self.send(rep(seq=1, settled_micro_eur=4321))
+        latest = self.evidence()["latest"]
+        self.assertEqual((latest["event_id"], latest["settled_micro_eur"], latest["seq"]), (item["event_id"], 4321, 1))
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:                                  # the same figure as the stored report
+            self.assertEqual(conn.execute("SELECT settled_micro_eur FROM gateway_totals WHERE event_id=?", (latest["event_id"],)).fetchone(), (4321,))
+        self.adopt({"event_id": latest["event_id"]})                                              # the id from `status` is the one `gateway-adopt` takes
+        block = self.evidence()
+        self.assertEqual((block["state"], block["adopted"]["event_id"]), ("usable", item["event_id"]))
+
     def test_the_keys_are_closed_and_include_the_two_information_figures_of_r1_3e(self):
         self.send(rep(seq=1))
         block = self.evidence()
@@ -578,11 +589,12 @@ class Status(_Op):
 
     def test_every_block_after_an_adoption_and_a_busy_report(self):
         first = self.first()
-        self.send(rep(seq=2, quiet=False, held_over_reservation=3, reconciliation_required=True, obs=OBS + 2000))
+        second = self.send(rep(seq=2, quiet=False, held_over_reservation=3, reconciliation_required=True, obs=OBS + 2000))
         block = self.evidence(now=OBS + 4000)
         self.assertEqual(block["adopted"], {"event_id": first["event_id"], "reader_incarnation": INC, "seq": 1, "epoch": 1,
                                             "period_start": SEP, "adopted_at": NOW, "kind": "operator"})
-        self.assertEqual(block["latest"], {"seq": 2, "observed_at": OBS + 2000, "age_ms": 2000, "quiet": False, "held_over_reservation": 3})
+        self.assertEqual(block["latest"], {"event_id": second["event_id"], "seq": 2, "observed_at": OBS + 2000, "age_ms": 2000, "quiet": False,
+                                           "held_over_reservation": 3, "settled_micro_eur": 5000})
         self.assertEqual(block["readers"], [{"reader_incarnation": INC, "state": "current", "first_seen_at": block["readers"][0]["first_seen_at"]}])
         self.assertEqual(block["last_quiet"], {"event_id": first["event_id"], "unattributed": 7})
         self.assertEqual([t["kind"] for t in block["open_transitions"]], ["reported_by_gateway"])
@@ -622,8 +634,10 @@ class Status(_Op):
             if isinstance(node, list):
                 return [n for v in node for n in numbers(v)]
             return [node] if isinstance(node, int) and not isinstance(node, bool) else []
-        for amount in (5000, 200, 30):                                      # settled, reserved, uncertain of the fixture reports
+        for amount in (200, 30):                                            # reserved and uncertain of the fixture reports: never shown
             self.assertNotIn(amount, numbers(block))
+        self.assertEqual(numbers(block["latest"]).count(5000), 1)           # the settled total is shown once, in `latest`, for the operator to compare
+        self.assertNotIn(5000, numbers({key: value for key, value in block.items() if key != "latest"}))
         for sentence in (errors.MSG_ADOPTION_REFUSED, errors.MSG_EVIDENCE_REQUIRED, evidence_view.ACTION_SENTENCE):
             self.assertTrue(sentence.isascii())
             for value in (PRICE, CAP, INC):

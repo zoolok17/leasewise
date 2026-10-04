@@ -217,7 +217,8 @@ def coverage(conn, gateway_id, latest):
 
 def project(conn, gateway_id, now_ms):
     """The `evidence` object of `status` for one gateway (8.3), or None when it has no version-4 report. Only numbers, closed words,
-    local aliases' ids and random identities: no amount other than the quiet figure, no hash, no path."""
+    local aliases' ids and random identities: no amount other than the quiet figure and the newest report's settled total (which the operator
+    compares with the gateway's own), no hash, no path."""
     latest = newest_report(conn, gateway_id)
     if latest is None:
         return None
@@ -238,8 +239,9 @@ def project(conn, gateway_id, now_ms):
         "state": state,
         "approved": _approved(conn, gateway_id, latest),
         "adopted": adopted,
-        "latest": {"seq": latest["seq"], "observed_at": latest["observed_at"], "age_ms": now_ms - latest["observed_at"],
-                   "quiet": bool(latest["quiet"]), "held_over_reservation": latest["held_over_reservation"]},
+        "latest": {"event_id": latest["event_id"], "seq": latest["seq"], "observed_at": latest["observed_at"],
+                   "age_ms": now_ms - latest["observed_at"], "quiet": bool(latest["quiet"]),
+                   "held_over_reservation": latest["held_over_reservation"], "settled_micro_eur": latest["settled_micro_eur"]},
         "readers": [{"reader_incarnation": r[0], "state": r[1], "first_seen_at": r[2]} for r in conn.execute(
             "SELECT reader_incarnation, state, first_seen_at FROM gateway_readers WHERE gateway_id=? "
             "ORDER BY first_seen_at, reader_incarnation", (gateway_id,))],
