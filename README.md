@@ -658,7 +658,8 @@ What is new:
   owner (re-checked under the lock) can create one, only when the stored report belongs to the same gateway, incarnation and epoch, and a repeat
   adds nothing. A collision from a reader marked `retired` is only counted. Nothing in this step resolves or overwrites a transition.
 
-**Nothing reads these rows until card R1-3c, so no seat, lease or admission decision changes. No reader sends version 4 live until card
+**No evidence consumer uses these rows for `status` or for any admission decision yet (ingest itself reads them, for its identity checks and
+for the transitions card R1-3c writes), so no seat, lease or admission decision changes. No reader sends version 4 live until card
 R1-READER closes its start-up and continuity check (D1).** Design note: `DESIGN-R1-3.md`, revision 2, sections 1.3 and 3.
 
 ### Technical detail (R1-3b)
@@ -668,6 +669,45 @@ required hashes. `http_api._wire_to_reading` marks a snapshot that names a `read
 totals and epoch rows; `store._record_collisions` (after a `ROLLBACK TO` the savepoint taken at the start of the import, inside the same
 transaction) writes the record, and `store._after_collision_record` is the fault-injection point. Tests: `tests/test_cardr13b_ingest.py`.
 Record: `docs/STEP-CARD-R1-3B.md`.
+
+## Card R1-3c - what a gateway report means for trust: the rules, and the transitions written at ingest
+
+In plain words: Leasewise now decides, for every version-4 gateway report that arrives, **what it means for trust**, and writes down any problem
+it shows, once. The decisions are a set of small rules that look at no database (`quota_balancer/evidence.py`); ingest feeds them the facts and
+writes what they return. **Only `status` will see the result (card R1-3d adds the block). No seat, lease or admission decision changes, and no
+operator command exists yet.**
+
+What the rules decide, in this order:
+
+1. **A report from a retired reader** is kept as history and counted. It creates no transition of any kind, on every path.
+2. **A clash of identity is a conflict, whatever arrived first.** The same (gateway, reader, epoch, number) with different content is a
+   `sequence_conflict`; the same (reader, epoch) with another generation is an `epoch_generation_mismatch`.
+3. **Then order.** The same number and content is a duplicate; an older epoch or older month of the current reader is old; a lower number is
+   late. These are counted and ignored.
+4. **Then what an in-order report shows:** a gateway that says it is on hold (`reported_by_gateway`), a new epoch, a changed fingerprint, a fall
+   of `settled` (checked on every report), and, **on quiet reports only**, a fall of `unattributed` or a rise of it above the adopted report.
+5. **The month roll.** The first quiet report of a new month rolls the chain on its own (a `period_roll` adoption with no operator) only if it is
+   from the same reader, epoch and generation, carries the approved pair, and **nothing is open**. A report that says "on hold" is decided before
+   any roll, so it blocks it.
+
+Readers: the first reader seen for a gateway with no adoption is `pending` and raises nothing; a new reader after an adoption raises one
+`reader_changed`. Whatever makes a reader `current` retires the old current one first.
+
+Stated limits and choices:
+
+- **A state kind is written once while it is open** (`reported_by_gateway`, `epoch_changed`, the two fingerprint changes, `unattributed_rose`);
+  an event kind (a fall, a conflict, a new reader) is written for each report that shows it. Nothing here resolves or overwrites a transition.
+- With **no adoption** there is no chain to differ from, so a gateway that has never been adopted raises only the identity kinds, which never
+  need a chain; a later adoption names what is open.
+- A busy gateway has an evidence gap at the start of each month until its first quiet report.
+
+### Technical detail (R1-3c)
+
+`evidence.assess(report, state)` returns the standing, the transitions, a counter, whether to create a reader row, whether the report becomes the
+last quiet one, and whether to roll. `store._evidence_state` reads the facts before the report is stored; `store._apply_assessment` writes the
+result; `store._roll_period`, `store._promote_reader` (retire first, then promote) and `store._reader_state` / `store._count_retired_report` (the
+one retired-reader classification, shared with the collision record) are the writers. `billing_eval._gateway_usable` stays a second line of
+defence: a version-4 chain must be one reader, generation and month. Tests: `tests/test_cardr13c_evidence.py`. Record: `docs/STEP-CARD-R1-3C.md`.
 
 ## Card 7a-2 - the reporter core
 

@@ -445,6 +445,9 @@ def _gateway_usable(ctx, now_ms, *, require_fresh=True):
 
     Reconcile state is authoritative; history validates continuity but does
     not re-latch a cleared transition. Other chains never supply money.
+
+    A second line of defence behind the store's own decisions (card R1-3c): the chain it is given starts at the adoption report
+    itself (a chain of that one report is a whole chain) and must be ONE reader's, in one epoch, generation and month.
     """
     by_id = {r["event_id"]: r for r in ctx["readings"]}
     unresolved = set(ctx["unresolved_event_ids"])
@@ -465,6 +468,8 @@ def _gateway_usable(ctx, now_ms, *, require_fresh=True):
             event = by_id[row[5]]
             payload = event["payload"]
             key = (event["machine"], payload["ledger_epoch"], payload["policy_hashes"])
+            if "reader_incarnation" in payload:                  # a version-4 report: one reader, one generation, one month
+                key += (payload["reader_incarnation"], payload["generation"], payload["period_start"])
             if identity is not None and key != identity:
                 return False
             identity = key

@@ -46,7 +46,7 @@ from .reduce import (
     reduce_window,
     window_freshness,
 )
-from . import money
+from . import evidence, money
 from .policy_config import apply_policy
 from .validate import validate
 from .validate_config_v2 import VERSION as CONFIG_V2, validate_v2
@@ -853,31 +853,152 @@ def _after_collision_record(conn):
     """A fault-injection point (a test replaces it): after the collision record is written and before it is committed."""
 
 
-def _note_transition(conn, gateway_id, kind, event_id, now_ms, conflict=(None, None, None)):
+def _note_transition(conn, gateway_id, kind, event_id, now_ms, conflict=(None, None, None), target=None):
     """Write one transition row (card R1-3b), once: the unique key (gateway, kind, event) makes a repeat a no-op. Nothing here
-    resolves or overwrites a transition. `conflict` is the incarnation, epoch and seq that collided (a conflict kind only)."""
+    resolves or overwrites a transition. `conflict` is the incarnation, epoch and seq that collided (a conflict kind only);
+    `target` is the reader a `reader_changed` is about (one row per reader, by its own unique key)."""
     chain = conn.execute("SELECT current_adoption_id FROM gateway_chain_state WHERE gateway_id=?", (gateway_id,)).fetchone()
     conn.execute(
-        "INSERT OR IGNORE INTO gateway_transitions(gateway_id, kind, event_id, adoption_id, conflict_incarnation, "
-        "conflict_epoch, conflict_seq, detected_at) VALUES(?,?,?,?,?,?,?,?)",
-        (gateway_id, kind, event_id, None if chain is None else chain[0], conflict[0], conflict[1], conflict[2], now_ms))
+        "INSERT OR IGNORE INTO gateway_transitions(gateway_id, kind, event_id, adoption_id, target_incarnation, "
+        "conflict_incarnation, conflict_epoch, conflict_seq, detected_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (gateway_id, kind, event_id, None if chain is None else chain[0], target, conflict[0], conflict[1], conflict[2], now_ms))
+
+
+def _reader_state(conn, gateway_id, incarnation):
+    """The state of a reader in `gateway_readers` (`pending`, `current`, `retired`), or None if it has no row. The ONE place a writer
+    asks whether a reader is retired: a report of a retired reader is kept and counted and creates no transition of any kind."""
+    row = conn.execute("SELECT state FROM gateway_readers WHERE gateway_id=? AND reader_incarnation=?",
+                       (gateway_id, incarnation)).fetchone()
+    return None if row is None else row[0]
+
+
+def _count_retired_report(conn, gateway_id):
+    conn.execute("INSERT OR IGNORE INTO gateway_chain_state(gateway_id) VALUES(?)", (gateway_id,))
+    conn.execute("UPDATE gateway_chain_state SET retired_reader_reports = retired_reader_reports + 1 WHERE gateway_id=?", (gateway_id,))
+
+
+# One fixed statement per counter: the names are never built into SQL text.
+_COUNTER_SQL = {
+    "late_reports": "UPDATE gateway_chain_state SET late_reports = late_reports + 1 WHERE gateway_id=?",
+    "old_chain_reports": "UPDATE gateway_chain_state SET old_chain_reports = old_chain_reports + 1 WHERE gateway_id=?",
+    "duplicate_reports": "UPDATE gateway_chain_state SET duplicate_reports = duplicate_reports + 1 WHERE gateway_id=?",
+}
+
+
+def _promote_reader(conn, gateway_id, incarnation, adoption_id, now_ms):
+    """Make one reader `current` (card R1-3c; adoption in R1-3d uses the same step). The old `current` reader and every `pending` one
+    is RETIRED FIRST, because the unique index on `current` is immediate; only then is the chosen reader promoted. A retired reader
+    never becomes current again, so a promotion of one is refused here as a fault."""
+    if _reader_state(conn, gateway_id, incarnation) == "retired":
+        raise QuotaError(CODE_STORE_ERROR, MSG_STORE_FAILED)
+    conn.execute(
+        "UPDATE gateway_readers SET state='retired', retired_at=?, decided_by_adoption=? "
+        "WHERE gateway_id=? AND reader_incarnation<>? AND state IN ('current','pending')",
+        (now_ms, adoption_id, gateway_id, incarnation))
+    conn.execute("UPDATE gateway_readers SET state='current', decided_by_adoption=?, retired_at=NULL "
+                 "WHERE gateway_id=? AND reader_incarnation=?", (adoption_id, gateway_id, incarnation))
+
+
+def _evidence_state(conn, gateway_id, report):
+    """Read, before the report is stored, the facts `evidence.assess` needs (card R1-3c)."""
+    inc, epoch = report.incarnation, report.epoch
+    chain = conn.execute("SELECT current_adoption_id, last_quiet_unattributed FROM gateway_chain_state WHERE gateway_id=?",
+                         (gateway_id,)).fetchone()
+    adoption_id = None if chain is None else chain[0]
+    adoption = None
+    if adoption_id is not None:
+        row = conn.execute(
+            "SELECT reader_incarnation, ledger_epoch, generation, period_start, seq, settled_micro_eur, unattributed_micro_eur, "
+            "price_hash, child_cap_hash FROM gateway_adoptions WHERE id=?", (adoption_id,)).fetchone()
+        adoption = evidence.Adoption(*row)
+    generation = conn.execute("SELECT generation FROM gateway_epochs WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=?",
+                              (gateway_id, inc, epoch)).fetchone()
+    same_seq = tuple(
+        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]), r[8], r[9], r[10], bool(r[11])) for r in conn.execute(
+            "SELECT period_start, period_end, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, "
+            "receipts_seq, quiet, held_over_reservation, price_hash, child_cap_hash, gateway_flag FROM gateway_totals "
+            "WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? AND seq=?", (gateway_id, inc, epoch, report.seq)))
+    max_seq = conn.execute("SELECT MAX(seq) FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=?",
+                           (gateway_id, inc, epoch)).fetchone()[0]
+    # The highest `settled` already seen in this report's own month (same reader, epoch, generation and month): `settled` is cumulative
+    # within every month, also before that month's adoption, so a fall is caught before any roll adopts the lower figure. In the adopted
+    # chain the adopted report itself is the floor; in any other month the first report is compared with nothing (the month reset).
+    floor, adopted = 0, None
+    if adoption is not None and (inc, epoch, report.generation, report.period_start) == (
+            adoption.incarnation, adoption.epoch, adoption.generation, adoption.period_start):
+        floor, adopted = adoption.seq, adoption.settled
+    row = conn.execute(
+        "SELECT MAX(settled_micro_eur) FROM gateway_totals WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=? "
+        "AND generation=? AND period_start=? AND seq>=? AND seq<?",
+        (gateway_id, inc, epoch, report.generation, report.period_start, floor, report.seq)).fetchone()[0]
+    previous = max((v for v in (adopted, row) if v is not None), default=None)
+    open_kinds = frozenset(r[0] for r in conn.execute(
+        "SELECT DISTINCT kind FROM gateway_transitions WHERE gateway_id=? AND resolved_by_adoption IS NULL", (gateway_id,)))
+    approved = conn.execute("SELECT 1 FROM gateway_approvals WHERE gateway_id=? AND price_hash=? AND child_cap_hash=?",
+                            (gateway_id, report.price_hash, report.child_cap_hash)).fetchone() is not None
+    return evidence.State(
+        _reader_state(conn, gateway_id, inc), adoption, None if generation is None else generation[0], same_seq, max_seq,
+        previous, None if chain is None else chain[1], open_kinds, approved)
+
+
+def _apply_assessment(conn, gateway_id, report, assessment, now_ms):
+    """Write what `evidence.assess` decided, once, at ingest (card R1-3c). Nothing is recomputed from history and nothing is resolved."""
+    if assessment.standing == evidence.STANDING_RETIRED:
+        _count_retired_report(conn, gateway_id)                       # kept as history and counted; no transition of any kind
+        return
+    if assessment.create_reader:
+        conn.execute("INSERT INTO gateway_readers(gateway_id, reader_incarnation, first_event_id, first_seen_at, state) "
+                     "VALUES(?,?,?,?,'pending')", (gateway_id, report.incarnation, report.event_id, now_ms))
+    for kind, conflict in assessment.transitions:
+        _note_transition(conn, gateway_id, kind, report.event_id, now_ms, conflict or (None, None, None),
+                         report.incarnation if kind == evidence.KIND_READER_CHANGED else None)
+    if assessment.counter is not None or assessment.remember_quiet or assessment.roll:
+        conn.execute("INSERT OR IGNORE INTO gateway_chain_state(gateway_id) VALUES(?)", (gateway_id,))
+    if assessment.counter is not None:
+        conn.execute(_COUNTER_SQL[assessment.counter], (gateway_id,))
+    if assessment.remember_quiet:
+        conn.execute("UPDATE gateway_chain_state SET last_quiet_event_id=?, last_quiet_unattributed=? WHERE gateway_id=?",
+                     (report.event_id, report.unattributed, gateway_id))
+    if assessment.roll:
+        _roll_period(conn, gateway_id, report, now_ms)
+
+
+def _roll_period(conn, gateway_id, report, now_ms):
+    """The automatic month roll (DESIGN-R1-3.md 4.4): a `period_roll` adoption whose baseline is the report, no operator. The same
+    reader stays current (the old current is retired before the promotion, as in every writer of `current`)."""
+    previous = conn.execute("SELECT current_adoption_id FROM gateway_chain_state WHERE gateway_id=?", (gateway_id,)).fetchone()[0]
+    adoption_id = conn.execute(
+        "INSERT INTO gateway_adoptions(gateway_id, event_id, reader_incarnation, ledger_epoch, generation, period_start, seq, "
+        "settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, price_hash, child_cap_hash, "
+        "adopted_at, operator, kind, prev_adoption_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'period_roll',?)",
+        (gateway_id, report.event_id, report.incarnation, report.epoch, report.generation, report.period_start, report.seq,
+         report.settled, report.reserved, report.uncertain, report.unattributed, report.price_hash, report.child_cap_hash,
+         now_ms, previous)).lastrowid
+    _promote_reader(conn, gateway_id, report.incarnation, adoption_id, now_ms)
+    conn.execute("UPDATE gateway_chain_state SET current_adoption_id=?, last_quiet_event_id=?, last_quiet_unattributed=? "
+                 "WHERE gateway_id=?", (adoption_id, report.event_id, report.unattributed, gateway_id))
+    conn.execute("INSERT INTO audit(actor_alias, action, object_id, at, redacted_details) VALUES(?,?,?,?,?)",
+                 ("coordinator", "gateway_period_roll", report.event_id, now_ms, json.dumps({"adoption_id": adoption_id})))
 
 
 def _record_report_v4(conn, reading, gateway_id, now_ms):
-    """Keep a version-4 gateway report (card R1-3b): record its (reader incarnation, epoch) with its generation, and copy it into
-    `gateway_totals`. The same (gateway, incarnation, epoch) with another generation is the identity conflict of the design
-    (`epoch_generation_mismatch`): it is recorded as such and the first mapping stays. Nothing reads these rows until R1-3c."""
+    """Keep a version-4 gateway report and decide what it means (cards R1-3b and R1-3c): record its (reader incarnation, epoch) with
+    its generation, copy it into `gateway_totals`, and write the transitions `evidence.assess` returns. The same (gateway,
+    incarnation, epoch) with another generation is the identity conflict of the design (`epoch_generation_mismatch`): the first
+    mapping stays. A report of a retired reader is kept and counted and creates no transition. Only `status` will read the result."""
     event_id = reading["event_id"]
     incarnation, epoch, generation = reading["reader_incarnation"], reading["ledger_epoch"], reading["generation"]
-    known = conn.execute(
-        "SELECT generation FROM gateway_epochs WHERE gateway_id=? AND reader_incarnation=? AND ledger_epoch=?",
-        (gateway_id, incarnation, epoch)).fetchone()
-    if known is None:
+    hashes = reading["policy_hashes"]
+    report = evidence.Report(
+        event_id, incarnation, epoch, generation, reading["seq"], reading["period_start"], reading["period_end"],
+        reading["settled_micro_eur"], reading["reserved_micro_eur"], reading["uncertain_micro_eur"], reading["unattributed_micro_eur"],
+        reading["receipts_seq"], bool(reading["quiet"]), reading["held_over_reservation"], hashes["price"], hashes["child_cap"],
+        bool(reading["reconciliation_required"]))
+    state = _evidence_state(conn, gateway_id, report)
+    assessment = evidence.assess(report, state)
+    if state.generation is None:
         conn.execute("INSERT INTO gateway_epochs(gateway_id, reader_incarnation, ledger_epoch, generation, first_event_id) "
                      "VALUES(?,?,?,?,?)", (gateway_id, incarnation, epoch, generation, event_id))
-    elif known[0] != generation:
-        _note_transition(conn, gateway_id, "epoch_generation_mismatch", event_id, now_ms, (incarnation, epoch, reading["seq"]))
-    hashes = reading["policy_hashes"]
     conn.execute(
         "INSERT INTO gateway_totals(event_id, gateway_id, reader_incarnation, ledger_epoch, generation, seq, period_start, "
         "period_end, settled_micro_eur, reserved_micro_eur, uncertain_micro_eur, unattributed_micro_eur, receipts_seq, quiet, "
@@ -888,6 +1009,7 @@ def _record_report_v4(conn, reading, gateway_id, now_ms):
          reading["unattributed_micro_eur"], reading["receipts_seq"], 1 if reading["quiet"] else 0,
          reading["held_over_reservation"], hashes["price"], hashes["child_cap"],
          1 if reading["reconciliation_required"] else 0, reading["observed_at"], now_ms))
+    _apply_assessment(conn, gateway_id, report, assessment, now_ms)
 
 
 def _record_collisions(conn, readings, now_ms):
@@ -922,12 +1044,8 @@ def _record_collisions(conn, readings, now_ms):
         if (report is None or report[0] != gateway_id or report[1] != reading["reader_incarnation"]
                 or report[2] != reading["ledger_epoch"]):
             continue                                                   # no provenance: the stored report is not this reader's
-        reader = conn.execute("SELECT state FROM gateway_readers WHERE gateway_id=? AND reader_incarnation=?",
-                              (gateway_id, reading["reader_incarnation"])).fetchone()
-        if reader is not None and reader[0] == "retired":
-            conn.execute("INSERT OR IGNORE INTO gateway_chain_state(gateway_id) VALUES(?)", (gateway_id,))
-            conn.execute("UPDATE gateway_chain_state SET retired_reader_reports = retired_reader_reports + 1 WHERE gateway_id=?",
-                         (gateway_id,))
+        if _reader_state(conn, gateway_id, reading["reader_incarnation"]) == "retired":
+            _count_retired_report(conn, gateway_id)
             continue
         _note_transition(conn, gateway_id, "sequence_conflict", reading["event_id"], now_ms,
                          (report[1], report[2], report[3]))
