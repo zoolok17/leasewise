@@ -57,6 +57,9 @@ CODE_SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"                  # 503
 # Card R1-M part 2, fix round 2 (D-177): accounts that share one money cap declare different cap bases (with VAT and without),
 # so their spending cannot be added into one number. A configuration conflict, refused at admission.
 CODE_CAP_BASIS_CONFLICT = "CAP_BASIS_CONFLICT"                    # 409
+# Card R1-3d (DESIGN-R1-3.md 8.1): the operator's evidence commands. Both are CLI-only (no HTTP route) and exit 2.
+CODE_ADOPTION_REFUSED = "ADOPTION_REFUSED"                        # the report named cannot be adopted now
+CODE_EVIDENCE_REQUIRED = "EVIDENCE_REQUIRED"                      # `reconcile` without a named report
 
 # Card 5 private-HTTP transport errors (docs/DESIGN.md sections 6-7).
 # These never occur off the HTTP transport (there is no CLI request to
@@ -108,6 +111,8 @@ EXIT_CODES = {
     CODE_RECONCILIATION_REQUIRED: 2,
     CODE_SERVICE_UNAVAILABLE: 3,
     CODE_CAP_BASIS_CONFLICT: 2,
+    CODE_ADOPTION_REFUSED: 2,
+    CODE_EVIDENCE_REQUIRED: 2,
 }
 
 MSG_INVALID_CONFIG = "config document is invalid"
@@ -151,6 +156,9 @@ MSG_METER_STALE = "the usage evidence is too old to decide; wait for a fresh rep
 MSG_RECONCILIATION_REQUIRED = "the gateway needs an operator reconciliation before this request can be decided"
 MSG_SERVICE_UNAVAILABLE = "the coordinator cannot answer right now; try again later"
 MSG_CAP_BASIS_CONFLICT = "accounts that share a spending cap declare different cap bases; give them all the same cap basis"
+# Card R1-3d. The reason for a refused adoption is never in the sentence: `status` shows it as a closed word (`adopt_blockers`).
+MSG_ADOPTION_REFUSED = "This report cannot be adopted now. Run `status` for the reason, then name the newest current report."
+MSG_EVIDENCE_REQUIRED = "Naming a report is now required. Use `gateway-adopt` with `--evidence`."
 
 # Every code and its fixed message, in one place: a test checks that no code is missing here and that no two
 # codes say the same thing.
@@ -192,6 +200,8 @@ MESSAGES = {
     CODE_RECONCILIATION_REQUIRED: MSG_RECONCILIATION_REQUIRED,
     CODE_SERVICE_UNAVAILABLE: MSG_SERVICE_UNAVAILABLE,
     CODE_CAP_BASIS_CONFLICT: MSG_CAP_BASIS_CONFLICT,
+    CODE_ADOPTION_REFUSED: MSG_ADOPTION_REFUSED,
+    CODE_EVIDENCE_REQUIRED: MSG_EVIDENCE_REQUIRED,
 }
 
 

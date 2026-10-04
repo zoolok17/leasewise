@@ -83,6 +83,11 @@ all five refusal tests that describe a refusal, both `Saturate` tests, and the q
 the billing-history alignment-and-unrelated test and the historical-hold case. The other three (a repairing import, a second conflicting scope,
 and the old cap can still be removed) describe behaviour that is the same before and after.
 
+**The baselines, by commit (named in card R1-3d, M-021 C1(c)).** The test file used for both counts is the one of the fix round, `185489e`
+(`tests/test_cardr1_money_fu.py`, 18 methods). Run against `c48ee96` (main before the card, the merge of R1-M part 2) it gives 14 failures and 2 errors,
+the first-build count above. Run against `45c09ec` (the first build, before the fix) it gives 7 errors, the fix-round count above. Both were re-run
+for this note.
+
 ## Existing tests
 
 **One file moved, for a stated reason.** `tests/test_cardr1_money_capbasis.py` built its mixed set-up through the public imports, which now

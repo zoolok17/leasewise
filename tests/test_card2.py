@@ -582,7 +582,8 @@ class GatewayReportReducer(_Base):
 
     def test_reconciliation_sticky_epoch(self):
         # M2: an epoch change sets reconciliation_required, and it stays set
-        # until the operator's explicit reconcile verb clears it; a matching
+        # until the operator clears it by adopting a named report
+        # (`gateway-adopt`, card R1-3d; the old `reconcile` now refuses); a matching
         # later report does NOT clear it.
         now = _now_ms()
         hashes = {"price": PRICE_HASH, "child_cap": CAP_HASH}
@@ -603,10 +604,11 @@ class GatewayReportReducer(_Base):
         reports = {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
         self.assertEqual(reports["g1"]["state"], "reconciliation_required")
 
-        # Only the explicit operator verb clears it.
-        self.assertEqual(_reconcile(self.db, "g1").returncode, 0)
+        # The old evidence-free verb is refused now (card R1-3d) and clears nothing: only `gateway-adopt` naming a report does
+        # (tests/test_cardr13d_operator.py clears this same sticky state that way).
+        self.assertEqual(_reconcile(self.db, "g1").returncode, 2)
         reports = {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
-        self.assertEqual(reports["g1"]["state"], "ok")
+        self.assertEqual(reports["g1"]["state"], "reconciliation_required")
 
     def test_reconciliation_sticky_hash(self):
         # M2: a policy-hash change (same epoch) sets reconciliation_required,
@@ -630,9 +632,9 @@ class GatewayReportReducer(_Base):
                                     now - 3000, policy_hashes=h2)])).returncode, 0)
         reports = {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
         self.assertEqual(reports["g1"]["state"], "reconciliation_required")
-        self.assertEqual(_reconcile(self.db, "g1").returncode, 0)
+        self.assertEqual(_reconcile(self.db, "g1").returncode, 2)        # refused (card R1-3d); `gateway-adopt` clears it, see the new tests
         reports = {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
-        self.assertEqual(reports["g1"]["state"], "ok")
+        self.assertEqual(reports["g1"]["state"], "reconciliation_required")
 
     def test_gateway_report_bound_to_owner(self):
         # m2: a gateway report binds to its owner. Section 5: both sources
@@ -1045,7 +1047,7 @@ class ConfigImportRepoint(_Base):
     owner's first report (a new ledger, typically seq 1) be dropped as a
     smaller seq, then accepted as a continuation without reconciliation.
     The new owner's seq 1 must be accepted and the gateway must stay
-    reconciliation_required until an operator runs reconcile."""
+    reconciliation_required until an operator adopts a named report (`gateway-adopt`)."""
 
     def _reports(self):
         return {g["alias"]: g["report"] for g in self._status_json()["gateways"]}
@@ -1079,7 +1081,7 @@ class ConfigImportRepoint(_Base):
         # The new owner's first report (a new ledger, seq 1) is neither
         # silently dropped as a smaller seq nor silently continued: it is
         # accepted, and the gateway stays reconciliation_required until an
-        # operator runs reconcile.
+        # operator adopts a named report (`gateway-adopt`).
         self.assertEqual(_readings_import(self.db, self.tmp,
             _doc([_gateway_snapshot(_eid("rp2"), "worker", "meter", "g1", 7, 1,
                                      now - 500,

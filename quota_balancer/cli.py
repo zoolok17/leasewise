@@ -1,6 +1,7 @@
 """Command line interface: init, config-import --file,
 billing-policy-import --file, status --json, reading-import --file,
-set-coverage --account --complete, reconcile --gateway (Cards 1-2b-1)."""
+set-coverage --account --complete, reconcile --gateway (Cards 1-2b-1), and the operator's evidence commands
+gateway-approve and gateway-adopt (card R1-3d); `reconcile` now only refuses and points to `gateway-adopt`."""
 
 import argparse
 import json
@@ -14,6 +15,8 @@ from .http_api import DEFAULT_HOST, BindRefused, make_server
 from .lease import block_clear, expire_sweep
 from .store import (
     billing_policy_import,
+    gateway_adopt,
+    gateway_approve,
     import_config,
     init_db,
     reading_import,
@@ -77,9 +80,24 @@ def _build_parser():
                           help="the coverage_complete value: 'true' or 'false'")
     recon = sub.add_parser(
         "reconcile",
-        help="clear a gateway's reconciliation_required state (operator-only)",
+        help="refused: naming a report is required; use gateway-adopt --evidence",
     )
     recon.add_argument("--gateway", required=True, help="gateway alias")
+    approver = sub.add_parser(
+        "gateway-approve",
+        help="approve a gateway's pair of policy fingerprints (operator-only, audited)")
+    approver.add_argument("--gateway", required=True, help="gateway alias")
+    approver.add_argument("--price-hash", required=True, help="64 lowercase hex characters")
+    approver.add_argument("--child-cap-hash", required=True, help="64 lowercase hex characters")
+    adopter = sub.add_parser(
+        "gateway-adopt",
+        help="adopt a quiet report as the gateway's baseline, choose its reader and "
+             "resolve the open items it names (operator-only, audited)")
+    adopter.add_argument("--gateway", required=True, help="gateway alias")
+    adopter.add_argument("--evidence", required=True, help="the event id of the report to adopt")
+    # A string, not `type=int`: a rejected value must not be echoed back by argparse.
+    adopter.add_argument("--resolve", action="append", default=[],
+                         help="the id of an open item to resolve; repeat it to name every open item")
     identity = sub.add_parser(
         "identity-set",
         help="enroll/update a machine's HTTP identity allowlist entry (operator-only)",
@@ -133,6 +151,12 @@ def main(argv=None):
             set_coverage(args.db, args.account, args.complete)
         elif args.verb == "reconcile":
             reconcile(args.db, args.gateway)
+        elif args.verb == "gateway-approve":
+            gateway_approve(args.db, args.gateway, args.price_hash, args.child_cap_hash)
+            print(json.dumps({"approved": True}, separators=(",", ":")))
+        elif args.verb == "gateway-adopt":
+            print(json.dumps({"adoption_id": gateway_adopt(args.db, args.gateway, args.evidence, args.resolve)},
+                             separators=(",", ":")))
         elif args.verb == "identity-set":
             set_machine_identity(args.db, args.machine, args.identity_ref,
                                  args.enabled)
