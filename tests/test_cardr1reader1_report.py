@@ -289,11 +289,6 @@ class ReceiptPage(unittest.TestCase):
                     receipts.parse_page(raw(doc), 0, month_rows=True)
                 self.assertEqual(caught.exception.args[0], word)
 
-    def test_the_only_caller_of_the_page_reader_still_reads_existing_rows(self):
-        """Compatibility finding (see the step record): `reporter/run.py` reads existing rows and would refuse a gateway on 921c82d4."""
-        with open(receipts.__file__.replace("receipts.py", "run.py"), encoding="utf-8") as handle:
-            self.assertIn("receipts.read_page(source, after, self.stop)", handle.read())
-
 
 # agenttalk's own documented output (docs/QWEN-OVH-TRIAL.md at 921c82d4, "The ledger report" and "Receipts"), copied byte for byte: the
 # report as `agenttalk gateway report --json` prints it (one line, no spaces) and the one-receipt page of `gateway receipts --after 0 --json`.

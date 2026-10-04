@@ -43,6 +43,10 @@ ENVELOPE_VERSION = 1
 # Card R1-READER step 1: the page envelope stays version 1 for every reader. A caller picks the ROW SHAPE it expects: the existing rows
 # (the keys of `KEYS`), or month rows (the same keys plus `charge_period`, a month "YYYY-MM" or null; `gwcontract.py`). A row of the other
 # shape is `bad_row`. Month rows are used only against a report that says `child_receipt_report_version` 2.
+# Card R1-RC: a third choice, `EITHER`, for the reporter's own receipt path. A page is read as existing rows if NONE of its rows has
+# `charge_period`, and as month rows if ALL of them have it; a page that mixes the two is `bad_row` (one gateway prints one shape).
+# The month is checked like any month row but is not kept: the reporter stores and sends the same receipt either way.
+EITHER = "either"
 _MONTH = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
 ENVELOPE_KEYS = frozenset({"envelope_version", "generation", "after_seq", "next_seq", "has_more", "receipts"})
 # The closed fields of one receipt: the gateway's own columns, without the agent or the message (names stay local).
@@ -57,7 +61,7 @@ MAX_MICRO_EUR = 10 ** 12             # a million euros
 INT64_MAX = 2 ** 63 - 1
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _GENERATION = re.compile(r"[0-9a-f]{32}")
-_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
+_ISO = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")      # ASCII digits only
 
 DEFAULT_MAX_BYTES = 1024 * 1024
 
@@ -129,6 +133,17 @@ def _iso(text):
     return True
 
 
+def _shape(items, month_rows):
+    """The row shape to check a page's rows against: `month_rows` as the caller said it, or, for `EITHER`, the one shape ALL the rows have.
+    A page that mixes the two shapes is refused (`bad_row`)."""
+    if month_rows != EITHER:
+        return month_rows
+    named = [type(item) is dict and gwcontract.KEY_CHARGE_PERIOD in item for item in items]
+    if any(named) and not all(named):
+        raise _Refused("bad_row")
+    return bool(named) and all(named)
+
+
 def _row(doc, month_rows=False):
     """One receipt from its JSON object, or _Refused. Closed keys, exact types, bounds."""
     keys = KEYS | {gwcontract.KEY_CHARGE_PERIOD} if month_rows else KEYS
@@ -184,7 +199,7 @@ def parse_page(raw, after_seq, limit=MAX_ROWS, month_rows=False):
     is stored is a page that was whole: the version, the closed keys, the generation, the asked-for number, the
     receipts, and that the numbers rise by exactly one. `limit` is the page length that was asked for: a longer page
     is refused before anything is read from it. The envelope is always version 1. `month_rows` is the row shape the caller
-    expects (see above); a row of the other shape is `bad_row`."""
+    expects (False, True or `EITHER`, see above); a row of the other shape is `bad_row`."""
     doc = _loads(raw)
     if type(doc) is not dict:
         raise _Refused("not_an_object")
@@ -201,7 +216,8 @@ def parse_page(raw, after_seq, limit=MAX_ROWS, month_rows=False):
         raise _Refused("wrong_after")
     if len(doc["receipts"]) > min(limit, MAX_ROWS):
         raise _Refused("too_many")
-    rows = [_row(item, month_rows) for item in doc["receipts"]]
+    shape = _shape(doc["receipts"], month_rows)
+    rows = [_row(item, shape) for item in doc["receipts"]]
     expected = after_seq
     for row in rows:
         if row.seq != expected + 1:

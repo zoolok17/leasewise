@@ -465,7 +465,7 @@ def load_config(path, *, permissions=None):
 SID_SYSTEM = "S-1-5-18"
 SID_ADMINISTRATORS = "S-1-5-32-544"
 _ALLOWED_SIDS = frozenset({SID_SYSTEM, SID_ADMINISTRATORS})
-_SID_TEXT = re.compile(r"S-1-\d+(?:-\d+){1,15}")
+_SID_TEXT = re.compile(r"S-1-[0-9]+(?:-[0-9]+){1,15}")
 
 
 def _refuse_permissions(why):

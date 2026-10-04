@@ -697,7 +697,7 @@ one table, `reporter/gwcontract.py`. The tests include agenttalk's own documente
 stays in "spend nobody owns" although a lease owns it. Wherever Leasewise shows the figure, it keeps that qualification.
 
 **One thing to decide before the gateway is upgraded:** the older receipt path (`reporter/run.py`, seat-lease receipts) reads existing rows and would
-refuse every row of a gateway at `921c82d4` or later. This step does not change it. Details: `docs/STEP-CARD-R1-READER-1.md`.
+refuse every row of a gateway at `921c82d4` or later. This step does not change it. Details: `docs/STEP-CARD-R1-READER-1.md`. **Closed by card R1-RC below.**
 
 Design: `DESIGN-R1-READER.md` (revision 3). Record: `docs/STEP-CARD-R1-READER-1.md`.
 
@@ -708,6 +708,28 @@ Design: `DESIGN-R1-READER.md` (revision 3). Record: `docs/STEP-CARD-R1-READER-1.
 the report command (exit code 2) arrive as the runner's `exit_code`. `receipts.parse_page(..., month_rows=False)` and `read_page(..., month_rows=False)`:
 the envelope is always version 1; `month_rows=True` returns `MonthReceipt` rows. `gwreport.parse_snapshot`, `fold_page`, `compute` and the `Totals`,
 `Snapshot` and `Figures` values are pure. Tests: `tests/test_cardr1reader1_report.py`.
+
+## Card R1-RC - the receipt path reads pages with or without the month
+
+In plain words: when the operator upgrades the live gateway (agenttalk `921c82d4` or later), every receipt on a page carries a new field, the month
+(`charge_period`). The reporter's receipt path, which settles seat leases from the gateway's receipts, only knew the old shape and would have refused
+every row from that day on. That is safe, but it would have gone blind. **Now it reads both shapes** and keeps working across the upgrade.
+
+- **What the operator sees:** nothing today. The receipt path keeps working after the gateway upgrade. This closes the residual risk R-017.
+- **The month is read and not kept.** What the reporter stores and sends for a receipt is exactly what it was; a test shows that the same receipt read from
+  an old page and from a month page gives identical stored rows and identical receipts at Leasewise.
+- **One gateway, one shape.** A page whose rows all have the month, or none has it, is read. A page that mixes the two is refused, and nothing of it is
+  stored. A receipt with no calls and a month is refused too, as agenttalk's own checker requires.
+- **A fix of one more instance of a known mistake:** the close-time check used a pattern that accepts the digits of other scripts. It now accepts only the
+  digits 0 to 9, and so do the park-marker time, the Windows security-identifier text and the journal segment number. A sweep of the whole package found no
+  other pattern of this kind.
+
+### Technical detail (R1-RC)
+
+`receipts.EITHER` is a third value of `month_rows` (with `False` and `True`); `receipts._shape` decides the shape of a page from its rows. `run.py`
+`_take_pages` passes `month_rows=receipts.EITHER`; `fold_page` (the R1 reader) still needs month rows. `_ISO`, `parkreader._PARKED_AT` and
+`config._SID_TEXT` use `[0-9]`, and `events.take_snapshot` takes a segment number only if it is ASCII digits. Tests: `tests/test_cardr1rc_either.py`.
+Record: `docs/STEP-CARD-R1-RC.md`.
 
 ## Card 7a-2 - the reporter core
 
