@@ -7,13 +7,16 @@ gateway, no agenttalk program.
 ## In plain words
 
 The reporter used to start the gateway's receipts program on every cycle: 12 times a minute at the default 5 seconds, up to 17,280 times a day, even when
-nobody used the gateway. Now it asks at two speeds. While a lease is waiting for its receipt it asks at most every **15 seconds**; when nothing waits, at
+nobody used the gateway. Now it asks at two speeds. While a lease is waiting for its receipt it begins a read at most every **15 seconds**; when nothing waits, at
 most every **300 seconds**. Nothing is lost by this. Each question is "give me what comes after the last number I hold", every receipt is stored once and is
 settled under an id made only from the receipt and the ledger, so a skipped question only makes a receipt arrive later.
 
 | | before | after, a lease waiting all day | after, nothing waiting |
 |---|---|---|---|
-| program starts per day and gateway | 17,280 | 5,760 | 288 |
+| program starts per day and gateway, default case (one page per pass, no backlog) | 17,280 | 5,760 | 288 |
+
+These numbers are limits on read **passes**. Each page of a pass can start another program, and a pass that left pages behind is followed by the next
+cycle's pass at once, skipping the interval. With more pages or a backlog there are more starts than the table shows, until the backlog is read.
 
 Raising `poll_seconds` was not the answer (D-217, D-234): that one number also paces the journal, the limit capture and every upload.
 
@@ -49,3 +52,11 @@ between them (their rig has a clock now).
 ## Gates
 
 See the reply to the lead: full suite in four chunks plus `test_card4_ops`, ruff (the operator's command) and bandit counts, `git status`, identity, LF.
+
+## Tidy (card RCPT-POLL-tidy, after Codex's read)
+
+- The test "a skipped read still runs the other lanes" now gives them real work after the first cycle (a journal message and its acquisition upload) and asserts the
+  journal was read (`new_events` 3), `/v1/leases` was called, and the receipts command was not started again. With `Reporter._read` disabled, or `Reporter._send`
+  disabled, in memory, it fails; with both restored it passes.
+- The estimates above are labelled as the default, one-page, no-backlog case and as limits on read passes, not program starts.
+- A test docstring (`WrongAccount` in `test_cardr1reader3b_cycle.py`) now says the recorder appends after the call returns.

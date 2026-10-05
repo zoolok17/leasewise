@@ -383,7 +383,8 @@ class WrongAccount(Env):
     two real ways out are to correct Leasewise's side (then `resume`) or to `reset` the reader.
 
     "The identical bytes" is proved where it matters: at the transport boundary. Every request the reader sends to the real loopback Leasewise is recorded as
-    (path, `Idempotency-Key`, exact body bytes, status) just before it goes out through the real HTTP client, and compared with the saved report. Comparing only the
+    (path, `Idempotency-Key`, exact body bytes, status) through the real HTTP client, and compared with the saved report. The recorder appends AFTER the call returns:
+    a completed exchange is recorded; a call that raises is not. Comparing only the
     stored row or the event ids would not do: a sender could change a field that is not part of the identity and keep both."""
 
     def setUp(self):

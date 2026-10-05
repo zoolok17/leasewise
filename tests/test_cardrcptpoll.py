@@ -20,6 +20,7 @@ from tests import test_cardr1reader3b_cycle as money
 from tests.l6a1_env import add_binding, configure, ledger, lease, receipt, write_json
 from tests.reporter_env import Rig
 from tests.test_card7l6a1_delivery import Net
+from tests.test_card7a3 import one_message
 from tests.test_card7l6a1b_runner import PYTHON
 from tests.test_cardr1reader3b_cycle import setUpModule, tearDownModule      # noqa: F401 - the money reader's env needs its store template
 
@@ -229,14 +230,18 @@ class OtherDuties(_Paced):
         self.assertEqual(self.reads(), 1)
         self.assertEqual((result.sent, len(self.net.settles())), (1, 3))
 
-    def test_a_skipped_cycle_still_sends_other_uploads_and_the_journal_is_read(self):
+    def test_a_skipped_cycle_still_reads_the_journal_and_sends_the_uploads_that_are_due(self):
+        """The other lanes get real work AFTER the first cycle: a message in the journal (its acquisition is an upload that is due). On the skipped cycle
+        the journal is read (`new_events`), the upload goes out (`/v1/leases`), and the receipts command is not started again."""
         reporter = self.start(count=1)
-        reporter.cycle()
-        before = len(self.net.settles())
+        reporter.cycle()                                               # read 1; the journal is still empty
+        paths_before = len(self.net.paths())
+        one_message(self.rig.journal, self.rig.clock.ms)               # new work for the journal lane and the upload lane
         self.later(5)
-        reporter.cycle()
-        self.assertEqual(self.reads(), 1)
-        self.assertEqual(len(self.net.settles()), before)
+        result = reporter.cycle()                                      # a skipped read for the receipt lane
+        self.assertEqual(self.reads(), 1)                              # the receipts command was not started again
+        self.assertEqual(result.new_events, 3)                         # the journal was read: three new events
+        self.assertIn("/v1/leases", self.net.paths()[paths_before:])   # the acquisition upload went out
         self.assertEqual(reporter.report()["gateway_receipts"]["last_seq"], 1)
 
 
