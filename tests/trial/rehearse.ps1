@@ -183,6 +183,26 @@ function Wait-NewReport([int]$Than, [int]$Seconds) {
 }
 
 # (Process objects keep their handle, so the exit code can be read after the process ends.)
+# Deletion safety (the liaison's rule of 2026-10-05): before a folder tree is deleted, count its links (reparse points: junctions, symbolic links) WITHOUT going
+# into any, and delete nothing if there is one. The same walk as the runbook's step 12.
+function Count-Links([string]$Path) {
+    if ((New-Object IO.DirectoryInfo($Path)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { return 1 }       # a linked root is never entered
+    $Found = 0
+    $Pending = New-Object System.Collections.Generic.Stack[string]
+    $Pending.Push($Path)
+    while ($Pending.Count -gt 0) {
+        foreach ($Entry in (New-Object IO.DirectoryInfo($Pending.Pop())).GetFileSystemInfos()) {
+            if ($Entry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Found++ }
+            elseif ($Entry -is [IO.DirectoryInfo]) { $Pending.Push($Entry.FullName) }
+        }
+    }
+    return $Found
+}
+function Remove-Scaffolding([string]$Path) {
+    if ((Count-Links $Path) -gt 0) { throw "the scaffolding folder contains a link: nothing was deleted ($Path)" }
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}
+
 # End a process through the object this script started (never a saved number), wait for it, and drop it from the list at once.
 function Stop-Proc($P) {
     if (-not $P.HasExited) { $P.Kill() }
@@ -249,7 +269,7 @@ try {
             if (($Listing -join ',') -ne ($ListingAfter -join ',')) { throw 'the refused folder was changed' }
             if ((Get-Content -LiteralPath (Join-Path $Trial 'precious.txt') -Raw).Trim() -ne 'do not touch') { throw 'the sentinel file was changed' }
             Say "drill: the existing folder was refused; its only content, the sentinel file, is untouched ($($Listing -join ', '))"
-            Remove-Item -LiteralPath $Trial -Recurse -Force          # the rehearsal's own scaffolding, made a moment ago by this script
+            Remove-Scaffolding $Trial                                # the rehearsal's own scaffolding, made a moment ago by this script (no link inside, checked first)
         }
     }
     # drill: the privacy check really catches a folder that someone else can open (the runbook's own functions, on a scratch folder)
@@ -304,6 +324,71 @@ try {
         if (-not $Wrapped -and $Kept) { throw 'line drill (unwrapped step 12): the unwrapped block deleted nothing, so this drill proves nothing' }
         if (-not $Wrapped) { Say 'red first: the UNWRAPPED step 12 block, pasted a line at a time, printed the refusal in red and then went on and DELETED the folder' }
     }
+    # drill: a link inside the trial folder. A junction (several levels down) points at a sentinel folder OUTSIDE the trial folder; both live in the scratch root.
+    # Step 12 is pasted one line at a time: it must refuse, and the folder, the junction and the sentinel must all be intact.
+    $LinkTrial = Join-Path $DrillRoot 'link-trial'
+    $Outside = Join-Path $Root 'outside-sentinel'
+    New-Item -ItemType Directory -Path $Outside | Out-Null
+    Set-Content -LiteralPath (Join-Path $Outside 'keep.txt') -Value 'do not touch' -Encoding ascii
+    $OutsideListing = (Names-Under $Outside) -join ','
+    $Junction = Join-Path $LinkTrial 'deep\inner\link-to-outside'
+    $Pre = Prelude-Lines $LinkTrial
+    $One = Block-Lines $Step1Block $true
+    $Twelve = Block-Lines $Step12Block $true
+    $MakeLink = @('', "New-Item -ItemType Directory -Path '$(Split-Path $Junction)' -Force | Out-Null",
+                  "New-Item -ItemType Junction -Path '$Junction' -Target '$Outside' | Out-Null")
+    $Run = Invoke-LineDrill 'link-rollback' ($Pre + $One + $MakeLink + $Twelve + @(''))
+    $LinkRefused = [bool](($Run.Err -replace '\s+', ' ') -match 'The trial folder contains a link\. Nothing was deleted\. Tell the lead\.')
+    $TrialKept = Test-Path -LiteralPath $LinkTrial
+    $JunctionKept = (Test-Path -LiteralPath $Junction) -and ((New-Object IO.DirectoryInfo($Junction)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))
+    $SentinelKept = ((Get-Content -LiteralPath (Join-Path $Outside 'keep.txt') -Raw).Trim() -eq 'do not touch') -and (((Names-Under $Outside) -join ',') -eq $OutsideListing)
+    Say ("drill [WRAPPED step 12, line by line, a junction inside]: refusal printed={0} trial folder kept={1} junction kept={2} sentinel outside intact={3}" -f $LinkRefused, $TrialKept, $JunctionKept, $SentinelKept)
+    if (-not ($LinkRefused -and $TrialKept -and $JunctionKept -and $SentinelKept)) { throw 'link drill: the rollback did not refuse cleanly' }
+    if ((Count-Links $LinkTrial) -ne 1) { throw 'link drill: the kit own link count is not 1' }
+    # clean up safely: remove the junction ITSELF (not recursive, so its target is never entered), check the sentinel again, then the scaffolding
+    [IO.Directory]::Delete($Junction)
+    if (Test-Path -LiteralPath $Junction) { throw 'link drill: the junction is still there' }
+    if (-not (Test-Path -LiteralPath (Join-Path $Outside 'keep.txt'))) { throw 'link drill: removing the junction touched the sentinel' }
+    Remove-Scaffolding $LinkTrial
+    Say 'drill: the junction was removed on its own, the sentinel outside is intact, the scaffolding was removed after a link-free check'
+    # drill: the trial folder ITSELF is a link (fix round 1). The root is a junction to a target inside the scratch root; the target holds a file and a second junction
+    # (to the outside sentinel). Nothing may be enumerated through the root: step 12 must refuse first thing (probe variables set beforehand stay untouched), and
+    # Count-Links must answer exactly 1 (entering the target would add the inner junction and give 2).
+    $RootTarget = Join-Path $DrillRoot 'rootlink-target'
+    $RootLink = Join-Path $DrillRoot 'rootlink'
+    $InnerLink = Join-Path $RootTarget 'inner-link'
+    $Pre = Prelude-Lines $RootTarget
+    $One = Block-Lines $Step1Block $true
+    $Twelve = Block-Lines $Step12Block $true
+    $Setup = @('', "New-Item -ItemType Junction -Path '$InnerLink' -Target '$Outside' | Out-Null",
+               "New-Item -ItemType Junction -Path '$RootLink' -Target '$RootTarget' | Out-Null",
+               "`$Trial = '$RootLink'", '$Links = -1', "`$Pending = 'untouched'")
+    $Run = Invoke-LineDrill 'root-link-rollback' ($Pre + $One + $Setup + $Twelve + @('', '"PROBE Links=$Links Pending=$Pending"', ''))
+    $RootRefused = [bool](($Run.Err -replace '\s+', ' ') -match 'The trial folder contains a link\. Nothing was deleted\. Tell the lead\.')
+    $NotWalked = [bool]($Run.Out -match 'PROBE Links=-1 Pending=untouched')
+    $TargetKept = (Test-Path -LiteralPath (Join-Path $RootTarget '.owner.json')) -and (Test-Path -LiteralPath $InnerLink)
+    $SentinelKept = ((Get-Content -LiteralPath (Join-Path $Outside 'keep.txt') -Raw).Trim() -eq 'do not touch')
+    $RootCount = Count-Links $RootLink
+    $OldWalk = { param($Path)       # the first version of the walk (read only): it counted a linked root and still entered it
+        $Found = 0
+        if ((New-Object IO.DirectoryInfo($Path)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Found++ }
+        $Stack = New-Object System.Collections.Generic.Stack[string]; $Stack.Push($Path)
+        while ($Stack.Count -gt 0) { foreach ($E in (New-Object IO.DirectoryInfo($Stack.Pop())).GetFileSystemInfos()) {
+            if ($E.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Found++ } elseif ($E -is [IO.DirectoryInfo]) { $Stack.Push($E.FullName) } } }
+        $Found }
+    $OldCount = & $OldWalk $RootLink
+    Say ("drill [WRAPPED step 12, line by line, the trial folder itself is a junction]: refusal printed={0} nothing walked (probe untouched)={1} target and inner junction kept={2} sentinel intact={3}" -f $RootRefused, $NotWalked, $TargetKept, $SentinelKept)
+    Say ("drill [Count-Links on a linked root]: new walk counts {0} (it did not enter the target); red first: the first version of the walk counted {1} because it entered the target and found its inner junction" -f $RootCount, $OldCount)
+    if (-not ($RootRefused -and $NotWalked -and $TargetKept -and $SentinelKept)) { throw 'root link drill: the rollback did not refuse cleanly before walking' }
+    if ($RootCount -ne 1) { throw 'root link drill: Count-Links entered a linked root' }
+    if ($OldCount -ne 2) { throw 'root link drill: the first version of the walk did not show the fault, so this drill proves nothing' }
+    # clean up: only the junctions themselves, one at a time, non-recursive (a link is never entered); then the target through the link-free check
+    [IO.Directory]::Delete($RootLink)
+    [IO.Directory]::Delete($InnerLink)
+    if ((Test-Path -LiteralPath $RootLink) -or (Test-Path -LiteralPath $InnerLink)) { throw 'root link drill: a junction is still there' }
+    if (-not (Test-Path -LiteralPath (Join-Path $Outside 'keep.txt'))) { throw 'root link drill: removing a junction touched the sentinel' }
+    Remove-Scaffolding $RootTarget
+    Say 'drill: both junctions were removed on their own, the sentinel outside is intact, the target was removed after a link-free check'
     # step 7 (wait for the first report), step 8 (compare, approve), step 9 (blockers, helper, adopt), step 10 (passed)
     foreach ($Count in 1..5) { $Block = Next-Block; $Number++; $BlockArg = $Block; $NumberArg = $Number; . $RunBlockSb }
     # (the 5 blocks: wait, approve, blockers, adopt, passed)
