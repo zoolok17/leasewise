@@ -35,6 +35,21 @@ or `icacls` on a folder about to be deleted. The runbook and the kit use none of
    file and the sentinel folder's listing are unchanged. Then the junction is removed **on its own** with `[IO.Directory]::Delete(<junction>)` (not recursive), the sentinel
    is checked again, and the scaffolding is removed through `Remove-Scaffolding`.
 
+## Fix round 1 (tk-fa26c50546ef)
+
+Codex's read found one thing: **a linked trial folder was counted but still walked.** The first version added 1 to the link count when the trial folder itself was a link, and
+then pushed it on the stack anyway, so `GetFileSystemInfos()` listed the link's **target** (Codex saw `Links=2`, the second coming from a junction inside the target).
+Nothing was deleted, but the check had gone into a link, which breaks the rule and the runbook's own promise.
+
+- **Step 12:** the root check now comes **first** in the block, right after `Set-Location`: if the trial folder is a reparse point the block throws the same sentence at
+  once, before the ownership marker is read, before anything is pushed and before anything is listed. Only a root that is not a link reaches the walk.
+- **Kit:** `Count-Links` returns 1 at once for a linked root, without pushing it; `Remove-Scaffolding` relies on that.
+- **Drill:** in the scratch root, the "trial folder" is a junction to a target that holds a file and a second junction (to the outside sentinel). Step 12 is pasted line
+  by line after setting probe variables (`$Links = -1`, `$Pending = 'untouched'`): it refused, the probes were **still** `-1` and `untouched` (so no counter and no stack
+  was ever made: nothing was walked), the target, its inner junction and the sentinel are intact. `Count-Links` on the linked root gives exactly 1; a read-only copy of
+  the first version of the walk, run on the same layout, gives 2 (red first). Afterwards only the two junctions are removed, each with a non-recursive
+  `[IO.Directory]::Delete`, the sentinel is checked, and the target is removed through `Remove-Scaffolding`. Everything is in the seat's scratch folder.
+
 ## Safety of the drill itself
 
 Every path the drill creates or deletes is under the rehearsal root in the seat's scratch folder. Nothing outside it is named by any delete. The only delete that could
@@ -45,3 +60,7 @@ reach a link is the junction's own, by `[IO.Directory]::Delete` without the recu
 Rehearsal once from a clean start (`idle-older`, with the apostrophe-and-non-ASCII application-data folder): passed in 347 s, bound 20 minutes, with every earlier
 drill, the existing line-by-line drill and the new link drill; the identity value is in no file outside the trial folder (0 files); repository status unchanged.
 The full suite, ruff and bandit are in the reply to the lead.
+
+Fix round 1: the full rehearsal once more from a clean start (`idle-empty`, ordinary folder) passed in 341 s with every drill above, the existing link drill, the
+existing line-by-line drill and the new linked-root drill (it ran on the working tree before the commit; the only difference is this paragraph). The suite, ruff and bandit
+are in the reply to the lead.

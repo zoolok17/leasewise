@@ -496,8 +496,8 @@ the line in step 1 first.) The gateway, agenttalk and the rest of the machine we
 
 **Why the block also looks for links.** A delete can follow a folder link (a junction or a symbolic link) out of the folder being deleted and remove files somewhere else.
 This runbook never makes a link, so a link inside the trial folder means something else put it there. Before it deletes, the block therefore walks the whole folder **without ever
-going into a link** and looks at every entry; if it finds **any** link (a folder or a file, at any depth, or the trial folder itself), it stops with "The trial folder contains a
-link. Nothing was deleted. Tell the lead." Only a folder with no link in it is deleted. (A few other special entries, such as a cloud-sync placeholder, count as links too: that is
+going into a link** and looks at every entry. If the trial folder **itself** is a link, it stops first thing, before it opens or lists anything. If it finds **any** link inside (a
+folder or a file, at any depth), it stops with "The trial folder contains a link. Nothing was deleted. Tell the lead." Only a folder with no link in it is deleted. (A few other special entries, such as a cloud-sync placeholder, count as links too: that is
 the safe side.)
 
 <!-- rehearse: run -->
@@ -505,11 +505,11 @@ the safe side.)
 . {
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $env:USERPROFILE
+if ((New-Object IO.DirectoryInfo($Trial)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw 'The trial folder contains a link. Nothing was deleted. Tell the lead.' }
 $Marker = Get-Content -LiteralPath (Join-Path $Trial '.owner.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $Here = (Resolve-Path -LiteralPath $Trial).ProviderPath
 if (($Marker.token -ne $Token) -or ($Marker.path -ne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
-$Links = 0                                               # a link anywhere: look at every entry, never go into a link
-if ((New-Object IO.DirectoryInfo($Trial)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Links++ }
+$Links = 0                                               # a link anywhere inside: look at every entry, never go into a link (a linked trial folder was refused above)
 $Pending = New-Object System.Collections.Generic.Stack[string]
 $Pending.Push($Here)
 while ($Pending.Count -gt 0) {
