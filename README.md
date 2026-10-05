@@ -1381,12 +1381,13 @@ What the reporter does with it:
   gateway's receipts program on **every** cycle, 12 times a minute at the default `poll_seconds = 5`, up to 17,280 times a
   day, even when nobody used the gateway. It now has its own clock with two speeds. **While a lease waits for its receipt**
   (a grant the reporter copied that has no receipt yet and is not past its own expiry: the count `status` shows as
-  `awaiting_receipt`) it starts the program at most once per `waiting_interval_seconds` (**15 s**, 5 to 60). **When no lease
-  waits** it starts it at most once per `idle_interval_seconds` (**300 s**, 60 to 900). The time is counted from the last
+  `awaiting_receipt`) it begins a read at most once per `waiting_interval_seconds` (**15 s**, 5 to 60). **When no lease
+  waits** it begins one at most once per `idle_interval_seconds` (**300 s**, 60 to 900). The time is counted from the last
   **attempt**, so a failing gateway is asked less often too, on a monotonic clock kept in memory only: a restart reads at
   once. A read that left pages behind (more than six, or the cycle's budget ran out) is followed by the next cycle's read
-  at once. Per day and gateway that is 5,760 starts at the most while a lease waits all day and 288 when none waits
-  (it was 17,280). A fixture file starts no program and is read on every cycle. Everything else in the cycle runs every time:
+  at once. These limits are on read **passes**, not on program starts: each page of a pass can start another program. In the default case
+  (one page per pass, no backlog) that is 5,760 starts a day at the most while a lease waits all day and 288 when none waits (it was
+  17,280). More pages, or a backlog (which is followed by a pass at once, skipping the interval), mean more starts than that. A fixture file starts no program and is read on every cycle. Everything else in the cycle runs every time:
   copying grants, delivering stored receipts, the journal, limits, every upload and the money reader. A skipped read only
   delays a receipt: the next one asks for the numbers after the last one stored, each receipt is stored once and settles
   under an id made only from the receipt and the ledger, so none is lost or counted twice. `poll_seconds` is not the answer:
