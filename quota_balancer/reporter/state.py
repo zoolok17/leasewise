@@ -538,6 +538,14 @@ class State:
                 self.bump(agent, "superseded_after_send" if state == "acquired" else "superseded")
         return len(rows)
 
+    def awaiting_receipts(self, gateway_id, now_ms):
+        """Grants of this gateway that no capture has answered yet -> (how many, when the oldest was copied, how many are past the lease's own
+        expiry). The one definition: `status` shows it, and the receipt lane's pace reads it (a lease is "waiting" while it is not past its expiry)."""
+        return self.one(
+            "SELECT COUNT(*), MIN(copied_ms), COALESCE(SUM(expires_ms < ?), 0) FROM receipt_binding b"
+            " WHERE b.gateway_id=? AND NOT EXISTS (SELECT 1 FROM receipt_capture c WHERE c.ref_sha256=b.ref_sha256)",
+            (now_ms, gateway_id))
+
     def message_is_bound(self, agent, message_id):
         """True when the message has a paid lease (a copied binding) or was set aside for one."""
         return self.one("SELECT 1 FROM receipt_binding WHERE agent=? AND message_id=?", (agent, message_id)) \

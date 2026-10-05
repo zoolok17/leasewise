@@ -1358,6 +1358,8 @@ command = ["C:/path/to/agenttalk.exe", "gateway", "receipts"]   # an argument li
 timeout_seconds = 20                                             # 1 to 60, default 20: one deadline for one read
 # max_bytes = 1048576                                            # the most output read (1024 to 4194304)
 # page_limit = 100                                               # receipts in one page, 1 to 1000
+# waiting_interval_seconds = 15                                  # 5 to 60, default 15: how often to ask while a lease waits for its receipt
+# idle_interval_seconds = 300                                    # 60 to 900, default 300: how often to ask when no lease waits
 
 [gateway_receipts.env]                                           # at most 8; the only extra settings the program gets
 AGENTTALK_ROOT = "C:/lw/team"
@@ -1372,7 +1374,23 @@ What the reporter does with it:
   list of 1 to 16 texts; the first element is not a fully qualified `X:\...` path (`C:foo` and `\foo` are refused; `/` is
   read as `\`); it starts from a network or device path (`\\server`, `//server`, `\\?\`, `\\.\`); it is not an `.exe`
   (Windows would run a `.bat` or `.cmd` through `cmd.exe`, which splits arguments by other rules); an argument has a double
-  quote or a control character; a reserved option; `timeout_seconds` or `env` outside their bounds, or given with a fixture.
+  quote or a control character; a reserved option; `timeout_seconds` or `env` outside their bounds, or given with a fixture;
+  `waiting_interval_seconds` or `idle_interval_seconds` outside their bounds, not a whole number (a bool, a text and a float
+  are refused too), or given with a fixture.
+- **How often the command is started (card RCPT-POLL, lead decision D-234).** In plain words: the reporter used to start the
+  gateway's receipts program on **every** cycle, 12 times a minute at the default `poll_seconds = 5`, up to 17,280 times a
+  day, even when nobody used the gateway. It now has its own clock with two speeds. **While a lease waits for its receipt**
+  (a grant the reporter copied that has no receipt yet and is not past its own expiry: the count `status` shows as
+  `awaiting_receipt`) it starts the program at most once per `waiting_interval_seconds` (**15 s**, 5 to 60). **When no lease
+  waits** it starts it at most once per `idle_interval_seconds` (**300 s**, 60 to 900). The time is counted from the last
+  **attempt**, so a failing gateway is asked less often too, on a monotonic clock kept in memory only: a restart reads at
+  once. A read that left pages behind (more than six, or the cycle's budget ran out) is followed by the next cycle's read
+  at once. Per day and gateway that is 5,760 starts at the most while a lease waits all day and 288 when none waits
+  (it was 17,280). A fixture file starts no program and is read on every cycle. Everything else in the cycle runs every time:
+  copying grants, delivering stored receipts, the journal, limits, every upload and the money reader. A skipped read only
+  delays a receipt: the next one asks for the numbers after the last one stored, each receipt is stored once and settles
+  under an id made only from the receipt and the ledger, so none is lost or counted twice. `poll_seconds` is not the answer:
+  it paces the whole cycle (D-217, D-234).
 - **Containment.** The program is created frozen and already inside a Windows job that ends everything in it, checked to be
   inside, and only then allowed to run. If that cannot be done, nothing runs. When the read ends (or the reporter stops)
   the job is ended and its own count of live processes is polled to zero. If that cannot be confirmed, the read says so

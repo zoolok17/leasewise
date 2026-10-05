@@ -86,7 +86,10 @@ class Reporter:
         self.stop = stop or threading.Event()
         self.fault = fault              # test seam: fault(stage)
         self.failures = 0               # consecutive blocked cycles
-        self.monotonic = time.monotonic     # the cycle's receipt budget (a test replaces it with a virtual clock)
+        self.monotonic = time.monotonic     # the cycle's receipt budget and the receipt pace (a test replaces it with a virtual clock)
+        # Card RCPT-POLL (D-234): when the receipt command was last started (None before the first start: a restart reads at once), and whether the
+        # last read left more pages behind. Memory only.
+        self.receipt_attempted, self.receipt_more = None, False
         # An operator who fixed a configuration fault only has to restart.
         with state.txn():
             state.clear_agent_stops()
@@ -194,7 +197,8 @@ class Reporter:
             now = self.clock()
             self._copy_bindings(source, now)
             source_id = self.state.ensure_source(source.gateway, source.gateway_id, now)
-            result.new_receipts = self._take_pages(source, source_id)
+            if self._receipt_read_due(source, now):
+                result.new_receipts = self._take_pages(source, source_id)
             self.state.release_waiting(self.clock())
             if self.fault:
                 self.fault("released")          # stage 2 is durable: the delivery bodies and `pending`
@@ -229,6 +233,20 @@ class Reporter:
         self.state.supersede_bound(now)
         self._refresh_summary(source.admission_store, now)
 
+    def _receipt_read_due(self, source, now):
+        """Card RCPT-POLL (lead decision D-234): may the receipt command be started in this cycle? A fixture file starts no program, so it is read
+        every cycle. A command is started when the interval for the CURRENT state has passed since the last ATTEMPT (a failed read counts, so a
+        failing gateway is asked less often too): `waiting_interval_seconds` while a lease waits for its receipt, else `idle_interval_seconds`.
+        The first cycle after a start, and a cycle that follows a read which left pages behind, read at once. A skipped read only delays: the next
+        one asks after the last stored number, as always. Nothing is written here."""
+        if source.command is None:
+            return True
+        if self.receipt_attempted is None or self.receipt_more:
+            return True
+        count, _oldest, overdue = self.state.awaiting_receipts(source.gateway_id, now)
+        interval = source.waiting_interval_seconds if count - overdue > 0 else source.idle_interval_seconds
+        return self.monotonic() - self.receipt_attempted >= interval
+
     def _take_pages(self, source, source_id):
         """Pages of this source, up to a few per cycle. A page from a generation other than the current one was
         asked for with another ledger's cursor: the generation is switched (a new one starts at 0, one seen
@@ -241,9 +259,12 @@ class Reporter:
         added = 0
         budget_end = None
         if source.command is not None:
-            budget_end = self.monotonic() + max(source.timeout_seconds, RECEIPT_BUDGET_FLOOR)
+            self.receipt_attempted = self.monotonic()
+            self.receipt_more = False
+            budget_end = self.receipt_attempted + max(source.timeout_seconds, RECEIPT_BUDGET_FLOOR)
         for _ in range(MAX_PAGES_PER_CYCLE):
             if budget_end is not None and self.monotonic() >= budget_end:
+                self.receipt_more = True            # the budget ended the read, not the ledger: go on at the next cycle
                 break
             generation, after = self.state.current_cursor(source_id)
             # Card R1-RC: a gateway at agenttalk 921c82d4 or later prints the month on every row, an older one does not; this path reads
@@ -267,6 +288,8 @@ class Reporter:
                 self.fault("captured")          # stage 1 is durable: the evidence and the cursor
             if not page.has_more:
                 break
+        else:
+            self.receipt_more = source.command is not None       # six pages and still more
         return added
 
     def _send(self, result):

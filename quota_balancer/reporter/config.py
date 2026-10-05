@@ -47,12 +47,17 @@ _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
 # Card L6a-1: where a gateway's receipts are read from. Gateway receipts are read from a fixture file in this version.
 # Card L6a-1b: a receipt source is a fixture file or a command (a program the reporter runs, on Windows only).
 _RECEIPT_KEYS = ("gateway", "admission_store")
-_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "env", "max_bytes", "page_limit")
+_RECEIPT_OPTIONAL = ("fixture", "command", "timeout_seconds", "env", "max_bytes", "page_limit", "waiting_interval_seconds", "idle_interval_seconds")
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1000
 MAX_COMMAND_ARGS = 16
 MAX_RECEIPT_ENV = 8
 DEFAULT_COMMAND_TIMEOUT = 20
+# Card RCPT-POLL (lead decision D-234): a command source is read at two speeds, not on every cycle. While a lease waits for its receipt the gateway's
+# receipts command is started at most once per `waiting_interval_seconds`; when none waits, at most once per `idle_interval_seconds`. Both are counted
+# from the last ATTEMPT. A speed limit, not a freshness promise; `poll_seconds` still paces everything else.
+DEFAULT_WAITING_INTERVAL, WAITING_INTERVAL_RANGE = 15, (5, 60)
+DEFAULT_IDLE_INTERVAL, IDLE_INTERVAL_RANGE = 300, (60, 900)
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 _DRIVE_ROOTED = re.compile(r"[A-Za-z]:\\")           # X:\ ... : fully qualified, not C:foo and not \foo
 
@@ -196,7 +201,7 @@ class GatewayReceipts:
     fills it from the policy-ids snapshot. The repr hides everything (a path can name a deployment)."""
 
     __slots__ = ("gateway", "gateway_id", "admission_store", "fixture", "max_bytes", "page_limit", "command",
-                 "timeout_seconds", "env")
+                 "timeout_seconds", "env", "waiting_interval_seconds", "idle_interval_seconds")
 
     def __repr__(self):
         return "GatewayReceipts(<hidden>)"
@@ -241,6 +246,13 @@ def _receipt_timeout(value, where):
     return value
 
 
+def _receipt_interval(table, key, default, bounds, where):
+    value = table.get(key, default)
+    if type(value) is not int or not bounds[0] <= value <= bounds[1]:
+        _invalid("%s: %s must be a whole number from %d to %d" % (where, key, bounds[0], bounds[1]))
+    return value
+
+
 def _receipt_env(value, where):
     if not isinstance(value, dict) or len(value) > MAX_RECEIPT_ENV \
             or not all(isinstance(item, str) and 0 < len(item) <= 1024 for item in value.values()):
@@ -262,14 +274,19 @@ def _gateway_receipts(table):
         _invalid("%s: name exactly one of fixture or command" % where)
     if "fixture" in table and ("timeout_seconds" in table or "env" in table):
         _invalid("%s: timeout_seconds and env belong to a command source" % where)
+    if "fixture" in table and ("waiting_interval_seconds" in table or "idle_interval_seconds" in table):
+        _invalid("%s: waiting_interval_seconds and idle_interval_seconds belong to a command source" % where)
     row = GatewayReceipts()
     row.command, row.timeout_seconds, row.env, row.fixture = None, None, (), None
+    row.waiting_interval_seconds = row.idle_interval_seconds = None          # a fixture file starts no program: nothing to pace
     if "command" in table:
         if not _windows():
             _invalid(MSG_COMMAND_NOT_WINDOWS)
         row.command = _receipt_command(table["command"], where)
         row.timeout_seconds = _receipt_timeout(table.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT), where)
         row.env = _receipt_env(table.get("env", {}), where)
+        row.waiting_interval_seconds = _receipt_interval(table, "waiting_interval_seconds", DEFAULT_WAITING_INTERVAL, WAITING_INTERVAL_RANGE, where)
+        row.idle_interval_seconds = _receipt_interval(table, "idle_interval_seconds", DEFAULT_IDLE_INTERVAL, IDLE_INTERVAL_RANGE, where)
     else:
         row.fixture = _path(table["fixture"], where)
     row.gateway = _alias(table["gateway"], where)

@@ -100,7 +100,13 @@ class _Wired(unittest.TestCase):
             lines += ["%s = %s" % (name, json.dumps(value)) for name, value in env.items()]
         self.rig.ws.write_config("http://127.0.0.1:9", self.rig.agents_cfg, extra="\n".join(lines) + "\n")
         self.net = net or Net()
-        return self.rig.open(transport=self.net)
+        reporter = self.rig.open(transport=self.net)
+        self.now = 1000.0                                                  # card RCPT-POLL: the receipt pace runs on this driven clock, never a sleep
+        reporter.monotonic = lambda: self.now
+        return reporter
+
+    def later(self, seconds):
+        self.now += seconds
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -131,6 +137,7 @@ class EndToEnd(_Wired):
     def test_the_next_cycle_asks_for_the_new_cursor(self):
         reporter = self.start(count=3)
         reporter.cycle()
+        self.later(300)                                                    # nothing waits any more: the idle interval
         reporter.cycle()
         first, second = self.calls()
         self.assertEqual(first[-5:], ["--after", "0", "--limit", "100", "--json"])
@@ -265,6 +272,7 @@ class Failures(_Wired):
         self.assertIn(status.CLEANUP_ACTION, report["operator_actions"])
         text = status.render_text(report)
         self.assertIn("termination requested but not confirmed 1 time(s) (not confirmed now)", text)
+        self.later(300)
         reporter.cycle()                                                                    # this time it is confirmed
         shown = self.receipt_status(reporter)
         self.assertEqual(shown["cleanup_incomplete"], {"count": 1, "current": False})
@@ -277,6 +285,7 @@ class Failures(_Wired):
         reporter.cycle()
         self.assertTrue(self.advice(reporter, status.NOT_FINISHING_ACTION))
         self.set_mode("ok")
+        self.later(300)
         reporter.cycle()
         shown = self.receipt_status(reporter)
         self.assertEqual((shown["last_read_result"], shown["last_read_reason"]), ("ok", "ok"))
@@ -291,6 +300,7 @@ class Failures(_Wired):
         self.assertEqual(len(self.net.settles()), 2)
         self.set_mode("exit1")
         self.write("ledger.json", json.dumps(ledger(self.rows + [receipt(lease(), 3)])))
+        self.later(300)
         result = reporter.cycle()
         self.assertEqual(result.new_receipts, 0)
         self.assertEqual(self.receipt_status(reporter)["last_read_reason"], "exit_code")
