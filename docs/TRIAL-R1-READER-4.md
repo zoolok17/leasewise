@@ -494,6 +494,12 @@ Rolling back is deleting the folder, **but only the folder this runbook made**. 
 the ones saved in step 1, and stops if either differs; it deletes nothing in that case. (`$Token` and `$Trial` come from the window you worked in; in a new window load them with
 the line in step 1 first.) The gateway, agenttalk and the rest of the machine were never changed.
 
+**Why the block also looks for links.** A delete can follow a folder link (a junction or a symbolic link) out of the folder being deleted and remove files somewhere else.
+This runbook never makes a link, so a link inside the trial folder means something else put it there. Before it deletes, the block therefore walks the whole folder **without ever
+going into a link** and looks at every entry; if it finds **any** link (a folder or a file, at any depth, or the trial folder itself), it stops with "The trial folder contains a
+link. Nothing was deleted. Tell the lead." Only a folder with no link in it is deleted. (A few other special entries, such as a cloud-sync placeholder, count as links too: that is
+the safe side.)
+
 <!-- rehearse: run -->
 ```powershell
 . {
@@ -502,6 +508,17 @@ Set-Location -LiteralPath $env:USERPROFILE
 $Marker = Get-Content -LiteralPath (Join-Path $Trial '.owner.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $Here = (Resolve-Path -LiteralPath $Trial).ProviderPath
 if (($Marker.token -ne $Token) -or ($Marker.path -ne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
+$Links = 0                                               # a link anywhere: look at every entry, never go into a link
+if ((New-Object IO.DirectoryInfo($Trial)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Links++ }
+$Pending = New-Object System.Collections.Generic.Stack[string]
+$Pending.Push($Here)
+while ($Pending.Count -gt 0) {
+    foreach ($Entry in (New-Object IO.DirectoryInfo($Pending.Pop())).GetFileSystemInfos()) {
+        if ($Entry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { $Links++ }
+        elseif ($Entry -is [IO.DirectoryInfo]) { $Pending.Push($Entry.FullName) }
+    }
+}
+if ($Links -gt 0) { throw 'The trial folder contains a link. Nothing was deleted. Tell the lead.' }
 Remove-Item -LiteralPath $Trial -Recurse -Force
 Test-Path -LiteralPath $Trial
 $ErrorActionPreference = 'Continue'
@@ -557,6 +574,8 @@ $ErrorActionPreference = 'Continue'
 | `period_mismatch` | the gateway reports a month later than this computer's clock | check the clock |
 | `receipts_exceed_settled`, `amount_invalid`, `unattributed_unavailable` | the gateway's figures are damaged or incomplete | nothing is sent; stop; tell the lead |
 | `status` shows `transition_open`, or the adopt block stops and lists open items | Leasewise saw something change that it wants a person to look at (for example money no lease accounts for went up). The items are listed in `status` under `open_transitions`, and the adopt block prints them | it is not a failure of the reader. **Do not adopt; tell the lead what is listed.** The adopt block never resolves an item by itself; you adopt only with no open items, or after the lead has answered for the items named |
+| Step 12 stops with "The trial folder contains a link" | a junction or symbolic link is inside the trial folder; a delete could follow it out and remove files elsewhere | **stop; keep the folder as it is and tell the lead.** Do not delete it by hand |
+| A delete fails or is refused (step 12 or any other) | something holds a file, or you may not delete it | keep the folder and tell the lead; **never try a stronger delete** (no `-Force` tricks, no `takeown`, no `icacls`, no `robocopy /MIR`) |
 | `send_failed` | Leasewise did not answer (is window 1 running?) | the same saved report is sent again; nothing is lost |
 | **`send_refused`** (the reader stopped itself) | Leasewise refused the waiting report five times in a row | see the next paragraph |
 | `continuity_conflict`, `state_unavailable`, `reader_halted` | the saved state is damaged or the reader stopped for good | run `reporter reset --confirm` (it archives the old state and starts a fresh reader identity), then approve and adopt again |
