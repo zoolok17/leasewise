@@ -37,7 +37,8 @@ You will use **two PowerShell windows**, both opened as the gateway user. Window
 
 Pasting a long block into a PowerShell window did not always work for the operator in the real trial, so **every step also comes as a small script**, one per step, in the
 folder `docs\trial-r1-reader-4\` (it is in the source archive once step 2 has unpacked it, and the lead can give you the folder to copy anywhere). Each script holds the same
-block, unchanged, after a short shared start (`trial-common.ps1`).
+block, unchanged, after a short shared start (`trial-common.ps1`). The shared start, and the two step-6 scripts, begin with one entry check (`trial-guard.ps1`): it
+stops, changing nothing, if the trial folder or `names.json` is a link, or if `names.json` names another folder.
 
 - **Choose one form before step 1 and keep it to the end.** Do not mix them. A pasted block can need variables that only the pasted blocks before it leave in your window
   (step 8 does), so a run that pastes one step after running another as a script can fail.
@@ -50,7 +51,7 @@ block, unchanged, after a short shared start (`trial-common.ps1`).
 - **Fill in the angle-bracket values in the step-1 script first** (`trial-01-setup.ps1`), the same values as the step-1 block asks for.
 - **Each script runs in its own window and its own process.** Nothing is carried over in variables. What the steps leave on purpose stays: the files in the trial folder (the
   source, the store, the reader's state) and `names.json`, which step 1 writes and every later step reads. Every script loads `trial-common.ps1` from its own folder, so keep the
-  folder's files together; the two step-6 scripts are the exception: they load `names.json` themselves.
+  folder's files together; the two step-6 scripts are the exception: they load `names.json` themselves, after the same entry check.
 - **The two step-6 scripts run in two windows**, as the two blocks do: the server in one, the reader in the other.
 - **Both forms use the default trial folder only** (`%LOCALAPPDATA%\leasewise-trial`): the step-6 windows read `names.json` from exactly there. The shared start stops with a plain
   message if `names.json` names another folder, and also if the trial folder or `names.json` is a link (nothing is changed; tell the lead).
@@ -156,7 +157,7 @@ $ErrorActionPreference = 'Continue'
 }
 ```
 
-It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": choose another name. If it stops with "Someone else can
+It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": an earlier trial's folder is still there, so roll it back with step 12 or tell the lead. **Do not choose another name** (the step-6 windows would not find it; the block's own message says "Choose a new name", and this page replaces that advice because the block itself cannot change). If it stops with "Someone else can
 open ...", the folder could not be made private: **stop and tell the lead**, because nothing secret may be written there.
 
 In the two extra windows (step 6) the names are loaded with one line, `$N = Get-Content -LiteralPath <the Trial folder>\names.json -Raw -Encoding UTF8 | ConvertFrom-Json`;

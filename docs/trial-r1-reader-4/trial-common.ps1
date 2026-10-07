@@ -36,18 +36,9 @@ function Assert-Private {
     if ($Seen -notcontains $Me) { throw "You cannot open $Path. Stop here." }
 }
 
-# The only trial folder the steps work with is the default one (the step-6 windows read it too).
-$DefaultTrial = Join-Path $env:LOCALAPPDATA 'leasewise-trial'
-$NamesFile = Join-Path $DefaultTrial 'names.json'
-# A link in the way (the folder or its names file): stop before anything is read, listed or entered.
-foreach ($Item in $DefaultTrial, $NamesFile) {
-    $Info = Get-Item -LiteralPath $Item -Force -ErrorAction SilentlyContinue
-    if ($Info -and ($Info.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Item is a link. Nothing was changed. Tell the lead." }
-}
-# The names saved by step 1 (absent before step 1 has run).
-if (Test-Path -LiteralPath $NamesFile) {
-    $N = Get-Content -LiteralPath $NamesFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($N.Trial -ne $DefaultTrial) { throw "names.json names the trial folder $($N.Trial), but only $DefaultTrial works with these steps. Nothing was changed. Tell the lead." }
+# The entry guard (a link in the way, or a different trial folder: stop before anything is read, listed or entered), then the names saved by step 1.
+. (Join-Path $PSScriptRoot 'trial-guard.ps1')
+if ($N) {
     foreach ($P in $N.PSObject.Properties) { Set-Variable -Name $P.Name -Value $P.Value }
     $GatewayPre = @($GatewayPre)                         # an empty list stays a list
     if (-not $KeepOutOfSource -and (Test-Path -LiteralPath $Src)) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 2)

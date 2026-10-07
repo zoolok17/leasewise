@@ -49,14 +49,29 @@ Everything else must be identical, line by line, in order, internal braces inclu
 3. step 1: the trailing explanation comments of six lines of the names block are dropped (the code on each line must be identical), and the helper definitions live in `trial-common.ps1` (checked there,
    whole and in order);
 4. step 2's second block (`Set-Location $Src`): done by the shared start, with the runbook's own target (checked);
-5. the two step-6 window scripts: their own stop line and bytecode setting (they do not use the shared start);
+5. the two step-6 window scripts: their own stop line, then the shared entry guard (`trial-guard.ps1`, the same file the shared start uses), then the bytecode setting (they do not use the shared start);
 6. **step 8: it starts with step 7's two status lines, exactly** (the pasted block used `$Gateway` left over from step 7's window; a script has its own process);
 7. "If an adopt is refused as too old": its block is step 9a's block without the open-items part (the test maps one to the other).
+
+## Fix round 2 (tk-c7bab31f9a96; Codex's delta tk-15f90afeb9d1 at 8756998d)
+
+- **The two step-6 scripts now pass the same entry checks.** The link check, the load of `names.json` and the default-folder check moved into ONE file, `trial-guard.ps1`. The shared start
+  (`trial-common.ps1`) and both step-6 scripts dot-source it, so the check cannot drift between copies. The unchanged step-6 block body follows the guard. Before this round the two window scripts
+  read `names.json` through a linked folder, entered the saved source folder and ran the saved program with no check at all.
+- **The drift test now pins the regions it used to exempt.** `trial-common.ps1` and `trial-guard.ps1` must equal approved copies kept in the test, character for character (line endings
+  normalised), so any change fails until the test is updated on purpose. A banner line is accepted only when the whole line is one single-quoted literal (no `;`, nothing after it).
+  Negative tests, each also run on CRLF copies: an executable line appended to the shared start; the `-not $KeepOutOfSource -and` part removed; a banner with a second command; the guard removed from each
+  step-6 script; the link check removed from the guard; the link check moved after `names.json` is read.
+- **Line endings in the mutation tests:** the scripts are normalised to LF when read, the mutation patterns are LF, and one test runs the real files and every mutation on CRLF-converted copies
+  (in memory) and still reports each one.
+- **Runbook prose (item b):** after the step-1 block the page said "choose another name"; it now says what the rest of the page says: an earlier trial's folder is still there, roll it back with step 12 or
+  tell the lead, do not choose another name. **The recorded residual:** the frozen step-1 block still prints "Choose a new name for `$Trial`" when the folder exists; the page says in two places that this
+  advice is replaced, because the block cannot change in this card.
 
 ## The drift test and what it guards
 
 - each script's complete executable body equals its block (blank lines and full-line comments aside; here-string lines always count), apart from the differences above;
-- the shared start: the stop line first, step 1's helper definitions whole and in order, the runbook's `Set-Location` target, the link check before `names.json` is read, the default-folder check, the switch;
+- the shared start and the entry guard are PINNED to approved copies (fix round 2); besides that, the shared start: the stop line first, step 1's helper definitions whole and in order, the runbook's `Set-Location` target, the guard dot-sourced; the guard: the link check before `names.json` is read, the default-folder check;
 - `trial-00-check.ps1` only prints the version and `scripts run here`; `trial-01-setup.ps1` holds the placeholders; the runbook names every script and every named script exists; every script is pure ASCII;
 - one test per mutation, each feeding a mutated text to the real checker: an added executable line in step 12; a placeholder kept but overridden later; the shared start's stop line removed; an internal
   closing brace removed (step 9b); the runbook's `Set-Location` target changed; a runbook character changed; a script line removed; an unnamed extra script; a placeholder replaced by a value; step 8's

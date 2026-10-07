@@ -9,6 +9,10 @@ stripped (``. {``, the two ``$ErrorActionPreference`` lines, the final ``}``); i
 stay. Blank lines and full-line comments are ignored (a here-string's lines are data and are never ignored). The only
 differences allowed are the named adaptations in ``check_drift``; anything else is reported.
 
+Two files are not compared with a block at all, so they are PINNED instead: the shared start (``trial-common.ps1``) and the
+entry guard (``trial-guard.ps1``) must equal the approved copies below, character for character (line endings normalised). Any
+change to either fails the test until the approved copy here is updated on purpose.
+
 The checks are text only. Line endings are normalised first (a Windows checkout may hold CRLF; the repository holds LF; the
 raw bytes of the scripts must be ASCII). One more test parses every script with PowerShell's own parser, when ``pwsh`` is on
 the path (it parses; it never runs a script).
@@ -27,6 +31,8 @@ SCRIPTS = ROOT / "docs" / "trial-r1-reader-4"
 COMMON = "trial-common.ps1"
 DOT_SOURCE = ". (Join-Path $PSScriptRoot 'trial-common.ps1')"
 DOT_SOURCE_NO_SOURCE = DOT_SOURCE + " -KeepOutOfSource"
+GUARD = "trial-guard.ps1"
+GUARD_DOT = ". (Join-Path $PSScriptRoot 'trial-guard.ps1')"
 STOP = "$ErrorActionPreference = 'Stop'"
 CONTINUE = "$ErrorActionPreference = 'Continue'"
 BYTECODE = "$env:PYTHONDONTWRITEBYTECODE = '1'"
@@ -47,7 +53,76 @@ SIMPLE = {
 }
 WINDOWS = {"trial-06a-server.ps1": B_SERVER, "trial-06b-reader.ps1": B_READER}
 ALL_SCRIPTS = (sorted(SIMPLE) + sorted(WINDOWS) +
-               ["trial-00-check.ps1", "trial-01-setup.ps1", "trial-08-approve.ps1", COMMON])
+               ["trial-00-check.ps1", "trial-01-setup.ps1", "trial-08-approve.ps1", COMMON, GUARD])
+
+# The approved copies of the two pinned files (see the docstring).
+APPROVED = {
+    COMMON: r'''param([switch]$KeepOutOfSource)    # step 12 sets this: it must not enter the source folder (which lives inside the folder it deletes)
+# Shared start for every trial step script (made 2026-10-07 by the desktop lead so the operator need not paste blocks).
+# It only does what the pasted runbook got from step 1's block and the open window: stop at the first error, the UTF-8 writer,
+# the two privacy helpers (copied unchanged from step 1), the saved names, and Leasewise's source folder as the working folder.
+$ErrorActionPreference = 'Stop'
+$env:PYTHONDONTWRITEBYTECODE = '1'                       # keeps the source folder clean
+$Utf8 = New-Object System.Text.UTF8Encoding($false)      # UTF-8 without a byte-order mark, for every file written below
+
+# Who may open the private things: you (by security identifier), SYSTEM and Administrators. Names are never compared, only identifiers.
+$Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$Allowed = @($Me, 'S-1-5-18', 'S-1-5-32-544')
+function Protect-Path {
+    param([string]$Path, [bool]$Folder)
+    $Acl = Get-Acl -LiteralPath $Path
+    $Acl.SetAccessRuleProtection($true, $false)                          # nothing inherited from the folder above
+    foreach ($Rule in @($Acl.Access)) { [void]$Acl.RemoveAccessRule($Rule) }
+    $Flags = if ($Folder) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+    foreach ($Sid in $Allowed) {
+        $Who = New-Object Security.Principal.SecurityIdentifier($Sid)
+        $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($Who, 'FullControl', $Flags, 'None', 'Allow')))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $Acl
+}
+function Assert-Private {
+    param([string]$Path, [bool]$OwnList)                                  # $OwnList: the item has its own list and inherits nothing
+    $Acl = Get-Acl -LiteralPath $Path
+    if ($OwnList -and -not $Acl.AreAccessRulesProtected) { throw "$Path still inherits access from its folder. Stop here; nothing secret has been written." }
+    $Seen = @()
+    foreach ($Rule in $Acl.Access) {
+        if ($Rule.AccessControlType -ne 'Allow') { continue }
+        $Sid = $Rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($Allowed -notcontains $Sid) { throw "Someone else can open $Path. Stop here; nothing secret has been written." }
+        if ($OwnList -and $Rule.IsInherited) { throw "$Path inherits an entry from its folder. Stop here; nothing secret has been written." }
+        $Seen += $Sid
+    }
+    if ($Seen -notcontains $Me) { throw "You cannot open $Path. Stop here." }
+}
+
+# The entry guard (a link in the way, or a different trial folder: stop before anything is read, listed or entered), then the names saved by step 1.
+. (Join-Path $PSScriptRoot 'trial-guard.ps1')
+if ($N) {
+    foreach ($P in $N.PSObject.Properties) { Set-Variable -Name $P.Name -Value $P.Value }
+    $GatewayPre = @($GatewayPre)                         # an empty list stays a list
+    if (-not $KeepOutOfSource -and (Test-Path -LiteralPath $Src)) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 2)
+}
+''',
+    GUARD: r'''# The one entry guard of the trial scripts. The shared start (trial-common.ps1) and the two step-6 window scripts all dot-source THIS file, so
+# the check cannot differ between copies. It runs before anything is entered or run, and it stops (nothing is changed) when:
+#   * the default trial folder, or its names.json, is a link (a junction or symbolic link): nothing is read, listed or entered through it;
+#   * names.json names a trial folder other than the default one: only the default folder works with these steps (the step-6 windows read it).
+# It leaves $DefaultTrial, $NamesFile and $N (the saved names, or nothing before step 1 has run) for the caller.
+$DefaultTrial = Join-Path $env:LOCALAPPDATA 'leasewise-trial'
+$NamesFile = Join-Path $DefaultTrial 'names.json'
+foreach ($Item in $DefaultTrial, $NamesFile) {
+    $Info = Get-Item -LiteralPath $Item -Force -ErrorAction SilentlyContinue
+    if ($Info -and ($Info.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Item is a link. Nothing was changed. Tell the lead." }
+}
+$N = $null
+if (Test-Path -LiteralPath $NamesFile) {
+    $N = Get-Content -LiteralPath $NamesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($N.Trial -ne $DefaultTrial) { throw "names.json names the trial folder $($N.Trial), but only $DefaultTrial works with these steps. Nothing was changed. Tell the lead." }
+}
+''',
+}
+# A banner is ONE single-quoted literal and nothing else (no second command after a semicolon).
+BANNER = re.compile(r"'== (?:[^']|'')*'")
 
 
 def norm(text: str) -> str:
@@ -114,7 +189,7 @@ def script_body(text):
     if lines and lines[0].startswith(". (Join-Path $PSScriptRoot"):
         dot, lines = lines[0], lines[1:]
     banner = None
-    if dot is not None and lines and re.fullmatch(r"'== .*'", lines[0]):
+    if dot is not None and lines and BANNER.fullmatch(lines[0]):
         banner, lines = lines[0], lines[1:]
     return dot, banner, lines
 
@@ -132,11 +207,13 @@ def check_drift(runbook: str, scripts: dict):
     """Everything that would make a script differ from its runbook block. Returns a list of problems (empty: no drift).
 
     The ONLY adaptations allowed, each stated here:
-      * the banner line (``'== Step N: ...'``) and the dot-source line at the top of a script (step 12's carries ``-KeepOutOfSource``);
+      * the banner line (one single-quoted literal) and the dot-source line at the top of a script (step 12's carries ``-KeepOutOfSource``);
       * step 1: the dropped trailing comments of the names block (the code on each line must be identical), and the helper
         definitions, which live in trial-common.ps1 (checked there, in order);
       * step 2's ``Set-Location``: done by the shared start (its target must be the runbook's);
-      * step 6's two window scripts: their own copy of the stop line and of the bytecode setting;
+      * step 6's two window scripts: their own copy of the stop line, the shared entry guard (trial-guard.ps1, the same file the
+        shared start uses) and the bytecode setting;
+      * the shared start and the entry guard are not compared with a block: they are pinned to the approved copies;
       * step 8: starts with step 7's two status lines (exactly);
       * "If an adopt is refused as too old": its block is step 9a's block without the open-items part (mapped to step 9a).
     """
@@ -206,12 +283,16 @@ def check_drift(runbook: str, scripts: dict):
         wanted = "Set-Location -LiteralPath " + target[0][len("Set-Location "):].strip()
         if not any(wanted in line for line in common):
             problems.append(f"{COMMON}: it must do {wanted!r} (the runbook's Set-Location target)")
-    if "param([switch]$KeepOutOfSource)" not in common_text:
-        problems.append(f"{COMMON}: the -KeepOutOfSource switch is missing")
-    if "ReparsePoint" not in common_text or common_text.find("ReparsePoint") > common_text.find("Get-Content"):
-        problems.append(f"{COMMON}: the link check must come before names.json is read")
-    if "$N.Trial -ne $DefaultTrial" not in common_text:
-        problems.append(f"{COMMON}: the default-folder check is missing")
+    if GUARD_DOT not in common:
+        problems.append(f"{COMMON}: it must dot-source the entry guard ({GUARD})")
+    for name in (COMMON, GUARD):
+        if norm(scripts[name]) != APPROVED[name]:
+            problems.append(f"{name}: it differs from the approved copy pinned in this test")
+    guard_text = norm(scripts[GUARD])
+    if "ReparsePoint" not in guard_text or guard_text.find("ReparsePoint") > guard_text.find("Get-Content"):
+        problems.append(f"{GUARD}: the link check must come before names.json is read")
+    if "$N.Trial -ne $DefaultTrial" not in guard_text:
+        problems.append(f"{GUARD}: the default-folder check is missing")
 
     # step 8: step 7's two status lines, exactly, then the block
     wait_lines = [line.strip() for line in body[B_WAIT]]
@@ -220,7 +301,7 @@ def check_drift(runbook: str, scripts: dict):
         problems.append("step 7's block no longer has exactly two status lines")
     compare("trial-08-approve.ps1", refresh + body[B_APPROVE])
 
-    # the two window scripts: their own stop line and bytecode setting, then the block
+    # the two window scripts: their own stop line, then the same entry guard, the bytecode setting, then the block
     for name, index in WINDOWS.items():
         dot, banner, got = parts[name]
         if dot is not None:
@@ -230,6 +311,10 @@ def check_drift(runbook: str, scripts: dict):
             rest = rest[1:]
         else:
             problems.append(f"{name}: it must start with its own stop line")
+        if rest[:1] == [GUARD_DOT]:
+            rest = rest[1:]
+        else:
+            problems.append(f"{name}: the entry guard must come right after the stop line, before names.json is read")
         if rest.count(BYTECODE) != 1:
             problems.append(f"{name}: it must hold the bytecode setting once")
         else:
@@ -276,7 +361,7 @@ def read_scripts(folder: Path):
     for path in sorted(folder.glob("*.ps1")):
         raw = path.read_bytes()
         raw.decode("ascii")                                          # raises on any non-ASCII byte
-        scripts[path.name] = raw.decode("ascii")
+        scripts[path.name] = norm(raw.decode("ascii"))                # LF, whatever the checkout holds
     return scripts
 
 
@@ -309,6 +394,51 @@ def mutate(files: dict, key: str, old: str, new: str):
     return changed
 
 
+def _replace(key, old, new):
+    return lambda files: mutate(files, key, old, new)
+
+
+def _append(key, extra):
+    def change(files):
+        changed = dict(files)
+        changed[key] = changed[key] + extra
+        return changed
+    return change
+
+
+def _move_link_check(files):
+    changed = dict(files)
+    text = changed[GUARD]
+    block = text[text.index("foreach ($Item in"):text.index("$N = $null")]
+    changed[GUARD] = text.replace(block, "") + block
+    return changed
+
+
+def _remove_guard_from(name):
+    return _replace(name, "\n" + GUARD_DOT, "")
+
+
+# label -> (the mutation, a word the reported problem must contain)
+MUTATIONS = {
+    "an added executable line in rollback": (_replace("trial-12-rollback.ps1", "'== Step 12: roll back'", "'== Step 12: roll back'\nWrite-Output 'extra'"), "trial-12-rollback.ps1"),
+    "a placeholder kept but overridden later": (_replace("trial-01-setup.ps1", "$AccountAlias = '<account alias>'", "$AccountAlias = '<account alias>'\n$AccountAlias = 'real-account'"), "trial-01-setup.ps1"),
+    "the shared start stop line removed": (_replace(COMMON, "$ErrorActionPreference = 'Stop'\n$env:PYTHONDONTWRITEBYTECODE", "$env:PYTHONDONTWRITEBYTECODE"), COMMON),
+    "an internal closing brace removed": (_replace("trial-09b-adopt.ps1", "\n}\n", "\n"), "trial-09b-adopt.ps1"),
+    "the runbook Set-Location target changed": (_replace("runbook", "Set-Location $Src", "Set-Location $Trial"), "Set-Location"),
+    "one character of a runbook block": (_replace("runbook", "'PASSED'", "'PASSEX'"), "trial-10-check.ps1"),
+    "a script line removed": (_replace("trial-10-check.ps1", "if ($Gateway.evidence.state -ne 'usable') { throw 'status does not say usable' }\n", ""), "trial-10-check.ps1"),
+    "a placeholder replaced by a value": (_replace("trial-01-setup.ps1", "'<account alias>'", "'real-account'"), "trial-01-setup.ps1"),
+    "the step 8 status refresh changed": (_replace("trial-08-approve.ps1", "$Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json", "$Status = (& $Py -m quota_balancer --db $Store status) | ConvertFrom-Json"), "trial-08-approve.ps1"),
+    "an executable line appended to the shared start": (_append(COMMON, "Write-Output 'synthetic extra command'\n"), COMMON),
+    "the keep-out-of-source condition removed": (_replace(COMMON, "-not $KeepOutOfSource -and ", ""), COMMON),
+    "a banner with a second command": (_replace("trial-12-rollback.ps1", "'== Step 12: roll back'", "'== Step 12: roll back'; Write-Output 'synthetic extra command'"), "trial-12-rollback.ps1"),
+    "the guard removed from the step 6 server script": (_remove_guard_from("trial-06a-server.ps1"), "trial-06a-server.ps1"),
+    "the guard removed from the step 6 reader script": (_remove_guard_from("trial-06b-reader.ps1"), "trial-06b-reader.ps1"),
+    "the link check removed from the guard": (_replace(GUARD, "-band [IO.FileAttributes]::ReparsePoint", "-band 0"), GUARD),
+    "the link check moved after names.json is read": (_move_link_check, GUARD),
+}
+
+
 class TrialScriptsTest(unittest.TestCase):
 
     @classmethod
@@ -318,11 +448,6 @@ class TrialScriptsTest(unittest.TestCase):
 
     def problems(self, runbook=None, scripts=None):
         return check_drift(runbook or self.runbook, scripts or self.scripts)
-
-    def mutated(self, key, old, new):
-        files = {"runbook": self.runbook, **self.scripts}
-        files = mutate(files, key, old, new)
-        return self.problems(files.pop("runbook"), files)
 
     # ---- the real files hold together
     def test_the_scripts_do_not_drift_from_the_runbook(self):
@@ -350,41 +475,76 @@ class TrialScriptsTest(unittest.TestCase):
                          "Both forms use the default trial folder only", "Do not choose another name"):
             self.assertIn(sentence, text)
 
+    def test_the_runbook_prose_no_longer_says_to_choose_another_name(self):
+        prose = re.sub(r"(?ms)^```powershell\n.*?^```", "", self.runbook)       # the frozen blocks keep their own words
+        self.assertNotIn("choose another name", prose.lower().replace("do not choose another name", "").replace("**do not choose another name**", ""))
+        self.assertIn("Do not choose another name", prose)
+        self.assertIn("an earlier trial's folder is still there", prose)
+
     def test_the_parser_accepts_every_script(self):
         errors = parse_errors(self.scripts)
         if errors is None:
             self.skipTest("pwsh is not on the path: PowerShell's own parser is not available here")
         self.assertEqual(errors, [])
 
-    # ---- mutations the check must report (each fed to the real checker)
+    # ---- mutations the check must report (each fed to the real checker, on LF text and on CRLF copies)
+    def reported(self, label):
+        change, needle = MUTATIONS[label]
+        for crlf in (False, True):
+            files = change({"runbook": self.runbook, **self.scripts})
+            if crlf:
+                files = {key: text.replace("\n", "\r\n") for key, text in files.items()}
+            runbook = files.pop("runbook")
+            found = check_drift(runbook, files)
+            self.assertTrue(any(needle in p for p in found), (label, "CRLF" if crlf else "LF", found))
+
     def test_mutation_an_added_executable_line_in_rollback(self):
-        found = self.mutated("trial-12-rollback.ps1", "'== Step 12: roll back'", "'== Step 12: roll back'\nWrite-Output 'extra'")
-        self.assertTrue(any("trial-12-rollback.ps1" in p for p in found), found)
+        self.reported("an added executable line in rollback")
 
     def test_mutation_a_placeholder_kept_but_overridden_later(self):
-        found = self.mutated("trial-01-setup.ps1", "$AccountAlias = '<account alias>'",
-                             "$AccountAlias = '<account alias>'\n$AccountAlias = 'real-account'")
-        self.assertTrue(any("trial-01-setup.ps1" in p for p in found), found)
+        self.reported("a placeholder kept but overridden later")
 
     def test_mutation_the_shared_start_stop_line_removed(self):
-        found = self.mutated(COMMON, "$ErrorActionPreference = 'Stop'\n$env:PYTHONDONTWRITEBYTECODE", "$env:PYTHONDONTWRITEBYTECODE")
-        self.assertTrue(any(COMMON in p for p in found), found)
+        self.reported("the shared start stop line removed")
 
     def test_mutation_an_internal_closing_brace_removed(self):
-        found = self.mutated("trial-09b-adopt.ps1", "\n}\n", "\n")
-        self.assertTrue(any("trial-09b-adopt.ps1" in p for p in found), found)
+        self.reported("an internal closing brace removed")
 
     def test_mutation_the_runbooks_set_location_target_changed(self):
-        found = self.mutated("runbook", "Set-Location $Src", "Set-Location $Trial")
-        self.assertTrue(any("Set-Location" in p for p in found), found)
+        self.reported("the runbook Set-Location target changed")
 
     def test_mutation_one_character_of_a_runbook_block(self):
-        found = self.mutated("runbook", "'PASSED'", "'PASSEX'")
-        self.assertTrue(any("trial-10-check.ps1" in p for p in found), found)
+        self.reported("one character of a runbook block")
 
     def test_mutation_a_script_line_removed(self):
-        found = self.mutated("trial-10-check.ps1", "if ($Gateway.evidence.state -ne 'usable') { throw 'status does not say usable' }\n", "")
-        self.assertTrue(any("trial-10-check.ps1" in p for p in found), found)
+        self.reported("a script line removed")
+
+    def test_mutation_a_placeholder_replaced_by_a_value(self):
+        self.reported("a placeholder replaced by a value")
+
+    def test_mutation_the_step_8_status_refresh_changed(self):
+        self.reported("the step 8 status refresh changed")
+
+    def test_mutation_an_executable_line_appended_to_the_shared_start(self):
+        self.reported("an executable line appended to the shared start")
+
+    def test_mutation_the_keep_out_of_source_condition_removed(self):
+        self.reported("the keep-out-of-source condition removed")
+
+    def test_mutation_a_banner_with_a_second_command(self):
+        self.reported("a banner with a second command")
+
+    def test_mutation_the_guard_removed_from_the_step_6_server_script(self):
+        self.reported("the guard removed from the step 6 server script")
+
+    def test_mutation_the_guard_removed_from_the_step_6_reader_script(self):
+        self.reported("the guard removed from the step 6 reader script")
+
+    def test_mutation_the_link_check_removed_from_the_guard(self):
+        self.reported("the link check removed from the guard")
+
+    def test_mutation_the_link_check_is_moved_after_names_json_is_read(self):
+        self.reported("the link check moved after names.json is read")
 
     def test_mutation_a_script_the_runbook_does_not_name(self):
         scripts = dict(self.scripts)
@@ -392,23 +552,12 @@ class TrialScriptsTest(unittest.TestCase):
         self.assertTrue(check_inventory(self.runbook, scripts))
         self.assertTrue(any("trial-99-extra.ps1" in p for p in check_drift(self.runbook, scripts)))
 
-    def test_mutation_a_placeholder_replaced_by_a_value(self):
-        found = self.mutated("trial-01-setup.ps1", "'<account alias>'", "'real-account'")
-        self.assertTrue(any("trial-01-setup.ps1" in p for p in found), found)
-
-    def test_mutation_the_step_8_status_refresh_changed(self):
-        found = self.mutated("trial-08-approve.ps1", "$Status = (& $Py -m quota_balancer --db $Store status --json) | ConvertFrom-Json",
-                             "$Status = (& $Py -m quota_balancer --db $Store status) | ConvertFrom-Json")
-        self.assertTrue(any("trial-08-approve.ps1" in p for p in found), found)
-
-    def test_mutation_the_link_check_is_moved_after_names_json_is_read(self):
-        files = {"runbook": self.runbook, **self.scripts}
-        text = files[COMMON]
-        link_block = text[text.index("# A link in the way"):text.index("# The names saved by step 1")]
-        moved = text.replace(link_block, "") + link_block
-        files[COMMON] = moved
-        runbook = files.pop("runbook")
-        self.assertTrue(any("link check" in p for p in self.problems(runbook, files)))
+    def test_every_mutation_is_reported_on_crlf_copies_and_the_real_files_are_clean_on_crlf(self):
+        crlf = {name: text.replace("\n", "\r\n") for name, text in self.scripts.items()}
+        self.assertEqual(check_drift(self.runbook.replace("\n", "\r\n"), crlf), [])
+        for label in MUTATIONS:
+            with self.subTest(label):
+                self.reported(label)
 
     def test_mutation_the_parser_reports_a_removed_brace(self):
         if parse_errors(self.scripts) is None:
@@ -416,10 +565,6 @@ class TrialScriptsTest(unittest.TestCase):
         scripts = dict(self.scripts)
         scripts["trial-09b-adopt.ps1"] = scripts["trial-09b-adopt.ps1"].replace("\n}\n", "\n", 1)
         self.assertTrue(parse_errors(scripts))
-
-    def test_line_endings_are_normalised_before_comparing(self):
-        crlf = {name: text.replace("\n", "\r\n") for name, text in self.scripts.items()}
-        self.assertEqual(check_drift(self.runbook.replace("\n", "\r\n"), crlf), [])
 
 
 if __name__ == "__main__":
