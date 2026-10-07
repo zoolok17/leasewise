@@ -1,7 +1,7 @@
 # Live trial of the money reader: the operator's runbook
 
 Mode: how-to. For: the operator, at the desktop where the gateway runs, in a maintenance window. Status: **rehearsed end to end on made-up data**
-(`tests/trial/`, `docs/STEP-CARD-R1-READER-4-PREP.md`); **not yet run against the real gateway**. Leasewise commit to install: `<COMMIT>` (the lead fills
+(`tests/trial/`, `docs/STEP-CARD-R1-READER-4-PREP.md`), and **passed against the real gateway on 2026-10-07, all 12 steps**. Leasewise commit to install: `<COMMIT>` (the lead fills
 this in at the merge). Plan: lead decision D-221.
 
 **How to paste.** Paste each block **whole** and press Enter **once**. Every block starts with `. {` and ends with `}`, so PowerShell runs it only when all of it has arrived, and if any line fails the **whole** block stops (a block that checks something and then acts never acts after a failed check). If anything is printed in red, **stop and tell the lead**; do not paste the next block.
@@ -33,11 +33,39 @@ You need all of these. If one is missing, stop.
 You will use **two PowerShell windows**, both opened as the gateway user. Window 1 runs the Leasewise server, window 2 runs the reader. Everything else
 (the setup steps) you can run in a third window, or in window 2 before you start the reader.
 
+## Two ways to run each step
+
+Pasting a long block into a PowerShell window did not always work for the operator in the real trial, so **every step also comes as a small script**, one per step, in the
+folder `docs\trial-r1-reader-4\` (it is in the source archive once step 2 has unpacked it, and the lead can give you the folder to copy anywhere). Each script holds the same
+block, unchanged, after a short shared start (`trial-common.ps1`). The shared start, and the two step-6 scripts, begin with one entry check (`trial-guard.ps1`): it
+stops, changing nothing, if the trial folder or `names.json` is a link, or if `names.json` names another folder.
+
+- **Choose one form before step 1 and keep it to the end.** Do not mix them. A pasted block can need variables that only the pasted blocks before it leave in your window
+  (step 8 does), so a run that pastes one step after running another as a script can fail.
+- **Which form.** The script form was rehearsed with **PowerShell 7**: `pwsh -NoProfile -File '<script>'`. Use it where PowerShell 7 is installed and the machine's script policy
+  lets the script run. Windows PowerShell 5.1 (`powershell -NoProfile -File '<script>'`) was **not** rehearsed with the scripts: it refused scripts on our machine. The machine's
+  policy decides, and it must **never** be changed. If scripts cannot run, paste the blocks, for the whole run.
+- **Check before step 1.** Run `docs\trial-r1-reader-4\trial-00-check.ps1` the same way. It changes nothing: it prints the PowerShell version and `scripts run here`. If it prints
+  that, you may use the script form for the whole run. If the machine refuses it, paste the blocks for the whole run. If a script is refused part-way through, **stop and tell the
+  lead**; do not switch forms in the middle.
+- **Fill in the angle-bracket values in the step-1 script first** (`trial-01-setup.ps1`), the same values as the step-1 block asks for.
+- **Each script runs in its own window and its own process.** Nothing is carried over in variables. What the steps leave on purpose stays: the files in the trial folder (the
+  source, the store, the reader's state) and `names.json`, which step 1 writes and every later step reads. Every script loads `trial-common.ps1` from its own folder, so keep the
+  folder's files together; the two step-6 scripts are the exception: they load `names.json` themselves, after the same entry check.
+- **The two step-6 scripts run in two windows**, as the two blocks do: the server in one, the reader in the other.
+- **Both forms use the default trial folder only** (`%LOCALAPPDATA%\leasewise-trial`): the step-6 windows read `names.json` from exactly there. The shared start stops with a plain
+  message if `names.json` names another folder, and also if the trial folder or `names.json` is a link (nothing is changed; tell the lead).
+- The line under each heading below names that step's script. If the machine's script policy refuses a script, see "Which form" above and **do not change the policy**.
+
 ## Step 1: choose the names, then make the private folder
+
+Script form: `docs\trial-r1-reader-4\trial-01-setup.ps1`.
 
 Edit the lines in angle brackets `<like this>` and run the block. Everything else is derived from them. Use plain letters and digits in aliases. The folder named
 by `$Trial` **must not exist yet**: the next block refuses an existing folder without changing it, because step 12 deletes this folder and must only ever delete one
-this runbook made. If you want another place, change that line.
+this runbook made. **Keep the default for `$Trial`**: the step-6 windows read `%LOCALAPPDATA%\leasewise-trial\names.json`, so another folder does not work, in either form.
+If the block below says the folder already exists, an earlier trial's folder is still there: roll it back with step 12, or tell the lead. **Do not choose another name.** (The block's
+own message says "Choose a new name"; this page replaces that advice, because the block itself cannot change.)
 
 <!-- rehearse: replace -->
 ```powershell
@@ -129,7 +157,7 @@ $ErrorActionPreference = 'Continue'
 }
 ```
 
-It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": choose another name. If it stops with "Someone else can
+It prints `True`. If the folder existed it stops with "The folder ... already exists. Nothing was changed.": an earlier trial's folder is still there, so roll it back with step 12 or tell the lead. **Do not choose another name** (the step-6 windows would not find it; the block's own message says "Choose a new name", and this page replaces that advice because the block itself cannot change). If it stops with "Someone else can
 open ...", the folder could not be made private: **stop and tell the lead**, because nothing secret may be written there.
 
 In the two extra windows (step 6) the names are loaded with one line, `$N = Get-Content -LiteralPath <the Trial folder>\names.json -Raw -Encoding UTF8 | ConvertFrom-Json`;
@@ -139,6 +167,8 @@ everything back with:
 (the helper functions of the block above are then missing; step 5 and the rollback tell you what to do).
 
 ## Step 2: check the archive, then unpack it
+
+Script form: `docs\trial-r1-reader-4\trial-02-unpack.ps1`.
 
 The checksum must match exactly. If it does not, **stop and tell the lead**; do not unpack.
 
@@ -169,6 +199,8 @@ $ErrorActionPreference = 'Continue'
 
 ## Step 3: check Python and the gateway program
 
+Script form: `docs\trial-r1-reader-4\trial-03-check.ps1`.
+
 Both checks only read. Neither changes anything.
 
 <!-- rehearse: run -->
@@ -189,6 +221,8 @@ or an empty last number), **stop**: the gateway is not ready for this trial. Lea
 `status_shape` or `child_cap_not_ready` and send nothing.
 
 ## Step 4: set up the store
+
+Script form: `docs\trial-r1-reader-4\trial-04-store.ps1`.
 
 Leasewise's store is a file. It needs to know this machine, the gateway's account, and the gateway bound to that machine and account (Leasewise only
 accepts a gateway's report from the machine **and** the account that own the gateway).
@@ -224,6 +258,8 @@ The first three commands print nothing when they work. The last line prints your
 does not make any lease.)
 
 ## Step 5: make the private file, then the identity value
+
+Script form: `docs\trial-r1-reader-4\trial-05-identity.ps1`.
 
 Leasewise knows the reader by a secret **identity value**. It is made here, on this machine, from the computer's secure random source. **It is never
 printed, never logged and never pasted into any message, to anyone, ever.** It lives in a variable, in Leasewise's store (inside the private folder of step 1), and in
@@ -308,7 +344,9 @@ application-data folder, so its variable **`LOCALAPPDATA`** is named in both `en
 
 ## Step 6: start it (two windows)
 
-**Window 1: the Leasewise server.** It prints nothing while it works. (Change the folder in the first line if you did not use the default.)
+Script form: `docs\trial-r1-reader-4\trial-06a-server.ps1`, `docs\trial-r1-reader-4\trial-06b-reader.ps1`.
+
+**Window 1: the Leasewise server.** It prints nothing while it works. (It reads the default trial folder.)
 
 <!-- rehearse: window ServeArgs -->
 ```powershell
@@ -346,6 +384,8 @@ sentence and a closed code, for example `CONFIG_INVALID`; it never prints what t
 
 ## Step 7: wait for the first report
 
+Script form: `docs\trial-r1-reader-4\trial-07-wait.ps1`.
+
 In your third window, run this. It asks Leasewise's `status` every few seconds for up to two minutes.
 
 <!-- rehearse: run -->
@@ -369,6 +409,8 @@ report. A new report follows about every minute.
 
 ## Step 8: compare the two fingerprints, then approve
 
+Script form: `docs\trial-r1-reader-4\trial-08-approve.ps1`.
+
 The gateway has two policy fingerprints (a price one and a child-cap one). You approve the pair you have **seen**. First compare what the gateway
 prints now with what Leasewise holds from the report it received. They must be equal; if they are not, **stop**.
 
@@ -389,6 +431,8 @@ $ErrorActionPreference = 'Continue'
 It prints `price equal: True   cap equal: True`, then `{"approved":true}`.
 
 ## Step 9: look at what blocks adoption, then adopt
+
+Script form: `docs\trial-r1-reader-4\trial-09a-blockers.ps1`, `docs\trial-r1-reader-4\trial-09b-adopt.ps1`.
 
 `adopt_blockers` lists every reason the newest report cannot be adopted yet. After the approval it should be empty.
 
@@ -439,6 +483,8 @@ when there are no open items, or after the lead has answered for the items named
 
 ## Step 10: check that it passed
 
+Script form: `docs\trial-r1-reader-4\trial-10-check.ps1`.
+
 "Passed" means all four are true at once: Leasewise accepted reports, you adopted one, `status` says **usable**, and the settled total Leasewise holds
 equals the gateway's own. Run this when the gateway has been quiet for a minute (so the two totals are taken at the same moment):
 
@@ -473,9 +519,11 @@ and the state stays `usable`.
 
 ## Step 11: stop
 
+Script form: `docs\trial-r1-reader-4\trial-11-stopped.ps1`.
+
 Press **Ctrl-C** in window 2 (the reader), then in window 1 (the server). Ctrl-C is a **request** to stop: **wait until both windows show their prompt again** before you go
 on to step 12. (Ctrl-C was **not** rehearsed: the rehearsal ended the two processes through the process objects it had started, which is harsher; the reader restarted cleanly
-after that.) Then check that no Leasewise process remains:
+after that.) In the server window, Ctrl-C prints a few lines that end in `KeyboardInterrupt`; this is normal, and it means the server has stopped. Then check that no Leasewise process remains:
 
 <!-- rehearse: run -->
 ```powershell
@@ -490,13 +538,16 @@ It prints nothing when everything has stopped. (Your own PowerShell window may s
 
 ## Step 12: roll back
 
+Script form: `docs\trial-r1-reader-4\trial-12-rollback.ps1`.
+
 Rolling back is deleting the folder, **but only the folder this runbook made**. The block compares the folder's resolved path and the token in its ownership marker with
 the ones saved in step 1, and stops if either differs; it deletes nothing in that case. (`$Token` and `$Trial` come from the window you worked in; in a new window load them with
 the line in step 1 first.) The gateway, agenttalk and the rest of the machine were never changed.
 
 **Why the block also looks for links.** A delete can follow a folder link (a junction or a symbolic link) out of the folder being deleted and remove files somewhere else.
 This runbook never makes a link, so a link inside the trial folder means something else put it there. Before it deletes, the block therefore walks the whole folder **without ever
-going into a link** and looks at every entry. If the trial folder **itself** is a link, it stops first thing, before it opens or lists anything. If it finds **any** link inside (a
+going into a link** and looks at every entry. If the trial folder **itself** is a link, it stops first thing, before it opens or lists anything. (The script form does the same: the shared start stops on a link, and the
+step-12 script does not enter the source folder.) If it finds **any** link inside (a
 folder or a file, at any depth), it stops with "The trial folder contains a link. Nothing was deleted. Tell the lead." Only a folder with no link in it is deleted. (A few other special entries, such as a cloud-sync placeholder, count as links too: that is
 the safe side.)
 
@@ -532,6 +583,8 @@ temp folder that Leasewise removes itself.
 
 ## If an adopt is refused as too old (rehearsed)
 
+Script form: `docs\trial-r1-reader-4\trial-09a-blockers.ps1`.
+
 A report must be adopted within 120 seconds. If you were slow, or the reader was stopped for a while, `gateway-adopt` prints its fixed refusal sentence
 and exit code 2, and `status` says why:
 
@@ -551,6 +604,8 @@ Make sure the reader (window 2) is running; it makes a new report at once when i
 under a minute, then run the Step 9 adopt block again. This refusal is the guard against adopting an old report; the reader's one-minute rhythm does not replace it.
 
 ## If something goes wrong
+
+Script form: `docs\trial-r1-reader-4\trial-help-status.ps1`.
 
 Everything the reader cannot do ends in **one closed word**, counted in `reporter status`. A word never carries a value from the gateway.
 
