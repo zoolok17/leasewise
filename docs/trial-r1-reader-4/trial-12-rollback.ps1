@@ -1,5 +1,6 @@
 # Step 12: roll back (the runbook's block, unchanged; $Token and $Trial come from names.json, saved in step 1).
-. (Join-Path $PSScriptRoot 'trial-common.ps1')
+# The shared start is told to stay out of the source folder, and it stops first thing if the trial folder or names.json is a link.
+. (Join-Path $PSScriptRoot 'trial-common.ps1') -KeepOutOfSource
 '== Step 12: roll back'
 Set-Location -LiteralPath $env:USERPROFILE
 if ((New-Object IO.DirectoryInfo($Trial)).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw 'The trial folder contains a link. Nothing was deleted. Tell the lead.' }

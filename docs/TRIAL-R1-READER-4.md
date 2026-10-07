@@ -36,21 +36,25 @@ You will use **two PowerShell windows**, both opened as the gateway user. Window
 ## Two ways to run each step
 
 Pasting a long block into a PowerShell window did not always work for the operator in the real trial, so **every step also comes as a small script**, one per step, in the
-folder `docs\trial-r1-reader-4\` (it is in the source archive once step 2 has unpacked it, and the lead can give you the folder to copy anywhere; each script finds
-`trial-common.ps1` next to itself). For each step you may do either of these:
+folder `docs\trial-r1-reader-4\` (it is in the source archive once step 2 has unpacked it, and the lead can give you the folder to copy anywhere). Each script holds the same
+block, unchanged, after a short shared start (`trial-common.ps1`).
 
-- **paste the block** from this page, as described above; or
-- **run that step's script** in a new window: `powershell -NoProfile -File <script>` (Windows PowerShell 5.1, the usual one on a desktop) or `pwsh -NoProfile -File <script>`
-  (PowerShell 7). The script holds the same block, unchanged, after a short shared start (`trial-common.ps1`).
-
-In plain words:
-
+- **Choose one form before step 1 and keep it to the end.** Do not mix them. A pasted block can need variables that only the pasted blocks before it leave in your window
+  (step 8 does), so a run that pastes one step after running another as a script can fail.
+- **Which form.** The script form was rehearsed with **PowerShell 7**: `pwsh -NoProfile -File '<script>'`. Use it where PowerShell 7 is installed and the machine's script policy
+  lets the script run. Windows PowerShell 5.1 (`powershell -NoProfile -File '<script>'`) was **not** rehearsed with the scripts: it refused scripts on our machine. The machine's
+  policy decides, and it must **never** be changed. If scripts cannot run, paste the blocks, for the whole run.
+- **Check before step 1.** Run `docs\trial-r1-reader-4\trial-00-check.ps1` the same way. It changes nothing: it prints the PowerShell version and `scripts run here`. If it prints
+  that, you may use the script form for the whole run. If the machine refuses it, paste the blocks for the whole run. If a script is refused part-way through, **stop and tell the
+  lead**; do not switch forms in the middle.
 - **Fill in the angle-bracket values in the step-1 script first** (`trial-01-setup.ps1`), the same values as the step-1 block asks for.
-- **Each script runs in its own window and its own process**, so nothing is carried over from one step to the next. The only thing the steps share is `names.json`, which
-  step 1 writes and every later script reads.
+- **Each script runs in its own window and its own process.** Nothing is carried over in variables. What the steps leave on purpose stays: the files in the trial folder (the
+  source, the store, the reader's state) and `names.json`, which step 1 writes and every later step reads. Every script loads `trial-common.ps1` from its own folder, so keep the
+  folder's files together; the two step-6 scripts are the exception: they load `names.json` themselves.
 - **The two step-6 scripts run in two windows**, as the two blocks do: the server in one, the reader in the other.
-- The line under each heading below names that step's script. If the machine's script policy refuses a script, paste that step's block instead; **do not change the
-  policy**.
+- **Both forms use the default trial folder only** (`%LOCALAPPDATA%\leasewise-trial`): the step-6 windows read `names.json` from exactly there. The shared start stops with a plain
+  message if `names.json` names another folder, and also if the trial folder or `names.json` is a link (nothing is changed; tell the lead).
+- The line under each heading below names that step's script. If the machine's script policy refuses a script, see "Which form" above and **do not change the policy**.
 
 ## Step 1: choose the names, then make the private folder
 
@@ -58,7 +62,9 @@ Script form: `docs\trial-r1-reader-4\trial-01-setup.ps1`.
 
 Edit the lines in angle brackets `<like this>` and run the block. Everything else is derived from them. Use plain letters and digits in aliases. The folder named
 by `$Trial` **must not exist yet**: the next block refuses an existing folder without changing it, because step 12 deletes this folder and must only ever delete one
-this runbook made. If you want another place, change that line.
+this runbook made. **Keep the default for `$Trial`**: the step-6 windows read `%LOCALAPPDATA%\leasewise-trial\names.json`, so another folder does not work, in either form.
+If the block below says the folder already exists, an earlier trial's folder is still there: roll it back with step 12, or tell the lead. **Do not choose another name.** (The block's
+own message says "Choose a new name"; this page replaces that advice, because the block itself cannot change.)
 
 <!-- rehearse: replace -->
 ```powershell
@@ -339,7 +345,7 @@ application-data folder, so its variable **`LOCALAPPDATA`** is named in both `en
 
 Script form: `docs\trial-r1-reader-4\trial-06a-server.ps1`, `docs\trial-r1-reader-4\trial-06b-reader.ps1`.
 
-**Window 1: the Leasewise server.** It prints nothing while it works. (Change the folder in the first line if you did not use the default.)
+**Window 1: the Leasewise server.** It prints nothing while it works. (It reads the default trial folder.)
 
 <!-- rehearse: window ServeArgs -->
 ```powershell
@@ -539,7 +545,8 @@ the line in step 1 first.) The gateway, agenttalk and the rest of the machine we
 
 **Why the block also looks for links.** A delete can follow a folder link (a junction or a symbolic link) out of the folder being deleted and remove files somewhere else.
 This runbook never makes a link, so a link inside the trial folder means something else put it there. Before it deletes, the block therefore walks the whole folder **without ever
-going into a link** and looks at every entry. If the trial folder **itself** is a link, it stops first thing, before it opens or lists anything. If it finds **any** link inside (a
+going into a link** and looks at every entry. If the trial folder **itself** is a link, it stops first thing, before it opens or lists anything. (The script form does the same: the shared start stops on a link, and the
+step-12 script does not enter the source folder.) If it finds **any** link inside (a
 folder or a file, at any depth), it stops with "The trial folder contains a link. Nothing was deleted. Tell the lead." Only a folder with no link in it is deleted. (A few other special entries, such as a cloud-sync placeholder, count as links too: that is
 the safe side.)
 

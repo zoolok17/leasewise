@@ -1,3 +1,4 @@
+param([switch]$KeepOutOfSource)    # step 12 sets this: it must not enter the source folder (which lives inside the folder it deletes)
 # Shared start for every trial step script (made 2026-10-07 by the desktop lead so the operator need not paste blocks).
 # It only does what the pasted runbook got from step 1's block and the open window: stop at the first error, the UTF-8 writer,
 # the two privacy helpers (copied unchanged from step 1), the saved names, and Leasewise's source folder as the working folder.
@@ -35,11 +36,19 @@ function Assert-Private {
     if ($Seen -notcontains $Me) { throw "You cannot open $Path. Stop here." }
 }
 
+# The only trial folder the steps work with is the default one (the step-6 windows read it too).
+$DefaultTrial = Join-Path $env:LOCALAPPDATA 'leasewise-trial'
+$NamesFile = Join-Path $DefaultTrial 'names.json'
+# A link in the way (the folder or its names file): stop before anything is read, listed or entered.
+foreach ($Item in $DefaultTrial, $NamesFile) {
+    $Info = Get-Item -LiteralPath $Item -Force -ErrorAction SilentlyContinue
+    if ($Info -and ($Info.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Item is a link. Nothing was changed. Tell the lead." }
+}
 # The names saved by step 1 (absent before step 1 has run).
-$NamesFile = Join-Path $env:LOCALAPPDATA 'leasewise-trial\names.json'
 if (Test-Path -LiteralPath $NamesFile) {
     $N = Get-Content -LiteralPath $NamesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($N.Trial -ne $DefaultTrial) { throw "names.json names the trial folder $($N.Trial), but only $DefaultTrial works with these steps. Nothing was changed. Tell the lead." }
     foreach ($P in $N.PSObject.Properties) { Set-Variable -Name $P.Name -Value $P.Value }
     $GatewayPre = @($GatewayPre)                         # an empty list stays a list
-    if (Test-Path -LiteralPath $Src) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 2)
+    if (-not $KeepOutOfSource -and (Test-Path -LiteralPath $Src)) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 2)
 }
