@@ -85,18 +85,70 @@ class Privacy(unittest.TestCase):
         for marker in MARKERS:
             self.assertNotIn(marker, text, marker)
 
-    def test_no_marker_appears_after_failures_faults_and_refusals(self):
-        net = ReadingNet(reading=[OSError(EXCEPTION), (403, {"error": {"code": "FORBIDDEN", "message": EXCEPTION}}),
-                                  (422, {"error": {"code": EXCEPTION, "message": EXCEPTION}}), (202, b"garbled " + EXCEPTION.encode())])
+    def run_answer(self, answer, cycles=1):
+        """One scripted answer that carries the private markers, repeated for every try. -> (net, reporter, text of the run)."""
+        net = ReadingNet(reading=[answer])
         reporter = self.reporter(net)
-        logs = self.cycle(reporter)
-        with mock.patch.object(readings, "run", side_effect=RuntimeError(EXCEPTION + USER)):
-            logs += self.cycle(reporter, 40_000)
-        logs += self.cycle(reporter, 200_000)
-        logs += self.cycle(reporter, 200_000)
+        logs = ""
+        for step in range(cycles):
+            logs += self.cycle(reporter, 0 if step == 0 else 1_000_000)
         text = self.everything(reporter) + logs + b"".join(call[2] for call in net.readings()).decode()
+        return net, reporter, text
+
+    def assert_clean(self, text):
         for marker in MARKERS:
             self.assertNotIn(marker, text, marker)
+
+    def row_states(self):
+        return self.rig.state.all("SELECT state, tries, last_error_code FROM reading ORDER BY id")
+
+    def test_a_transport_failure_that_names_the_markers_leaks_nothing(self):
+        net, _reporter, text = self.run_answer(OSError(EXCEPTION + USER))
+        self.assertEqual(len(net.readings()), 1)                               # the answer was really used: one try, then a retry
+        self.assert_clean(text)
+        self.assertEqual(self.row_states()[0][:2], ("pending", 1))
+
+    def test_a_403_that_names_the_markers_leaks_nothing(self):
+        net, _reporter, text = self.run_answer((403, {"error": {"code": "FORBIDDEN", "message": EXCEPTION}}))
+        self.assertEqual(len(net.readings()), 2)
+        self.assert_clean(text)
+        self.assertEqual({row[0::2] for row in self.row_states()}, {("failed_permanent", "FORBIDDEN")})
+
+    def test_a_422_with_a_marker_as_its_code_leaks_nothing_and_becomes_the_unknown_word(self):
+        net, _reporter, text = self.run_answer((422, {"error": {"code": EXCEPTION, "message": EXCEPTION}}))
+        self.assertEqual(len(net.readings()), 2)
+        self.assert_clean(text)
+        self.assertEqual({row[0::2] for row in self.row_states()}, {("failed_permanent", "UNKNOWN_CODE")})
+
+    def test_a_garbled_202_that_carries_the_markers_really_reaches_the_client_and_leaks_nothing(self):
+        net, _reporter, text = self.run_answer((202, b"garbled " + EXCEPTION.encode() + USER.encode()), cycles=3)
+        self.assertGreaterEqual(len(net.readings()), 2)                        # the garbled answer was consumed more than once
+        self.assert_clean(text)
+        pending = [row for row in self.row_states() if row[0] == "pending"]
+        self.assertTrue(pending)
+        self.assertEqual({row[2] for row in pending if row[1]}, {"MALFORMED_RESPONSE"})     # the client parsed it as unusable
+        self.assertGreaterEqual(max(row[1] for row in pending), 2)
+
+    def test_every_scripted_answer_of_a_sequence_is_consumed_and_none_leaks(self):
+        answers = [OSError(EXCEPTION), (202, b"garbled " + EXCEPTION.encode()), (202, {"event_id": EXCEPTION, "accepted": USER})]
+        net = ReadingNet(reading=list(answers))
+        reporter = self.reporter(net)
+        logs = ""
+        for step in range(6):
+            logs += self.cycle(reporter, 0 if step == 0 else 1_000_000)
+        self.assertEqual(len(net.reading), 1)                                  # all but the repeating last were handed to the client
+        self.assertEqual({row[0] for row in self.row_states()}, {"sent"})       # the last answer, an accepted one, closed the rows
+        text = self.everything(reporter) + logs + b"".join(call[2] for call in net.readings()).decode()
+        self.assert_clean(text)
+
+    def test_a_capture_fault_that_names_the_markers_leaks_nothing(self):
+        net = ReadingNet()
+        reporter = self.reporter(net)
+        with mock.patch.object(readings, "run", side_effect=RuntimeError(EXCEPTION + USER)):
+            logs = self.cycle(reporter)
+        logs += self.cycle(reporter, 40_000)
+        text = self.everything(reporter) + logs + b"".join(call[2] for call in net.readings()).decode()
+        self.assert_clean(text)
         self.assertEqual(self.rig.state.counter("_readings", "capture_fault"), 1)
 
     def test_every_body_has_only_the_allow_listed_keys(self):
