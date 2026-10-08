@@ -1,0 +1,52 @@
+{
+  "agenttalk_version": "0.99.0",
+  "files": {
+    "claude_statusline.synthetic.json": {
+      "call": "CapacitySnapshot(source='claude_statusline', ...) -> for_publication() -> to_dict()",
+      "note": "the status-line source: the same field layout as the stream source; its time is a file's modified time in agenttalk"
+    },
+    "claude_stream_both.synthetic.json": {
+      "call": "claude_stream_reading(info) -> read_claude_stream() -> for_publication() -> to_dict()",
+      "note": "five_hour 2 percent and seven_day 14 percent, both seen at 12:00:00Z, both basis assumed"
+    },
+    "claude_stream_rejected.synthetic.json": {
+      "call": "claude_stream_reading(rejected event, utilization 1.03) -> read_claude_stream() -> for_publication() -> to_dict()",
+      "note": "seven_day 103 percent, status rejected, rate_limit_reached_type set"
+    },
+    "claude_stream_stale.synthetic.json": {
+      "call": "read_claude_stream(now=T0+20min) -> for_publication(now=T0+20min) -> to_dict()",
+      "note": "confidence stale: every figure is null, the times are kept"
+    },
+    "claude_stream_status_only.synthetic.json": {
+      "call": "claude_stream_reading({'status': 'allowed'}) -> read_claude_stream() -> for_publication() -> to_dict()",
+      "note": "reason no_figures_in_event: a status but no percentage and no window"
+    },
+    "claude_stream_weekly_only.synthetic.json": {
+      "call": "claude_stream_reading(info with only seven_day) -> read_claude_stream() -> for_publication() -> to_dict()",
+      "note": "only seven_day, 15 percent, seen at 12:05:00Z"
+    },
+    "codex_assumed.synthetic.json": {
+      "call": "_codex_snapshot(source_agent, rollout record without window_minutes) -> for_publication() -> to_dict()",
+      "note": "no window length in the record: agenttalk fills 300 and 10080 by position (basis assumed)"
+    },
+    "codex_measured.synthetic.json": {
+      "call": "_codex_snapshot(source_agent, rollout record) -> for_publication() -> to_dict()",
+      "note": "both windows report their length (basis measured)"
+    },
+    "codex_mixed.synthetic.json": {
+      "call": "_codex_snapshot(...) with window_minutes only on the secondary window -> for_publication() -> to_dict()",
+      "note": "one window measured, the other assumed"
+    },
+    "unknown_bound.synthetic.json": {
+      "call": "CapacitySnapshot.unknown(source_agent, reason='claude_source_not_configured', account=placeholder) -> to_dict()",
+      "note": "a seat that has had no turn yet"
+    },
+    "unknown_unbound.synthetic.json": {
+      "call": "CapacitySnapshot.unknown(source_agent, reason='claude_seat_source_unknown') -> to_dict()",
+      "note": "account is null: the unbound manual refresh"
+    }
+  },
+  "generator": "scratch script gen_fixtures.py, run with the 0.99.0 runtime python in isolated mode",
+  "label": "SYNTHETIC: made by agenttalk's own writer from made-up readings; every account and user is a placeholder",
+  "reference_time": "2026-10-08T12:00:00Z"
+}

@@ -1,0 +1,165 @@
+"""From capacity files to one current figure per account and window (card 7b; DESIGN-7B2.md sections 3 and 4).
+
+`capacityreader` says what each file holds. This module decides, with no clock of its own and no file access,
+which figure is the freshest *current* one for each (account alias, window) and why the others were not used.
+Everything is a pure function of its arguments, and `now_ms` is the reporter's clock, passed in.
+
+The decision order for one file (1.5): `no_reading`, `source_not_accepted`, `no_figure` (or a more specific
+window counter), `no_account`, `unmapped` / `refused`, and only then selection. Counters are whole numbers
+and nothing else; no text from a file is kept.
+"""
+
+import math
+
+from . import capacityreader
+
+FIVE_HOUR = "five_hour"
+SEVEN_DAY = "seven_day"
+WINDOWS = (FIVE_HOUR, SEVEN_DAY)
+
+MINUTES_TO_WINDOW = {300: FIVE_HOUR, 10080: SEVEN_DAY}
+CLAUDE_POSITION = {"primary": FIVE_HOUR, "secondary": SEVEN_DAY}   # agenttalk's `_CLAUDE_WINDOWS`
+PROVIDER_OF_SOURCE = {"claude_stream": "claude", "codex_rollout": "codex"}
+
+MAX_RESET_AHEAD_MS = 9 * 86_400_000       # a reset is at most nine days after its observation
+MAX_AHEAD_MS = 25_000                      # the server refuses 30 s ahead; 25 leaves room
+MAX_AGE_MS = 600_000                       # agenttalk's own limit: a figure counts for ten minutes
+MAX_BPS = 10_000
+
+COUNTERS = ("no_reading", "source_not_accepted", "no_figure", "window_incomplete", "assumed_dropped",
+            "ambiguous_window", "time_unusable", "no_account", "unmapped", "refused", "not_current", "future")
+
+
+class Pick:
+    """The freshest current figure of one window of one account: numbers only."""
+
+    __slots__ = ("alias", "window", "used_bps", "resets_at_ms", "observed_ms")
+
+    def __init__(self, alias, window, used_bps, resets_at_ms, observed_ms):
+        self.alias = alias
+        self.window = window
+        self.used_bps = used_bps
+        self.resets_at_ms = resets_at_ms
+        self.observed_ms = observed_ms
+
+    def __repr__(self):
+        return "Pick(%s %s %d bps)" % (self.alias, self.window, self.used_bps)
+
+
+class Selection:
+    """picks: {(alias, window): Pick}; counters: {name: whole number}, every name in COUNTERS present."""
+
+    __slots__ = ("picks", "counters")
+
+    def __init__(self):
+        self.picks = {}
+        self.counters = dict.fromkeys(COUNTERS, 0)
+
+
+def used_bps(percent):
+    """Basis points of a percentage, rounded half up and held to 0..10000 (above 100 percent is 10000)."""
+    return max(0, min(MAX_BPS, math.floor(percent * 100 + 0.5)))
+
+
+def _keyed(capacity):
+    """-> [(window key or None, Window)], the key coming from the provider's name (Claude) or from the measured
+    length alone (Codex). A window with no figure at all is left out; a dropped one carries None."""
+    counters = {}
+    keyed = []
+    claude = capacity.source == "claude_stream"
+    for window in capacity.windows:
+        if window.used_percent is None and window.resets_at is None:
+            continue                                  # nothing to say: not a problem
+        if claude:
+            key = CLAUDE_POSITION[window.position]
+            if window.window_minutes != {FIVE_HOUR: 300, SEVEN_DAY: 10080}[key]:
+                key = None
+        elif window.basis != "measured":
+            key = None
+            counters["assumed_dropped"] = counters.get("assumed_dropped", 0) + 1
+        else:
+            key = MINUTES_TO_WINDOW.get(window.window_minutes)
+        keyed.append((key, window))
+    return keyed, counters
+
+
+def usable_windows(capacity):
+    """-> ({window key: Window}, {counter: count}) for the windows of one file that can become a reading (4.1)."""
+    keyed, counters = _keyed(capacity)
+    if capacity.source == "codex_rollout":
+        seen = {}
+        for key, _ in keyed:
+            if key is not None:
+                seen[key] = seen.get(key, 0) + 1
+        double = {key for key, count in seen.items() if count > 1}
+        if double:
+            counters["ambiguous_window"] = len(double)
+            keyed = [(None if key in double else key, window) for key, window in keyed]
+    usable = {}
+    for key, window in keyed:
+        if key is None:
+            if capacity.source == "codex_rollout" and window.basis == "measured":
+                if window.window_minutes in MINUTES_TO_WINDOW:
+                    continue                          # already counted as ambiguous
+                counters["window_incomplete"] = counters.get("window_incomplete", 0) + 1
+            elif capacity.source == "claude_stream":
+                counters["window_incomplete"] = counters.get("window_incomplete", 0) + 1
+            continue
+        if window.used_percent is None or window.resets_at is None:
+            counters["window_incomplete"] = counters.get("window_incomplete", 0) + 1
+        elif window.observed_ms is None:
+            counters["time_unusable"] = counters.get("time_unusable", 0) + 1
+        elif not window.observed_ms < window.resets_at * 1000 <= window.observed_ms + MAX_RESET_AHEAD_MS:
+            counters["window_incomplete"] = counters.get("window_incomplete", 0) + 1
+        else:
+            usable[key] = window
+    return usable, counters
+
+
+def select(files, mapping, now_ms):
+    """-> Selection for the `Capacity` objects of one scan.
+
+    `mapping` is {account text: (alias, provider)}, the operator's table (section 2; built in a later step).
+    A figure is current when `-25 s <= now - observed <= 600 s`: newer than that is `future`, older is
+    `not_current`. The freshest current figure of a (alias, window) wins; a tie on the second goes to the
+    larger `used_percent`, then the smaller reset time, then the smaller file stem."""
+    result = Selection()
+    counters = result.counters
+    candidates = {}
+    for capacity in files:
+        stop = capacityreader.verdict(capacity)
+        if stop is not None:
+            counters[stop] += 1
+            continue
+        usable, window_counters = usable_windows(capacity)
+        for name, count in window_counters.items():
+            counters[name] += count
+        if not usable:
+            if not window_counters:
+                counters["no_figure"] += 1
+            continue
+        if capacity.account is None:
+            counters["no_account"] += 1
+            continue
+        row = mapping.get(capacity.account)
+        if row is None:
+            counters["unmapped"] += 1
+            continue
+        alias, provider = row
+        if provider != PROVIDER_OF_SOURCE[capacity.source]:
+            counters["refused"] += 1
+            continue
+        for key, window in usable.items():
+            age = now_ms - window.observed_ms
+            if age < -MAX_AHEAD_MS:
+                counters["future"] += 1
+            elif age > MAX_AGE_MS:
+                counters["not_current"] += 1
+            else:
+                candidates.setdefault((alias, key), []).append((window, capacity.stem))
+    for (alias, key), found in candidates.items():
+        window, _ = min(found, key=lambda item: (-item[0].observed_ms, -item[0].used_percent,
+                                                  item[0].resets_at, item[1]))
+        result.picks[(alias, key)] = Pick(alias, key, used_bps(window.used_percent), window.resets_at * 1000,
+                                          window.observed_ms)
+    return result
