@@ -206,3 +206,79 @@ end-to-end test over the real Leasewise handler (step 7b-4).
 ### Gates
 
 See the reply for the counts of this step.
+
+## Step 7b-3
+
+Branch `card-7b2`, on top of step 7b-2 (`a3a94d3`). Spec: `DESIGN-7B2.md` revision 3, the send side of 6.3, and
+7.2 to 7.5. The lead's answers to the 7b-2 notes: the counter names are accepted (7b-4 shows them in `status`); the
+window memory is the guard after pruning; a settled row never returns to `pending` (added here).
+
+### In plain words
+
+Steps 7b-1 and 7b-2 read the usage files and keep the newest figure per account and allowance on disk. Step 7b-3
+**sends** those figures to Leasewise.
+
+- **At most one accepted figure per account and allowance every two minutes.** After Leasewise accepts a figure, the
+  next figure of the same allowance waits until two minutes have passed. The other allowance is not held back.
+- **A new allowance period goes at once.** If the reset time of a figure differs from the one last accepted, the
+  figure is not held back; the next figure of that new period waits again.
+- **A retry never moves the clock of the gate.** If Leasewise does not answer, answers "try again later" or does
+  not know us (401), the figure stays and is tried again after its own short wait (5 seconds growing to 15
+  minutes). Only an accepted answer starts the two minutes.
+- **A refusal fails only that figure.** Any other refusal (for example "this machine is not allowed to report for the
+  account") fails that one figure for good, with Leasewise's own word, and never stops a seat or any other figure.
+- **After an outage only the newest figure per allowance is sent**, then the two-minute gate holds the next one.
+- **A clock that moved back an hour does no harm.** A gate more than two minutes ahead, or a retry wait more than 15
+  minutes ahead, is pulled back to those limits, and the pulled-back value is what is stored.
+- **A crash between sending and writing down the answer** sends the same bytes again after the restart (Leasewise
+  treats the repeat as the same figure) and the gate moves then.
+- **Nothing blocks anything else.** Readings are sent after limit events and before receipts and leases, each in its
+  own pass, so a parked account, a refused lease or a lease retry never holds a reading back, and a reading retry
+  never holds a lease back. While readings are configured the wait between cycles never exceeds 60 seconds.
+- **A settled figure never becomes "waiting" again** (a database rule).
+
+Nothing a seat does changes: the seats run in shadow, and a test shows the lease outcome is the same with readings
+sent to a real in-process Leasewise.
+
+### What changed
+
+- `decisions.py`: the kind `READING`, deciding like `LIMIT`: 401 retry (`UNAUTHENTICATED`); no answer, 429 and 5xx retry;
+  200, 201 and 202 done; any other 4xx fails that row with its closed word. Never an agent stop, a rebuild or a drop.
+- `client.py`: the (kind, path) pair `READING` to exactly `/v1/readings` (no suffix, no query, no other kind); the
+  answer is read for its status and error word only. The money reader's `post_reading` lane is untouched.
+- `state.py`: `next_reading_item` (the clamps, then the offer rule, in one transaction, oldest first; a stored body that
+  no longer fits the allow-list is not sent: that row fails once with `INVALID_REQUEST`, counted as `body_invalid`);
+  `apply` moves `gate_ms` and `last_sent_reset_ms` only on an accepted answer, in the same transaction that marks the
+  row `sent`; the trigger `reading_no_return`. The trigger was added to the version 7 definition; no version 7 file exists
+  outside the tests yet, so the version does not change again.
+- `run.py`: the readings send pass after limit events; the 60-second wait cap now also applies while readings are on.
+
+### Decisions inside the step
+
+- The no-return rule is a trigger on the state column: only a move to `pending` from another state is refused.
+  A pending row can still move on to any state.
+- `body_invalid` is a cumulative counter under `_readings`; the row fails once so it is not counted every cycle.
+- The `Item` for a reading carries agent `_readings` and no message, so the generic answer handling (`last_ok`,
+  credential notes) works unchanged.
+
+### Tests
+
+- `tests/test_card7b2_delivery.py` (34 + 1): the answers (200, 201, 202 done; each refusal permanent with its closed
+  word; 401, 429, 5xx, no answer and unusable 2xx retried), the gate (first figure at once, held for one pace, opens at
+  exactly the pace, a retry does not move it, a new reset passes, the other window is free, two sends are at least a
+  pace apart, outage then restart sends one row per window, a restart keeps the gate, a crash between answer and
+  marking), the clock moved back (clamps and their exact edges, stored and kept through a restart), isolation in both
+  directions and the pass order, the 60-second cap, the no-return rule, a damaged stored body, and the shadow lease
+  outcome with the real in-process Leasewise.
+- `tests/test_card7c2_client.py`: the reading pair (exact path only; other kinds and other paths refused; status and
+  word only; unusable 2xx retried; wire bytes; the money reader's lane untouched).
+- `tests/test_card7b2_wiring.py`: now expects the readings to be sent in the same cycle.
+
+### Not built yet
+
+`reporter status` (the counters, the last stored sample, the stated gaps), the README, `docs/DESIGN.md`, `privacy_7b2`,
+the end-to-end test over the real Leasewise reading handler and the upgrade test (step 7b-4).
+
+### Gates
+
+See the reply for the counts of this step.

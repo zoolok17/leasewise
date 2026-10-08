@@ -28,6 +28,10 @@ READING_AGENT = "_readings"
 READING_WINDOWS = mapper.LIMIT_WINDOWS
 READING_EXPIRY_AFTER_MS = 2 * 3_600_000          # a pending row expires after its reset has passed AND this long since capture
 READING_KEEP_MS = 2 * 86_400_000                 # a settled row is deleted this long after its capture
+READING_PACE_MS = 120_000                        # an accepted send of a window holds the next send of that window this long
+READING_MAX_BACKOFF_MS = 900_000                 # the longest retry back-off (`decisions.backoff_ms`): a deadline further ahead is clamped
+READING_PATH = "/v1/readings"
+READING_BAD_BODY_CODE = "INVALID_REQUEST"      # a stored body that no longer fits the allow-list is not sent: that row fails for good
 RELEASE_BATCH = 500             # captures stage 2 works on in one cycle
 PERMANENT_REASONS = ("wrong_gateway", "duplicate_reference")
 BODY_CAP_NOTE = "receipt_store_body_cap"      # how many messages are held at the body cap (a count)
@@ -230,6 +234,8 @@ _READING_DDL = (
     " resets_ms, captured_ms ON reading BEGIN SELECT RAISE(ABORT, 'a reading is immutable'); END",
     "CREATE TRIGGER reading_keep BEFORE DELETE ON reading WHEN OLD.state NOT IN ('sent','expired','superseded') BEGIN"
     " SELECT RAISE(ABORT, 'a waiting or failed reading is never deleted'); END",
+    "CREATE TRIGGER reading_no_return BEFORE UPDATE OF state ON reading WHEN OLD.state <> 'pending'"
+    " AND NEW.state = 'pending' BEGIN SELECT RAISE(ABORT, 'a settled reading never becomes pending again'); END",
     "CREATE TABLE reading_window(account_alias TEXT NOT NULL, window_key TEXT NOT NULL,"
     " last_observed_ms INTEGER NOT NULL, last_reset_ms INTEGER NOT NULL, last_used_bps INTEGER NOT NULL,"
     " gate_ms INTEGER NOT NULL DEFAULT 0, last_sent_reset_ms INTEGER,"
@@ -507,6 +513,35 @@ class State:
             " last_used_bps=excluded.last_used_bps",
             (account_alias, window, body["observed_at"], entry["resets_at"], entry["used_bps"]))
         return "new"
+
+    def next_reading_item(self, now_ms):
+        """The oldest pending reading that is due, as an Item, or None (DESIGN-7B2.md 7.2). In ONE transaction, for the
+        (at most one) pending row of each window, oldest first: a clock that moved back is clamped first (a gate more than
+        one pace ahead of `now` becomes `now + pace`; a retry deadline more than the longest back-off ahead becomes
+        `now + longest back-off`; both are stored); then the row is offered only if its own back-off is over AND (the gate
+        is open OR its reset differs from the reset of the last accepted send, so a new reset period is never held back).
+        A stored body that is no longer exactly the allow-listed shape is never sent: that row fails for good, once.
+        Readings belong to no agent and no message: nothing about a lease or a stopped agent holds one back."""
+        with self.txn():
+            self.conn.execute("UPDATE reading_window SET gate_ms=? WHERE gate_ms>?",
+                              (now_ms + READING_PACE_MS, now_ms + READING_PACE_MS))
+            self.conn.execute("UPDATE reading SET not_before_ms=? WHERE state='pending' AND not_before_ms>?",
+                              (now_ms + READING_MAX_BACKOFF_MS, now_ms + READING_MAX_BACKOFF_MS))
+            for row_id, event_id, body, not_before, resets, alias, window in self.all(
+                    "SELECT id, event_id, body, not_before_ms, resets_ms, account_alias, window_key FROM reading"
+                    " WHERE state='pending' ORDER BY id"):
+                if not self.valid_reading_body(body):
+                    self.conn.execute("UPDATE reading SET state='failed_permanent', last_error_code=? WHERE id=?",
+                                      (READING_BAD_BODY_CODE, row_id))
+                    self.bump(READING_AGENT, "body_invalid")
+                    continue
+                memory = self.one("SELECT gate_ms, last_sent_reset_ms FROM reading_window WHERE account_alias=? AND window_key=?",
+                                  (alias, window))
+                gate, last_sent = memory if memory is not None else (0, None)
+                if not_before <= now_ms and (now_ms >= gate or resets != last_sent):
+                    return Item(decisions.READING, READING_AGENT, "", READING_PATH, json.loads(body), event_id,
+                                ("reading", row_id), None)
+        return None
 
     @staticmethod
     def valid_reading_body(text):
@@ -851,6 +886,12 @@ class State:
                     self.conn.execute(
                         "UPDATE %s SET state='sent', last_error_code=NULL "
                         "WHERE %s=?" % (table, key), (row_id,))
+                    if table == "reading":
+                        # Only an accepted send moves the gate, in the same transaction that marks the row sent.
+                        self.conn.execute(
+                            "UPDATE reading_window SET gate_ms=?, last_sent_reset_ms=(SELECT resets_ms FROM reading WHERE id=?)"
+                            " WHERE (account_alias, window_key)=(SELECT account_alias, window_key FROM reading WHERE id=?)",
+                            (now_ms + READING_PACE_MS, row_id, row_id))
             elif decision.action == decisions.RETRY:
                 tries = self.one("SELECT tries FROM %s WHERE %s=?" % (table, key),
                                  (row_id,))[0] + 1

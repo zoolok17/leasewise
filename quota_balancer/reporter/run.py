@@ -316,8 +316,8 @@ class Reporter:
         return added
 
     def _send(self, result):
-        """Three passes, in this order and SEPARATE: limit events (card 7c-2), then gateway receipts
-        (card L6a-1), then leases. Limit events and receipts belong to no seat and no message, so
+        """Passes, in this order and SEPARATE: limit events (card 7c-2), then readings (card 7b), then gateway receipts
+        (card L6a-1), then leases. Limit events, readings and receipts belong to no seat and no message, so
         nothing a lease answers (a retry, a 429 from a parked account, a refusal) may delay one; and
         each route can fail on its own while the others work, so a retry in one pass does not stop
         the next. Each pass stops on its own wall. `result.blocked` combines the outcomes by RANK, so
@@ -325,6 +325,7 @@ class Reporter:
         shows as CREDENTIAL, above UNREACHABLE (no answer, 5xx, 429), above nothing."""
         self._send_report(result)
         self._send_pass(result, self.state.next_limit_item)
+        self._send_pass(result, self.state.next_reading_item)      # card 7b: after limit events, before receipts and leases
         self._send_pass(result, self.state.next_receipt_item)
         self._send_pass(result, lambda now: self.state.next_item(now, self.gateway_agents))
 
@@ -401,6 +402,6 @@ class Reporter:
                 wait = max(wait, decisions.backoff_ms(
                     self.failures, self.rng()) / 1000.0)
             longest = MAX_SLEEP_SECONDS
-            if self.limit_sources:
-                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)
+            if self.limit_sources or self.reading_sources:
+                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)       # a figure counts for 600 s: do not sleep past a look
             self.stop.wait(min(wait, longest))

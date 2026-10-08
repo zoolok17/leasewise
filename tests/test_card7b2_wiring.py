@@ -19,6 +19,7 @@ from tests.card7b2_fixtures import CLAUDE_ACCOUNT, NOW, edited, put
 from tests.reporter_env import Rig
 from tests.test_card7a3 import cli, one_message
 from tests.test_card7c2_capture import source as limit_source
+from tests.test_card7b2_delivery import ReadingNet
 from tests.test_card7c2_delivery import Net
 from tests.test_card7c2_reader import marker
 
@@ -71,14 +72,15 @@ class _Wired(unittest.TestCase):
 
 
 class Cycle(_Wired):
-    def test_a_cycle_stores_the_readings_and_sends_none(self):
-        net = Net()
+    def test_a_cycle_stores_the_readings_and_sends_them_in_the_same_cycle(self):
+        net = ReadingNet()
         reporter = self.start(net)
         result = reporter.cycle()
         self.assertEqual(result.new_readings, 2)
-        self.assertEqual(self.rows(), [("pending", "five_hour"), ("pending", "seven_day")])
-        self.assertNotIn("/v1/readings", net.paths())
-        self.assertEqual(net.calls, [])
+        self.assertEqual(self.rows(), [("sent", "five_hour"), ("sent", "seven_day")])
+        self.assertEqual(net.paths(), ["/v1/readings", "/v1/readings"])
+        self.assertEqual(reporter.cycle().new_readings, 0)                       # the same fact is not stored or sent again
+        self.assertEqual(len(net.paths()), 2)
 
     def test_the_result_line_is_unchanged(self):
         reporter = self.start(Net())
@@ -221,17 +223,17 @@ class Start(unittest.TestCase):
                                 primary_observed_at=stamp(-10), secondary_observed_at=stamp(-10),
                                 primary_resets_at=int(now) + 3600, secondary_resets_at=int(now) + 86_400))
 
-    def test_a_resolved_map_starts_and_stores_the_readings_without_sending_them(self):
+    def test_a_resolved_map_starts_stores_and_sends_the_readings(self):
         path = self.write([{"alias": "claude-main", "id": ACCOUNT_ID}])
         self.fresh_file()
-        net = Net()
+        net = ReadingNet()
         code, out, err = cli(["drain", "--config", path], permissions=lambda p: None, transport=net)
         self.assertEqual((code, err), (EXIT_OK, ""))
-        self.assertEqual(net.calls, [])
+        self.assertEqual(net.paths(), ["/v1/readings", "/v1/readings"])
         state = State(self.rig.ws.state)
         try:
             self.assertEqual(state.all("SELECT state, window_key FROM reading ORDER BY id"),
-                             [("pending", "five_hour"), ("pending", "seven_day")])
+                             [("sent", "five_hour"), ("sent", "seven_day")])
             self.assertEqual(json.loads(state.one("SELECT body FROM reading")[0])["account_id"], ACCOUNT_ID)
         finally:
             state.close()
