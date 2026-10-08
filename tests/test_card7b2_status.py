@@ -171,6 +171,9 @@ class Report(_Status):
         self.cycle(reporter)
         self.assertEqual(reporter.report()["readings"]["refused_streak"], 0)
 
+    def test_many_scans_in_a_row_means_ten_about_five_minutes_at_the_scan_spacing(self):
+        self.assertEqual(status.REFUSED_SCANS_IN_A_ROW, 10)
+
     def test_empty_files_never_raise_the_format_line(self):
         for number, name in enumerate(("unknown_unbound", "unknown_bound", "claude_stream_stale", "claude_stream_status_only")):
             put(self.folder, edited(name, source_agent="seat-%d" % number))
