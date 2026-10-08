@@ -334,7 +334,7 @@ class Numbers(unittest.TestCase):
         self.assertEqual((five.used_bps, five.resets_at_ms, five.observed_ms), (200, FIVE_RESET_S * 1000, NOW))
         self.assertEqual((week.used_bps, week.resets_at_ms, week.observed_ms), (1400, WEEK_RESET_S * 1000, NOW))
         for pick in (five, week):
-            self.assertEqual(pick.__slots__, ("alias", "window", "used_bps", "resets_at_ms", "observed_ms"))
+            self.assertEqual(pick.__slots__, ("alias", "window", "used_percent", "used_bps", "resets_at_ms", "observed_ms"))
             self.assertTrue(0 <= pick.used_bps <= 10_000)
 
     def test_the_reading_time_is_the_windows_own_time_in_milliseconds(self):

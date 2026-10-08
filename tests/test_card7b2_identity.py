@@ -470,5 +470,82 @@ class Capture(Rig):
             self.assertNotIn(LOUD.encode(), handle.read())
 
 
+class FoldersDoNotChangeTheResult(Rig):
+    """Spec 3.1 and 3.4: where the same candidate files lie (one folder, or split across two folders of one alias) never
+    changes the body that is stored. The ranking uses the original percentage; basis points are made after the choice."""
+
+    def bodies(self, layout, five_only=True):
+        """layout: [(folder number, stem, overrides)]. -> the stored bodies of a fresh state, sorted."""
+        self.tearDown_state_folders()
+        roots = [self.bus, os.path.join(self._tmp.name, "bus2")]
+        os.makedirs(os.path.join(roots[1], "state"), exist_ok=True)
+        used = sorted({number for number, _, _ in layout})
+        for number, stem, over in layout:
+            put(os.path.join(roots[number], "state"), edited("claude_stream_both", source_agent=stem, **over))
+        rows = ()
+        for number in used:
+            rows += self.sources(bus_root=roots[number])
+        readings.run(self.state, rows, MACHINE, NOW)
+        return sorted(r[6] for r in self.rows())
+
+    def tearDown_state_folders(self):
+        self.state.close()
+        for root in (self.bus, os.path.join(self._tmp.name, "bus2")):
+            folder = os.path.join(root, "state")
+            if os.path.isdir(folder):
+                for name in os.listdir(folder):
+                    os.remove(os.path.join(folder, name))
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.state_path + suffix):
+                os.remove(self.state_path + suffix)
+        self.state = State(self.state_path)
+
+    def check(self, first, second):
+        """The same two candidates in one folder and in two folders, in both file orders: one set of bytes."""
+        one = self.bodies([(0, "seat-a", first), (0, "seat-b", second)])
+        swapped = self.bodies([(0, "seat-a", second), (0, "seat-b", first)])
+        split = self.bodies([(0, "seat-a", first), (1, "seat-b", second)])
+        split_swapped = self.bodies([(1, "seat-a", first), (0, "seat-b", second)])
+        split_other = self.bodies([(0, "seat-a", second), (1, "seat-b", first)])
+        self.assertEqual(len(one), 2)
+        for other in (swapped, split, split_swapped, split_other):
+            self.assertEqual(other, one)
+        return one
+
+    def test_two_percentages_that_round_to_the_same_basis_points_still_rank_by_the_percentage(self):
+        low = dict(primary_used_percent=10.001, primary_resets_at=FIVE_RESET_S)
+        high = dict(primary_used_percent=10.004, primary_resets_at=FIVE_RESET_S + 1800)
+        bodies = self.check(low, high)
+        five = [json.loads(b) for b in bodies if '"five_hour"' in b][0]
+        self.assertEqual(five["payload"]["windows"][0]["resets_at"], (FIVE_RESET_S + 1800) * 1000)       # the larger percentage wins
+        self.assertEqual(five["payload"]["windows"][0]["used_bps"], 1000)
+
+    def test_two_percentages_over_the_cap_still_rank_by_the_percentage(self):
+        low = dict(primary_used_percent=110.0, primary_resets_at=FIVE_RESET_S)
+        high = dict(primary_used_percent=150.0, primary_resets_at=FIVE_RESET_S + 1800)
+        bodies = self.check(low, high)
+        five = [json.loads(b) for b in bodies if '"five_hour"' in b][0]
+        self.assertEqual(five["payload"]["windows"][0]["resets_at"], (FIVE_RESET_S + 1800) * 1000)
+        self.assertEqual(five["payload"]["windows"][0]["used_bps"], 10_000)
+
+    def test_equal_percentages_go_to_the_smaller_reset_in_every_layout(self):
+        a = dict(primary_used_percent=40.0, primary_resets_at=FIVE_RESET_S + 900)
+        b = dict(primary_used_percent=40.0, primary_resets_at=FIVE_RESET_S)
+        bodies = self.check(a, b)
+        five = [json.loads(x) for x in bodies if '"five_hour"' in x][0]
+        self.assertEqual(five["payload"]["windows"][0]["resets_at"], FIVE_RESET_S * 1000)
+
+    def test_a_perfect_tie_gives_the_same_bytes_without_the_file_stem(self):
+        same = dict(primary_used_percent=40.0)
+        self.check(same, dict(same))
+
+    def test_a_newer_observation_still_wins_over_a_larger_percentage(self):
+        old = dict(primary_used_percent=90.0, primary_observed_at=at(-60))
+        new = dict(primary_used_percent=5.0, primary_observed_at=at(-30))
+        bodies = self.check(old, new)
+        five = [json.loads(x) for x in bodies if '"five_hour"' in x][0]
+        self.assertEqual(five["payload"]["windows"][0]["used_bps"], 500)
+
+
 if __name__ == "__main__":
     unittest.main()

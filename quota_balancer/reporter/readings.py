@@ -37,12 +37,13 @@ COUNTERS = ("no_reading", "source_not_accepted", "no_figure", "window_incomplete
 class Pick:
     """The freshest current figure of one window of one account: numbers only."""
 
-    __slots__ = ("alias", "window", "used_bps", "resets_at_ms", "observed_ms")
+    __slots__ = ("alias", "window", "used_percent", "used_bps", "resets_at_ms", "observed_ms")
 
-    def __init__(self, alias, window, used_bps, resets_at_ms, observed_ms):
+    def __init__(self, alias, window, used_percent, resets_at_ms, observed_ms):
         self.alias = alias
         self.window = window
-        self.used_bps = used_bps
+        self.used_percent = used_percent      # the original figure: ranking uses it, never the rounded one
+        self.used_bps = used_bps(used_percent)
         self.resets_at_ms = resets_at_ms
         self.observed_ms = observed_ms
 
@@ -164,19 +165,19 @@ def select(files, mapping, now_ms):
     for (alias, key), found in candidates.items():
         window, _ = min(found, key=lambda item: (-item[0].observed_ms, -item[0].used_percent,
                                                   item[0].resets_at, item[1]))
-        result.picks[(alias, key)] = Pick(alias, key, used_bps(window.used_percent), window.resets_at * 1000,
-                                          window.observed_ms)
+        result.picks[(alias, key)] = Pick(alias, key, window.used_percent, window.resets_at * 1000, window.observed_ms)
     return result
 
 
 def _merge(picks):
-    """The freshest pick per (alias, window) over the folders: newest observation, then the larger figure, then the
-    smaller reset (the tie rules of 3.1; the file stem is only known inside one folder)."""
+    """The freshest pick per (alias, window) over the folders: newest observation, then the larger ORIGINAL percentage
+    (basis points are rounded and capped, so two different percentages can share them), then the smaller reset (the tie
+    rules of 3.1; the file stem is only known inside one folder, and a perfect tie gives the same bytes without it)."""
     best = {}
     for pick in picks:
         key = (pick.alias, pick.window)
         old = best.get(key)
-        if old is None or (-pick.observed_ms, -pick.used_bps, pick.resets_at_ms) < (-old.observed_ms, -old.used_bps, old.resets_at_ms):
+        if old is None or (-pick.observed_ms, -pick.used_percent, pick.resets_at_ms) < (-old.observed_ms, -old.used_percent, old.resets_at_ms):
             best[key] = pick
     return best
 
