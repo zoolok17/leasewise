@@ -282,3 +282,51 @@ the end-to-end test over the real Leasewise reading handler and the upgrade test
 ### Gates
 
 See the reply for the counts of this step.
+
+## Fix round 1 (steps 7b-1 and 7b-2)
+
+Codex read steps 7b-1 and 7b-2 at `a3a94d3` and asked for three fixes. They are three commits on top of 7b-3, one per
+finding. Codex's final read after step 7b-4 covers them too.
+
+### In plain words
+
+- **Where a file lies must never change the figure.** When one account's files lay in two folders, each folder chose
+  its best figure and rounded it to hundredths of a percent before the two were compared. Two different percentages
+  could look equal after rounding (10.001 and 10.004, or 110 and 150 once capped), and then the earlier reset won
+  instead of the larger percentage. The reset time tells Leasewise which allowance period a figure belongs to, so this
+  was a wrong figure, not only a display detail. Now the original percentage decides, and rounding happens after the choice.
+- **A date that cannot exist is refused.** The reader accepted `2026-99-99T99:99:99Z` in the "last status" time because
+  it only looked at the pattern. It now has to be a real day and a real clock time. An old (or future) real time is
+  still fine: a diagnostic time does not have to be fresh.
+- **A stale figure says "stale".** A file whose figures were all 700 seconds old used to be counted as "account not in
+  the table" or "no account". Freshness is now judged first; the account words come only for figures that are current.
+
+### What changed
+
+- `readings.py`: a pick keeps its original percentage (`used_percent`) and the cross-folder merge ranks by it
+  (newest observation, larger original percentage, smaller reset). A perfect tie gives the same bytes without the file
+  stem. In `select`, the `not_current` and `future` filter now comes before `no_account`, `unmapped` and the provider
+  check; the window counters are kept.
+- `capacityreader.py`: `last_status_at` must be a real moment. This is the only time the reader checks by shape and
+  then drops. `observed_at` and the two window times are parsed (so an impossible one is already `time_unusable` for
+  that window and never refuses the file, as the spec says).
+
+### Tests
+
+- `test_card7b2_identity.FoldersDoNotChangeTheResult` (5): the same two files in one folder and split across two, in
+  every file order, give identical stored bytes; the rounded-equal and the capped-equal cases; equal percentages; a
+  perfect tie; a newer observation still beats a larger percentage.
+- `test_card7b2_reader.ImpossibleTimes` (4): ten impossible times refused in a populated and in an unknown snapshot; an
+  old and a future real time accepted; the other times only make their window unusable.
+- `test_card7b2_select.FreshnessFirst` (7): stale and future figures with a null and with an unmapped account, with a
+  wrong-provider row, one stale and one current window, and the window counters kept.
+- **Red first:** each new test was run on the 7b-3 head before its fix: 2 of 5 folder tests failed, all impossible-time
+  checks failed (30 subtests), and the freshness tests failed.
+
+### Two of Codex's notes, written down so nothing is over-promised
+
+- **Same-key conflict detection holds only while the row exists.** After a settled row is pruned (two days after its
+  capture), a repeated offer of that figure is counted `older` (the window memory remembers the last observation),
+  not as a conflict. Never promise to detect a conflicting body for ever.
+- **Pruning counts from capture time.** A row that is settled late (for example sent after a long outage) may be pruned at
+  once, because its two days started when it was captured. Its window memory and the counters remain.
