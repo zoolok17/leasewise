@@ -13,7 +13,7 @@ import sqlite3
 import time
 import unittest
 
-from quota_balancer.reporter import config as cfg, decisions
+from quota_balancer.reporter import config as cfg, decisions, mapper
 from quota_balancer.reporter.client import HttpClient
 from quota_balancer.reporter.state import READING_AGENT, READING_PATH, Item
 from tests.card7b2_fixtures import CLAUDE_ACCOUNT, edited, put
@@ -163,15 +163,60 @@ class RealHandler(_E2E):
         self.assertEqual(window[0], 500)                                  # a new period may lower the figure
         self.assertGreater(window[1], stored_reset)
 
-    def test_the_epoch_rule_has_two_sides(self):
-        """One millisecond before the stored reset the larger reset is jitter; at the reset it is a new period."""
+    def send_at(self, observed_ms, used_bps, resets_ms, tag):
+        """One reading sent straight to the real handler, with the exact observation time given (the capacity files only
+        carry whole seconds, so a millisecond boundary can only be reached at the handler). -> (the body, the answer)."""
+        key = mapper.reading_key("desktop", self.alias, "five_hour", observed_ms) + "|" + tag
+        body = mapper.reading_body(key, self.accounts[self.alias], "five_hour", used_bps, resets_ms, observed_ms)
+        item = Item(decisions.READING, READING_AGENT, "", READING_PATH, body, body["event_id"], ("reading", 0), None)
+        return body, self.client().send(item)
+
+    def stored_period(self):
+        """(used_bps, resets_at, observed_at) of the five-hour window in the real store."""
+        return self.windows()["five_hour"]
+
+    def test_one_millisecond_before_the_stored_reset_a_larger_reset_is_jitter_in_the_same_period(self):
         self.figure(five=60.0, week=10.0, five_reset=HOUR_S)
         self.cycle()
-        stored_reset = self.windows()["five_hour"][1]
-        self.rig.clock.ms = stored_reset - 2000
-        self.figure(five=5.0, week=10.0, five_seen=-1, five_reset=5 * HOUR_S)
+        stored = self.stored_period()
+        stored_reset = stored[1]
+        self.rig.clock.ms = stored_reset                                     # the server must not see the reading as future
+        body, answer = self.send_at(stored_reset - 1, 500, stored_reset + 4 * HOUR_S * 1000, "before")
+        self.assertEqual(body["observed_at"], stored_reset - 1)              # exactly one millisecond before the stored reset
+        self.assertEqual((answer.status, answer.code), (202, None))
+        after = self.stored_period()
+        self.assertEqual(after[0], 6000)                                     # the high-water of the same period stays
+        self.assertEqual(after[1], stored_reset)                             # the stored reset stays
+        self.assertEqual(after[2], stored_reset - 1)                         # the observation time moved to the exact value sent
+
+    def test_exactly_at_the_stored_reset_a_larger_reset_starts_a_new_period(self):
+        self.figure(five=60.0, week=10.0, five_reset=HOUR_S)
         self.cycle()
-        self.assertEqual(self.windows()["five_hour"][0:2], (6000, stored_reset))
+        stored_reset = self.stored_period()[1]
+        self.rig.clock.ms = stored_reset
+        new_reset = stored_reset + 4 * HOUR_S * 1000
+        body, answer = self.send_at(stored_reset, 500, new_reset, "at")
+        self.assertEqual(body["observed_at"], stored_reset)                  # exactly the stored reset
+        self.assertEqual((answer.status, answer.code), (202, None))
+        self.assertEqual(self.stored_period(), (500, new_reset, stored_reset))      # a new period may lower the figure
+
+    def test_an_equal_reset_is_never_a_new_period_whatever_the_time(self):
+        self.figure(five=60.0, week=10.0, five_reset=HOUR_S)
+        self.cycle()
+        stored_reset = self.stored_period()[1]
+        self.rig.clock.ms = stored_reset + 1000
+        _body, answer = self.send_at(stored_reset + 500, 100, stored_reset, "equal")
+        self.assertEqual(answer.status, 202)
+        self.assertEqual(self.stored_period()[0:2], (6000, stored_reset))    # the same period: the high-water stays
+
+    def test_a_smaller_reset_is_ignored(self):
+        self.figure(five=60.0, week=10.0, five_reset=HOUR_S)
+        self.cycle()
+        before = self.stored_period()
+        self.rig.clock.ms = before[1]
+        _body, answer = self.send_at(before[1], 900, before[1] - 1000, "smaller")
+        self.assertEqual(answer.status, 202)
+        self.assertEqual(self.stored_period(), before)
 
     def test_a_replay_of_the_stored_bytes_is_a_no_op_and_a_changed_body_is_a_409(self):
         self.figure(five=20.0, week=50.0)
