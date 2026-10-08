@@ -129,7 +129,8 @@ class Reporter:
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
                                    self.config.silent_after_seconds,
-                                   self.limit_sources, self.gateway_receipts, self.gateway_agents)
+                                   self.limit_sources, self.gateway_receipts, self.gateway_agents,
+                                   self.reading_sources)
 
     def _read(self, result):
         try:

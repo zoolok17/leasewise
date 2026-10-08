@@ -476,6 +476,11 @@ class State:
                 self.conn.execute(
                     "INSERT INTO counter(agent, name, value) VALUES(?,?,?) ON CONFLICT(agent, name) "
                     "DO UPDATE SET value=excluded.value", (READING_AGENT, "scan:" + name, value))
+            if counts:      # how many scans in a row turned a file away: a streak, so `status` can tell a one-off from a pattern
+                streak = self.counter(READING_AGENT, "refused_streak") + 1 if counts.get("file_refused") else 0
+                self.conn.execute(
+                    "INSERT INTO counter(agent, name, value) VALUES(?,?,?) ON CONFLICT(agent, name) "
+                    "DO UPDATE SET value=excluded.value", (READING_AGENT, "refused_streak", streak))
             self.set_note("readings_last_scan", None, now_ms)
         return added
 

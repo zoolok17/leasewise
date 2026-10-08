@@ -10,10 +10,11 @@ import datetime
 import json
 import os
 
-from . import capture, decisions, gwcycle, gwstate, receipts, rounds
+from . import capture, decisions, gwcycle, gwstate, readings, receipts, rounds
 from . import state as state_mod
 
-STATUS_VERSION = 4          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`; 4: card R1-READER step 3a added `money_reader`
+STATUS_VERSION = 5          # 2: card 7c-2 added `limit_events`; 3: card L6a-1 added `gateway_receipts`; 4: card R1-READER step 3a added `money_reader`;
+#                             5: card 7b added `readings`
 
 # Said by `status` and the README, word for word (claude-agenttalk-lead approved it; DESIGN-7B 13.12):
 # capture of limit events is best effort, and this is what closes the gap.
@@ -27,6 +28,34 @@ LIMIT_GAP = ("A park that starts and ends while the reporter is not running, or 
 # (still running during an upgrade): it never claims that limit capture is off.
 OLDER_REPORTER = ("A reporter from before this version is still running. Its status has no limit-event "
                   "section, so nothing is said here about limit events.")
+
+# Said by `status` and the README, word for word (DESIGN-7B2.md section 9): readings are best effort, and this is what they
+# can and cannot do.
+READING_GAPS = ("Readings are best effort. A figure is stored only if agenttalk still counted it as current (ten minutes old "
+                "at most) when the reporter looked at it. Each window keeps only its latest unsent figure, and Leasewise gets "
+                "at most one figure per window every two minutes (a new reset period excepted). It can reach Leasewise "
+                "later, after a short wait or an outage. A figure that is replaced by a newer one before its turn, or that is "
+                "still unsent two hours after its reset period ended, is never delivered, even if it was the highest of its "
+                "period, and what was never delivered cannot be recovered; the reporter's status counts both. An account "
+                "whose seats are idle shows no current figure rather than a zero. A refusal that leaves no figure leaves no "
+                "reading, and the reading never says \"refused\": refusals travel as limit events, which for now cover "
+                "Claude only and are also best effort. Leasewise keeps the highest percentage it received within one reset "
+                "period, so what it shows can differ from the last figure the reporter stored, which is what the reporter's "
+                "own status shows. The reporter cannot see which login is behind an agenttalk account, so the table of "
+                "accounts is trusted as the operator wrote it.")
+
+# Said in the text view when the report is the snapshot of a reporter older than status version 5 (still running during an
+# upgrade): it never claims that readings are off.
+OLDER_READINGS = ("A reporter from before this version is still running. Its status has no readings section, so nothing is "
+                  "said here about readings.")
+
+UNMAPPED_ACTION = ("%d seat file(s) name an agenttalk account that is not in readings.sources. Run \"agenttalk capacity\" to see "
+                   "the account names, then add a row, or ignore this if the account is not meant to be reported.")
+FORBIDDEN_ACTION = ("%d reading(s) were refused with FORBIDDEN: this machine is not an authorized reporter for the account: "
+                    "ask whoever manages Leasewise.")
+FORMAT_ACTION = ("A seat file has not followed the documented capacity format for %d scans in a row: is agenttalk the version "
+                 "this reporter expects?")
+REFUSED_SCANS_IN_A_ROW = 10        # about five minutes at the 30-second scan spacing
 
 # Said by `status` and the README (decision O2): the gateway records no cached input, so a receipt
 # settles with 0 there. Zero is a gap in what is recorded, not a measurement.
@@ -228,6 +257,54 @@ def _limit_events(state, limit_sources):
     }
 
 
+def _readings(state, reading_sources):
+    """The `readings` object (DESIGN-7B2.md section 9): closed words and counts only. Per configured row only the provider
+    and the Leasewise alias the operator wrote, never the agenttalk account text, a seat name, a file name or a path."""
+    agent = state_mod.READING_AGENT
+    rows = dict.fromkeys(("pending", "sent", "failed_permanent", "expired", "superseded"), 0)
+    for name, count in state.all("SELECT state, COUNT(*) FROM reading GROUP BY state"):
+        rows[name] = count
+    failed, retrying = {}, {}
+    for code, count in state.all("SELECT last_error_code, COUNT(*) FROM reading WHERE state='failed_permanent' "
+                                 "GROUP BY last_error_code"):
+        word = decisions.closed_code(code) or decisions.UNKNOWN_CODE
+        failed[word] = failed.get(word, 0) + count
+    for code, count in state.all("SELECT last_error_code, COUNT(*) FROM reading WHERE state='pending' AND tries>0 "
+                                 "GROUP BY last_error_code"):
+        word = decisions.closed_code(code) or decisions.UNKNOWN_CODE
+        retrying[word] = retrying.get(word, 0) + count
+    scan = state.note("readings_last_scan")
+    fault = state.note("readings_last_fault")
+    ok = state.note(state_mod.last_ok_note(agent))
+    configured = bool(reading_sources)
+    last_stored = [{"account": alias, "window": window, "used_percent": bps / 100.0, "observed_at": iso(observed),
+                    "resets_at": iso(reset)}
+                   for alias, window, bps, observed, reset in state.all(
+                       "SELECT account_alias, window_key, last_used_bps, last_observed_ms, last_reset_ms FROM reading_window "
+                       "ORDER BY account_alias, window_key")]
+    return {
+        "configured": configured,
+        "sources": sorted(({"provider": s.provider, "account": s.account} for s in reading_sources),
+                          key=lambda s: (s["provider"], s["account"])),
+        "last_scan": None if scan is None else iso(scan[1]),
+        "scan": {name: state.counter(agent, "scan:" + name) for name in readings.SCAN_COUNTS},
+        "captured": state.counter(agent, "captured"),
+        "superseded": state.counter(agent, "superseded"),
+        "expired": state.counter(agent, "expired"),
+        "pruned": state.counter(agent, "pruned"),
+        "body_invalid": state.counter(agent, "body_invalid"),
+        "refused_streak": state.counter(agent, "refused_streak"),
+        "rows": rows,
+        "failed": failed,
+        "retrying": retrying,
+        "capture_fault": {"count": state.counter(agent, "capture_fault"),
+                          "last": None if fault is None else iso(fault[1])},
+        "last_stored": last_stored,
+        "last_ok": None if ok is None else iso(ok[1]),
+        "gaps": READING_GAPS if configured else None,
+    }
+
+
 QUARANTINE_ACTIONS = {
     "unknown_reference": "No admission record names this receipt's lease yet: check that the admission store is the "
                          "one this machine uses. It is sent by itself once its record appears.",
@@ -391,7 +468,7 @@ def _gateway_receipts(state, source, now_ms, gateway_agents=()):
 
 
 def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=(), gateway_receipts=None,
-                 gateway_agents=()):
+                 gateway_agents=(), reading_sources=()):
     """The whole report as plain data. `configured` is the set of agent
     names that have a table in the configuration file; `limit_sources` is the
     account map of card 7c-2 (empty: limit events are off); `gateway_receipts` is the receipt
@@ -418,6 +495,7 @@ def build_status(state, configured, now_ms, silent_after_seconds, limit_sources=
         "code": decisions.closed_code(refused[0]), "at": iso(refused[1]),
         "active": state.note(_NOTE_CREDENTIAL) is not None}
     report["limit_events"] = _limit_events(state, limit_sources)
+    report["readings"] = _readings(state, reading_sources)
     report["gateway_receipts"] = _gateway_receipts(state, gateway_receipts, now_ms, gateway_agents)
     report["money_reader"] = _money_reader(state)
     report["silent_configured_seats"] = sorted(
@@ -493,6 +571,23 @@ def _actions(report, gateway_agents=()):
     if limit["capture_fault"]["count"]:
         actions.append("limit event capture failed %d time(s) (last at %s): lease sending was not "
                        "affected" % (limit["capture_fault"]["count"], limit["capture_fault"]["last"]))
+    reading = report["readings"]
+    if reading["failed"].get("FORBIDDEN"):
+        actions.append(FORBIDDEN_ACTION % reading["failed"]["FORBIDDEN"])
+    other = reading["rows"]["failed_permanent"] - reading["failed"].get("FORBIDDEN", 0)
+    if other > 0:
+        actions.append("%d reading(s) failed for good and will not be retried (see readings: failed, with each closed code)"
+                       % other)
+    if reading["scan"]["unmapped"]:
+        actions.append(UNMAPPED_ACTION % reading["scan"]["unmapped"])
+    if reading["refused_streak"] >= REFUSED_SCANS_IN_A_ROW:
+        actions.append(FORMAT_ACTION % reading["refused_streak"])
+    if reading["body_invalid"]:
+        actions.append("%d stored reading(s) no longer fitted the allowed shape and were not sent (see readings: failed)"
+                       % reading["body_invalid"])
+    if reading["capture_fault"]["count"]:
+        actions.append("reading capture failed %d time(s) (last at %s): sending was not affected"
+                       % (reading["capture_fault"]["count"], reading["capture_fault"]["last"]))
     return actions
 
 
@@ -556,6 +651,13 @@ def render_text(report):
         out.append(OLDER_REPORTER)
     elif limit["configured"]:
         out.append("limit events (best effort): " + limit["gap"])
+    reading = report.get("readings")                # a snapshot of a reporter before status version 5 has none
+    if reading is None:
+        out.append(OLDER_READINGS)
+    elif reading["configured"]:
+        out.append("readings (best effort): " + reading["gaps"])
+    else:
+        out.append("readings: off")
     receipt = report.get("gateway_receipts")       # a snapshot of a version 1 or 2 reporter has none
     if receipt is not None and receipt["configured"]:
         out.append("gateway receipts: last seq %d, pending %d, delivered %d, failed %d. %s"

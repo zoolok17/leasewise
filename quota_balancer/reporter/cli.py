@@ -261,7 +261,7 @@ def _status(config, args):
             report = status_mod.build_status(
                 state, set(config.agents), now, config.silent_after_seconds,
                 config.limit_sources, config.gateway_receipts,
-                config.admission.gateway_agents if config.admission is not None else ())
+                config.admission.gateway_agents if config.admission is not None else (), config.reading_sources)
         finally:
             state.close()
     except StateOwned:

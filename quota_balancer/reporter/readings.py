@@ -31,6 +31,9 @@ MAX_BPS = 10_000
 # could not list or cut short. Whole numbers only; they describe the LAST pass.
 FILE_COUNTS = ("file_refused", "file_read_later", "too_many_entries", "folder_unreadable")
 
+# What `status` shows of the last pass: the selection counters, the file counts and the capture outcomes.
+CAPTURE_OUTCOMES = ("same", "same_second_conflict", "older")
+
 COUNTERS = ("no_reading", "source_not_accepted", "no_figure", "window_incomplete", "assumed_dropped",
             "ambiguous_window", "time_unusable", "no_account", "unmapped", "refused", "not_current", "future")
 
@@ -60,6 +63,8 @@ class Selection:
     def __init__(self):
         self.picks = {}
         self.counters = dict.fromkeys(COUNTERS, 0)
+
+SCAN_COUNTS = COUNTERS + FILE_COUNTS + CAPTURE_OUTCOMES
 
 
 def used_bps(percent):
