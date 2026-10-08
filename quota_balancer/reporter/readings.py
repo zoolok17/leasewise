@@ -11,7 +11,7 @@ and nothing else; no text from a file is kept.
 
 import math
 
-from . import capacityreader
+from . import capacityreader, mapper
 
 FIVE_HOUR = "five_hour"
 SEVEN_DAY = "seven_day"
@@ -25,6 +25,10 @@ MAX_RESET_AHEAD_MS = 9 * 86_400_000       # a reset is at most nine days after i
 MAX_AHEAD_MS = 25_000                      # the server refuses 30 s ahead; 25 leaves room
 MAX_AGE_MS = 600_000                       # agenttalk's own limit: a figure counts for ten minutes
 MAX_BPS = 10_000
+
+# What one capture pass counts besides `COUNTERS`: the files the reader turned away or could not read yet, and the folders it
+# could not list or cut short. Whole numbers only; they describe the LAST pass.
+FILE_COUNTS = ("file_refused", "file_read_later", "too_many_entries", "folder_unreadable")
 
 COUNTERS = ("no_reading", "source_not_accepted", "no_figure", "window_incomplete", "assumed_dropped",
             "ambiguous_window", "time_unusable", "no_account", "unmapped", "refused", "not_current", "future")
@@ -163,3 +167,46 @@ def select(files, mapping, now_ms):
         result.picks[(alias, key)] = Pick(alias, key, used_bps(window.used_percent), window.resets_at * 1000,
                                           window.observed_ms)
     return result
+
+
+def _merge(picks):
+    """The freshest pick per (alias, window) over the folders: newest observation, then the larger figure, then the
+    smaller reset (the tie rules of 3.1; the file stem is only known inside one folder)."""
+    best = {}
+    for pick in picks:
+        key = (pick.alias, pick.window)
+        old = best.get(key)
+        if old is None or (-pick.observed_ms, -pick.used_bps, pick.resets_at_ms) < (-old.observed_ms, -old.used_bps, old.resets_at_ms):
+            best[key] = pick
+    return best
+
+
+def run(state, sources, machine, now_ms):
+    """Scan every configured folder once, choose the freshest current figure of each (account alias, window) and store
+    the new ones (card 7b; DESIGN-7B2.md 7.6). `sources` are the resolved `readings` rows. -> the number of NEW rows.
+
+    A row belongs to one folder: a file is attributed only by the rows of the folder it was read in. Folders that name
+    one alias take part in one selection. The body is built field by field from checked numbers and stored frozen."""
+    counts = dict.fromkeys(COUNTERS + FILE_COUNTS, 0)
+    by_folder = {}
+    ids = {}
+    for source in sources:
+        folder = by_folder.setdefault(source.folder, (source.bus_root, {}))
+        folder[1][source.agenttalk_account] = (source.account, source.provider)
+        ids[source.account] = source.account_id
+    picks = []
+    for bus_root, mapping in by_folder.values():
+        scanned = capacityreader.scan(bus_root, now_ms)
+        counts["file_refused"] += scanned.refused
+        counts["file_read_later"] += scanned.read_later
+        counts["too_many_entries"] += 1 if scanned.too_many_entries else 0
+        counts["folder_unreadable"] += 1 if scanned.folder_unreadable else 0
+        chosen = select(scanned.files, mapping, now_ms)
+        for name, value in chosen.counters.items():
+            counts[name] += value
+        picks.extend(chosen.picks.values())
+    items = []
+    for (alias, window), pick in sorted(_merge(picks).items()):
+        key = mapper.reading_key(machine, alias, window, pick.observed_ms)
+        items.append((alias, window, mapper.reading_body(key, ids[alias], window, pick.used_bps, pick.resets_at_ms, pick.observed_ms)))
+    return state.record_readings(items, counts, now_ms)

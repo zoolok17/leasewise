@@ -71,8 +71,8 @@ class Schema(_Tmp):
 
     def test_a_fresh_file_has_the_current_version_with_the_limit_table(self):
         state = self.open()
-        self.assertEqual(state_mod.SCHEMA_VERSION, 6)                # card L6a-2 moved it from 3 to 4; R1-READER step 2 to 5; step 3a to 6
-        self.assertEqual(state.one("PRAGMA user_version")[0], 6)
+        self.assertEqual(state_mod.SCHEMA_VERSION, 7)                # card L6a-2 moved it from 3 to 4; R1-READER step 2 to 5; step 3a to 6
+        self.assertEqual(state.one("PRAGMA user_version")[0], 7)
         columns = [r[1] for r in state.all("PRAGMA table_info(limit_event)")]
         self.assertEqual(columns, ["id", "event_id", "account_alias", "body", "state", "tries",
                                    "not_before_ms", "last_error_code", "captured_ms"])
@@ -106,7 +106,7 @@ class Schema(_Tmp):
         self.assertEqual(self.raw("PRAGMA user_version"), [(1,)])
         self.assertEqual(self.raw("SELECT name FROM sqlite_master WHERE name='limit_event'"), [])
         state = self.open()
-        self.assertEqual(state.one("PRAGMA user_version")[0], 6)     # 1 -> 6 in one step since card R1-READER step 3a
+        self.assertEqual(state.one("PRAGMA user_version")[0], 7)     # 1 -> 7 in one step since card 7b
         self.assertEqual(self.lease_snapshot(), before)
         self.assertEqual(self.rows(), [])
         self.assertTrue(state.add_limit_event(ALIAS, body(), NOW))
@@ -119,7 +119,7 @@ class Schema(_Tmp):
         State(self.path).close()
         self.assertEqual(self.raw("SELECT type, name, sql FROM sqlite_master ORDER BY name"), schema)
         self.assertEqual(self.lease_snapshot(), before)
-        self.assertEqual(self.raw("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw("PRAGMA user_version"), [(7,)])
 
     def test_a_migration_that_fails_leaves_the_file_at_version_1(self):
         self._make_version_1()
@@ -133,7 +133,7 @@ class Schema(_Tmp):
         self.assertEqual(self.raw("PRAGMA user_version"), [(1,)])
         self.assertEqual(self.raw("SELECT name FROM sqlite_master WHERE name='limit_event'"), [])
         self.open()                                            # and the good code still migrates it
-        self.assertEqual(self.raw("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw("PRAGMA user_version"), [(7,)])
         self.assertEqual(len(self.raw("SELECT name FROM sqlite_master WHERE name='limit_event'")), 1)
 
     def _fingerprint(self):
@@ -157,7 +157,7 @@ class Schema(_Tmp):
     def test_a_newer_unknown_version_is_refused_and_changes_nothing(self):
         State(self.path).close()
         conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA user_version=7")
+        conn.execute("PRAGMA user_version=8")
         conn.commit()
         conn.close()
         before = self._fingerprint()

@@ -104,3 +104,105 @@ See the reply for the counts of this step.
    refuses the file; it is refused here.
 3. 1.5 puts the decision order in the reader; it is split here (`capacityreader.verdict` for steps 1 and 2,
    `readings.select` for the rest) because steps 3 to 6 need the mapping.
+
+The lead accepted all of these. Finding 1 stays as built: a time more than 30 seconds ahead of the clock counts
+as `time_unusable`, not `future`.
+
+## Step 7b-2
+
+Branch `card-7b2`, on top of step 7b-1 (`6c7b718`). Spec: `DESIGN-7B2.md` revision 3, sections 2, 6.1-6.5, 7.1,
+7.6 and 8.
+
+### In plain words
+
+Step 7b-1 taught the reporter to read agenttalk's usage files and to pick the freshest figure for each account
+and allowance. Step 7b-2 lets the operator say **which account is which**, gives every figure a **fixed identity
+and a fixed message**, and **stores** the figure so that it survives a restart.
+
+- **The operator names the accounts.** A new optional block in the reporter's settings file, `[[readings.sources]]`,
+  has one row per agenttalk account: the agenttalk folder, the provider, the account text exactly as
+  `agenttalk capacity` prints it, and the Leasewise account name it belongs to. A file whose account text is in no
+  row is counted and ignored. The text holds the operator's user name, so it is never printed, logged, stored or
+  sent; it is only compared.
+- **One text, one account name.** The same account text must always mean the same Leasewise account, in every
+  folder. Two different texts may share one account name (the operator says they share a budget). If the same
+  folder and provider also appears under `limit_events`, both must name the same account.
+- **A figure is one fact.** Its identity comes from the machine, the account name, the allowance and the
+  second the source gave, never from the seat, the file or the figure itself. Two seats that report the same
+  second for the same allowance are one fact.
+- **The message is frozen.** It is built once from checked numbers, saved as exact text, and never rebuilt.
+  It carries only an id, the account's local id, the allowance, the figure in hundredths of a percent, the reset
+  and the observation time.
+- **Only the newest figure waits.** For each account and allowance at most one figure is waiting. A newer figure
+  replaces it (the old one is marked `superseded`). A figure that is not newer than the last one stored is ignored.
+- **Old waiting figures expire.** A waiting figure is dropped only after its allowance has reset **and** two hours
+  have passed since it was stored. Finished rows are deleted two days after they were stored.
+- **Nothing is sent yet.** The sending, the pacing gate's update, the status view and the README are steps 7b-3 and
+  7b-4. Until then the stored figures wait and are replaced or expire; nothing leaves the machine and nothing a seat
+  does changes.
+
+**A loss that is accepted on purpose** (spec question 9): if 97 percent is stored and 20 percent with the same reset
+replaces it before it could be sent, only 20 percent will ever be sent. A test asserts this.
+
+### What changed
+
+- `quota_balancer/reporter/config.py`: the `readings` block with its closed keys and checks (spec 2.3), the
+  account-text rule (provider word, user part, `:home-` and eight lowercase hexadecimal characters, at most 160
+  characters), the whole-file rule that one text names one alias, the cross-check with `limit_events`, the state
+  file and the configuration file not inside a readings folder, and `resolve_reading_sources` with the same
+  sentences as `resolve_limit_sources`. Every refusal is a fixed sentence that names no value. The classes hide
+  everything from `repr` and `str`.
+- `quota_balancer/reporter/mapper.py`: `reading_key`, `reading_event_id` (prefix `reading|`), `reading_body` and
+  `reading_body_text`, which checks every value (UUID text, plain integers, fixed words, a real `false`) and not
+  only the key sets.
+- `quota_balancer/reporter/state.py`: **state version 7.** Tables `reading` and `reading_window`, a partial unique
+  index that makes a second pending row for one window impossible, triggers (identity columns never change; only a
+  `sent`, `expired` or `superseded` row can be deleted; the observation memory only moves forward; a window memory
+  cannot be renamed), migration of versions 1 to 6 in one transaction, `record_readings` (same key first, strictly
+  newer, latest only, memory update, counters under `_readings`), `housekeep_readings`, `note_readings_fault` and
+  `valid_reading_body`. The gate columns `gate_ms` and `last_sent_reset_ms` exist now and are ordinary columns, so
+  the version does not change again in 7b-3.
+- `quota_balancer/reporter/readings.py`: `run(state, sources, machine, now_ms)`, the capture pass (spec 7.6).
+- `quota_balancer/reporter/run.py` and `cli.py`: `Reporter._capture_readings` is wired into every cycle: a scan at
+  most every 30 seconds on the monotonic clock (memory only, so a restart scans at once), the housekeeping every
+  cycle, and any fault caught whole, counted as `capture_fault`, with no text kept. It needs no send-side change. The
+  command line resolves the readings rows at start like the limit-event rows.
+
+### Decisions inside the step (where the spec left room)
+
+- **Counters.** Under the agent word `_readings`: cumulative `captured`, `superseded`, `expired`, `pruned`,
+  `capture_fault`; and `scan:<name>` for the last pass (absolute): the twelve selection counters of 7b-1, the file
+  counts `file_refused`, `file_read_later`, `too_many_entries`, `folder_unreadable`, and the capture outcomes
+  `same`, `same_second_conflict`, `older`. `file_refused` is a file the reader turned away; `refused` is a file of
+  the wrong provider for its row.
+- **Several folders.** Each folder is scanned once and chosen on its own rows; folders that name one alias are then
+  merged on the same tie rules (newest, larger figure, smaller reset). The file stem is only known inside one folder.
+- **Age of a settled row.** The two days count from the row's capture time (there is no "sent at" time).
+- **A pruned row.** A figure whose row was deleted is still recognised as not newer, because the window memory is
+  never pruned.
+- **The version bump touched five older tests.** `test_card7c2_state`, `test_card7l6a1_state`,
+  `test_card7l6a2_fix1b`, `test_cardr1reader2_state` and `test_cardr1reader3a_schema6` assert the final version
+  number and compare every table; they now expect 7, the two new empty tables, and 8 as the "newer than known"
+  version. Nothing else in them changed.
+- **Bandit.** The fault count in `_capture_readings` uses `contextlib.suppress` so the Low count stays at 5.
+
+### Tests
+
+- `tests/test_card7b2_config.py` (32): the block, the closed keys, the account text, one text one alias (two
+  different folders), two texts one alias, the `limit_events` cross-check, the folder rules, hiding, and resolution.
+- `tests/test_card7b2_identity.py`: the key and id (stable across processes), the body and every explicit value
+  check, and the capture cases of 6.5 on the real capture step over writer-made fixtures.
+- `tests/test_card7b2_state.py`: the schema, the migration from every version 1 to 6 (and a failed migration), a
+  newer file refused, every trigger, the one-pending rule, recording, expiry and pruning at their exact edges.
+- `tests/test_card7b2_wiring.py`: the 30-second spacing, the restart, the housekeeping, fault isolation in both
+  directions, and the start-up resolution or refusal.
+
+### Not built yet
+
+Offering a stored row for sending, the pacing gate's update on an accepted answer, the clamps for a clock that moved
+back, the decisions, the client and the send pass (step 7b-3); `reporter status`, the README, `docs/DESIGN.md` and the
+end-to-end test over the real Leasewise handler (step 7b-4).
+
+### Gates
+
+See the reply for the counts of this step.
