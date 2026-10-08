@@ -417,3 +417,31 @@ while the row exists; deletion counts from capture time; the table is trusted (R
 Leasewise keeps readings: about 1,400 rows a day per account at the two-minute pace) and 12.7 (the format of the account
 text). For the lead before the first live run: 12.4 (the lead checks that the reporter's machine is an authorized
 reporter for the Claude and Codex accounts of the machine; otherwise every reading fails for good with `FORBIDDEN`).
+
+## Tidy after the merge (card 7b-tidy)
+
+Card 7b version 2 was merged (`5a80ffa`) after Codex's final read said GO at `7439d5d` with three minor points and one
+note. This follow-up changes **no behaviour**: wording, a status sentence, two tests and one table label.
+
+1. **Expiry has two starting points (wording).** The README and the shared gaps sentence in `status` said a waiting figure
+   is dropped "two hours after its reset". The built and approved rule (spec 7.1) is: its reset has passed **and** it was
+   stored more than two hours ago. A figure stored four hours before its reset is dropped at the reset itself. The README
+   (two places), the sentence in `status.py` and the tests that assert the sentence now say that. The code is as it was.
+2. **Two tests now reach what they promise.**
+   - `test_card7b2_privacy.py`: the old test queued a transport failure, a 403, a 422 and a garbled 202 with private
+     markers; the two rows failed for good on the 403 and the 422, so the garbled 202 was never used (shown by running the old
+     script: three calls, no `MALFORMED_RESPONSE`). Every answer now has its own test, the garbled 202 is repeated until it
+     is used several times and the row shows `MALFORMED_RESPONSE`, and a sequence test proves each scripted answer is handed
+     to the client in order.
+   - `test_card7b2_e2e.py`: the old "one millisecond before the reset" case sent a time about two seconds before it. The
+     tests now send an explicit reading straight to the real handler at the stored reset minus 1 ms (same period: the
+     high-water and the reset stay, the observation time is that exact value) and exactly at the stored reset (a larger
+     reset starts a new period), plus an equal reset and a smaller reset. The capacity files only carry whole seconds, so a
+     millisecond boundary can only be reached at the handler.
+3. **The 7d row.** In `docs/DESIGN.md` the whole context/enforcement row said `PAUSED (2026-10-07, D-288).`, but the paragraph
+   above the table pauses only its enforcement part. The row now starts `Enforcement part PAUSED (2026-10-07, D-288).`
+   (the README/design test checks it).
+4. **The timing guarantees, said precisely (README).** The send exception is **any change of the reset time**, small jitter
+   included, and is the reporter's own rule, not Leasewise's rule for a new period. The gate moves only after an accepted
+   answer is recorded, so a lost success followed by a newer figure can give Leasewise one extra true reading (accepted by the
+   spec). The retry wait is not "5 seconds": the first retry waits 2.5 to under 5 seconds (jitter), growing to 15 minutes.
