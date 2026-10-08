@@ -314,6 +314,53 @@ class Windows(unittest.TestCase):
         self.assertEqual((chosen.picks, nonzero(chosen)), ({}, {"no_figure": 1}))
 
 
+class FreshnessFirst(unittest.TestCase):
+    """The currency filter comes before any account warning: a figure that is too old or too new says so, whatever the
+    account text holds (spec 1.5 step 4 and 3.1)."""
+
+    def tally(self, capacity, mapping=MAPPING):
+        chosen = select([capacity], mapping, NOW)
+        return nonzero(chosen), chosen.picks
+
+    def test_stale_figures_with_an_unmapped_or_a_null_account_are_not_current(self):
+        for account in ("claude:<os-user>:home-deadbeef", None):
+            for age in (601, 700, 86_400):
+                with self.subTest(account=account, age=age):
+                    doc = edited("claude_stream_both", account=account, primary_observed_at=at(-age), secondary_observed_at=at(-age))
+                    counts, picks = self.tally(cap(doc))
+                    self.assertEqual((counts, picks), ({"not_current": 2}, {}))
+
+    def test_future_figures_with_an_unmapped_or_a_null_account_are_future(self):
+        for account in ("claude:<os-user>:home-deadbeef", None):
+            with self.subTest(account=account):
+                doc = edited("claude_stream_both", account=account, primary_observed_at=at(-100), secondary_observed_at=at(-100))
+                capacity = cap(dict(doc, primary_observed_at=at(26), secondary_observed_at=at(28)))
+                self.assertEqual(self.tally(capacity), ({"future": 2}, {}))
+
+    def test_a_stale_figure_with_a_wrong_provider_row_is_not_current_not_refused(self):
+        capacity = cap(edited("claude_stream_both", primary_observed_at=at(-700), secondary_observed_at=at(-700)))
+        self.assertEqual(self.tally(capacity, {CLAUDE_ACCOUNT: ("x", "codex")}), ({"not_current": 2}, {}))
+
+    def test_a_current_figure_still_gets_the_account_warning(self):
+        self.assertEqual(self.tally(cap(edited("claude_stream_both", account=None)))[0], {"no_account": 1})
+        self.assertEqual(self.tally(cap(edited("claude_stream_both", account="claude:<os-user>:home-deadbeef")))[0], {"unmapped": 1})
+        self.assertEqual(self.tally(cap(fixture("claude_stream_both")), {CLAUDE_ACCOUNT: ("x", "codex")})[0], {"refused": 1})
+
+    def test_one_stale_and_one_current_window_count_both(self):
+        doc = edited("claude_stream_both", account=None, primary_observed_at=at(-700))
+        self.assertEqual(self.tally(cap(doc)), ({"not_current": 1, "no_account": 1}, {}))
+        doc = edited("claude_stream_both", account="claude:<os-user>:home-deadbeef", primary_observed_at=at(-700))
+        self.assertEqual(self.tally(cap(doc)), ({"not_current": 1, "unmapped": 1}, {}))
+
+    def test_the_window_counters_are_kept(self):
+        doc = edited("claude_stream_both", account=None, primary_observed_at=at(-700), secondary_window_minutes=60)
+        self.assertEqual(self.tally(cap(doc))[0], {"not_current": 1, "window_incomplete": 1})
+
+    def test_a_stale_file_changes_nothing_when_mapped(self):
+        capacity = cap(edited("claude_stream_both", primary_observed_at=at(-700), secondary_observed_at=at(-700)))
+        self.assertEqual(self.tally(capacity), ({"not_current": 2}, {}))
+
+
 class Numbers(unittest.TestCase):
     """4.2: what a figure becomes."""
 

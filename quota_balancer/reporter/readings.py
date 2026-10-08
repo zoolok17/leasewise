@@ -5,7 +5,8 @@ which figure is the freshest *current* one for each (account alias, window) and 
 Everything is a pure function of its arguments, and `now_ms` is the reporter's clock, passed in.
 
 The decision order for one file (1.5): `no_reading`, `source_not_accepted`, `no_figure` (or a more specific
-window counter), `no_account`, `unmapped` / `refused`, and only then selection. Counters are whole numbers
+window counter), then the freshness filter (`not_current`, `future`), then `no_account`, `unmapped` / `refused`, and only
+then selection. A figure that is too old or too new says so whatever the account text holds. Counters are whole numbers
 and nothing else; no text from a file is kept.
 """
 
@@ -143,6 +144,17 @@ def select(files, mapping, now_ms):
             if not window_counters:
                 counters["no_figure"] += 1
             continue
+        current = {}
+        for key, window in usable.items():          # freshness comes before any word about the account
+            age = now_ms - window.observed_ms
+            if age < -MAX_AHEAD_MS:
+                counters["future"] += 1
+            elif age > MAX_AGE_MS:
+                counters["not_current"] += 1
+            else:
+                current[key] = window
+        if not current:
+            continue
         if capacity.account is None:
             counters["no_account"] += 1
             continue
@@ -154,14 +166,8 @@ def select(files, mapping, now_ms):
         if provider != PROVIDER_OF_SOURCE[capacity.source]:
             counters["refused"] += 1
             continue
-        for key, window in usable.items():
-            age = now_ms - window.observed_ms
-            if age < -MAX_AHEAD_MS:
-                counters["future"] += 1
-            elif age > MAX_AGE_MS:
-                counters["not_current"] += 1
-            else:
-                candidates.setdefault((alias, key), []).append((window, capacity.stem))
+        for key, window in current.items():
+            candidates.setdefault((alias, key), []).append((window, capacity.stem))
     for (alias, key), found in candidates.items():
         window, _ = min(found, key=lambda item: (-item[0].observed_ms, -item[0].used_percent,
                                                   item[0].resets_at, item[1]))
