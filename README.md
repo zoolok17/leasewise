@@ -778,7 +778,7 @@ In plain words: the money reader must never skip or replace a report number. It 
 it saved for n. This step builds the **memory** that makes that rule hold. **Nothing here reads a gateway or sends anything**; it is state and the rules
 over it, with tests, and no seat, lease or admission decision changes.
 
-What exists now (the reporter's own database, schema version 5, and 6 since step 3a; `reporter/gwstate.py`):
+What exists now (the reporter's own database, schema version 5, 6 since step 3a, and 7 since card 7b; `reporter/gwstate.py`):
 
 - **An identity** (a random value) that never changes, with a halt that is empty or one of three words (`continuity_conflict`, `send_refused`,
   `state_unavailable`).
@@ -1232,7 +1232,7 @@ dropped, and never leave the machine.
 - **No backfill.** Blocks that already exist keep the `retry_at` they have; only new events get the 30
   seconds.
 - **No downgrade of the state file.** *(Historical: this is how it was when card 7c-2 landed. The state file is
-  version 3 since card L6a-1, and `status_version` is 3; see that card below.)* The state file became version 2, and
+  version 3 since card L6a-1 and 7 since card 7b; `status_version` was 3 then and is 5 since card 7b; see those cards.)* The state file became version 2, and
   a version-1 file is upgraded the first time the new reporter opens it. A reporter built before this card meets a
   version-2 file with its existing "the state file version is not supported" refusal: it never opens
   or changes it. Keep a copy of the state file if you may need to go back.
@@ -1250,6 +1250,131 @@ before the lease pass and the two stay separate; `status_version` was 2 with a t
 One limit fact is (installation, account alias, evidence kind, window, reset); with an unknown reset the
 park time joins the key. `event_id` and `turn_id` are derived from that key; the body is built field by
 field with the reset RAW. Leasewise's margin is `LIMIT_RETRY_MARGIN_MS` in `lease.py`.
+
+## Card 7b - usage readings
+
+**Status: built.** agenttalk keeps one small usage file for every seat, and the files say how full each account's
+5-hour and weekly allowances are. The reporter now reads those files, picks the freshest figure for each account and
+allowance, and sends it to Leasewise, so that Leasewise can show how much of each allowance is used. Audience: the
+operator of a Leasewise store. See docs/STEP-CARD-7B.md and docs/DESIGN.md (the card 7b row).
+
+Nothing a seat does changes: the seats run in shadow, and a reading only changes what `status` shows.
+
+### What it does, in plain words
+
+1. **It looks** at the usage files (`<agenttalk folder>/state/<seat>.capacity.json`) of the folders you name, at most
+   every 30 seconds. A file is read strictly: a file that is not exactly in agenttalk's documented shape is turned away
+   and nothing from it is used, and a file that may only be half written is looked at again on the next look. A seat
+   that has not worked yet, or a manual refresh with no account, leaves an empty file; that is normal and is only
+   counted.
+2. **It uses a figure only while it is fresh.** A figure counts when agenttalk counted it as current (ten minutes old at
+   most) at the moment the reporter looked. Claude windows are known by the provider's own names; a Codex window is used
+   only when the provider reported its length. The status-line source is not used.
+3. **It chooses one figure per account and allowance.** Several seat files of one account are never added together: the
+   newest figure of each allowance wins (a tie goes to the larger percentage, then the earlier reset). The 5-hour and
+   weekly figures may come from different files.
+4. **It keeps only the newest unsent figure of each allowance**, stored on disk with its message frozen before anything is
+   sent, so a restart or an outage loses nothing that was stored. A newer figure replaces a waiting one; a waiting figure
+   is dropped only after its allowance has reset and two hours have passed.
+5. **It sends at a calm pace.** After Leasewise accepts a figure, the next figure of the same allowance waits two minutes.
+   A figure that starts a new reset period goes at once. If Leasewise does not answer, the figure waits and is tried
+   again with the same bytes (5 seconds growing to 15 minutes); only an accepted answer starts the two minutes. Readings
+   are sent after limit events and before receipts and leases, in their own pass, so none of them holds up another.
+6. **`reporter status`** shows what readings are doing, including the sentence under "Limits" below.
+
+### How to set it up
+
+1. **Save the ids again** (`policy-ids --json`, as for limit events): the reporter needs each account's local id and
+   refuses to start when a configured account is missing from the snapshot or appears twice.
+2. **Find the account text.** Run `agenttalk capacity` on the machine where the seats run. Each account is printed as
+   `<provider>:<os-user>:home-<hash>`; copy it exactly. The text holds your OS user name, so it stays in the configuration
+   file only (a file only you can read) and is never printed, logged, stored or sent.
+3. **Add a row per account** (every key is required, at most 16 rows):
+
+```toml
+[[readings.sources]]
+bus_root          = "C:/path/to/the/agenttalk/folder"   # read only; never the folder holding this file
+provider          = "claude"                            # "claude" or "codex"
+agenttalk_account = "claude:<os-user>:home-<hash>"      # exactly as `agenttalk capacity` prints it
+account           = "claude-main"                       # a Leasewise account alias
+```
+
+   The rules:
+   - **One account text names one alias, everywhere in the file.** The same text in two folders must name the same
+     alias. Different texts may share an alias (you say they share one budget, for example Codex homes made from one
+     login); two real budgets must have two aliases.
+   - If `limit_events` has a source for the same folder and provider, every readings row for that folder and provider must
+     name the same alias. A folder that holds seats of two Claude budgets therefore cannot also have a `limit_events`
+     source: leave that source out (limit events are not reported for the folder) and never merge two budgets into one
+     alias to satisfy the check.
+   - Two rows may not name the same folder and the same text; the folder may not contain the reporter's state file or this
+     configuration file; the reporter never writes into the folder.
+   - A file whose text is in no row is counted as `unmapped` and not used; `status` says so.
+4. **Make sure this machine is an authorized reporter for each account** in Leasewise. If it is not, Leasewise answers
+   `403 FORBIDDEN` for the account's readings; each such reading fails for good and `status` asks you to talk to
+   whoever manages Leasewise.
+5. **Start the reporter** as before. A configuration without a `readings` block behaves exactly as before: no scan, no new
+   counters, and `status` says "readings: off".
+
+### What is sent, and what never is
+
+Sent, for each figure: a Leasewise event id, the account's local id, the allowance name (`five_hour` or `seven_day`), the
+figure in hundredths of a percent (held at 100 percent), the reset and the observation time, and the fixed words
+`cli_window` and `observed`. **Never leaves the machine:** the agenttalk account text and the OS user name inside it, seat
+names, file names and paths, the plan, the reason, any status or refusal word, the context figures, the hash of the
+config folder, and the agenttalk folder. The message is built from checked numbers only, never from the file.
+
+### The new status fields
+
+`reporter status --json` has a `readings` object (`status_version` 5): whether readings are on; for each row only the
+provider and the Leasewise alias; the counters of the last look (files turned away or not yet readable, unmapped,
+no reading, no account, not current, future, a stale or incomplete window, a refused source, and what was ignored as
+the same fact, older or in conflict); how many figures were captured, replaced, expired and deleted; the rows by state
+(waiting, sent, failed for good, expired, superseded); failures by Leasewise's closed word; figures that are being
+retried; stored figures that no longer fitted the allowed shape (`body_invalid`); the capture fault; and for each account
+and allowance the **last stored figure** (percent, observation time, reset), which survives the deletion of old rows.
+That is what the reporter stored, not what Leasewise shows. The plain text view prints one line with the gap sentence
+when readings are on, and the lines that ask for action. A snapshot written by an older reporter during an upgrade is shown
+as such; `status` never says readings are off because of it.
+
+### Limits
+
+- **The gaps (best effort).** Readings are best effort. A figure is stored only if agenttalk still counted it as current (ten minutes old at most) when the reporter looked at it. Each window keeps only its latest unsent figure, and Leasewise gets at most one figure per window every two minutes (a new reset period excepted). It can reach Leasewise later, after a short wait or an outage. A figure that is replaced by a newer one before its turn, or that is still unsent two hours after its reset period ended, is never delivered, even if it was the highest of its period, and what was never delivered cannot be recovered; the reporter's status counts both. An account whose seats are idle shows no current figure rather than a zero. A refusal that leaves no figure leaves no reading, and the reading never says "refused": refusals travel as limit events, which for now cover Claude only and are also best effort. Leasewise keeps the highest percentage it received within one reset period, so what it shows can differ from the last figure the reporter stored, which is what the reporter's own status shows. The reporter cannot see which login is behind an agenttalk account, so the table of accounts is trusted as the operator wrote it.
+- **The loss of an unsent higher figure is accepted.** If 97 percent is stored and a newer 20 percent in the same period
+  replaces it before it could be sent, only 20 percent is ever sent. Newer figures are not always higher.
+- **Leasewise's own number.** Within one reset period Leasewise keeps the highest percentage it received, so its figure can
+  differ from the last one this reporter stored; the reporter's `last_stored` is the reporter's sample.
+- **A garbled success answer is repeated.** If Leasewise answers 202 without a usable body, the reporter treats it as no
+  answer and sends the same stored bytes again after the usual wait; `status` shows it as a retry (`retrying`). Leasewise
+  treats the repeat as the same figure.
+- **Conflict detection holds only while the row exists.** If a later look offers a different figure for a second that is
+  already stored, the first one stays and the second is counted (`same_second_conflict`). After a settled row is deleted
+  (two days after it was stored), a repeat is counted as older instead; do not rely on detection for ever.
+- **Deletion counts from the time of capture.** A row that is settled late (for example sent after a long outage) may be
+  deleted at once. The memory of the last figure and the counters remain.
+- **One outbox, one memory.** The guarantee that one observation is one message holds for one state file, one `machine`
+  alias and one account id. A recreated state file, or two reporters with one `machine` alias, can store different first
+  messages for one fact; Leasewise then answers `409 IDEMPOTENCY_CONFLICT` and that figure fails for good; `status` shows it.
+- **The table is trusted (R-011).** If a different login is put into the same agenttalk folder the text does not change,
+  and the table is wrong until you edit it. A moved or renamed Claude folder changes the hash: the old row stops matching,
+  the new account shows as `unmapped`, and you edit the row.
+- **A busy folder.** At most 4,096 folder entries are looked at and at most 64 usage files are read per look; more sets a
+  flag in `status` (`too_many_entries`), and the files read are still used.
+- **Claude and Codex only.** The status-line source is not used. Refusals are not carried by readings (see the gaps).
+- **No downgrade of the state file.** The reporter state file is version 7 since this card and `status_version` is 5. A
+  version 1 to 6 file is upgraded in one step the first time the new reporter opens it. A reporter built before this card
+  refuses a version-7 file with its existing "the state file version is not supported" sentence and never opens or changes
+  it. Keep a copy of the state file if you may need to go back.
+- **No server change.** Leasewise needs nothing new: readings use the existing `/v1/readings` route and only the
+  reporter's own machine must be an authorized reporter.
+
+### Technical detail
+
+The strict reader is `reporter/capacityreader.py` (rules and the per-key table of the design), the choice of a figure is
+`reporter/readings.py` (pure functions over a clock), identity and bodies are in `reporter/mapper.py` (`reading|` ids,
+`reading_body_text`), and the state is in `reporter/state.py` (tables `reading` and `reading_window`, one waiting row per
+window enforced by the database, `next_reading_item` and the gate). The gate is two columns of the window memory
+(`gate_ms`, `last_sent_reset_ms`) moved only by an accepted answer. The design is `DESIGN-7B2.md` (revision 3).
 
 ## Card L6a-1 - gateway receipts
 
@@ -1499,7 +1624,7 @@ settle text), and `receipt_state` (the mutable delivery-status table: `captured`
 all new captures without a record in one statement, then works on the captures whose reference has a record, oldest
 first, at most 500 per cycle, found by a direct join on the reference hash (`receipt_capture_ref` indexes it).
 `event_id` is a UUIDv5 of the reference hash and the ledger generation. The pass order is limit, receipt,
-lease; `status_version` is 3. The admission store is opened with `mode=ro` and `query_only`; its layout is
+lease (when this card landed; since card 7b the order is limit, reading, receipt, lease); `status_version` was 3 then and is 5 since card 7b. The admission store is opened with `mode=ro` and `query_only`; its layout is
 in `quota_balancer/reporter/admission_store.py`, the one module the admission command will reuse.
 
 ## Card L6a-2 - the turn admission program (`reporter admit`)
