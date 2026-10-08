@@ -12,9 +12,10 @@ import sqlite3
 
 from . import decisions, gwstate, mapper
 
-SCHEMA_VERSION = 6       # 2: card 7c-2 added limit_event; 3: card L6a-1 added the receipt custody tables;
+SCHEMA_VERSION = 7       # 2: card 7c-2 added limit_event; 3: card L6a-1 added the receipt custody tables;
 #                          4: card L6a-2 added the superseded record; 5: card R1-READER step 2 added the money reader's memory (`gwstate`);
-#                          6: card R1-READER step 3a added its archive quarantine column and audit table
+#                          6: card R1-READER step 3a added its archive quarantine column and audit table;
+#                          7: card 7b added the readings outbox and its per-window memory
                          # (older files are migrated; a reporter that knows less refuses a newer file)
 
 # The agent word on a limit item. Real agent names start with a letter or a digit, so this can
@@ -22,6 +23,15 @@ SCHEMA_VERSION = 6       # 2: card 7c-2 added limit_event; 3: card L6a-1 added t
 LIMIT_AGENT = "_limit_events"
 # The same for a gateway receipt (card L6a-1): it belongs to one lease and to no seat and no message.
 RECEIPT_AGENT = "_gateway_receipts"
+# The same for a reading (card 7b): it belongs to one account window and to no seat and no message.
+READING_AGENT = "_readings"
+READING_WINDOWS = mapper.LIMIT_WINDOWS
+READING_EXPIRY_AFTER_MS = 2 * 3_600_000          # a pending row expires after its reset has passed AND this long since capture
+READING_KEEP_MS = 2 * 86_400_000                 # a settled row is deleted this long after its capture
+READING_PACE_MS = 120_000                        # an accepted send of a window holds the next send of that window this long
+READING_MAX_BACKOFF_MS = 900_000                 # the longest retry back-off (`decisions.backoff_ms`): a deadline further ahead is clamped
+READING_PATH = "/v1/readings"
+READING_BAD_BODY_CODE = "INVALID_REQUEST"      # a stored body that no longer fits the allow-list is not sent: that row fails for good
 RELEASE_BATCH = 500             # captures stage 2 works on in one cycle
 PERMANENT_REASONS = ("wrong_gateway", "duplicate_reference")
 BODY_CAP_NOTE = "receipt_store_body_cap"      # how many messages are held at the body cap (a count)
@@ -207,7 +217,37 @@ _GWR_DDL = gwstate.GWR_DDL
 # Version 6 (card R1-READER step 3a): its own step, from a file at version 5 (a version-5 file already exists on main without these).
 _GWR_V6_DDL = gwstate.GWR_V6_DDL
 
-_DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL + _SUPERSEDED_DDL + _GWR_DDL + _GWR_V6_DDL
+# Version 7 (card 7b, DESIGN-7B2.md 7.1): the readings outbox. One `pending` row at most per (account alias, window): the
+# partial unique index makes a second one impossible. The identity and the frozen body never change; only a settled row
+# (`sent`, `expired`, `superseded`) can be deleted, so a waiting or a failed row is never lost. `reading_window` is the
+# memory of each window: the last observation stored (only forward) and the send gate (ordinary columns: a clock that moved
+# back must be able to lower the gate). It holds no text but the alias and the window word.
+_READING_DDL = (
+    "CREATE TABLE reading(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,"
+    " account_alias TEXT NOT NULL, window_key TEXT NOT NULL CHECK(window_key IN ('five_hour','seven_day')),"
+    " body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN"
+    " ('pending','sent','failed_permanent','expired','superseded')), tries INTEGER NOT NULL DEFAULT 0,"
+    " not_before_ms INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, observed_ms INTEGER NOT NULL,"
+    " resets_ms INTEGER NOT NULL, captured_ms INTEGER NOT NULL) STRICT",
+    "CREATE UNIQUE INDEX reading_one_pending ON reading(account_alias, window_key) WHERE state = 'pending'",
+    "CREATE TRIGGER reading_immutable BEFORE UPDATE OF event_id, account_alias, window_key, body, observed_ms,"
+    " resets_ms, captured_ms ON reading BEGIN SELECT RAISE(ABORT, 'a reading is immutable'); END",
+    "CREATE TRIGGER reading_keep BEFORE DELETE ON reading WHEN OLD.state NOT IN ('sent','expired','superseded') BEGIN"
+    " SELECT RAISE(ABORT, 'a waiting or failed reading is never deleted'); END",
+    "CREATE TRIGGER reading_no_return BEFORE UPDATE OF state ON reading WHEN OLD.state <> 'pending'"
+    " AND NEW.state = 'pending' BEGIN SELECT RAISE(ABORT, 'a settled reading never becomes pending again'); END",
+    "CREATE TABLE reading_window(account_alias TEXT NOT NULL, window_key TEXT NOT NULL,"
+    " last_observed_ms INTEGER NOT NULL, last_reset_ms INTEGER NOT NULL, last_used_bps INTEGER NOT NULL,"
+    " gate_ms INTEGER NOT NULL DEFAULT 0, last_sent_reset_ms INTEGER,"
+    " PRIMARY KEY(account_alias, window_key)) STRICT",
+    "CREATE TRIGGER reading_window_forward BEFORE UPDATE OF last_observed_ms ON reading_window"
+    " WHEN NEW.last_observed_ms < OLD.last_observed_ms BEGIN"
+    " SELECT RAISE(ABORT, 'the observation memory only moves forward'); END",
+    "CREATE TRIGGER reading_window_identity BEFORE UPDATE OF account_alias, window_key ON reading_window BEGIN"
+    " SELECT RAISE(ABORT, 'a window memory cannot be renamed'); END",
+)
+
+_DDL = _DDL_V1 + _LIMIT_DDL + _RECEIPT_DDL + _SUPERSEDED_DDL + _GWR_DDL + _GWR_V6_DDL + _READING_DDL
 
 
 # The column that names a row in each outbox table (every table but the receipt state is keyed by `id`).
@@ -262,10 +302,11 @@ class State:
             for statement in _DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
-        elif version in (1, 2, 3, 4, 5):
-            # Version 1 to 5 -> 6, inside the caller's transaction: all or nothing, nothing deleted. Version 3 is
+        elif version in (1, 2, 3, 4, 5, 6):
+            # Version 1 to 6 -> 7, inside the caller's transaction: all or nothing, nothing deleted. Version 3 is
             # L6a-1's final layout and gains `superseded`; 1 and 2 pass through the earlier steps first; every file below 5
-            # gains the money reader's tables, and every file below 6 gains the quarantine column and the audit table.
+            # gains the money reader's tables, every file below 6 gains the quarantine column and the audit table, and
+            # every file gains the readings tables.
             if version == 1:
                 self.conn.execute(_NOTE_DDL)        # a file made before card 7a-3
                 for statement in _LIMIT_DDL:
@@ -279,7 +320,10 @@ class State:
             if version < 5:
                 for statement in _GWR_DDL:
                     self.conn.execute(statement)
-            for statement in _GWR_V6_DDL:
+            if version < 6:
+                for statement in _GWR_V6_DDL:
+                    self.conn.execute(statement)
+            for statement in _READING_DDL:
                 self.conn.execute(statement)
             self.conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         elif version != SCHEMA_VERSION:
@@ -406,6 +450,134 @@ class State:
             return None
         return Item(decisions.LIMIT, LIMIT_AGENT, "", "/v1/limit-events", json.loads(row[2]),
                     row[1], ("limit_event", row[0]), None)
+
+    # --- the readings outbox (card 7b) -------------------------------------------------------------
+
+    def record_readings(self, items, counts, now_ms):
+        """One scan's result, in ONE transaction. `items` is [(account alias, window, body)] in the order they were
+        chosen. For each, in this order (DESIGN-7B2.md 6.3): the same key first (the same bytes: nothing; other bytes:
+        a conflict, the first stays), then not-strictly-newer than the window's memory (`older`, not stored), then the
+        window's pending row, tried or not, becomes `superseded` and the candidate is stored as the one pending row,
+        with the memory moved. A body that is not the allow-listed shape stores nothing at all (StateError, fixed
+        sentence, no value). The counts of the LAST scan are written absolute; `captured` and `superseded` are
+        cumulative. -> the number of new rows."""
+        added = 0
+        outcomes = {"same": 0, "same_second_conflict": 0, "older": 0}
+        with self.txn():
+            for account_alias, window, body in items:
+                outcome = self._put_reading(account_alias, window, body, now_ms)
+                if outcome == "new":
+                    added += 1
+                else:
+                    outcomes[outcome] += 1
+            if added:
+                self.bump(READING_AGENT, "captured", added)
+            for name, value in {**counts, **outcomes}.items():
+                self.conn.execute(
+                    "INSERT INTO counter(agent, name, value) VALUES(?,?,?) ON CONFLICT(agent, name) "
+                    "DO UPDATE SET value=excluded.value", (READING_AGENT, "scan:" + name, value))
+            if counts:      # how many scans in a row turned a file away: a streak, so `status` can tell a one-off from a pattern
+                streak = self.counter(READING_AGENT, "refused_streak") + 1 if counts.get("file_refused") else 0
+                self.conn.execute(
+                    "INSERT INTO counter(agent, name, value) VALUES(?,?,?) ON CONFLICT(agent, name) "
+                    "DO UPDATE SET value=excluded.value", (READING_AGENT, "refused_streak", streak))
+            self.set_note("readings_last_scan", None, now_ms)
+        return added
+
+    def _put_reading(self, account_alias, window, body, now_ms):
+        """The decision for one candidate, inside the caller's transaction. -> "new", "same", "same_second_conflict"
+        or "older"."""
+        try:
+            text = mapper.reading_body_text(body)
+        except ValueError:
+            raise StateError("a reading body is not valid") from None
+        entry = body["payload"]["windows"][0]
+        if (type(account_alias) is not str or _ALIAS.fullmatch(account_alias) is None or type(window) is not str
+                or window not in READING_WINDOWS or entry["key"] != window):
+            raise StateError("a reading body is not valid")
+        known = self.one("SELECT body FROM reading WHERE event_id=?", (body["event_id"],))
+        if known is not None:
+            return "same" if known[0] == text else "same_second_conflict"
+        memory = self.one("SELECT last_observed_ms FROM reading_window WHERE account_alias=? AND window_key=?",
+                          (account_alias, window))
+        if memory is not None and body["observed_at"] <= memory[0]:
+            return "older"
+        replaced = self.conn.execute(
+            "UPDATE reading SET state='superseded' WHERE account_alias=? AND window_key=? AND state='pending'",
+            (account_alias, window)).rowcount
+        if replaced:
+            self.bump(READING_AGENT, "superseded", replaced)
+        self.conn.execute(
+            "INSERT INTO reading(event_id, account_alias, window_key, body, observed_ms, resets_ms, captured_ms)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (body["event_id"], account_alias, window, text, body["observed_at"], entry["resets_at"], now_ms))
+        self.conn.execute(
+            "INSERT INTO reading_window(account_alias, window_key, last_observed_ms, last_reset_ms, last_used_bps)"
+            " VALUES(?,?,?,?,?) ON CONFLICT(account_alias, window_key) DO UPDATE SET"
+            " last_observed_ms=excluded.last_observed_ms, last_reset_ms=excluded.last_reset_ms,"
+            " last_used_bps=excluded.last_used_bps",
+            (account_alias, window, body["observed_at"], entry["resets_at"], entry["used_bps"]))
+        return "new"
+
+    def next_reading_item(self, now_ms):
+        """The oldest pending reading that is due, as an Item, or None (DESIGN-7B2.md 7.2). In ONE transaction, for the
+        (at most one) pending row of each window, oldest first: a clock that moved back is clamped first (a gate more than
+        one pace ahead of `now` becomes `now + pace`; a retry deadline more than the longest back-off ahead becomes
+        `now + longest back-off`; both are stored); then the row is offered only if its own back-off is over AND (the gate
+        is open OR its reset differs from the reset of the last accepted send, so a new reset period is never held back).
+        A stored body that is no longer exactly the allow-listed shape is never sent: that row fails for good, once.
+        Readings belong to no agent and no message: nothing about a lease or a stopped agent holds one back."""
+        with self.txn():
+            self.conn.execute("UPDATE reading_window SET gate_ms=? WHERE gate_ms>?",
+                              (now_ms + READING_PACE_MS, now_ms + READING_PACE_MS))
+            self.conn.execute("UPDATE reading SET not_before_ms=? WHERE state='pending' AND not_before_ms>?",
+                              (now_ms + READING_MAX_BACKOFF_MS, now_ms + READING_MAX_BACKOFF_MS))
+            for row_id, event_id, body, not_before, resets, alias, window in self.all(
+                    "SELECT id, event_id, body, not_before_ms, resets_ms, account_alias, window_key FROM reading"
+                    " WHERE state='pending' ORDER BY id"):
+                if not self.valid_reading_body(body):
+                    self.conn.execute("UPDATE reading SET state='failed_permanent', last_error_code=? WHERE id=?",
+                                      (READING_BAD_BODY_CODE, row_id))
+                    self.bump(READING_AGENT, "body_invalid")
+                    continue
+                memory = self.one("SELECT gate_ms, last_sent_reset_ms FROM reading_window WHERE account_alias=? AND window_key=?",
+                                  (alias, window))
+                gate, last_sent = memory if memory is not None else (0, None)
+                if not_before <= now_ms and (now_ms >= gate or resets != last_sent):
+                    return Item(decisions.READING, READING_AGENT, "", READING_PATH, json.loads(body), event_id,
+                                ("reading", row_id), None)
+        return None
+
+    @staticmethod
+    def valid_reading_body(text):
+        """True if a stored body text is still exactly the canonical allow-listed shape (checked again before a send)."""
+        try:
+            return mapper.reading_body_text(json.loads(text)) == text
+        except (ValueError, TypeError, RecursionError):
+            return False
+
+    def note_readings_fault(self, now_ms):
+        """A readings capture pass failed as a whole: count it (no text) and say when."""
+        with self.txn():
+            self.bump(READING_AGENT, "capture_fault")
+            self.set_note("readings_last_fault", None, now_ms)
+
+    def housekeep_readings(self, now_ms):
+        """Once per cycle, in ONE transaction. The pending row of a window expires only when its reset has passed AND it was
+        captured more than two hours ago; a settled row (`sent`, `expired`, `superseded`) is deleted two days after its
+        capture. -> (rows expired, rows deleted)."""
+        with self.txn():
+            expired = self.conn.execute(
+                "UPDATE reading SET state='expired' WHERE state='pending' AND resets_ms<=? AND captured_ms<?",
+                (now_ms, now_ms - READING_EXPIRY_AFTER_MS)).rowcount
+            pruned = self.conn.execute(
+                "DELETE FROM reading WHERE state IN ('sent','expired','superseded') AND captured_ms<?",
+                (now_ms - READING_KEEP_MS,)).rowcount
+            if expired:
+                self.bump(READING_AGENT, "expired", expired)
+            if pruned:
+                self.bump(READING_AGENT, "pruned", pruned)
+        return expired, pruned
 
     # --- the receipt custody chain (card L6a-1, DESIGN-6A 8.3) ---------------------------------------
 
@@ -719,6 +891,12 @@ class State:
                     self.conn.execute(
                         "UPDATE %s SET state='sent', last_error_code=NULL "
                         "WHERE %s=?" % (table, key), (row_id,))
+                    if table == "reading":
+                        # Only an accepted send moves the gate, in the same transaction that marks the row sent.
+                        self.conn.execute(
+                            "UPDATE reading_window SET gate_ms=?, last_sent_reset_ms=(SELECT resets_ms FROM reading WHERE id=?)"
+                            " WHERE (account_alias, window_key)=(SELECT account_alias, window_key FROM reading WHERE id=?)",
+                            (now_ms + READING_PACE_MS, row_id, row_id))
             elif decision.action == decisions.RETRY:
                 tries = self.one("SELECT tries FROM %s WHERE %s=?" % (table, key),
                                  (row_id,))[0] + 1

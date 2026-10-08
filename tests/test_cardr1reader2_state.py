@@ -117,8 +117,8 @@ class _State(unittest.TestCase):
 class Schema(_State):
 
     def test_the_file_is_version_6_with_the_seven_tables(self):
-        self.assertEqual(state_mod.SCHEMA_VERSION, 6)
-        self.assertEqual(self.state.one("PRAGMA user_version")[0], 6)
+        self.assertEqual(state_mod.SCHEMA_VERSION, 7)
+        self.assertEqual(self.state.one("PRAGMA user_version")[0], 7)
         names = {r[0] for r in self.state.all("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue(set(gwstate.TABLES) <= names)
 
@@ -138,7 +138,7 @@ class Schema(_State):
         raw.close()
         migrated = State(path)
         self.addCleanup(migrated.close)
-        self.assertEqual(migrated.one("PRAGMA user_version")[0], 6)
+        self.assertEqual(migrated.one("PRAGMA user_version")[0], 7)
         self.assertEqual(migrated.all("SELECT agent, name, value FROM counter"), [("alpha", "reports_dropped", 3)])
         for table in gwstate.TABLES:
             self.assertEqual(migrated.all("SELECT * FROM " + table), [], table)                         # fixed names

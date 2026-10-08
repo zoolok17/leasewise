@@ -40,7 +40,7 @@ AGENT_FIELDS = {
     "permanent_failures", "permanent_failures_total"}
 TOP_FIELDS = {
     "status_version", "generated_at", "source", "rounds_completed", "agents",
-    "journal_refused", "last_401", "limit_events", "gateway_receipts", "money_reader", "silent_configured_seats",
+    "journal_refused", "last_401", "limit_events", "readings", "gateway_receipts", "money_reader", "silent_configured_seats",
     "operator_actions"}
 
 

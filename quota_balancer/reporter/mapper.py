@@ -83,6 +83,68 @@ def limit_body(key, account_id, parked_at_ms, reset_epoch, window):
             "exhausted_windows": [window]}
 
 
+# Card 7b: the ONLY fields a reading may carry (the allow-list, DESIGN-7B2.md section 8). One window per reading,
+# always `cli_window` and `observed`: nothing from the agenttalk file but the figure, its reset and its time.
+READING_BODY_KEYS = frozenset({"event_id", "account_id", "observed_at", "kind", "payload"})
+READING_PAYLOAD_KEYS = frozenset({"windows", "confidence", "source_stale", "covered_seq"})
+READING_WINDOW_KEYS = frozenset({"key", "used_bps", "resets_at"})
+READING_KIND = "cli_window"
+READING_CONFIDENCE = "observed"
+MAX_BPS = 10_000
+
+
+def reading_key(machine, account_alias, window, observed_ms):
+    """One reading fact: (installation, account alias, window, the source's own observation time in whole
+    seconds). The seat, the file, the agenttalk account text, the OS user and the figure are NOT in it, so two
+    seats that report one second for one window make one fact."""
+    return "|".join((machine, account_alias, READING_KIND, window, str(observed_ms // 1000)))
+
+
+def reading_event_id(key):
+    return str(uuid.uuid5(NAMESPACE, "reading|" + key))
+
+
+def reading_body(key, account_id, window, used_bps, resets_at_ms, observed_ms):
+    """The reading body, built field by field from checked numbers (never from a parsed file)."""
+    return {"event_id": reading_event_id(key), "account_id": account_id, "observed_at": observed_ms,
+            "kind": READING_KIND,
+            "payload": {"windows": [{"key": window, "used_bps": used_bps, "resets_at": resets_at_ms}],
+                        "confidence": READING_CONFIDENCE, "source_stale": False, "covered_seq": None}}
+
+
+def reading_body_text(body):
+    """The canonical text of a reading body, or ValueError if it is not exactly the allow-listed shape. Every
+    value is checked by its type first (a list or an object is not hashable and a boolean is not a number),
+    then by its range or its fixed words. The error carries no value."""
+    if type(body) is not dict or frozenset(body) != READING_BODY_KEYS:
+        raise ValueError("shape")
+    for key in ("event_id", "account_id"):
+        if type(body[key]) is not str or _LIMIT_UUID.fullmatch(body[key]) is None:
+            raise ValueError("id")
+    if not _plain_int(body["observed_at"], 1, INT64_MAX):
+        raise ValueError("observed_at")
+    if type(body["kind"]) is not str or body["kind"] != READING_KIND:
+        raise ValueError("kind")
+    payload = body["payload"]
+    if type(payload) is not dict or frozenset(payload) != READING_PAYLOAD_KEYS:
+        raise ValueError("payload")
+    if type(payload["confidence"]) is not str or payload["confidence"] != READING_CONFIDENCE:
+        raise ValueError("confidence")
+    if payload["source_stale"] is not False or payload["covered_seq"] is not None:
+        raise ValueError("payload")
+    windows = payload["windows"]
+    if type(windows) is not list or len(windows) != 1:
+        raise ValueError("windows")
+    entry = windows[0]
+    if type(entry) is not dict or frozenset(entry) != READING_WINDOW_KEYS:
+        raise ValueError("window")
+    if type(entry["key"]) is not str or entry["key"] not in LIMIT_WINDOWS:
+        raise ValueError("window key")
+    if not _plain_int(entry["used_bps"], 0, MAX_BPS) or not _plain_int(entry["resets_at"], 1, INT64_MAX):
+        raise ValueError("window figure")
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
 class AgentConfig:
     """One agent's already-resolved request settings (7a-3 builds these
     from the configuration file and a `policy-ids --json` snapshot)."""

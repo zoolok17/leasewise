@@ -166,5 +166,84 @@ class Answers(unittest.TestCase):
         self.assertNotEqual(decisions.decide(decisions.ACQUIRE, answer).action, decisions.DONE)
 
 
+READINGS_PATH = "/v1/readings"
+
+
+def reading_item(path=READINGS_PATH, kind=decisions.READING, key=None):
+    body = {"event_id": key or str(uuid.uuid4())}
+    return state_mod.Item(kind, state_mod.READING_AGENT, "", path, body, body["event_id"], ("reading", 1), None)
+
+
+class ReadingPair(unittest.TestCase):
+    """Card 7b: a reading row goes to exactly /v1/readings and nothing else can; the answer is its status and word only."""
+
+    def test_a_reading_row_is_sent_to_exactly_the_readings_path(self):
+        rec = Recorder((202, {"event_id": "x", "accepted": True}))
+        answer = make_client(rec).send(reading_item())
+        self.assertEqual(answer.status, 202)
+        self.assertEqual([c["path"] for c in rec.calls], [READINGS_PATH])
+        self.assertEqual(rec.calls[0]["method"], "POST")
+
+    def test_a_reading_row_to_any_other_path_is_refused_and_nothing_is_sent(self):
+        settle = "/v1/leases/%s/settle" % uuid.uuid4()
+        for path in ("/v1/leases", settle, LIMIT_PATH, "/v1/status", READINGS_PATH + "/", READINGS_PATH + "/x",
+                     READINGS_PATH + "?x", READINGS_PATH + "?a=1", READINGS_PATH + "#x", "//v1/readings", "/v1/readings/../leases",
+                     "/V1/readings", "v1/readings", "http://evil.invalid/v1/readings", ""):
+            with self.subTest(path=path):
+                rec = Recorder((202, {}))
+                answer = make_client(rec).send(reading_item(path=path))
+                self.assertEqual((answer.status, answer.code), (None, client_mod.BAD_ANSWER))
+                self.assertEqual(rec.calls, [])
+
+    def test_no_other_kind_can_reach_the_readings_path(self):
+        for kind in (decisions.ACQUIRE, decisions.REPORT, decisions.FINAL, decisions.RECEIPT, decisions.LIMIT):
+            for path in (READINGS_PATH, READINGS_PATH + "/x", READINGS_PATH + "?x"):
+                with self.subTest(kind=kind, path=path):
+                    rec = Recorder((202, {}))
+                    answer = make_client(rec).send(lease_item(kind, path))
+                    self.assertEqual((answer.status, answer.code), (None, client_mod.BAD_ANSWER))
+                    self.assertEqual(rec.calls, [])
+
+    def test_a_reading_row_cannot_use_a_lease_or_limit_path(self):
+        lease = str(uuid.uuid4())
+        for path in ("/v1/leases", "/v1/leases/%s/settle" % lease, LIMIT_PATH):
+            rec = Recorder((200, {"lease_id": lease}))
+            self.assertEqual(make_client(rec).send(reading_item(path=path)).code, client_mod.BAD_ANSWER)
+            self.assertEqual(rec.calls, [])
+
+    def test_a_202_is_read_for_its_status_only(self):
+        answer = make_client(Recorder((202, {"event_id": str(uuid.uuid4()), "accepted": True, "lease_id": str(uuid.uuid4()),
+                                             "state": "x"}))).send(reading_item())
+        self.assertEqual((answer.status, answer.code, answer.lease_id), (202, None, None))
+
+    def test_a_202_with_an_unusable_body_is_no_answer_and_is_retried(self):
+        for raw in (b"", b"not json", b"[]", b"null", b"\xff\xfe", b"x" * (client_mod.MAX_ANSWER_BYTES + 1)):
+            with self.subTest(raw=raw[:8]):
+                answer = make_client(Recorder((202, raw))).send(reading_item())
+                self.assertEqual((answer.status, answer.code), (None, client_mod.MALFORMED_RESPONSE))
+                self.assertEqual(decisions.decide(decisions.READING, answer).action, decisions.RETRY)
+
+    def test_an_error_answer_keeps_only_the_closed_word(self):
+        answer = make_client(Recorder((403, {"error": {"code": "FORBIDDEN", "message": "LOUD"}}))).send(reading_item())
+        self.assertEqual((answer.status, answer.code), (403, "FORBIDDEN"))
+        answer = make_client(Recorder((403, {"error": {"code": IDENTITY, "message": "x"}}))).send(reading_item())
+        self.assertEqual(answer.code, decisions.UNKNOWN_CODE)
+
+    def test_the_wire_bytes_and_headers_are_the_stored_ones(self):
+        rec = Recorder((202, {}))
+        item = reading_item(key="11111111-1111-4111-8111-111111111111")
+        make_client(rec).send(item)
+        call = rec.calls[0]
+        self.assertEqual(call["headers"]["Idempotency-Key"], item.key)
+        self.assertEqual(call["headers"]["X-Machine-Identity"], IDENTITY)
+        self.assertEqual(json.loads(call["body"]), item.body)
+
+    def test_the_money_readers_own_lane_is_untouched(self):
+        rec = Recorder((202, {"x": 1}))
+        status, doc, code = make_client(rec).post_reading("k", b"{}")
+        self.assertEqual((status, doc, code), (202, {"x": 1}, None))
+        self.assertEqual(rec.calls[0]["path"], READINGS_PATH)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -74,7 +74,7 @@ class Schema6(unittest.TestCase):
         self.assertNotIn("gwr_audit", text)
         self.assertIn("quarantine", " ".join(gwstate.GWR_V6_DDL))
         self.assertIn("gwr_audit", " ".join(gwstate.GWR_V6_DDL))
-        self.assertEqual(state_mod.SCHEMA_VERSION, 6)
+        self.assertEqual(state_mod.SCHEMA_VERSION, 7)
 
     def test_a_version_5_file_upgrades_to_6_and_every_old_row_is_unchanged(self):
         path = self.make_v5()
@@ -83,9 +83,10 @@ class Schema6(unittest.TestCase):
         before = self.rows(path)
         self.assertTrue(before["gwr_pending"] and before["gwr_seq"] and before["gwr_receipt_months"] and before["gwr_archive"])
         State(path).close()
-        self.assertEqual(self.raw(path, "PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw(path, "PRAGMA user_version"), [(7,)])
         after = self.rows(path)
         self.assertEqual(after.pop("gwr_audit"), [])                                                # the new table arrives empty
+        self.assertEqual((after.pop("reading"), after.pop("reading_window")), ([], []))             # so do the readings tables (card 7b)
         archive = after.pop("gwr_archive")
         self.assertEqual(archive, [row + (None,) for row in before.pop("gwr_archive")])                  # the old row, plus a NULL quarantine
         self.assertEqual(after, before)                                                             # every other row, in every table, as it was
@@ -95,7 +96,7 @@ class Schema6(unittest.TestCase):
         State(upgraded).close()
         fresh = self.path("fresh.db")
         State(fresh).close()
-        self.assertEqual(self.raw(fresh, "PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw(fresh, "PRAGMA user_version"), [(7,)])
         self.assertEqual(self.schema(fresh), self.schema(upgraded))
 
     def test_a_fault_inside_the_upgrade_leaves_version_5_and_no_new_table_or_column(self):
@@ -110,7 +111,7 @@ class Schema6(unittest.TestCase):
         columns = [r[1] for r in self.raw(path, "PRAGMA table_info(gwr_archive)")]
         self.assertNotIn("quarantine", columns)
         State(path).close()                                                                         # and the good code still upgrades it
-        self.assertEqual(self.raw(path, "PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw(path, "PRAGMA user_version"), [(7,)])
 
     def test_a_fault_between_the_two_statements_of_the_step_also_leaves_version_5(self):
         path = self.make_v5()
@@ -139,7 +140,7 @@ class Schema6(unittest.TestCase):
                 with mock.patch.object(state_mod, "SCHEMA_VERSION", version), mock.patch.object(state_mod, "_DDL", ddl):
                     State(path).close()
                 State(path).close()
-                self.assertEqual(self.raw(path, "PRAGMA user_version"), [(6,)])
+                self.assertEqual(self.raw(path, "PRAGMA user_version"), [(7,)])
                 names = {r[0] for r in self.raw(path, "SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertTrue(set(gwstate.TABLES) <= names)
                 fresh = self.path("fresh%d.db" % version)

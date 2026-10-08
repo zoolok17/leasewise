@@ -143,10 +143,12 @@ class Upgrade(_Tmp):
     def test_version_3_upgrades_to_4_in_one_step_and_nothing_is_deleted(self):
         before = self.contents()
         State(self.path).close()
-        self.assertEqual(self.raw("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw("PRAGMA user_version"), [(7,)])
         after = self.contents()
         self.assertEqual(after.pop("superseded"), [])
         for table in gwstate.TABLES:                                        # the money reader's tables (card R1-READER step 2) arrive empty
+            self.assertEqual(after.pop(table), [], table)
+        for table in ("reading", "reading_window"):                         # the readings tables (card 7b) arrive empty too
             self.assertEqual(after.pop(table), [], table)
         self.assertEqual(after, before)                                     # every old row is as it was
         triggers = {name for (name,) in self.raw("SELECT name FROM sqlite_master WHERE type='trigger'")}
@@ -172,7 +174,7 @@ class Upgrade(_Tmp):
         with mock.patch.object(state_mod, "SCHEMA_VERSION", 3):             # the reporter of card L6a-1
             with self.assertRaisesRegex(StateError, "version is not supported"):
                 State(self.path)
-        self.assertEqual(self.raw("PRAGMA user_version"), [(6,)])
+        self.assertEqual(self.raw("PRAGMA user_version"), [(7,)])
         self.assertEqual(self.contents(), before)
 
     def test_versions_1_and_2_reach_4_with_the_superseded_table(self):
@@ -189,7 +191,7 @@ class Upgrade(_Tmp):
                 State(path).close()
                 conn = sqlite3.connect(path)
                 try:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (6,))
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone(), (7,))
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name IN"
                                                   " ('superseded','receipt_binding','receipt_state','limit_event')")
                                      .fetchone(), (4,))

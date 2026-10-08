@@ -30,7 +30,7 @@ _LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 TOP_REQUIRED = ("version", "base_url", "identity", "machine", "journal_root",
                 "state_path", "policy_ids")
-TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "gateway_receipts",
+TOP_OPTIONAL = ("agents", "poll_seconds", "silent_after_seconds", "limit_events", "readings", "gateway_receipts",
                 "admission", "gateway_report")
 AGENT_REQUIRED = ("seat", "model", "task_class", "effort", "expected_calls",
                   "max_calls", "output_cap", "per_call_output_cap", "ttl_ms")
@@ -43,6 +43,14 @@ _CEILINGS = ("expected_calls", "max_calls", "output_cap",
 LIMIT_PROVIDERS = ("claude",)
 MAX_LIMIT_SOURCES = 8
 _LIMIT_SOURCE_KEYS = ("bus_root", "os_user", "provider", "account")
+
+# Card 7b: the readings map. Each row says: the capacity files of this provider, in this agenttalk folder, whose `account`
+# text is exactly `agenttalk_account`, belong to this Leasewise account. The text is what `agenttalk capacity` prints.
+READING_PROVIDERS = ("claude", "codex")
+MAX_READING_SOURCES = 16
+_READING_SOURCE_KEYS = ("bus_root", "provider", "agenttalk_account", "account")
+MAX_AGENTTALK_ACCOUNT = 160
+_ACCOUNT_TAIL = re.compile(r":home-[0-9a-f]{8}")
 
 # Card L6a-1: where a gateway's receipts are read from. Gateway receipts are read from a fixture file in this version.
 # Card L6a-1b: a receipt source is a fixture file or a command (a program the reporter runs, on Windows only).
@@ -86,7 +94,7 @@ class Config:
     __slots__ = ("scheme", "host", "port", "identity", "machine",
                  "journal_root", "state_path", "policy_ids_path",
                  "poll_seconds", "silent_after_seconds", "agents",
-                 "limit_sources", "gateway_receipts", "admission", "gateway_report")
+                 "limit_sources", "reading_sources", "gateway_receipts", "admission", "gateway_report")
 
     def __repr__(self):
         return "Config(<hidden>)"
@@ -190,6 +198,70 @@ def _limit_sources(table, state_path):
         seen.add((source.folder, source.provider))
         if accounts.setdefault((source.os_user, source.provider), source.account) != source.account:
             _invalid("%s: one OS user and provider must name one account" % where)
+        if _inside(state_key, source.folder):
+            _invalid("%s: the state file may not be inside a bus folder" % where)
+        found.append(source)
+    return tuple(found)
+
+
+class ReadingSource:
+    """One line of the readings map. `folder` is the RESOLVED, normalised bus folder. The repr hides everything:
+    the account text holds the operator's OS user name."""
+
+    __slots__ = ("bus_root", "provider", "agenttalk_account", "account", "folder")
+
+    def __repr__(self):
+        return "ReadingSource(<hidden>)"
+
+    __str__ = __repr__
+
+
+def _agenttalk_account(value, provider):
+    """The account text as agenttalk writes it: `<provider>:<user>:home-<8 lowercase hex>`. The refusal never
+    shows the text."""
+    message = "readings source: agenttalk_account is not a valid agenttalk account text"
+    if not isinstance(value, str) or not 0 < len(value) <= MAX_AGENTTALK_ACCOUNT or _has_control_character(value):
+        _invalid(message)
+    tail = len(":home-0123abcd")
+    user = value[len(provider) + 1:-tail]
+    if not value.startswith(provider + ":") or _ACCOUNT_TAIL.fullmatch(value[-tail:]) is None or not user:
+        _invalid(message)
+    return value
+
+
+def _reading_sources(table, state_path, limit_sources):
+    where = "readings"
+    if not isinstance(table, dict):
+        _invalid("%s: must be a table" % where)
+    _closed_keys(table, ("sources",), (), where)
+    rows = table["sources"]
+    if not isinstance(rows, list) or not 0 < len(rows) <= MAX_READING_SOURCES:
+        _invalid("%s: sources must be a list of 1 to %d tables" % (where, MAX_READING_SOURCES))
+    state_key = folder_key(state_path)
+    limit_alias = {(source.folder, source.provider): source.account for source in limit_sources}
+    found, seen, aliases = [], set(), {}
+    for row in rows:
+        if not isinstance(row, dict):
+            _invalid("%s: a source must be a table" % where)
+        _closed_keys(row, _READING_SOURCE_KEYS, (), where + " source")
+        source = ReadingSource()
+        source.bus_root = _path(row["bus_root"], where + " source")
+        provider = row["provider"]
+        if not isinstance(provider, str) or provider not in READING_PROVIDERS:
+            _invalid("%s source: this provider is not supported" % where)
+        source.provider = provider
+        source.agenttalk_account = _agenttalk_account(row["agenttalk_account"], provider)
+        source.account = _alias(row["account"], where + " source")
+        source.folder = folder_key(source.bus_root)
+        if (source.folder, source.agenttalk_account) in seen:
+            _invalid("%s: two sources name the same folder and agenttalk account" % where)
+        seen.add((source.folder, source.agenttalk_account))
+        if aliases.setdefault(source.agenttalk_account, source.account) != source.account:
+            _invalid("%s: one agenttalk account must name one account alias" % where)
+        other = limit_alias.get((source.folder, source.provider))
+        if other is not None and other != source.account:
+            _invalid("%s: an account differs from limit_events for the same folder and provider; "
+                     "see the README on limit_events and readings" % where)
         if _inside(state_key, source.folder):
             _invalid("%s: the state file may not be inside a bus folder" % where)
         found.append(source)
@@ -486,6 +558,9 @@ def parse_config(text):
     config.limit_sources = ()
     if "limit_events" in data:
         config.limit_sources = _limit_sources(data["limit_events"], config.state_path)
+    config.reading_sources = ()
+    if "readings" in data:
+        config.reading_sources = _reading_sources(data["readings"], config.state_path, config.limit_sources)
     config.gateway_receipts = None
     if "gateway_receipts" in data:
         config.gateway_receipts = _gateway_receipts(data["gateway_receipts"])
@@ -540,6 +615,10 @@ def load_config(path, *, permissions=None):
         if any(_inside(here, source.folder) for source in config.limit_sources):
             # The file holds a secret and never belongs in a bus folder.
             _invalid("limit_events: the configuration file may not be inside a bus folder")
+    if config.reading_sources:
+        here = folder_key(path)
+        if any(_inside(here, source.folder) for source in config.reading_sources):
+            _invalid("readings: the configuration file may not be inside a bus folder")
     return config
 
 
@@ -754,6 +833,36 @@ class ResolvedLimitSource:
 
 
 _UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+class ResolvedReadingSource:
+    """A readings row whose account alias is resolved to the account's local id. The repr hides everything."""
+
+    __slots__ = ("bus_root", "folder", "provider", "agenttalk_account", "account", "account_id")
+
+    def __repr__(self):
+        return "ResolvedReadingSource(<hidden>)"
+
+    __str__ = __repr__
+
+
+def resolve_reading_sources(config, snapshot):
+    """-> a tuple of ResolvedReadingSource, with the same rules and sentences as `resolve_limit_sources`: every
+    account alias must be in the snapshot exactly once with a valid id, or the reporter refuses to start."""
+    resolved = []
+    for source in config.reading_sources:
+        ids = [account_id for alias, account_id in snapshot["accounts"] if alias == source.account]
+        if not ids:
+            raise ConfigError(CONFIG_UNRESOLVED, "readings: an account is not in the policy-ids snapshot")
+        if len(ids) > 1:
+            raise ConfigError(CONFIG_UNRESOLVED, "readings: an account alias is ambiguous in the policy-ids snapshot")
+        if _UUID_TEXT.fullmatch(ids[0]) is None:
+            raise ConfigError(CONFIG_UNRESOLVED, "readings: an account id in the policy-ids snapshot is not valid")
+        row = ResolvedReadingSource()
+        row.bus_root, row.folder, row.provider = source.bus_root, source.folder, source.provider
+        row.agenttalk_account, row.account, row.account_id = source.agenttalk_account, source.account, ids[0]
+        resolved.append(row)
+    return tuple(resolved)
 
 
 def resolve_limit_sources(config, snapshot):

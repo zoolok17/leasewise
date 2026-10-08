@@ -34,6 +34,7 @@ REPORT = "report"
 FINAL = "final"
 LIMIT = "limit"                # card 7c-2: an account-level limit event (no agent, no message)
 RECEIPT = "receipt"            # card L6a-1: a gateway's final receipt for one quota lease
+READING = "reading"            # card 7b: one window figure of an account (no agent, no message)
 
 # Actions.
 DONE = "done"                  # accepted: record it
@@ -74,7 +75,7 @@ class Decision:
 
 
 def decide(kind, response, rebuilds=0):
-    """`kind` is ACQUIRE, REPORT, FINAL, LIMIT or RECEIPT; `rebuilds` is how many rebuilds
+    """`kind` is ACQUIRE, REPORT, FINAL, LIMIT, READING or RECEIPT; `rebuilds` is how many rebuilds
     this acquisition already used (it survives restarts in the state)."""
     status, code = response.status, closed_code(response.code)
     if status == 401:
@@ -83,8 +84,8 @@ def decide(kind, response, rebuilds=0):
         return Decision(RETRY, code or "UNAUTHENTICATED")
     if status is None or status >= 500 or status == 429:
         return Decision(RETRY, code)
-    if kind == LIMIT:
-        # An account-level event belongs to no seat and no message: a refusal can only fail
+    if kind in (LIMIT, READING):
+        # An account-level event or reading belongs to no seat and no message: a refusal can only fail
         # THIS row, for good. Never an agent stop, a rebuild or a drop. 202 means "recorded".
         if status in (200, 201, 202):
             return Decision(DONE)

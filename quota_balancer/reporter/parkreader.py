@@ -21,17 +21,17 @@ Nothing here keeps text from a file or an exception, and the agent name, the mes
 wrapper generation are checked and then dropped: they never leave this module.
 """
 
-import datetime
-import json
 import os
 import re
 
+from . import strictfile
 from .events import _NAME
 from .mapper import LIMIT_WINDOWS
 
-OK = "ok"
-READ_LATER = "read_later"
-REFUSED = "refused"
+# The generic parts live in `strictfile` (card 7b); the old names stay here, so nothing else changes.
+OK = strictfile.OK
+READ_LATER = strictfile.READ_LATER
+REFUSED = strictfile.REFUSED
 
 PARK_FOLDER = ("state", "usage-limit-park")
 MAX_ENTRIES = 256
@@ -41,17 +41,16 @@ PROVIDERS = ("claude",)
 WINDOWS = LIMIT_WINDOWS                  # ONE list, shared with the queue's validator (mapper)
 MARKER_STATE = "usage_limit_parked"
 STALE_SECONDS = 300                       # agenttalk's MARKER_STALE_SECONDS
-MAX_EPOCH = 4_102_444_800                 # 2100-01-01: no marker time is later than this
+MAX_EPOCH = strictfile.MAX_EPOCH          # 2100-01-01: no marker time is later than this
 MAX_RESET_AHEAD_SECONDS = 9 * 86400       # agenttalk keeps a reset at most 8 days ahead; one day of slack
 WAKE_AFTER_RESET_SECONDS = 30             # the wrapper's try-again time is the reset plus this
 MAX_UPDATED_AHEAD_SECONDS = 60            # a clock a little ahead of ours is fine; a lot is not
-MAX_PARKED_AHEAD_MS = 30_000
+MAX_PARKED_AHEAD_MS = strictfile.MAX_PARKED_AHEAD_MS
 
 KEYS = frozenset({"schema_version", "agent", "state", "provider", "window", "reset_epoch", "wake_epoch",
                   "message_id", "parked_at", "wrapper_generation", "updated_at_epoch"})
-_REPARSE_POINT = 0x400
 _TEXT = re.compile(r"[0-9A-Za-z._:-]{1,64}")
-_PARKED_AT = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,6}))?Z")
+_PARKED_AT = strictfile.TIME_RE
 
 
 class Marker:
@@ -83,51 +82,12 @@ class Scan:
         self.folder_unreadable = False
 
 
-class _Break(Exception):
-    """A rule of the contract is broken (not a torn read)."""
-
-
-def _pairs(items):
-    keys = [k for k, _ in items]
-    if len(keys) != len(set(keys)):
-        raise _Break
-    return dict(items)
-
-
-def _constant(_name):
-    raise _Break                              # NaN, Infinity, -Infinity
-
-
-def _is_link(entry):
-    if entry.is_symlink():
-        return True
-    try:
-        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-    except OSError:
-        return False
-    return bool(attributes & _REPARSE_POINT)  # a junction or another reparse point (Windows)
-
-
-def _whole(value, low, high):
-    return type(value) is int and low <= value <= high
-
-
-def parked_at_ms(text, now_ms):
-    """The epoch milliseconds of an agenttalk time (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`), counted down,
-    never rounded up; None if it is not a real time or lies more than 30 s ahead of the clock."""
-    found = _PARKED_AT.fullmatch(text)
-    if found is None:
-        return None
-    year, month, day, hour, minute, second = (int(found.group(i)) for i in range(1, 7))
-    try:
-        moment = datetime.datetime(year, month, day, hour, minute, second, tzinfo=datetime.timezone.utc)
-    except ValueError:
-        return None
-    fraction = (found.group(7) or "").ljust(6, "0")
-    millis = int(moment.timestamp()) * 1000 + int(fraction) // 1000
-    if millis < 1 or millis > now_ms + MAX_PARKED_AHEAD_MS:
-        return None
-    return millis
+_Break = strictfile.Break
+_pairs = strictfile.pairs
+_constant = strictfile.constant
+_is_link = strictfile.is_link
+_whole = strictfile.whole
+parked_at_ms = strictfile.parked_at_ms
 
 
 def _check(data, stem, now_ms):
@@ -179,23 +139,9 @@ def _check(data, stem, now_ms):
 
 def read_marker(path, stem, now_ms):
     """-> (outcome, Marker or None) for one file. Never raises; keeps no text."""
-    try:
-        with open(path, "rb") as handle:
-            raw = handle.read(MAX_BYTES + 1)
-    except OSError:                           # missing, a sharing violation, anything about the open
-        return READ_LATER, None
-    if len(raw) > MAX_BYTES:
-        return REFUSED, None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:                # half a character: a torn read
-        return READ_LATER, None
-    try:
-        data = json.loads(text, object_pairs_hook=_pairs, parse_constant=_constant)
-    except ValueError:                        # half a document, or none: a torn read
-        return READ_LATER, None
-    except (_Break, RecursionError):
-        return REFUSED, None
+    outcome, data = strictfile.load_json(path, MAX_BYTES)
+    if outcome != OK:
+        return outcome, None
     try:
         return _check(data, stem, now_ms)
     except Exception:                         # a bug here must not become an event
@@ -212,32 +158,11 @@ def scan(bus_root, now_ms):
     a folder with more than MAX_ENTRIES entries some markers may not be seen in that scan."""
     result = Scan()
     folder = os.path.join(bus_root, *PARK_FOLDER)
-    names = []
-    visited = 0
-    try:
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                if visited == MAX_ENTRIES:
-                    result.too_many_entries = True
-                    break
-                visited += 1
-                name = entry.name
-                if not name.endswith(".json") or _NAME.fullmatch(name[:-5]) is None:
-                    continue
-                try:
-                    if _is_link(entry) or not entry.is_file(follow_symlinks=False):
-                        continue
-                except OSError:
-                    result.read_later += 1
-                    continue
-                names.append(name)
-    except FileNotFoundError:
-        return result
-    except OSError:
-        result.folder_unreadable = True
-        return result
-    names.sort()
-    for name in names:
+    found = strictfile.walk(folder, ".json", lambda stem: _NAME.fullmatch(stem) is not None, MAX_ENTRIES)
+    result.read_later += found.read_later
+    result.too_many_entries = found.too_many
+    result.folder_unreadable = found.unreadable
+    for name in found.names:
         outcome, marker = read_marker(os.path.join(folder, name), name[:-5], now_ms)
         if outcome == OK:
             result.markers.append(marker)

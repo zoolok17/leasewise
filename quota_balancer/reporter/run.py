@@ -14,7 +14,7 @@ import random
 import threading
 import time
 
-from . import admission_store, capture, decisions, events, gwcycle, gwsend, gwstate, receipts, rounds, status
+from . import admission_store, capture, decisions, events, gwcycle, gwsend, gwstate, readings, receipts, rounds, status
 from . import state as state_mod
 
 # What a cycle ended with.
@@ -27,6 +27,7 @@ MAX_SLEEP_SECONDS = 900
 # is not answering: the wrapper refreshes a park file about once a minute and a file counts as fresh
 # for 300 seconds, so a longer wait could let a park start and end between two looks (decision D5).
 LIMIT_CAPTURE_MAX_WAIT_SECONDS = 60
+READING_SCAN_SECONDS = 30           # card 7b: the capacity files are looked at at most this often (a minimum spacing, not a promise)
 MAX_PAGES_PER_CYCLE = 6          # card L6a-1: pages (and generation switches) taken from a receipt source per cycle
 RECEIPT_BUDGET_FLOOR = 30       # card L6a-1b: seconds of command reading per cycle, at least (checked before a read starts)
 MAX_GRANT_BATCHES = 20          # card L6a-2: batches of admission grants (500 each) copied per cycle
@@ -46,10 +47,11 @@ def _now_ms():
 
 
 class CycleResult:
-    __slots__ = ("new_events", "sent", "blocked", "journal_stopped", "new_limit_events", "new_receipts")
+    __slots__ = ("new_events", "sent", "blocked", "journal_stopped", "new_limit_events", "new_receipts", "new_readings")
 
     def __init__(self):
         self.new_limit_events = 0       # card 7c-2: limit events captured this cycle
+        self.new_readings = 0           # card 7b: readings captured this cycle
         self.new_receipts = 0           # card L6a-1: gateway receipts stored this cycle
         self.new_events = 0
         self.sent = 0
@@ -65,9 +67,12 @@ class CycleResult:
 
 class Reporter:
     def __init__(self, config, agents, state, client, *, clock=_now_ms,
-                 rng=random.random, stop=None, fault=None, limit_sources=(), gateway_receipts=None, gateway_report=None):
+                 rng=random.random, stop=None, fault=None, limit_sources=(), gateway_receipts=None, gateway_report=None,
+                 reading_sources=()):
         self.config = config
         self.limit_sources = tuple(limit_sources)   # card 7c-2: resolved account map (may be empty)
+        self.reading_sources = tuple(reading_sources)   # card 7b: the resolved readings map (may be empty)
+        self.reading_scanned = None                 # the monotonic time of the last readings scan; memory only (a restart scans at once)
         self.gateway_receipts = gateway_receipts    # card L6a-1: the resolved receipt source, or None
         # Card R1-READER step 3b: the money reader's report command. It works only with a command receipt source of the same gateway
         # (the configuration refuses anything else); without the table the reader does nothing and the lane only sends a waiting report.
@@ -102,6 +107,8 @@ class Reporter:
         if not self.stop.is_set():
             self._capture(result)
         if not self.stop.is_set():
+            self._capture_readings(result)
+        if not self.stop.is_set():
             self._receive(result)
         if not self.stop.is_set():
             self._summarize()
@@ -122,7 +129,8 @@ class Reporter:
         return status.build_status(self.state, set(self.config.agents),
                                    self.clock(),
                                    self.config.silent_after_seconds,
-                                   self.limit_sources, self.gateway_receipts, self.gateway_agents)
+                                   self.limit_sources, self.gateway_receipts, self.gateway_agents,
+                                   self.reading_sources)
 
     def _read(self, result):
         try:
@@ -159,6 +167,22 @@ class Reporter:
                 self.state.note_capture_fault(self.clock())
             except Exception:           # noqa: BLE001 - even the count may fail; sending goes on
                 pass
+
+    def _capture_readings(self, result):
+        """Read the capacity files of the configured folders and store the freshest figure of each window (card 7b),
+        at most once every READING_SCAN_SECONDS. A fault anywhere in here is caught whole: counted, no text kept, and it
+        stops neither the limit-event capture nor any sending."""
+        if not self.reading_sources:
+            return
+        try:
+            now = self.monotonic()
+            if self.reading_scanned is None or now - self.reading_scanned >= READING_SCAN_SECONDS:
+                self.reading_scanned = now
+                result.new_readings = readings.run(self.state, self.reading_sources, self.config.machine, self.clock())
+            self.state.housekeep_readings(self.clock())
+        except Exception:               # noqa: BLE001 - nothing from the fault is kept
+            with contextlib.suppress(Exception):    # even the count may fail; sending goes on
+                self.state.note_readings_fault(self.clock())
 
     def _summarize(self):
         """The admission summary (the store's state and how many messages are held at the body cap) is refreshed
@@ -293,8 +317,8 @@ class Reporter:
         return added
 
     def _send(self, result):
-        """Three passes, in this order and SEPARATE: limit events (card 7c-2), then gateway receipts
-        (card L6a-1), then leases. Limit events and receipts belong to no seat and no message, so
+        """Passes, in this order and SEPARATE: limit events (card 7c-2), then readings (card 7b), then gateway receipts
+        (card L6a-1), then leases. Limit events, readings and receipts belong to no seat and no message, so
         nothing a lease answers (a retry, a 429 from a parked account, a refusal) may delay one; and
         each route can fail on its own while the others work, so a retry in one pass does not stop
         the next. Each pass stops on its own wall. `result.blocked` combines the outcomes by RANK, so
@@ -302,6 +326,7 @@ class Reporter:
         shows as CREDENTIAL, above UNREACHABLE (no answer, 5xx, 429), above nothing."""
         self._send_report(result)
         self._send_pass(result, self.state.next_limit_item)
+        self._send_pass(result, self.state.next_reading_item)      # card 7b: after limit events, before receipts and leases
         self._send_pass(result, self.state.next_receipt_item)
         self._send_pass(result, lambda now: self.state.next_item(now, self.gateway_agents))
 
@@ -378,6 +403,6 @@ class Reporter:
                 wait = max(wait, decisions.backoff_ms(
                     self.failures, self.rng()) / 1000.0)
             longest = MAX_SLEEP_SECONDS
-            if self.limit_sources:
-                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)
+            if self.limit_sources or self.reading_sources:
+                longest = min(longest, LIMIT_CAPTURE_MAX_WAIT_SECONDS)       # a figure counts for 600 s: do not sleep past a look
             self.stop.wait(min(wait, longest))
