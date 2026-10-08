@@ -411,6 +411,44 @@ class Scanning(_Folder):
         self.assertEqual((args[1], args[3], args[4]), (".capacity.json", 4096, 64))
 
 
+class ImpossibleTimes(_Folder):
+    """A time that is well shaped but not a real moment is refused; an old or a future real moment is not (validity is
+    not freshness). `last_status_at` is the one time the reader checks and drops; the others are parsed, and a time that
+    does not parse only makes its window unusable."""
+
+    IMPOSSIBLE = ("2026-99-99T99:99:99Z", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-10-08T24:00:00Z",
+                  "2026-10-08T12:60:00Z", "2026-10-08T12:00:60Z", "2026-00-10T00:00:00Z", "2026-10-00T00:00:00Z",
+                  "0000-01-01T00:00:00Z", "2025-02-29T00:00:00Z")
+
+    def test_an_impossible_last_status_time_refuses_a_populated_file(self):
+        for text in self.IMPOSSIBLE:
+            with self.subTest(text=text):
+                self.assertEqual(self.read_as_seat_a(edited("claude_stream_both", last_status_at=text)), (cr.REFUSED, None))
+
+    def test_an_impossible_last_status_time_refuses_an_unknown_snapshot_too(self):
+        for name in ("unknown_unbound", "unknown_bound"):
+            for text in self.IMPOSSIBLE:
+                with self.subTest(name=name, text=text):
+                    self.assertEqual(self.read_as_seat_a(edited(name, last_status_at=text)), (cr.REFUSED, None))
+
+    def test_an_old_or_a_future_valid_last_status_time_is_accepted(self):
+        for text in ("2020-01-01T00:00:00Z", "1970-01-02T00:00:00Z", "2099-12-31T23:59:59Z", "2024-02-29T12:00:00Z"):
+            for name in ("claude_stream_both", "unknown_bound"):
+                with self.subTest(name=name, text=text):
+                    self.assertEqual(self.read_as_seat_a(edited(name, last_status_at=text))[0], cr.OK)
+
+    def test_the_other_times_never_refuse_the_file_they_make_the_window_unusable(self):
+        for text in self.IMPOSSIBLE:
+            with self.subTest(text=text):
+                outcome, capacity = self.read_as_seat_a(edited("claude_stream_both", primary_observed_at=text))
+                self.assertEqual(outcome, cr.OK)
+                self.assertIsNone(capacity.windows[0].observed_ms)
+                outcome, capacity = self.read_as_seat_a(edited("claude_stream_both", observed_at=text, primary_observed_at=None,
+                                                               secondary_observed_at=None))
+                self.assertEqual(outcome, cr.OK)
+                self.assertEqual([w.observed_ms for w in capacity.windows], [None, None])
+
+
 class DecisionOrder(_Folder):
     """DESIGN-7B2.md 1.5: the first rule that fits ends the decision, after the shape checks."""
 

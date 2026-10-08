@@ -23,6 +23,7 @@ Nothing here keeps text from a file or from an exception. The account text is he
 and leaves this module only to be compared with the operator's table; no other text survives.
 """
 
+import datetime
 import math
 import os
 import re
@@ -155,6 +156,20 @@ def _flat(value):
     return value is None or type(value) in (bool, int, str)
 
 
+def _real_moment(text):
+    """True if `text` is an agenttalk time that names a real calendar day and clock time. Validity only: an old or a
+    future moment is fine here (freshness is judged elsewhere, and only for the figures)."""
+    found = _TIME_SHAPE.fullmatch(text)
+    if found is None:
+        return False
+    year, month, day, hour, minute, second = (int(part) for part in re.split(r"[-T:Z]", text[:-1]))
+    try:
+        datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False
+    return True
+
+
 def _observed_ms(text, fallback_ms, now_ms):
     """A window's own time, else the file's. None if the text it comes from is not a usable time."""
     if text is None:
@@ -202,8 +217,8 @@ def _check(data, stem, now_ms):
         return REFUSED, None
     if not all(_any_number(data[key]) for key in ("context_used_percent", "context_window_size", "context_tokens")):
         return REFUSED, None
-    if data["last_status_at"] is not None and _TIME_SHAPE.fullmatch(data["last_status_at"]) is None:
-        return REFUSED, None                  # checked, then dropped: a malformed time is not the documented shape
+    if data["last_status_at"] is not None and not _real_moment(data["last_status_at"]):
+        return REFUSED, None                  # checked, then dropped: a time that is not a real moment is not the documented shape
     fallback_ms = _observed_ms(observed, None, now_ms)
     windows = tuple(
         Window(name, data[name + "_used_percent"], data[name + "_resets_at"], data[name + "_window_minutes"],
