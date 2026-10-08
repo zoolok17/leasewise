@@ -405,7 +405,7 @@ Leasewise account through the operator's table (7b-2), keeps only the latest uns
 a two-minute gate that only an accepted answer moves (7b-3), and shows it in `status` and the README (7b-4). Fix round 1
 made the choice independent of where files lie, refused impossible dates, and judged freshness first.
 
-**Tests.** About 400 tests across `test_card7b2_*` (reader, select, config, identity, state, wiring, delivery, status,
+**Tests.** About 350 tests across `test_card7b2_*` (reader, select, config, identity, state, wiring, delivery, status,
 privacy, e2e, upgrade, readme), the neutral move guarded by the unchanged park-marker tests, and the client cases in
 `test_card7c2_client.py`.
 
