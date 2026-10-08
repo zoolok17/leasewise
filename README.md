@@ -1275,10 +1275,13 @@ Nothing a seat does changes: the seats run in shadow, and a reading only changes
    weekly figures may come from different files.
 4. **It keeps only the newest unsent figure of each allowance**, stored on disk with its message frozen before anything is
    sent, so a restart or an outage loses nothing that was stored. A newer figure replaces a waiting one; a waiting figure
-   is dropped only after its allowance has reset and two hours have passed.
+   is dropped only when its allowance has reset **and** it was stored more than two hours ago (two
+   conditions with two starting points: a figure stored four hours before its reset is dropped at the reset itself).
 5. **It sends at a calm pace.** After Leasewise accepts a figure, the next figure of the same allowance waits two minutes.
-   A figure that starts a new reset period goes at once. If Leasewise does not answer, the figure waits and is tried
-   again with the same bytes (5 seconds growing to 15 minutes); only an accepted answer starts the two minutes. Readings
+   A figure whose reset time differs from the reset time of the last accepted figure goes at once (any change counts,
+   even a small jitter in the reset time; this is the reporter's own rule, not Leasewise's rule for a new period). If
+   Leasewise does not answer, the figure waits and is tried again with the same bytes (the wait starts at 2.5 to under
+   5 seconds, has jitter, and grows to 15 minutes); only an accepted answer starts the two minutes. Readings
    are sent after limit events and before receipts and leases, in their own pass, so none of them holds up another.
 6. **`reporter status`** shows what readings are doing, including the sentence under "Limits" below.
 
@@ -1339,7 +1342,7 @@ as such; `status` never says readings are off because of it.
 
 ### Limits
 
-- **The gaps (best effort).** Readings are best effort. A figure is stored only if agenttalk still counted it as current (ten minutes old at most) when the reporter looked at it. Each window keeps only its latest unsent figure, and Leasewise gets at most one figure per window every two minutes (a new reset period excepted). It can reach Leasewise later, after a short wait or an outage. A figure that is replaced by a newer one before its turn, or that is still unsent two hours after its reset period ended, is never delivered, even if it was the highest of its period, and what was never delivered cannot be recovered; the reporter's status counts both. An account whose seats are idle shows no current figure rather than a zero. A refusal that leaves no figure leaves no reading, and the reading never says "refused": refusals travel as limit events, which for now cover Claude only and are also best effort. Leasewise keeps the highest percentage it received within one reset period, so what it shows can differ from the last figure the reporter stored, which is what the reporter's own status shows. The reporter cannot see which login is behind an agenttalk account, so the table of accounts is trusted as the operator wrote it.
+- **The gaps (best effort).** Readings are best effort. A figure is stored only if agenttalk still counted it as current (ten minutes old at most) when the reporter looked at it. Each window keeps only its latest unsent figure, and Leasewise gets at most one figure per window every two minutes (a new reset period excepted). It can reach Leasewise later, after a short wait or an outage. A figure that is replaced by a newer one before its turn, or that is still unsent when its reset period has ended and it was stored more than two hours ago, is never delivered, even if it was the highest of its period, and what was never delivered cannot be recovered; the reporter's status counts both. An account whose seats are idle shows no current figure rather than a zero. A refusal that leaves no figure leaves no reading, and the reading never says "refused": refusals travel as limit events, which for now cover Claude only and are also best effort. Leasewise keeps the highest percentage it received within one reset period, so what it shows can differ from the last figure the reporter stored, which is what the reporter's own status shows. The reporter cannot see which login is behind an agenttalk account, so the table of accounts is trusted as the operator wrote it.
 - **The loss of an unsent higher figure is accepted.** If 97 percent is stored and a newer 20 percent in the same period
   replaces it before it could be sent, only 20 percent is ever sent. Newer figures are not always higher.
 - **Leasewise's own number.** Within one reset period Leasewise keeps the highest percentage it received, so its figure can
@@ -1347,6 +1350,10 @@ as such; `status` never says readings are off because of it.
 - **A garbled success answer is repeated.** If Leasewise answers 202 without a usable body, the reporter treats it as no
   answer and sends the same stored bytes again after the usual wait; `status` shows it as a retry (`retrying`). Leasewise
   treats the repeat as the same figure.
+- **A lost success can mean one extra true reading.** The two-minute gate moves only after an accepted answer has been
+  recorded. If Leasewise stored a figure but the answer was lost, the reporter sends the same bytes again; and if a newer
+  figure replaced the waiting one in the meantime, Leasewise may receive both. That is one extra true reading, not a wrong
+  one, and it is accepted.
 - **Conflict detection holds only while the row exists.** If a later look offers a different figure for a second that is
   already stored, the first one stays and the second is counted (`same_second_conflict`). After a settled row is deleted
   (two days after it was stored), a repeat is counted as older instead; do not rely on detection for ever.

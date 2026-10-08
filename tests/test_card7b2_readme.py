@@ -43,7 +43,10 @@ class Readme(unittest.TestCase):
         needles = ("**Status: built.**", "### What it does, in plain words", "### How to set it up",
                    "### What is sent, and what never is", "### The new status fields", "### Limits", "agenttalk capacity",
                    "readings.sources", "403 FORBIDDEN", "authorized reporter", "One account text names one alias", "limit_events",
-                   "two minutes", "A figure that starts a new reset period goes at once",
+                   "two minutes", "A figure whose reset time differs from the reset time of the last accepted figure goes at once",
+                   "even a small jitter in the reset time", "not Leasewise's rule for a new period",
+                   "2.5 to under 5 seconds", "A lost success can mean one extra true reading",
+                   "stored more than two hours ago", "dropped at the reset itself",
                    "The loss of an unsent higher figure is accepted", "highest percentage it received",
                    "A garbled success answer is repeated", "Conflict detection holds only while the row exists",
                    "Deletion counts from the time of capture", "(R-011)", "No downgrade of the state file", "version 7",
@@ -101,10 +104,13 @@ class Design(unittest.TestCase):
         heading = text.index("### Remaining cards")
         self.assertLess(heading, text.index("**PAUSED by the operator"))
         self.assertLess(text.index("**PAUSED by the operator"), text.index("| Card | Tables/module"))
-        for prefix in ("| 6a: gateway child binding | ", "| 6b: required sized-reservation gate | ", "| 7d: context/enforcement switch | "):
+        for prefix in ("| 6a: gateway child binding | ", "| 6b: required sized-reservation gate | "):
             self.assertIn(prefix + "**PAUSED (2026-10-07, D-288).**", text)
+        # Only the enforcement part of card 7d is paused, as the paragraph above the table says.
+        self.assertIn("| 7d: context/enforcement switch | **Enforcement part PAUSED (2026-10-07, D-288).** ", text)
         self.assertIn("**PAUSED (2026-10-07, D-288).** The enforcement sub-cards 6a-2a, 6a-2b and 6a-3; the child binding already merged stays.", text)
-        self.assertEqual(text.count("**PAUSED (2026-10-07, D-288).**"), 3)
+        self.assertEqual(text.count("**PAUSED (2026-10-07, D-288).**"), 2)
+        self.assertEqual(text.count("**Enforcement part PAUSED (2026-10-07, D-288).**"), 1)
 
     def test_the_7b_row_is_the_version_2_contract(self):
         text = read("docs/DESIGN.md")
