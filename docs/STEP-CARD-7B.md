@@ -330,3 +330,90 @@ finding. Codex's final read after step 7b-4 covers them too.
   not as a conflict. Never promise to detect a conflicting body for ever.
 - **Pruning counts from capture time.** A row that is settled late (for example sent after a long outage) may be pruned at
   once, because its two days started when it was captured. Its window memory and the counters remain.
+
+## Step 7b-4
+
+Branch `card-7b2`, on top of fix round 1 (`6527f7f`). Spec: `DESIGN-7B2.md` revision 3, sections 6.6, 8, 9, 10 and the 7b-4
+row of section 11. The lead's answers to the 7b-3 notes: the repeated garbled 202 is accepted as specified (said in the
+README and visible in `status` as a retry); a stored body that no longer fits the allow-list fails once as
+`INVALID_REQUEST`, counted `body_invalid`, and `status` shows it.
+
+### In plain words
+
+The reporter now reads, stores and sends usage figures. This step makes that **visible and honest**.
+
+- **`reporter status` shows readings.** Whether they are on; which accounts (the Leasewise name and the provider, never the
+  agenttalk account text); what the last look found; how many figures were stored, replaced, dropped and deleted; what is
+  waiting, sent or failed, and why; and, for every account and allowance, the **last figure the reporter stored** (that
+  survives the deletion of old rows). It also says, in the words of the design, what readings cannot do.
+- **Three lines ask the operator to act:** a machine that is not an authorized reporter for an account (`FORBIDDEN`), seat
+  files whose account is not in the table, and a seat file that has not followed the documented format for ten looks in a
+  row. An empty file never raises the last one.
+- **The README explains how to switch readings on**, where to find the account text, what is sent and what never is, and
+  every limit. Older README sentences that readings made untrue were corrected (see below).
+- **The design record says the enforcement cards are paused** (the operator's decision of 2026-10-07) and replaces the 7b
+  row with the version 2 contract.
+- **The last tests prove the whole path** against the real Leasewise reading handler and store reducer.
+
+### What changed
+
+- `status.py`: `STATUS_VERSION` 5, the `readings` object (`_readings`), the gap sentence `READING_GAPS`, the three operator
+  lines, the text view line (`readings (best effort): ...`, `readings: off`, or `OLDER_READINGS` for a snapshot of a
+  reporter from before status version 5, which never claims readings are off). The status file stays ASCII.
+- `state.py`: the `refused_streak` counter (scans in a row that turned a file away; reset by a clean scan).
+- `readings.py`: `SCAN_COUNTS`, the closed list of counters a scan reports.
+- `run.py`, `cli.py`: `status` gets the configured readings rows.
+- `README.md`: the section "Card 7b - usage readings" after "Card 7c-2 - limit events".
+- `docs/DESIGN.md`: the pause paragraph under "Remaining cards", the bold `PAUSED (2026-10-07, D-288).` at the start of rows
+  6a, 6b and 7d, the 7b row replaced by the version 2 contract, and one "Superseded" sentence in section 5 (the older text stays).
+- Four older tests now expect status version 5 and the new `readings` key.
+
+### README claims corrected (spec 10.1)
+
+The README was searched for "7b", "readings", "capacity", "statusline" and "isolated". Nothing said readings were not live,
+and the words "statusline" and "isolated" did not occur in present-tense claims. Three present-tense claims that readings
+made untrue were corrected: the reporter database "schema version 5, and 6 since step 3a" (now also "7 since card 7b"); the
+pass order "limit, receipt, lease; `status_version` is 3" in card L6a-1 (now "was 3 then and is 5 since card 7b", with the
+new order limit, reading, receipt, lease); and the historical note in card 7c-2 ("version 3 since card L6a-1, and
+`status_version` is 3"), which now also says 7 and 5.
+
+### Tests
+
+- `test_card7b2_status.py` (17): the closed shape, off and on, the gap sentence word for word, the one text line, last stored
+  figures that outlive pruning, replaced and expired counts, retries (a garbled 202 repeated) and refusals by closed word, the
+  three operator lines (and that empty files never raise the format line), a capture fault and a damaged body, nothing private,
+  the ASCII snapshot, and the `status` command.
+- `test_card7b2_privacy.py` (6, `privacy_7b2`): loud markers (an account text with an OS user name, a seat name, a path, a
+  plan, a reason, a window word, an exception text) never appear in a stored or wired body, an outbox row, the window memory,
+  a counter, a note, the status JSON or text, a log line, the state file or the snapshot; every body has only the allowed keys.
+- `test_card7b2_e2e.py` (10): over the real handler and store reducer, an in-process loopback server: both windows arrive;
+  one window leaves the other as it was; a late reading is accepted and keeps its own time; the highest figure of a period
+  stays; a larger reset before the stored reset is jitter and at or after it starts a new period; a replay is a no-op and a
+  changed body is a 409; an unauthorized machine gets 403 `FORBIDDEN` and nothing is stored.
+- `test_card7b2_upgrade.py` (9): the previous version's real code (from history, `ba17d0e`) writes a status snapshot and a
+  state file; the new `status` shows the old snapshot as old; the state file migrates in one step; the previous reporter
+  refuses the new file and changes nothing.
+- `test_card7b2_readme.py` (11): the README section and its example, the gap sentence byte for byte, placeholders only, the
+  corrected claims, and the `docs/DESIGN.md` edits.
+- Mutation pass over `status.py` and the streak: 18 breaks, 16 caught at once; the 2 survivors (the "ten scans" threshold
+  changed by one) got a test that fixes the number.
+
+### The whole card 7b
+
+**What exists.** The reporter reads agenttalk's per-seat usage files strictly (7b-1), maps agenttalk's account text to a
+Leasewise account through the operator's table (7b-2), keeps only the latest unsent figure per window (7b-2), sends it with
+a two-minute gate that only an accepted answer moves (7b-3), and shows it in `status` and the README (7b-4). Fix round 1
+made the choice independent of where files lie, refused impossible dates, and judged freshness first.
+
+**Tests.** About 400 tests across `test_card7b2_*` (reader, select, config, identity, state, wiring, delivery, status,
+privacy, e2e, upgrade, readme), the neutral move guarded by the unchanged park-marker tests, and the client cases in
+`test_card7c2_client.py`.
+
+**Limits (all in the README).** Readings are best effort; an unsent higher figure replaced by a newer one is lost on
+purpose; Leasewise keeps the highest figure it received per period; a garbled 202 is repeated; conflict detection holds only
+while the row exists; deletion counts from capture time; the table is trusted (R-011); the state file cannot be downgraded.
+
+**Open.** For the liaison: spec questions 12.2 (should the status of a refused window travel in the reading), 12.3 (how long
+Leasewise keeps readings: about 1,400 rows a day per account at the two-minute pace) and 12.7 (the format of the account
+text). For the lead before the first live run: 12.4 (the lead checks that the reporter's machine is an authorized
+reporter for the Claude and Codex accounts of the machine; otherwise every reading fails for good with `FORBIDDEN`).
