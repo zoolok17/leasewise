@@ -39,7 +39,7 @@ STEPS = [
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "0bca963b56dee86dce917034c4374507e8baf7d76d53483b712323a43bff3d77",
+    COMMON: "b1aabd8527bd44384dba89c830f4ba001a6014724cccad90643aa4d0421506f5",
     GUARD: "09f7065fafd9611026d5ddcd80b67faa7bf55aba1da6f9e6613cbf060bf4b71b",
 }
 
@@ -203,7 +203,7 @@ class Safety(unittest.TestCase):
         self.assertLess(text.index("$Links -gt 0"), text.index("Remove-Item"))
         self.assertLess(text.index("Assert-NoLink $MarkerFile"), text.index("Get-Content"))                              # the marker is no link before it is read
         self.assertLess(text.index("Get-LiveProcesses"), text.index("Remove-Item"))                                     # nothing is deleted while a window still runs
-        self.assertLess(text.index("Window 1 or 2 is still running"), text.index("Remove-Item"))
+        self.assertLess(text.index("A program that uses the live folder is still running"), text.index("Remove-Item"))
         order = [text.index(word) for word in ("Remove-Item -LiteralPath $Child.FullName", "Remove-Item -LiteralPath $NamesFile", "Remove-Item -LiteralPath $MarkerFile",
                                                "[IO.Directory]::Delete($LiveRoot)")]
         self.assertEqual(order, sorted(order))                                # everything else, then names.json, then the marker, then the empty folder
@@ -264,10 +264,11 @@ class Safety(unittest.TestCase):
         self.assertLess(text.index("Assert-PrivateAfter $Store $false"), text.index("WriteAllText($ConfigPath"))
         self.assertLess(text.index("WriteAllText($ConfigPath"), text.index("Assert-PrivateAfter $ConfigPath $true"))
         setup = script_text("switchon-01-setup.ps1")
-        self.assertLess(setup.index("WriteAllText((Join-Path $LiveRoot '.owner.json')"), setup.index("Protect-Path $LiveRoot $true"))    # the marker and names.json come first, at once
-        self.assertLess(setup.index("WriteAllText($Names"), setup.index("Protect-Path $LiveRoot $true"))
-        self.assertLess(setup.index("Assert-Private $LiveRoot $true"), setup.index("New-Item -ItemType Directory -Path $StateDir"))
-        self.assertIn("was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead.", setup)
+        self.assertLess(setup.index("WriteAllText((Join-Path $LiveRoot '.owner.json')"), setup.index("Protect-Path $LiveRoot $true"))    # the marker comes first
+        self.assertLess(setup.index("Assert-Private $LiveRoot $true"), setup.index("WriteAllText($Names"))                    # names.json (the path of Python) only after privacy passed
+        self.assertLess(setup.index("WriteAllText($Names"), setup.index("New-Item -ItemType Directory -Path $StateDir"))
+        self.assertEqual(setup.count("WriteAllText("), 2)                                                                       # the marker and names.json, nothing else
+        self.assertIn("was made and holds only the ownership marker (a random token and the folder path), but it could not be made private. Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead.", setup)
         self.assertNotIn("MaskInput", setup)                                  # nothing in step 1 is secret
         common = script_text(COMMON)
         self.assertIn("nothing secret has been written", common)
@@ -318,10 +319,24 @@ class Safety(unittest.TestCase):
         self.assertLess(reporter.index("Assert-OurServerListens"), reporter.index("& $Py"))                    # the identity value is never sent to a stranger
         self.assertLess(reporter.index("Assert-NoReporterRunning"), reporter.index("& $Py"))
         common = script_text(COMMON)
-        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "$Rows[0].Address -cne '127.0.0.1'",
+        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound*,Get-NetTCPConnection", "$Rows[0].Address -cne '127.0.0.1'",
                        "is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
             self.assertIn(needle, common, needle)
         self.assertNotIn("0.0.0.0", "".join(script_text(name) for name in ALL))
+
+    def test_step_0_refuses_an_older_powershell_with_a_seam_for_the_version(self):
+        text = script_text("switchon-00-check.ps1")
+        for needle in ("$Version = $PSVersionTable.PSVersion", "-lt [version]'7.3'", "This needs PowerShell 7.3 or newer; this window runs $($Version.ToString()). Nothing was changed."):
+            self.assertIn(needle, text, needle)
+        self.assertLess(text.index("-lt [version]'7.3'"), text.index("'scripts run here'"))
+        self.assertNotIn("Join-Path", text)                                                                   # step 0 still reads nothing at all
+
+    def test_only_the_cim_not_found_answer_means_nothing_listens(self):
+        body = script_text(COMMON)
+        body = body[body.index("function Get-PortListeners"):body.index("# The words step 10 passes")]
+        for needle in ("-clike 'CmdletizationQuery_NotFound*,Get-NetTCPConnection'", "$_.Exception.GetType().FullName -ceq 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException'",
+                       "if (-not $Nothing) { throw"):
+            self.assertIn(needle, body, needle)
 
     def test_every_python_call_uses_the_one_shared_flag_list_and_none_depends_on_the_environment(self):
         common = script_text(COMMON)
@@ -399,6 +414,10 @@ class Runbook(unittest.TestCase):
                        "switchon-12-baseline.ps1 -Again", "Use `-Again` for nothing else", "30 seconds ahead", "the stated clock tolerance",
                        "does **not** prove the reporter is still running", "Waiting does not prove that the reporter's delivery queue is empty",
                        "later than both the clock time and the delivered maximum"):
+            self.assertIn(needle, flat, needle)
+        for needle in ("look at the list of all programs running on this machine", "never a command line", "**PowerShell 7.3 or newer**", "This needs PowerShell 7.3 or newer",
+                       "writes **only** the ownership marker", "none of your answers were written",
+                       "A program that uses the live folder is still running (process N, program X)"):
             self.assertIn(needle, flat, needle)
         self.assertNotIn("privacy helpers are unchanged", flat)
         self.assertNotIn("running for about a minute", flat)
