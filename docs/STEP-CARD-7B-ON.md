@@ -277,7 +277,7 @@ from the last read. Two commits on top of `af33f1a`: the scripts with the rebuil
 8. **Python without outside influence.** One list, `$PyFlags = -E -s -B`, in `switchon-common.ps1`, used by every Python call (a drift test checks every call). `-I` was not used because the scripts run from the source folder.
    `PYTHONDONTWRITEBYTECODE` is gone (`-E` ignores it; `-B` replaces it).
 9. **Privacy per Windows account.** Said plainly in the runbook: only your Windows account, SYSTEM and Administrators can open the folder; any program running under your Windows account can read it, including another team's seats
-   on this machine if they run under the same account (on Laptop B they do); what that exposes is the identity value (it only lets a program send readings to this machine's own Leasewise) and the account texts.
+   on this machine if they run under the same account (when the lead checked on 2026-10-09, only this team's seat wrappers were running on Laptop B, all under one account; the limit applies if another team's seats ever run here under it); what that exposes is the identity value (it only lets a program send readings to this machine's own Leasewise) and the account texts.
 10. **Clock (Codex's MINOR).** Step 13 reads the clock through one function, `Get-Now`, at the start and again, fresh, when it decides; the "clock moved back" check and the scan age use that fresh reading.
 
 ### Stated limits (also in the runbook's "Limits that remain")

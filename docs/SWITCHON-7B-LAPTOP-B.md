@@ -63,7 +63,7 @@ pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
 - **Python runs without outside influence.** Every Python call in every script uses the same three switches (`-E -s -B`): `PYTHON...` environment variables such as `PYTHONPATH` are ignored, your own installed
   Python packages are not used, and no bytecode files are written.
 - **"Private" means private to your Windows account.** Only your Windows account, SYSTEM and Administrators can open `C:\lw\live`. But **any program running under your Windows account can read it**, including
-  another team's seats on this machine if they run under the same account. On Laptop B they do, so this limit applies here. What that exposes: the identity value (it only lets a program send readings to this
+  another team's seats on this machine if they run under the same account. When the lead checked on 9 October 2026, only this team's seats were running here; if another team's seats ever run here under your account, this limit applies to them. What that exposes: the identity value (it only lets a program send readings to this
   machine's own Leasewise) and the account texts. The scripts cannot change this.
 - **Limits that remain, stated plainly.** (1) The live folder is private, so a link could appear between the check and its use only if you, SYSTEM or an Administrator made it. (2) The port checks of steps 10 and 11
   happen once, when you start: a program that took the port over *after* step 11's check would have to run under your own Windows account (Windows refuses a second program from another account on a port that is
