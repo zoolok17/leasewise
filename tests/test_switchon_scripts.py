@@ -40,7 +40,7 @@ ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
     COMMON: "86a173489b81e604b79932051d16a50cbf19e1014b47c12cc4812efa6e834fff",
-    GUARD: "0f5459c5189ced9fbec3272f180103f05dff1c5d61dd56f2b850f213165cfd9d",
+    GUARD: "7cf862672a3dba1e44210f71bfa5a514e02fd36500457fe04a4e555c235dac61",
 }
 
 
@@ -109,6 +109,9 @@ class Files(unittest.TestCase):
         for name in STEPS[1:]:
             code = [line for line in script_text(name).split("\n") if line.strip() and not line.startswith("#")]
             expected = DOT_SOURCE + (" -KeepOutOfSource" if name == "switchon-15-rollback.ps1" else "")
+            if name == "switchon-12-baseline.ps1":                                        # its one switch is declared first, as PowerShell requires
+                self.assertTrue(code[0].startswith("param([switch]$Again)"), name)
+                code = code[1:]
             self.assertEqual(code[0], expected, name)
         code = [line for line in script_text(STEPS[0]).split("\n") if line.strip() and not line.startswith("#")]
         self.assertNotIn("Join-Path", " ".join(code))                     # step 0 reads nothing at all
@@ -263,13 +266,29 @@ class Safety(unittest.TestCase):
 
     def test_the_done_check_has_the_conditions_it_promises(self):
         text = script_text("switchon-13-done.ps1")
-        for needle in ("baseline.json", "-le [int64]$Base.$Alias", "TotalSeconds -gt 180", "$LASTEXITCODE -ne 0", "$Readings.sources", "operator_actions.Count -ne 0",
-                       "failed_permanent -ne 0", "capture_fault.count -ne 0", "mode=ro", "$WaitMinutes = 10"):
+        for needle in ("baseline.json", "$Newest[$Alias] -le $Cut", "$Newest[$Alias] -le $Delivered[$Alias]", "$Age -gt 180", "$Age -lt -30", "$LASTEXITCODE -ne 0", "$R.sources",
+                       "@($Status.operator_actions).Count -ne 0", "failed_permanent -ne 0", "capture_fault.count -ne 0", "mode=ro", "$WaitMinutes = 10",
+                       "ConvertFrom-Json -NoEnumerate", "'System.Management.Automation.PSCustomObject'", "$R.configured -ne $true", "lt $Cut - 30000",
+                       "The clock moved back since step 12", "step 12 again with -Again", "ask the lead for the two turns again", "Nothing was changed"):
             self.assertIn(needle, text, needle)
         self.assertEqual(text.count("$LASTEXITCODE -ne 0"), 2)                       # the store query and the status command
+        self.assertNotIn("-is [pscustomobject]", text)                               # PowerShell calls a list one too
         baseline = script_text("switchon-12-baseline.ps1")
         self.assertIn("A baseline was already recorded", baseline)
+        self.assertIn("-and -not $Again", baseline)
         self.assertLess(baseline.index("mode=ro"), baseline.index("WriteAllText"))
+        self.assertLess(baseline.index("$Cut = "), baseline.index("mode=ro"))          # the clock is read before the store is asked
+
+    def test_the_guard_walks_the_whole_live_folder_before_it_reads_anything(self):
+        guard = script_text("switchon-guard.ps1")
+        self.assertIn("function Assert-NoLinkUnder", guard)
+        self.assertIn("$Seen -gt 50000", guard)
+        self.assertLess(guard.index("Assert-NoLinkUnder $LiveRoot"), guard.index("Get-Content -LiteralPath $NamesFile"))       # before names.json is read
+        walk = guard[guard.index("function Assert-NoLinkUnder"):guard.index("function Assert-Separate")]
+        self.assertIn("ReparsePoint", walk)
+        self.assertNotIn("Get-ChildItem", walk)                                       # a listing that could follow a link is not used
+        self.assertLess(walk.index("ReparsePoint"), walk.index("$Pending.Push($Root)"))   # the root itself is refused before it is queued
+        self.assertLess(walk.index("if ($Entry.Attributes"), walk.index("$Pending.Push($Entry.FullName)"))
 
     def test_only_the_server_listens_and_only_on_this_machine(self):
         for name, lines in self.all_code().items():
@@ -292,6 +311,16 @@ class Safety(unittest.TestCase):
 class Runbook(unittest.TestCase):
     def setUp(self):
         self.text = norm(RUNBOOK.read_text(encoding="utf-8"))
+
+    def test_it_states_the_link_rule_the_time_cut_and_the_corrected_wording(self):
+        flat = " ".join(self.text.split())
+        for needle in ("No link anywhere in the live folder", "never following a link", "50,000 entries", "only you, SYSTEM and Administrators can write in it",
+                       "switchon-12-baseline.ps1 -Again", "Use `-Again` for nothing else", "30 seconds ahead", "the stated clock tolerance",
+                       "does **not** prove the reporter is still running", "Waiting does not prove that the reporter's delivery queue is empty",
+                       "later than both the clock time and the delivered maximum"):
+            self.assertIn(needle, flat, needle)
+        self.assertNotIn("privacy helpers are unchanged", flat)
+        self.assertNotIn("running for about a minute", flat)
 
     def test_it_has_every_step_and_the_sections_the_operator_needs(self):
         for needle in ("# Switching on usage readings on Laptop B", "## What this does, in plain words", "## Before you start", "## How to run each step",

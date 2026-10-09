@@ -69,8 +69,8 @@ class Base(unittest.TestCase):
                 env[key] = value
         return env
 
-    def run_script(self, name, env=None, stdin=None, scripts=SCRIPTS):
-        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(Path(scripts) / name)], capture_output=True, text=True, input=stdin,
+    def run_script(self, name, env=None, stdin=None, scripts=SCRIPTS, args=()):
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(Path(scripts) / name), *args], capture_output=True, text=True, input=stdin,
                               env=env or self.env(), timeout=180)
 
     def command(self, text, env=None):
@@ -179,6 +179,71 @@ class Containment(Base):
         self.assertIn("src is a link. Nothing was changed", self.said(done))
         self.assertNotIn("usage file(s) found", done.stdout)
 
+    def python_that_leaves_a_trace(self):
+        """A Python stand-in that writes a file whenever it is started, so a test can prove Python never ran."""
+        trace = self.tmp / "python-ran.txt"
+        shim = self.tmp / "tracer.ps1"
+        shim.write_text('[IO.File]::AppendAllText("%s", "ran`n")\n& "%s" @args\nexit $LASTEXITCODE\n' % (trace, sys.executable), encoding="ascii")
+        self.default_over = {"Py": str(shim)}
+        return trace
+
+    def test_a_linked_package_below_a_plain_source_folder_is_refused_before_python_starts(self):
+        trace = self.python_that_leaves_a_trace()
+        self.names()
+        package = self.tmp / "evil-package"
+        package.mkdir()
+        (package / "__init__.py").write_text("open(r'%s', 'w').write('imported')\n" % (self.tmp / "imported.txt"), encoding="ascii")
+        (self.live / "src").mkdir()
+        self.junction(self.live / "src" / "quota_balancer", package)
+        for step in ("switchon-03-check.ps1", "switchon-04-store.ps1", "switchon-09-check-table.ps1", "switchon-13-done.ps1"):
+            done = self.run_script(step)
+            self.assertNotEqual(done.returncode, 0, step)
+            self.assertIn("quota_balancer is a link. Nothing was changed", self.said(done), step)
+            self.assertFalse(trace.exists(), step + ": Python was started")
+        self.assertFalse((self.tmp / "imported.txt").exists())
+
+    def test_a_link_at_the_reporters_database_or_at_a_store_file_is_refused_before_python_starts(self):
+        trace = self.python_that_leaves_a_trace()
+        self.names()
+        target = self.tmp / "elsewhere"
+        target.mkdir()
+        (self.live / "state").mkdir()
+        (self.live / "store").mkdir()
+        for link in (self.live / "state" / "reporter.db", self.live / "store" / "inventory.db"):
+            self.junction(link, target)
+            done = self.run_script("switchon-03-check.ps1")
+            self.assertNotEqual(done.returncode, 0, str(link))
+            self.assertIn(link.name + " is a link. Nothing was changed", self.said(done))
+            self.assertFalse(trace.exists(), str(link))
+            os.rmdir(link)
+
+    def test_a_link_inside_a_folder_below_the_live_folder_is_found_at_any_depth_and_the_target_is_not_entered(self):
+        self.names()
+        target = self.tmp / "elsewhere"
+        target.mkdir()
+        (target / "never-listed.txt").write_text("x", encoding="ascii")
+        deep = self.live / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        self.junction(deep / "link", target)
+        done = self.run_script("switchon-03-check.ps1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("link is a link. Nothing was changed", self.said(done))
+        self.assertNotIn("never-listed", self.said(done))
+
+    def test_the_walk_is_bounded(self):
+        self.names()
+        text = (SCRIPTS / "switchon-guard.ps1").read_text(encoding="ascii")
+        bounded = self.tmp / "scripts"
+        shutil.copytree(SCRIPTS, bounded)
+        guard = bounded / "switchon-guard.ps1"
+        guard.write_text(text.replace("$Seen -gt 50000", "$Seen -gt 5"), encoding="ascii", newline="\n")
+        for number in range(8):
+            (self.live / ("file%d.txt" % number)).write_text("x", encoding="ascii")
+        done = self.run_script("switchon-03-check.ps1", scripts=bounded)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("more than 50,000 entries", self.said(done))
+        self.assertIn("-gt 50000", text)                                              # the real script keeps the stated bound
+
     def test_a_linked_archive_parent_and_an_archive_outside_c_lw_or_without_zip_are_refused(self):
         real = self.tmp / "real-archives"
         real.mkdir()
@@ -255,7 +320,7 @@ class Containment(Base):
         self.junction(self.live / "inner-link", target)
         done = self.run_script("switchon-15-rollback.ps1")
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("contains a link. Nothing was deleted", self.said(done))
+        self.assertIn("inner-link is a link. Nothing was changed", self.said(done))      # the entry guard finds it first; the rollback's own look is the second line of defence
         self.assertTrue((target / "precious.txt").exists())
 
 
@@ -280,12 +345,20 @@ class RehearsalMode(Base):
             done = self.run_script("switchon-03-check.ps1", env)
             self.assertNotIn(LOUD, self.said(done))
 
-    def test_without_any_rehearsal_variable_the_operator_defaults_are_used_and_nothing_is_created(self):
+    def test_without_any_rehearsal_variable_the_operator_defaults_are_chosen_without_touching_the_file_system(self):
+        # Only the guard's final `else` branch (plain assignments) is run; the real default folders are never opened, listed or tested.
+        guard = (SCRIPTS / "switchon-guard.ps1").read_text(encoding="ascii")
+        branch = re.search(r"\nelse \{\n(.*?)\n\}\n", guard, re.S).group(1)
+        self.assertNotRegex(branch, r"Test-Path|Get-|Assert-|Set-|New-|Remove-|Join-Path")
         env = self.env(LW_SWITCHON_REHEARSAL=None, LW_SWITCHON_ROOT=None, LW_SWITCHON_BUS=None, LW_SWITCHON_PORT=None, LW_SWITCHON_INPUT=None)
-        done = self.command(". '%s'; $LiveRoot; $BusRoot; $PortNumber" % COMMON, env)
+        done = self.command("%s; $LiveRoot; $BusRoot; $PortNumber" % branch, env)
         self.assertEqual(done.returncode, 0, self.said(done))
         self.assertEqual(done.stdout.split(), ["C:\\lw\\live", "C:\\lw\\team\\.agenttalk", "8443"])
-        self.assertFalse(os.path.exists("C:\\lw\\live"))
+
+    def test_a_start_without_any_rehearsal_variable_stops_on_a_stray_one_before_it_opens_any_folder(self):
+        env = self.env(LW_SWITCHON_REHEARSAL=None, LW_SWITCHON_ROOT=None, LW_SWITCHON_BUS=None, LW_SWITCHON_PORT=None, LW_SWITCHON_INPUT=None,
+                       LW_SWITCHON_CLAUDE_TEXT="x")
+        self.refuses(env, "A rehearsal setting (LW_SWITCHON_...) is present in this window")
 
     def test_the_two_roots_may_not_overlap(self):
         nested = self.live / "nested-bus"
@@ -369,6 +442,28 @@ class Prompt(Base):
         self.assertNotIn(LOUD, shown)
         self.assertEqual(self.digest(self.live / "reporter.toml"), before)
 
+    def test_the_console_helper_gives_back_every_handle_even_when_the_child_has_to_be_stopped(self):
+        import ctypes
+        import ctypes.wintypes as wt
+        from tests.switchon_console import k32, run_in_console
+        k32.GetCurrentProcess.restype = wt.HANDLE
+        k32.GetProcessHandleCount.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+
+        def handles():
+            count = wt.DWORD()
+            self.assertTrue(k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(count)))
+            return count.value
+        cmd = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        run_in_console('"%s" /c echo warm-up' % cmd, [], first_delay=0.5, wait_seconds=20)
+        before = handles()
+        for _ in range(3):
+            code, shown = run_in_console('"%s" /c echo done' % cmd, [], first_delay=0.5, wait_seconds=20)
+            self.assertEqual(code, 0)
+            self.assertIn("done", shown)
+        code, _ = run_in_console('"%s" /c ping -n 8 127.0.0.1 > nul' % cmd, [], first_delay=0.5, wait_seconds=1)       # outlives the wait: stopped by its own handle
+        self.assertEqual(code, 1)
+        self.assertLessEqual(handles(), before + 2)                                    # four runs, no leak of the six handles each one opens
+
     def test_the_env_branch_exists_only_for_the_rehearsal_and_writes_the_same_rows(self):
         self.private_live()
         done = self.run_script("switchon-08-table.ps1", self.env(LW_SWITCHON_INPUT="env", LW_SWITCHON_CLAUDE_TEXT=LOUD_CLAUDE, LW_SWITCHON_CODEX_TEXT=LOUD_CODEX))
@@ -437,7 +532,10 @@ class PrivacyBeforeWriting(Base):
 
 
 class DoneCheck(Base):
-    """Step 13 against a real sqlite file and a status shim; the wait is set to zero in a COPY of the script (the real one waits ten minutes)."""
+    """Steps 12 and 13 against a real sqlite file and a status shim; the wait is set to zero in a COPY of the script (the real one waits ten minutes).
+
+    Times are real: the baseline's clock time is ten minutes ago, the newest delivered figures are older than that, and a new figure is one observed later.
+    """
 
     def setUp(self):
         super().setUp()
@@ -447,7 +545,6 @@ class DoneCheck(Base):
         self.private_live()
         (self.live / "store").mkdir(exist_ok=True)
         self.store = self.live / "store" / "inventory.db"
-        self.status_file = self.tmp / "status.json"
         self.scripts = self.tmp / "scripts"
         shutil.copytree(SCRIPTS, self.scripts)
         done = self.scripts / "switchon-13-done.ps1"
@@ -457,16 +554,19 @@ class DoneCheck(Base):
                            "INSERT INTO accounts VALUES('a','claude-main'),('b','codex-main');")
         conn.commit()
         conn.close()
-        self.base = 1_000_000_000_000
-        self.write_baseline(claude=self.base, codex=self.base)
+        self.cut = int(time.time() * 1000) - 600_000
+        self.old_claude, self.old_codex = self.cut - 60_000, self.cut - 120_000
+        self.write_baseline()
 
     def set_shim(self, status_exit):
         shim = self.tmp / "shim.ps1"
         shim.write_text('if ($args[0] -eq "-c") { & "%s" @args; exit $LASTEXITCODE }\nif ($args -contains "status") { if (%d -ne 0) { exit %d }; Get-Content -LiteralPath "%s" -Raw; exit 0 }\nexit 0\n'
                         % (sys.executable, status_exit, status_exit, self.status_file), encoding="ascii")
 
-    def write_baseline(self, claude, codex):
-        (self.live / "baseline.json").write_text(json.dumps({"claude-main": claude, "codex-main": codex}), encoding="ascii")
+    def write_baseline(self, **over):
+        record = {"schema": 1, "cut_ms": self.cut, "delivered": {"claude-main": self.old_claude, "codex-main": self.old_codex}}
+        record.update(over)
+        (self.live / "baseline.json").write_text(json.dumps(record), encoding="ascii")
 
     def rows(self, claude, codex):
         conn = sqlite3.connect(self.store)
@@ -477,52 +577,123 @@ class DoneCheck(Base):
         conn.commit()
         conn.close()
 
-    def status(self, scan_age=10, sources=None, actions=(), failed=0, faults=0, configured=True):
-        last_scan = None if scan_age is None else time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - scan_age))
+    def good_rows(self):
+        self.rows(self.cut + 1000, self.cut + 2000)
+
+    def status_body(self, scan_age=10, sources=None, actions=(), failed=0, faults=0, configured=True, scan=None):
+        if scan is None and scan_age is not None:
+            scan = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - scan_age))
         sources = sources if sources is not None else [{"provider": "claude", "account": "claude-main"}, {"provider": "codex", "account": "codex-main"}]
-        self.status_file.write_text(json.dumps({"operator_actions": list(actions), "readings": {
-            "configured": configured, "sources": sources, "last_scan": last_scan, "rows": {"sent": 4, "pending": 0, "failed_permanent": failed},
-            "capture_fault": {"count": faults, "last": None}}}), encoding="ascii")
+        return {"operator_actions": list(actions), "readings": {
+            "configured": configured, "sources": sources, "last_scan": scan, "rows": {"sent": 4, "pending": 0, "failed_permanent": failed},
+            "capture_fault": {"count": faults, "last": None}}}
+
+    def status(self, **over):
+        self.status_file.write_text(json.dumps(self.status_body(**over)), encoding="ascii")
 
     def check(self):
         return self.run_script("switchon-13-done.ps1", scripts=self.scripts)
 
+    def fails(self, word, case=None):
+        done = self.check()
+        self.assertNotEqual(done.returncode, 0, case)
+        self.assertNotIn("PASSED", done.stdout, case)
+        self.assertIn(word, self.said(done), case)
+        self.assertIn("Nothing was changed", self.said(done), case)
+        return done
+
     def test_new_figures_a_recent_scan_and_a_clean_status_pass(self):
-        self.rows(self.base + 1, self.base + 2)
+        self.good_rows()
         self.status()
         done = self.check()
         self.assertEqual(done.returncode, 0, self.said(done))
         self.assertIn("PASSED", done.stdout)
-        self.assertNotIn("LOUD", done.stdout)
 
     def test_old_rows_only_fail(self):
-        for claude, codex in ((self.base, self.base + 5), (self.base - 1, self.base + 5), (None, self.base + 5), (self.base + 5, self.base)):
+        for claude, codex in ((self.old_claude, self.cut + 5), (self.old_claude - 1, self.cut + 5), (None, self.cut + 5), (self.cut + 5, self.old_codex)):
             self.rows(claude, codex)
             self.status()
-            done = self.check()
-            self.assertNotEqual(done.returncode, 0, (claude, codex))
-            self.assertNotIn("PASSED", done.stdout)
-            self.assertIn("no accepted figure newer than the baseline", self.said(done))
+            self.fails("no accepted figure observed after the baseline", (claude, codex))
+
+    def test_a_figure_observed_before_the_time_cut_but_delivered_after_it_fails(self):
+        # newer than the delivered maximum, older than the clock time of step 12: it was only delivered late
+        for late in (self.old_claude + 1, self.cut - 1, self.cut):
+            self.rows(late, self.cut + 2000)
+            self.status()
+            self.fails("claude-main: no accepted figure observed after the baseline", late)
+        self.rows(self.cut + 1, self.cut + 2000)
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_figure_must_beat_both_the_time_cut_and_the_delivered_maximum(self):
+        self.cut = int(time.time() * 1000) - 600_000
+        self.old_claude = self.cut + 90_000                      # a delivered figure later than the cut (the usual case)
+        self.write_baseline(delivered={"claude-main": self.old_claude, "codex-main": None})
+        self.rows(self.old_claude, self.cut + 5)
+        self.status()
+        self.fails("claude-main: no accepted figure observed after the baseline")
+        self.rows(self.old_claude + 1, self.cut + 5)
+        self.assertEqual(self.check().returncode, 0)               # none delivered for codex-main: only the cut counts
 
     def test_a_reporter_that_never_ran_or_has_stopped_fails(self):
-        self.rows(self.base + 1, self.base + 2)
+        self.good_rows()
         for age in (None, 181, 3600):
             self.status(scan_age=age)
-            done = self.check()
-            self.assertNotEqual(done.returncode, 0, age)
-            self.assertNotIn("PASSED", done.stdout)
-            self.assertRegex(self.said(done), "has not scanned")
+            self.fails("has not scanned", age)
         self.status(scan_age=170)
         self.assertEqual(self.check().returncode, 0)
 
+    def test_a_scan_time_ahead_of_the_clock_fails_beyond_thirty_seconds_and_passes_within(self):
+        self.good_rows()
+        self.status(scan_age=-60)
+        self.fails("more than 30 seconds ahead")
+        self.status(scan_age=-3600)
+        self.fails("more than 30 seconds ahead")
+        for age in (-15, 0):
+            self.status(scan_age=age)
+            self.assertEqual(self.check().returncode, 0, age)
+
+    def test_a_scan_time_that_cannot_be_read_fails(self):
+        self.good_rows()
+        for scan in ("yesterday", "", 12345, True, ["2026-01-01T00:00:00Z"]):
+            self.status(scan=scan)
+            done = self.check()
+            self.assertNotEqual(done.returncode, 0, scan)
+            self.assertNotIn("PASSED", done.stdout, scan)
+
+    def test_a_status_that_is_null_a_list_or_missing_a_part_fails(self):
+        self.good_rows()
+        body = self.status_body()
+        cases = [("null", "is not a JSON object"), ("[]", "is not a JSON object"), ("[1, 2]", "is not a JSON object"), ('"text"', "is not a JSON object"),
+                 ("not json at all", "is not a JSON object"), ("", "is not a JSON object"), (json.dumps([body]), "is not a JSON object"),
+                 ("{}", "missing a part"), (json.dumps(self.without(body, "readings")), "missing a part"), (json.dumps(self.without(body, "operator_actions")), "missing a part"),
+                 (json.dumps(self.without(body, "readings", "rows")), "missing a part"), (json.dumps(self.without(body, "readings", "capture_fault")), "missing a part"),
+                 (json.dumps(self.without(body, "readings", "sources")), "missing a part"), (json.dumps(self.without(body, "readings", "last_scan")), "missing a part"),
+                 (json.dumps(self.without(body, "readings", "configured")), "missing a part"), (json.dumps(self.without(body, "readings", "rows", "failed_permanent")), "missing a part"),
+                 (json.dumps(self.without(body, "readings", "capture_fault", "count")), "missing a part"),
+                 (json.dumps(dict(body, operator_actions=None)), "missing a part"), (json.dumps(dict(body, operator_actions="none")), "missing a part"),
+                 (json.dumps(dict(body, readings=[1])), "missing a part"), (json.dumps(dict(body, readings=None)), "missing a part")]
+        for text, word in cases:
+            self.status_file.write_text(text, encoding="ascii")
+            self.fails(word, text[:60])
+        stringy = self.status_body()
+        stringy["readings"]["rows"]["failed_permanent"] = "0"
+        self.status_file.write_text(json.dumps(stringy), encoding="ascii")
+        self.fails("missing a part", "a string where a number belongs")
+
+    @staticmethod
+    def without(body, *path):
+        copy = json.loads(json.dumps(body))
+        node = copy
+        for key in path[:-1]:
+            node = node[key]
+        del node[path[-1]]
+        return copy
+
     def test_a_failed_status_command_fails(self):
-        self.rows(self.base + 1, self.base + 2)
+        self.good_rows()
         self.status()
         self.set_shim(status_exit=3)
-        done = self.check()
-        self.assertNotEqual(done.returncode, 0)
-        self.assertNotIn("PASSED", done.stdout)
-        self.assertIn("reporter status could not be read", self.said(done))
+        self.fails("reporter status could not be read")
 
     def test_a_failed_store_query_fails(self):
         self.status()
@@ -532,12 +703,13 @@ class DoneCheck(Base):
         self.assertNotIn("PASSED", done.stdout)
 
     def test_the_wrong_sources_a_warning_a_failure_or_a_fault_fail(self):
-        self.rows(self.base + 1, self.base + 2)
+        self.good_rows()
         cases = (dict(sources=[{"provider": "claude", "account": "claude-main"}]),
                  dict(sources=[{"provider": "claude", "account": "claude-main"}, {"provider": "codex", "account": "codex-main"},
                                {"provider": "codex", "account": "extra"}]),
                  dict(sources=[{"provider": "claude", "account": "claude-main"}, {"provider": "codex", "account": "other"}]),
-                 dict(configured=False), dict(actions=["a warning"]), dict(failed=1), dict(faults=1))
+                 dict(sources=[]), dict(sources=["claude-main", "codex-main"]), dict(configured=False), dict(actions=["a warning"]), dict(failed=1),
+                 dict(faults=1))
         for over in cases:
             self.status(**over)
             done = self.check()
@@ -550,16 +722,68 @@ class DoneCheck(Base):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("No baseline was recorded", self.said(done))
 
-    def test_the_baseline_step_records_the_newest_accepted_figure_once(self):
+    def test_a_baseline_that_is_not_what_step_12_writes_fails(self):
+        self.good_rows()
+        self.status()
+        good = {"schema": 1, "cut_ms": self.cut, "delivered": {"claude-main": self.old_claude, "codex-main": None}}
+        broken = [("not json", None), ("null", None), ("[]", None), ("[1]", None), ('"x"', None)]
+        for name in ("schema", "cut_ms", "delivered"):
+            broken.append((json.dumps({k: v for k, v in good.items() if k != name}), None))
+        broken += [(json.dumps(dict(good, schema=2)), None), (json.dumps(dict(good, schema="1")), None), (json.dumps(dict(good, extra=1)), None),
+                   (json.dumps(dict(good, cut_ms="123")), None), (json.dumps(dict(good, cut_ms=0)), None), (json.dumps(dict(good, cut_ms=-5)), None),
+                   (json.dumps(dict(good, cut_ms=1.5)), None), (json.dumps(dict(good, cut_ms=None)), None),
+                   (json.dumps(dict(good, delivered=None)), None), (json.dumps(dict(good, delivered=[1, 2])), None),
+                   (json.dumps(dict(good, delivered={"claude-main": 5})), None), (json.dumps(dict(good, delivered={"claude-main": 5, "codex-main": 6, "x": 7})), None),
+                   (json.dumps(dict(good, delivered={"claude-main": -1, "codex-main": None})), None),
+                   (json.dumps(dict(good, delivered={"claude-main": "5", "codex-main": None})), None),
+                   (json.dumps(dict(good, delivered={"claude-main": 5.5, "codex-main": None})), None),
+                   (json.dumps({"claude-main": self.old_claude, "codex-main": self.old_codex}), None)]       # the first version's file
+        for text, _ in broken:
+            (self.live / "baseline.json").write_text(text, encoding="ascii")
+            self.fails("The baseline is not the file step 12 made", text[:70])
+        (self.live / "baseline.json").write_text(json.dumps(good), encoding="ascii")
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_clock_that_moved_back_since_step_12_stops_with_the_instruction(self):
+        self.good_rows()
+        self.status()
+        self.write_baseline(cut_ms=int(time.time() * 1000) + 120_000)
+        done = self.fails("The clock moved back since step 12")
+        self.assertIn("run step 12 again with -Again", " ".join(self.said(done).replace("Run", "run").split()))
+        self.assertIn("ask the lead for the two turns again", self.said(done))
+        self.write_baseline(cut_ms=int(time.time() * 1000) + 15_000)               # within the 30-second tolerance: not the clock message
+        self.assertNotIn("clock moved back", self.said(self.check()))
+
+    def test_the_baseline_step_records_the_clock_and_the_newest_delivered_figure(self):
         (self.live / "baseline.json").unlink()
-        self.rows(self.base + 7, None)
+        self.rows(self.old_claude, None)
+        before = int(time.time() * 1000)
         done = self.run_script("switchon-12-baseline.ps1")
+        after = int(time.time() * 1000)
         self.assertEqual(done.returncode, 0, self.said(done))
-        self.assertEqual(json.loads((self.live / "baseline.json").read_text(encoding="ascii")), {"claude-main": self.base + 7, "codex-main": 0})
+        record = json.loads((self.live / "baseline.json").read_text(encoding="ascii"))
+        self.assertEqual(sorted(record), ["cut_ms", "delivered", "schema"])
+        self.assertEqual(record["schema"], 1)
+        self.assertTrue(before <= record["cut_ms"] <= after, record)
+        self.assertEqual(record["delivered"], {"claude-main": self.old_claude, "codex-main": None})
         self.assertIn("codex-main: no accepted figure yet", done.stdout)
+
+    def test_a_plain_rerun_of_the_baseline_refuses_and_again_replaces_it(self):
+        (self.live / "baseline.json").unlink()
+        self.rows(self.old_claude, self.old_codex)
+        self.assertEqual(self.run_script("switchon-12-baseline.ps1").returncode, 0)
+        first = (self.live / "baseline.json").read_bytes()
+        time.sleep(0.05)
         again = self.run_script("switchon-12-baseline.ps1")
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("already recorded", self.said(again))
+        self.assertEqual((self.live / "baseline.json").read_bytes(), first)         # not one byte changed
+        self.rows(self.old_claude + 10, self.old_codex + 10)
+        replaced = self.run_script("switchon-12-baseline.ps1", args=("-Again",))
+        self.assertEqual(replaced.returncode, 0, self.said(replaced))
+        record = json.loads((self.live / "baseline.json").read_text(encoding="ascii"))
+        self.assertEqual(record["delivered"], {"claude-main": self.old_claude + 10, "codex-main": self.old_codex + 10})
+        self.assertGreater(record["cut_ms"], json.loads(first)["cut_ms"])
 
 
 class NoSecretOnACommandLine(Base):
