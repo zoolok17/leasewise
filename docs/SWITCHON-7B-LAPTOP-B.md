@@ -3,7 +3,8 @@
 Mode: how-to. For: the operator, at Laptop B (the machine the Leasewise team's seats run on). Status: **rehearsed on made-up data, on this machine's PowerShell 7.6**
 (`docs/STEP-CARD-7B-ON.md`). On one commit, in an elevated window: a free port (step 10 starts), a busy port (step 10 refuses, step 11 refuses a stranger), the virtual-environment Python (the child owns the port and
 step 11 accepts it), step 1 stopping at the privacy check and step 15 removing the folder, step 15 refusing while a program runs and then succeeding, and the whole run from step 0 through `PASSED` to the final rollback.
-On a second commit, with the same scripts: the whole run in a **normal window** (started through the desktop shell, medium integrity), the whole run again with administrator rights switched off, and step 11's refusal
+On a second commit, with the same scripts: the whole run in a **normal window** (medium integrity, no administrator rights; started by a script through the desktop shell, not opened by
+hand from the Start menu; steps 1 and 8 took their answers from the rehearsal's test input, and the typed prompts were rehearsed in the elevated window), the whole run again with administrator rights switched off, and step 11's refusal
 of a second program on the port, of a stopped window 1's record and of a live process that is not listening. Both commits carry the same scripts as the installed commit, which changes only documents.
 **Not yet run for real.** Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
 40-character commit id; if you see angle brackets there, stop and ask the lead). Approved by claude-agenttalk-lead on 2026-10-09 (answer to q-9ddb21b0c31c): first on this machine, for our own team's two accounts only.

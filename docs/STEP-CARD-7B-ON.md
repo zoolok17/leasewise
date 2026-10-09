@@ -455,7 +455,8 @@ Documents only: `git diff --name-only 2b6263d HEAD` lists `docs/STEP-CARD-7B-ON.
 2. **Step 11's identity refusal with a valid `server.json`.** Cases g1, g2 and g3 (below).
 3. **One self-contained index** of every rehearsal: `C:\lw\scratch\claude-lw-developer-1\switchon\rehearsal8\INDEX.md` (commit, window kind, PowerShell version, result, file), with the notes that (d) simulates the privacy
    failure with a copy of the shared script whose access-list function throws (it proves the recovery, not a real access-list error) and that (f) begins with a refused step 10 and 11 because the stranger of case (b) still held the port.
-4. **The runbook names the window kind** ("a normal PowerShell 7 window, not 'Run as administrator'") in "How to run each step" and steps 10 and 11, and its status line names the commits and window kinds exactly.
+4. **The runbook names the window kind** ("a normal PowerShell 7 window, not 'Run as administrator'") in "How to run each step" and steps 10 and 11, and its status line tells the two rehearsed versions and the window kinds apart (this record and the rehearsal index name the commits). The normal-window run was started by a script through
+   the desktop shell, not opened by hand from the Start menu, and steps 1 and 8 took their answers from the rehearsal's test input; the status line says so (liaison, 2026-10-10).
 5. **One sentence in step 11:** if another program also listens on the port, step 11 refuses even a working window 1 until that program is gone (see the g1 finding).
 
 **Every rehearsal case** (strict rehearsal mode, made-up data, a system-chosen loopback port, the venv launcher as step 1's Python, PowerShell 7.6.6, all PASS):
