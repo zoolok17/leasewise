@@ -178,8 +178,9 @@ It must list the source folders (`docs`, `quota_balancer`, `tests` and a few fil
 
 ## Step 3: check Python and the usage files
 
-Script: `switchon-03-check.ps1`. It only reads. It prints Python's version, **how many** usage files agenttalk has, and for each provider **how many usable ones** (numbers only; nothing in them is shown). A usable file is one the reporter can
-accept: format number exactly 2, scope "account", and an account text that starts with `claude:` or `codex:`.
+Script: `switchon-03-check.ps1`. It only reads. It prints Python's version, **how many** usage files agenttalk has, and for each provider **how many usable ones** (numbers only; nothing in them is shown). A usable file is one the reporter's own scan
+accepts (format number exactly 2, scope "account" and every other documented field) and whose account text starts with `claude:` or `codex:`. If the folder cannot be read, or holds more entries or usage files than the reporter looks at (4096
+entries, 64 files), step 3 and step 8 say so and stop.
 
 <!-- script: switchon-03-check.ps1 -->
 ```powershell
@@ -191,9 +192,9 @@ if (-not (Test-Path -LiteralPath $StateFolder -PathType Container)) { throw 'The
 $Count = @(Get-ChildItem -LiteralPath $StateFolder -Filter '*.capacity.json' -File).Count
 '{0} usage file(s) found' -f $Count
 if ($Count -eq 0) { throw 'No usage file was found yet. Run a turn in a seat first, or tell the lead. Nothing was changed.' }
-$Usable = @(Get-UsageAccounts)                           # the format the reporter accepts (agenttalk 0.99.0 or newer); only counted, never shown
+$Usable = Invoke-UsageScan 'count' $null                     # asked of the reporter's own scan (agenttalk 0.99.0 or newer); only counted, never shown
 foreach ($Provider in 'claude', 'codex') {
-    $Number = @($Usable | Where-Object { $_.Provider -ceq $Provider }).Count
+    $Number = $Usable.$Provider
     '{0}: {1} usable usage file(s)' -f $Provider, $Number
     if ($Number -eq 0) { throw "No usable $Provider usage file was found. Every seat must run agenttalk 0.99.0 or newer, be restarted on it, and have done one turn since. If they do, a later agenttalk may write another format: tell the lead. Nothing was changed." }
 }
@@ -343,8 +344,8 @@ way agenttalk writes them in its usage files, `<provider>:<name>:home-<8 charact
 questions, and never into the repository, a message to the lead, a report or a chat.**
 
 Run the script `switchon-08-table.ps1`. It first checks that the settings file is private (a refusal there changes nothing), then asks four questions. **Nothing you type or paste is shown** (the questions are masked):
-type each part, press Enter. It checks the shape of each part and says which one is wrong without showing it. Because masked typing hides typos, it then compares each assembled text with the account text in our own
-usage files (the same files the reporter reads) and prints only a count, like `Claude: matches 2 usage file(s)`. If a text matches no file it says so and writes nothing. The table is written into the private settings
+type each part, press Enter. It checks the shape of each part and says which one is wrong without showing it. Because masked typing hides typos, it then asks **the reporter's own file scan** (the very code the reporter runs, so it looks at exactly the files the reporter reads and accepts) how many usage files carry exactly that
+account text; the texts reach it on standard input, never on a command line, and only a count comes back, like `Claude: matches 1 usage file(s)`. If a text matches no file it says so and writes nothing. The table is written into the private settings
 file only if both are right.
 
 <!-- script: switchon-08-table.ps1 -->
@@ -373,9 +374,9 @@ function Join-AccountText {
 }
 $ClaudeText = Join-AccountText 'claude' 'Claude' $ClaudeName $ClaudeHome
 $CodexText = Join-AccountText 'codex' 'Codex' $CodexName $CodexHome
-$Usage = @(Get-UsageAccounts)                            # the same files the reporter reads; compared in memory, only counted on screen
-foreach ($Pair in @(@('Claude', $ClaudeText), @('Codex', $CodexText))) {
-    $Found = @($Usage | Where-Object { $_.Account -ceq $Pair[1] }).Count
+$Counts = Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }          # the reporter's own scan; the texts go in on standard input, only counts come back
+foreach ($Pair in @(@('Claude', 'claude'), @('Codex', 'codex'))) {
+    $Found = $Counts.($Pair[1])
     if ($Found -eq 0) { throw ('The {0} text you typed does not match any of our usage files. Nothing was changed. Compare with your agenttalk capacity screen and run step 8 again.' -f $Pair[0]) }
     '{0}: matches {1} usage file(s)' -f $Pair[0], $Found
 }
@@ -436,16 +437,19 @@ $Holders = @(Get-PortListeners $PortNumber)
 if ($Holders.Count -gt 0) {
     throw ('Something on this machine already listens on port {0} (process {1}, program {2}). Nothing was started. If it is window 1 from earlier, go back to that window; otherwise tell the lead.' -f $PortNumber, $Holders[0].ProcessId, $Holders[0].Name)
 }
-$ServeArgs = @('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)
+$ServeArgs = Get-ServeArgs                               # the exact words step 11 expects
 & $Py @PyFlags @ServeArgs
 ```
 
 ## Step 11 (window 2): the reporter
 
-A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is window 1's
-Leasewise server (started by your Python with `quota_balancer`, `serve` and `--db` followed by exactly the store). Otherwise it says "Port 8443 is held by a program that is not window 1's Leasewise server. Nothing was started,
-and the identity value was not sent. Tell the lead." It also refuses to start when a reporter for the same settings is already running. (A virtual environment's `python.exe` starts the real interpreter as a second process
-that owns the port; the check accepts that second process only when its parent is your Python with the same command line.) The reporter prints one line per cycle, like
+A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is window 1's Leasewise server **started with exactly the command step 10 launches**: your Python,
+then `-E -s -B -m quota_balancer --db`, the store, `serve --host 127.0.0.1 --port 8443`, in that order, with no word before, between or after (the store is compared as a Windows path, ignoring capitals; every other word
+exactly). A program that merely contains these words (for example a different script given them as arguments) is refused. The program must be your Python itself, or, when your Python is a virtual environment's launcher
+(a `pyvenv.cfg` in the folder above it, inside `C:\lw`), the one base interpreter that file names, started by that launcher with the identical command line; nothing else is accepted, and a program whose command line or path
+cannot be read is refused. Otherwise it says "Port 8443 is held by a program that is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." It also refuses to start when
+a reporter for the same settings is already running. What this cannot tell apart: a program under your own Windows account that copies this exact command line, for example from another folder; such a program could read the
+settings file anyway. The reporter prints one line per cycle, like
 `{"blocked": null, "journal": "ok", "new_events": 0, "sent": 2}`. Leave it open.
 
 <!-- script: switchon-11-reporter.ps1 -->

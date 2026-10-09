@@ -6,5 +6,5 @@ $Holders = @(Get-PortListeners $PortNumber)
 if ($Holders.Count -gt 0) {
     throw ('Something on this machine already listens on port {0} (process {1}, program {2}). Nothing was started. If it is window 1 from earlier, go back to that window; otherwise tell the lead.' -f $PortNumber, $Holders[0].ProcessId, $Holders[0].Name)
 }
-$ServeArgs = @('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)
+$ServeArgs = Get-ServeArgs                               # the exact words step 11 expects
 & $Py @PyFlags @ServeArgs

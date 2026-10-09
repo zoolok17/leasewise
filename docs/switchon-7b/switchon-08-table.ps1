@@ -29,9 +29,9 @@ function Join-AccountText {
 }
 $ClaudeText = Join-AccountText 'claude' 'Claude' $ClaudeName $ClaudeHome
 $CodexText = Join-AccountText 'codex' 'Codex' $CodexName $CodexHome
-$Usage = @(Get-UsageAccounts)                            # the same files the reporter reads; compared in memory, only counted on screen
-foreach ($Pair in @(@('Claude', $ClaudeText), @('Codex', $CodexText))) {
-    $Found = @($Usage | Where-Object { $_.Account -ceq $Pair[1] }).Count
+$Counts = Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }          # the reporter's own scan; the texts go in on standard input, only counts come back
+foreach ($Pair in @(@('Claude', 'claude'), @('Codex', 'codex'))) {
+    $Found = $Counts.($Pair[1])
     if ($Found -eq 0) { throw ('The {0} text you typed does not match any of our usage files. Nothing was changed. Compare with your agenttalk capacity screen and run step 8 again.' -f $Pair[0]) }
     '{0}: matches {1} usage file(s)' -f $Pair[0], $Found
 }

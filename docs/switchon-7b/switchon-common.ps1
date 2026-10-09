@@ -65,24 +65,51 @@ if ($N) {
     if (-not $KeepOutOfSource -and (Test-Path -LiteralPath $Src)) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 3)
 }
 
-# What the reporter reads: <agenttalk folder>\state\*.capacity.json, the first 64 by name, at most 16 KiB each, links skipped. Returns one object (Provider, Account)
-# for each file the reporter could use as a source: schema_version exactly the whole number 2, scope "account", a non-empty text account that starts with
-# "claude:" or "codex:". It prints nothing; the caller counts or compares in memory.
-function Get-UsageAccounts {
-    $Folder = Join-Path $BusRoot 'state'
-    try { $Paths = [string[]]@([IO.Directory]::EnumerateFileSystemEntries($Folder, '*.capacity.json')) } catch { throw 'The agenttalk state folder could not be read. Nothing was changed. Tell the lead.' }
-    [Array]::Sort($Paths, [StringComparer]::Ordinal)
-    foreach ($Path in ($Paths | Select-Object -First 64)) {
-        $Info = New-Object IO.FileInfo($Path)
-        if (($Info.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -or $Info.Length -gt 16384) { continue }
-        try { $Data = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-        if (-not (($null -ne $Data) -and ($Data.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject'))) { continue }
-        $Version, $Scope, $Account = $Data.schema_version, $Data.scope, $Data.account
-        if (-not ((($Version -is [int]) -or ($Version -is [long])) -and $Version -eq 2 -and $Scope -is [string] -and $Scope -ceq 'account' -and $Account -is [string])) { continue }
-        foreach ($Provider in 'claude', 'codex') {
-            if ($Account.StartsWith($Provider + ':', [StringComparison]::Ordinal) -and $Account.Length -gt ($Provider.Length + 1)) { [pscustomobject]@{ Provider = $Provider; Account = $Account } }
-        }
+# What the reporter reads, asked of the reporter's own scan: one small Python helper calls quota_balancer.reporter.capacityreader.scan on the agenttalk folder
+# (the same code the reporter runs: bounded listing, links and folders dropped, names checked, the first 64 files, at most 16 KiB each, every field checked) and
+# counts what it accepts. Mode "count": per provider, the accepted files whose account starts with "claude:" or "codex:". Mode "match": the two assembled texts
+# arrive on STANDARD INPUT (never on a command line) and the answer is, per provider, how many accepted files have exactly that account. The answer holds numbers
+# only; on any problem the helper prints one fixed sentence and no account text, and the step stops with a plain message.
+$UsageHelper = @'
+import json, sys, time
+def stop(word):
+    print("USAGE_SCAN_FAILED " + word)
+    sys.exit(2)
+try:
+    from quota_balancer.reporter import capacityreader
+    found = capacityreader.scan(sys.argv[1], int(time.time() * 1000))
+    if found.folder_unreadable:
+        stop("unreadable")
+    if found.too_many_entries:
+        stop("too_many")
+    wanted = json.loads(sys.stdin.read()) if sys.argv[2] == "match" else None
+    accounts = [item.account for item in found.files if isinstance(item.account, str)]
+    answer = {}
+    for provider in ("claude", "codex"):
+        if wanted is None:
+            answer[provider] = sum(1 for text in accounts if text.startswith(provider + ":") and len(text) > len(provider) + 1)
+        else:
+            answer[provider] = sum(1 for text in accounts if text == wanted[provider])
+    print(json.dumps(answer))
+except SystemExit:
+    raise
+except BaseException:
+    stop("error")
+'@
+function Invoke-UsageScan {
+    param([string]$Mode, $Texts)
+    $Stdin = if ($Mode -ceq 'match') { $Texts | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii } else { '{}' }
+    $Answer = @($Stdin | & $Py @PyFlags -c $UsageHelper $BusRoot $Mode)
+    if ($LASTEXITCODE -ne 0) {
+        $Said = $Answer -join ' '
+        if ($Said -like '*unreadable*') { throw 'The agenttalk state folder could not be read. Nothing was changed. Tell the lead.' }
+        if ($Said -like '*too_many*') { throw 'The agenttalk state folder holds more entries or usage files than the reporter looks at (4096 entries, 64 files). Nothing was changed. Tell the lead.' }
+        throw 'The usage files could not be checked. Nothing was changed. Tell the lead.'
     }
+    try { $Counts = ($Answer -join '') | ConvertFrom-Json -ErrorAction Stop } catch { $Counts = $null }
+    $Fits = $Counts -and ((@($Counts.PSObject.Properties.Name) -join ',') -ceq 'claude,codex') -and (($Counts.claude -is [int]) -or ($Counts.claude -is [long])) -and (($Counts.codex -is [int]) -or ($Counts.codex -is [long]))
+    if (-not $Fits) { throw 'The usage files could not be checked. Nothing was changed. Tell the lead.' }
+    $Counts
 }
 
 # Every process on this machine whose command line names the live folder, leaving out this script's own process (ids and program names are all that is shown).
@@ -112,27 +139,45 @@ function Get-PortListeners {
     }
 }
 
+# The words step 10 passes to Python after $PyFlags: step 10 launches them and step 11 expects exactly them, from this one function.
+function Get-ServeArgs {
+    @('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)
+}
+
 function Split-CommandLine {
     param([string]$Text)                                                 # the words of a Windows command line; a double-quoted part is one word
     @([regex]::Matches($Text, '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
 }
 
-# Step 11's start check: the only program that listens on the port is window 1's Leasewise server (listening on 127.0.0.1, started by step 1's Python with
-# "quota_balancer", "serve" and "--db" followed by exactly the store). A venv's python.exe is a launcher that starts the real interpreter as a child, and
-# the child owns the socket: a child counts only if its parent is step 1's Python with the same command line.
+# Step 11's start check: the only program that listens on the port is window 1's Leasewise server, found by the exact command step 10 launches: step 1's Python
+# followed, in order and with nothing before, between or after, by $PyFlags and Get-ServeArgs (every word compared exactly; the store compared as a Windows path,
+# ignoring case), listening on 127.0.0.1. The program is either (a) step 1's Python itself, or (b) when step 1's Python is a venv launcher (a pyvenv.cfg in the folder
+# above its folder, inside C:\lw), the base interpreter that file names, started by that launcher with the identical command line. A process whose command line or
+# program cannot be read is refused. What this cannot tell apart: a program under the operator's own Windows account that copies this exact command line.
 function Assert-OurServerListens {
     $Rows = @(Get-PortListeners $PortNumber)
     if ($Rows.Count -eq 0) { throw "Nothing listens on port $PortNumber yet. Start window 1 (step 10) first and wait a few seconds. Nothing was started." }
     $NotOurs = "Port $PortNumber is held by a program that is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."
     if ($Rows.Count -ne 1 -or $Rows[0].Address -cne '127.0.0.1') { throw $NotOurs }
     $Row = $Rows[0]
+    if (-not $Row.CommandLine -or -not $Row.Path -or (($Row.CommandLine.Length - $Row.CommandLine.Replace('"', '').Length) % 2) -ne 0) { throw $NotOurs }
     $Words = @(Split-CommandLine $Row.CommandLine)
-    $After = [Array]::IndexOf(@($Words | ForEach-Object { $_.ToLowerInvariant() }), '--db')
-    $Fits = $Words -contains 'quota_balancer' -and $Words -contains 'serve' -and $After -ge 0 -and ($After + 1) -lt $Words.Count
-    if (-not $Fits -or [IO.Path]::GetFullPath($Words[$After + 1]) -ine $Store) { throw $NotOurs }
-    $Direct = $Row.Path -ieq $Py
-    $ViaLauncher = $Row.ParentPath -ieq $Py -and $Row.ParentCommandLine -ieq $Row.CommandLine
-    if (-not ($Direct -or $ViaLauncher)) { throw $NotOurs }
+    $Want = @($PyFlags) + @(Get-ServeArgs)
+    if ($Words.Count -ne ($Want.Count + 1) -or -not [IO.Path]::IsPathRooted($Words[0]) -or [IO.Path]::GetFullPath($Words[0]) -ine $Py) { throw $NotOurs }
+    for ($Index = 0; $Index -lt $Want.Count; $Index++) {
+        $Same = if ($Want[$Index] -ceq $Store) { [IO.Path]::GetFullPath($Words[$Index + 1]) -ieq $Store } else { $Words[$Index + 1] -ceq $Want[$Index] }
+        if (-not $Same) { throw $NotOurs }
+    }
+    if ($Row.Path -ieq $Py) { return }                                                                  # (a) step 1's Python itself
+    $Config = Join-Path (Split-Path -Parent (Split-Path -Parent $Py)) 'pyvenv.cfg'                      # (b) a venv launcher and its one child
+    if ($Config -notlike 'C:\lw\*' -or -not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw $NotOurs }
+    try { Assert-NoLink $Config } catch { throw $NotOurs }
+    $Lines = @(Get-Content -LiteralPath $Config -Encoding UTF8)
+    $Executable = @($Lines | Where-Object { $_ -match '^\s*executable\s*=\s*(.+?)\s*$' } | ForEach-Object { $Matches[1] }) | Select-Object -First 1
+    $HomeFolder = @($Lines | Where-Object { $_ -match '^\s*home\s*=\s*(.+?)\s*$' } | ForEach-Object { $Matches[1] }) | Select-Object -First 1
+    $Base = if ($Executable) { $Executable } elseif ($HomeFolder) { Join-Path $HomeFolder 'python.exe' } else { $null }
+    if (-not $Base -or -not [IO.Path]::IsPathRooted($Base) -or $Row.Path -ine [IO.Path]::GetFullPath($Base)) { throw $NotOurs }
+    if ($Row.ParentPath -ine $Py -or -not $Row.ParentCommandLine -or $Row.ParentCommandLine -cne $Row.CommandLine) { throw $NotOurs }
 }
 
 # Step 11's second start check: no reporter for this settings file is running already.
