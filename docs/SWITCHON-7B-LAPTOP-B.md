@@ -1,8 +1,8 @@
 # Switching on usage readings on Laptop B: the operator's runbook
 
 Mode: how-to. For: the operator, at Laptop B (the machine the Leasewise team's seats run on). Status: **rehearsed end to end on made-up data** in the
-lead's scratch folder (`docs/STEP-CARD-7B-ON.md`); **not yet run for real**. Leasewise commit to install: `<COMMIT>` (the lead fills this in at the
-hand-over). Approved by claude-agenttalk-lead on 2026-10-09 (answer to q-9ddb21b0c31c): first on this machine, for our own team's two accounts only.
+lead's scratch folder (`docs/STEP-CARD-7B-ON.md`); **not yet run for real**. Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
+40-character commit id; if you see angle brackets there, stop and ask the lead). Approved by claude-agenttalk-lead on 2026-10-09 (answer to q-9ddb21b0c31c): first on this machine, for our own team's two accounts only.
 
 ## What this does, in plain words
 
@@ -21,7 +21,7 @@ Everything lives in **one new folder**, `C:\lw\live`. Deleting that folder (step
 
 **Done when** the reporter's status shows accepted figures for both accounts after a real turn of each seat, and shows no warning (step 13 checks this, and only counts figures newer than a baseline you record in step 12).
 
-**How long.** About 45 minutes of your time from the first script to step 12 (most of it is copying two texts and reading what each script prints), then a wait
+**How long.** About 45 minutes of your time from the first script to step 12 (most of it is typing the parts of two account texts and reading what each script prints), then a wait
 for one real turn of a Claude seat and of the Codex seat (the lead can give each a small task), then step 13.
 
 ## Before you start
@@ -31,10 +31,13 @@ You need all of these. If one is missing, stop.
 1. **PowerShell 7** (`pwsh`). The scripts were rehearsed with it. Windows PowerShell 5.1 was **not** rehearsed with them and refused scripts on our machines earlier. The machine's
    script policy decides what may run, and it must **never** be changed. If the check in step 0 says scripts cannot run, stop and tell the lead.
 2. **Python 3.11 or newer**, with its full path (for example the team's `C:\lw\venv\Scripts\python.exe`). Leasewise needs no other package.
-3. **Three things from the lead**: the folder `docs\switchon-7b` (the scripts; copy it anywhere you like, for example to `C:\lw\switchon-7b`, and keep its files together),
-   `leasewise-<COMMIT>.zip` (a source archive of the exact commit; **put it inside `C:\lw`**, for example `C:\lw\leasewise-<COMMIT>.zip`: step 1 refuses an archive anywhere else or behind a link) and its SHA-256 checksum.
-4. **Nothing else uses port 8443** on this machine (Leasewise listens only on `127.0.0.1`, which is this machine; it refuses any other address).
-5. **The account texts**: you will copy two lines from your own screen in step 8. See step 8 for how to get them; do not collect them earlier than that.
+3. **agenttalk 0.99.0 or newer** on this machine, with **every seat restarted on it and one turn done since**. Older agenttalk writes usage files without the account text this feature needs. Step 3 checks that
+   usable files exist for both providers and stops if not. If a later agenttalk writes another format, step 3 stops too: then tell the lead; do not try to get around it.
+4. **Three things from the lead**: the folder `docs\switchon-7b` (the scripts; copy it anywhere you like, for example to `C:\lw\switchon-7b`, and keep its files together),
+   the archive `leasewise-<COMMIT>.zip` (a source archive of the exact commit; in your copy `<COMMIT>` is the commit id, and if you still see angle brackets, stop and ask the lead; **put the archive inside `C:\lw`**: step 1 refuses an archive anywhere else or behind a link) and its SHA-256 checksum.
+5. **Nothing else uses port 8443** on this machine (Leasewise listens only on `127.0.0.1`, which is this machine; it refuses any other address). Step 10 checks this and refuses to start if anything listens
+   there; step 11 checks that the only listener is window 1's server before it sends anything.
+6. **The account parts**: you will type four short parts from your own screen in step 8 (a name and 8 characters, for each of the two accounts). See step 8 for how to get them; do not collect them earlier than that.
 
 You will use **two extra PowerShell windows** at the end: window 1 runs the Leasewise server, window 2 runs the reporter.
 
@@ -57,6 +60,15 @@ pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
   (never following a link) and stops if any entry in it is a link: a junction, a symbolic link or any other kind. That one rule covers the source package, the store, the state folder, the reporter's
   database and the settings. It stops with a message too if the folder holds more than 50,000 entries, which it never should. The remaining limit, stated plainly: the live folder is private (only you,
   SYSTEM and Administrators can write in it), so a link could appear between the check and its use only if one of those made it.
+- **Python runs without outside influence.** Every Python call in every script uses the same three switches (`-E -s -B`): `PYTHON...` environment variables such as `PYTHONPATH` are ignored, your own installed
+  Python packages are not used, and no bytecode files are written.
+- **"Private" means private to your Windows account.** Only your Windows account, SYSTEM and Administrators can open `C:\lw\live`. But **any program running under your Windows account can read it**, including
+  another team's seats on this machine if they run under the same account. When the lead checked on 9 October 2026, only this team's seats were running here; if another team's seats ever run here under your account, this limit applies to them. What that exposes: the identity value (it only lets a program send readings to this
+  machine's own Leasewise) and the account texts. The scripts cannot change this.
+- **Limits that remain, stated plainly.** (1) The live folder is private, so a link could appear between the check and its use only if you, SYSTEM or an Administrator made it. (2) The port checks of steps 10 and 11
+  happen once, when you start: a program that stopped the server and took the port over *after* step 11's check, or that edited `server.json`, would have to run under your own Windows account (Windows refuses a second program from another account on a port that is
+  in use; Microsoft's page "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE" describes this), and a program under your own account can read the settings file anyway. The Leasewise server itself is unchanged. (3) Hard links
+  are not detected; the scripts only write files they create.
 - **If a script stops with a message, read it.** Each message says whether anything was changed. The scripts never print a secret, an account text, a user name or a seat name.
 - **Never set an `LW_SWITCHON_...` environment variable.** They exist only for the lead's test run in a scratch folder, which needs a switch and all of its settings together. If one is present
   in your window the scripts stop at once with a plain message and change nothing: close that window and open a new one.
@@ -91,16 +103,24 @@ It must print `PowerShell 7...` and `scripts run here`. If the machine refuses i
 
 ## Step 1: choose the names, then make the private folder
 
-Script: `switchon-01-setup.ps1`. **Edit the three lines in angle brackets first**: the full path of Python, the full path of the archive, and the checksum the lead gave you. The other names
-(`laptop-b`, `claude-main`, `codex-main`, `leasewise-team`) are Leasewise's own names for this machine, the two accounts and the project; keep them unless the lead says otherwise.
+Script: `switchon-01-setup.ps1`. **You do not edit it.** It asks three plain questions and shows what you type, because none of it is secret: the full path of Python (for example `C:\Python313\python.exe`), the full
+path of the archive (inside `C:\lw`), and the checksum the lead gave you. Quote marks around a path are removed. The other names (`laptop-b`, `claude-main`, `codex-main`, `leasewise-team`) are Leasewise's own names for this
+machine, the two accounts and the project; they stay fixed in the script.
 
 <!-- script: switchon-01-setup.ps1 -->
 ```powershell
 '== Step 1: names and the private folder'
 
-$Py            = '<C:\path\to\python.exe>'                      # Python 3.11 or newer
-$Archive       = '<C:\path\to\leasewise-COMMIT.zip>'            # the archive the lead gave you; it must lie inside C:\lw
-$ExpectedSha   = '<the SHA-256 the lead gave you>'
+if (Test-Path -LiteralPath 'Env:LW_SWITCHON_PYTHON') {   # the lead's test run only (the guard allows it in rehearsal mode and nowhere else)
+    $Py = $env:LW_SWITCHON_PYTHON
+    $Archive = $env:LW_SWITCHON_ARCHIVE
+    $ExpectedSha = $env:LW_SWITCHON_SHA
+}
+else {
+    $Py = (Read-Host 'The full path of python.exe (Python 3.11 or newer), for example C:\Python313\python.exe').Trim().Trim('"')
+    $Archive = (Read-Host 'The full path of the archive the lead gave you (it must lie inside C:\lw), for example C:\lw\leasewise-1234abcd.zip').Trim().Trim('"')
+    $ExpectedSha = (Read-Host 'The SHA-256 checksum the lead gave you (64 characters)').Trim()
+}
 $MachineAlias  = 'laptop-b'                                     # this machine, as Leasewise names it
 $ClaudeAlias   = 'claude-main'                                  # our Claude account, as Leasewise names it
 $CodexAlias    = 'codex-main'                                   # our Codex account, as Leasewise names it
@@ -112,32 +132,31 @@ $StateDir   = Join-Path $LiveRoot 'state'                       # the reporter's
 $Journal    = Join-Path $LiveRoot 'journal'                     # an empty folder the reporter insists on
 $Names      = Join-Path $LiveRoot 'names.json'
 
-if ($Py -like '*<*' -or $Archive -like '*<*' -or $ExpectedSha -like '*<*') { throw 'Fill in the three values in angle brackets first. Nothing was changed.' }
-if (($ExpectedSha -cnotmatch '^[0-9A-Fa-f]{64}$') -or (($MachineAlias, $ClaudeAlias, $CodexAlias, $ProjectAlias | Where-Object { $_ -cnotmatch '^[a-z0-9][a-z0-9-]{0,62}$' }).Count -gt 0)) { throw 'The checksum or a name is not in the allowed form. Nothing was changed.' }
+if (($ExpectedSha -cnotmatch '^[0-9A-Fa-f]{64}$') -or (($MachineAlias, $ClaudeAlias, $CodexAlias, $ProjectAlias | Where-Object { $_ -cnotmatch '^[a-z0-9][a-z0-9-]{0,62}$' }).Count -gt 0)) { throw 'The checksum is not 64 characters of 0-9 and a-f. Nothing was changed. Run step 1 again.' }
 Assert-PythonFile $Py
 Assert-PlainFile $Archive                                       # a file inside C:\lw with no link anywhere on its way
 if ([IO.Path]::GetExtension($Archive) -ne '.zip') { throw 'The archive must be a .zip file. Nothing was changed.' }
 if (Test-Path -LiteralPath $LiveRoot) { throw "The folder $LiveRoot already exists. Nothing was changed. If an earlier run made it, roll it back with step 15; otherwise tell the lead." }
 New-Item -ItemType Directory -Path $LiveRoot | Out-Null  # no -Force: an existing folder is an error
-Protect-Path $LiveRoot $true
-Assert-Private $LiveRoot $true
 
+# The marker and names.json come first, at once: neither holds a secret, and step 15 can remove the folder from them whatever happens next.
 $Token = [guid]::NewGuid().ToString('N')                 # random
 $Here = (Resolve-Path -LiteralPath $LiveRoot).ProviderPath
 [IO.File]::WriteAllText((Join-Path $LiveRoot '.owner.json'), (ConvertTo-Json @{ token = $Token; path = $Here }), $Utf8)
-New-Item -ItemType Directory -Path $StateDir, $Journal, (Split-Path $Store) | Out-Null
-
 $Saved = [ordered]@{                                     # only these names are ever read back; every path is recomputed from LiveRoot and BusRoot
     LiveRoot = $LiveRoot; BusRoot = $BusRoot; Port = $PortNumber; Token = $Token; Py = $Py; Archive = $Archive; ExpectedSha = $ExpectedSha
     MachineAlias = $MachineAlias; ClaudeAlias = $ClaudeAlias; CodexAlias = $CodexAlias; ProjectAlias = $ProjectAlias
 }
 [IO.File]::WriteAllText($Names, ($Saved | ConvertTo-Json -Depth 3), $Utf8)
+try { Protect-Path $LiveRoot $true; Assert-Private $LiveRoot $true }
+catch { throw "$LiveRoot was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead." }
+New-Item -ItemType Directory -Path $StateDir, $Journal, (Split-Path $Store) | Out-Null
 Test-Path -LiteralPath $Names
 ```
 
 It checks the three values (Python must be one plain file; the archive must be a `.zip` file inside `C:\lw` with no link on its way), refuses a folder that already exists (nothing is changed), creates
-`C:\lw\live`, makes it **private** and reads the access list back by security identifier before anything is written, writes an ownership marker (which the rollback checks before it deletes anything)
-and saves a short list of names. It must print `True`.
+`C:\lw\live`, **at once** writes the ownership marker and the short list of names (neither holds a secret; step 15 needs them), and only then makes the folder **private** and reads the access list back by security
+identifier. If that fails it says "`C:\lw\live` was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead." It must print `True`.
 If it says the folder already exists, an earlier run made it: roll that back with step 15, or tell the lead. **Do not choose another folder.**
 
 ## Step 2: check the archive, then unpack it
@@ -159,21 +178,30 @@ It must list the source folders (`docs`, `quota_balancer`, `tests` and a few fil
 
 ## Step 3: check Python and the usage files
 
-Script: `switchon-03-check.ps1`. It only reads. It prints Python's version and **how many** usage files agenttalk has (a number; nothing in them is shown).
+Script: `switchon-03-check.ps1`. It only reads. It prints Python's version, **how many** usage files agenttalk has, and for each provider **how many usable ones** (numbers only; nothing in them is shown). A usable file is one the reporter's own scan
+accepts (format number exactly 2, scope "account" and every other documented field) and whose account text starts with `claude:` or `codex:`. If the folder cannot be read, or holds more entries or usage files than the reporter looks at (4096
+entries, 64 files), step 3 and step 8 say so and stop.
 
 <!-- script: switchon-03-check.ps1 -->
 ```powershell
 '== Step 3: check Python and the usage files'
-& $Py -c 'import sys; print(sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 11) else 1)'
+& $Py @PyFlags -c 'import sys; print(sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 11) else 1)'
 if ($LASTEXITCODE -ne 0) { throw 'Python is older than 3.11.' }
 $StateFolder = Join-Path $BusRoot 'state'
 if (-not (Test-Path -LiteralPath $StateFolder -PathType Container)) { throw 'The agenttalk state folder was not found. Nothing was changed. Tell the lead.' }
 $Count = @(Get-ChildItem -LiteralPath $StateFolder -Filter '*.capacity.json' -File).Count
 '{0} usage file(s) found' -f $Count
 if ($Count -eq 0) { throw 'No usage file was found yet. Run a turn in a seat first, or tell the lead. Nothing was changed.' }
+$Usable = Invoke-UsageScan 'count' $null                     # asked of the reporter's own scan (agenttalk 0.99.0 or newer); only counted, never shown
+foreach ($Provider in 'claude', 'codex') {
+    $Number = $Usable.$Provider
+    '{0}: {1} usable usage file(s)' -f $Provider, $Number
+    if ($Number -eq 0) { throw "No usable $Provider usage file was found. Every seat must run agenttalk 0.99.0 or newer, be restarted on it, and have done one turn since. If they do, a later agenttalk may write another format: tell the lead. Nothing was changed." }
+}
 ```
 
-It must print a version of 3.11 or newer and at least one usage file. If there is none yet, run a turn in a seat first.
+It must print a version of 3.11 or newer, at least one usage file and at least one usable file for **each** of Claude and Codex. If a provider has none, the seats are on an older agenttalk or have not done a turn
+since the restart: update and restart them, run a turn in a seat of each provider, and run step 3 again. If a later agenttalk writes another format, step 3 stops and you tell the lead.
 
 ## Step 4: set up the store
 
@@ -182,7 +210,7 @@ Script: `switchon-04-store.ps1`. It creates Leasewise's empty store (private).
 <!-- script: switchon-04-store.ps1 -->
 ```powershell
 '== Step 4: set up the store'
-& $Py -m quota_balancer --db $Store init
+& $Py @PyFlags -m quota_balancer --db $Store init
 if ($LASTEXITCODE -ne 0) { throw 'init failed' }
 Assert-Private (Split-Path $Store) $false
 Test-Path -LiteralPath $Store
@@ -199,6 +227,14 @@ and refuses nothing. Read the block, then run the script `switchon-05-accounts.p
 <!-- script: switchon-05-accounts.ps1 -->
 ```powershell
 '== Step 5: the two accounts and the allowed reporter'
+$Question = @'
+import sqlite3, sys
+conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+print(conn.execute("SELECT (SELECT COUNT(*) FROM accounts) + (SELECT COUNT(*) FROM machines)").fetchone()[0])
+'@
+$Have = & $Py @PyFlags -c $Question $Store                 # read-only: how many accounts and machines the store already has
+if ($LASTEXITCODE -ne 0 -or "$Have" -cnotmatch '^[0-9]+$') { throw 'The store could not be read. Nothing was changed. Tell the lead.' }
+if ([int]"$Have" -ne 0) { throw 'Step 5 was already done. Nothing was changed. Go on with step 6.' }
 $Inventory = @"
 {"version":2,
  "accounts":[{"alias":"$ClaudeAlias","vendor":"anthropic","kind":"subscription","budget_micro_eur":null},
@@ -213,14 +249,15 @@ $Inventory = @"
 "@
 $InventoryFile = Join-Path $LiveRoot 'inventory.json'    # inside the private folder: new files there inherit its private list
 Set-Content -LiteralPath $InventoryFile -Value $Inventory -Encoding ascii
-& $Py -m quota_balancer --db $Store config-import --file $InventoryFile
+& $Py @PyFlags -m quota_balancer --db $Store config-import --file $InventoryFile
 if ($LASTEXITCODE -ne 0) { throw 'config-import failed. Nothing else was changed. Tell the lead.' }
-& $Py -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
+& $Py @PyFlags -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
 if ($LASTEXITCODE -ne 0) { throw 'policy-ids failed' }
 (Get-Content -LiteralPath $PolicyIds -Raw | ConvertFrom-Json).accounts | ForEach-Object { $_.alias }
 ```
 
-It must print the two account names. It replaces Leasewise's inventory, which is empty at this point; it touches nothing else.
+It must print the two account names. It replaces Leasewise's inventory, which is empty at this point; it touches nothing else. Before it writes anything it checks, read-only, that the store has no account or
+machine yet; if it has, it says "Step 5 was already done. Nothing was changed. Go on with step 6." and you do.
 
 ### Check after step 5 (step 6)
 
@@ -242,7 +279,7 @@ for alias in sys.argv[3:]:
     bad += row is None
 sys.exit(1 if bad else 0)
 '@
-& $Py -c $Question $Store $MachineAlias $ClaudeAlias $CodexAlias
+& $Py @PyFlags -c $Question $Store $MachineAlias $ClaudeAlias $CodexAlias
 if ($LASTEXITCODE -ne 0) { throw 'This machine is not an allowed reporter for both accounts. Do not go on. Tell the lead.' }
 'both accounts: allowed'
 ```
@@ -269,7 +306,7 @@ $Bytes = New-Object byte[] 24
 $Rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $Rng.GetBytes($Bytes)
 $Id = ($Bytes | ForEach-Object { $_.ToString('x2') }) -join ''
-$Id | & $Py -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true
+$Id | & $Py @PyFlags -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true
 if ($LASTEXITCODE -ne 0) { throw 'identity-set failed' }
 Assert-PrivateAfter $Store $false                             # the store now holds the value: it must still be private
 
@@ -296,12 +333,20 @@ It must print `private: 3 access entries, all of them you, SYSTEM or Administrat
 
 This is the step that needs your hand. The reporter finds an account by **the account text agenttalk writes**, and you tell it which Leasewise account each text means.
 
-**Get the two texts.** On your own screen, run `agenttalk capacity` (the same way you run agenttalk anywhere else). It prints one line per account, written `<provider>:<your Windows user name>:home-<eight letters or digits>`.
-Find the **Claude** line (it starts with `claude:`) and the **Codex** line (it starts with `codex:`). The texts contain your Windows user name, so: **copy them only from your own screen, only into this script's two
+**Get the four parts.** On your own screen, run `agenttalk capacity` (the same way you run agenttalk anywhere else). For each account it prints a line like
+
+```
+  claude account of OS user <name> (home-xxxxxxxx), 2 seats: ...
+```
+
+You need two parts of that line, for the Claude line and again for the Codex line: **the name after "OS user"** and **the 8 characters of `home-xxxxxxxx`** (with or without the `home-` in front). The script puts them together the
+way agenttalk writes them in its usage files, `<provider>:<name>:home-<8 characters>`. The name is your Windows user name, so: **type the parts only from your own screen, only into this script's four
 questions, and never into the repository, a message to the lead, a report or a chat.**
 
-Run the script `switchon-08-table.ps1`. It first checks that the settings file is private (a refusal there changes nothing), then asks for the two texts. **Nothing you type or paste is shown** (the question is masked):
-paste each, press Enter. It checks their **shape** and says which one is wrong without showing it, and writes the table into the private settings file only if both are right.
+Run the script `switchon-08-table.ps1`. It first checks that the settings file is private (a refusal there changes nothing), then asks four questions. **Nothing you type or paste is shown** (the questions are masked):
+type each part, press Enter. It checks the shape of each part and says which one is wrong without showing it. Because masked typing hides typos, it then asks **the reporter's own file scan** (the very code the reporter runs, so it looks at exactly the files the reporter reads and accepts) how many usage files carry exactly that
+account text; the texts reach it on standard input, never on a command line, and only a count comes back, like `Claude: matches 1 usage file(s)`. If a text matches no file it says so and writes nothing. The table is written into the private settings
+file only if both are right.
 
 <!-- script: switchon-08-table.ps1 -->
 ```powershell
@@ -310,17 +355,31 @@ Assert-Private $LiveRoot $true                           # before anything is as
 Assert-Private $ConfigPath $true
 if ((Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8) -match '\[\[readings\.sources\]\]') { throw 'The account table is already in the settings file. Nothing was changed. Tell the lead.' }
 if ($env:LW_SWITCHON_INPUT -ceq 'env') {                 # the lead's test run only (the guard allows it in rehearsal mode and nowhere else)
-    $ClaudeText = $env:LW_SWITCHON_CLAUDE_TEXT
-    $CodexText = $env:LW_SWITCHON_CODEX_TEXT
+    $ClaudeName, $ClaudeHome = $env:LW_SWITCHON_CLAUDE_NAME, $env:LW_SWITCHON_CLAUDE_HOME
+    $CodexName, $CodexHome = $env:LW_SWITCHON_CODEX_NAME, $env:LW_SWITCHON_CODEX_HOME
 }
 else {
-    $ClaudeText = Read-Host -MaskInput 'Claude account text, as agenttalk capacity prints it (it is not shown as you type)'
-    $CodexText = Read-Host -MaskInput 'Codex account text, as agenttalk capacity prints it (it is not shown as you type)'
+    $ClaudeName = Read-Host -MaskInput 'Claude: the name after "OS user" (it is not shown as you type)'
+    $ClaudeHome = Read-Host -MaskInput 'Claude: the 8 characters of home-xxxxxxxx (it is not shown as you type)'
+    $CodexName = Read-Host -MaskInput 'Codex: the name after "OS user" (it is not shown as you type)'
+    $CodexHome = Read-Host -MaskInput 'Codex: the 8 characters of home-xxxxxxxx (it is not shown as you type)'
 }
-$Shape = '^{0}:.+:home-[0-9a-f]{{8}}$'
-if ($ClaudeText -cnotmatch ($Shape -f 'claude')) { throw 'The Claude text is not in the form claude:<user>:home-<8 characters 0-9 a-f>. Nothing was changed. Copy it again.' }
-if ($CodexText -cnotmatch ($Shape -f 'codex')) { throw 'The Codex text is not in the form codex:<user>:home-<8 characters 0-9 a-f>. Nothing was changed. Copy it again.' }
-if ($ClaudeText -eq $CodexText) { throw 'The two texts are the same. Nothing was changed. Copy them again.' }
+function Join-AccountText {
+    param([string]$Provider, [string]$Label, [string]$Name, [string]$Home8)
+    if ($Name.Length -lt 1 -or $Name.Length -gt 256 -or $Name -cmatch '[\p{Cc}:]' -or $Name -cne $Name.Trim()) {
+        throw "The $Label name is not in the allowed form (1 to 256 characters, no colon, no control character, no space at either end). Nothing was changed. Run step 8 again."
+    }
+    if ($Home8 -cnotmatch '^(home-)?([0-9a-f]{8})$') { throw "The $Label home part must be exactly 8 characters 0-9 and a-f, with or without home- in front. Nothing was changed. Run step 8 again." }
+    '{0}:{1}:home-{2}' -f $Provider, $Name, $Matches[2]
+}
+$ClaudeText = Join-AccountText 'claude' 'Claude' $ClaudeName $ClaudeHome
+$CodexText = Join-AccountText 'codex' 'Codex' $CodexName $CodexHome
+$Counts = Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }          # the reporter's own scan; the texts go in on standard input, only counts come back
+foreach ($Pair in @(@('Claude', 'claude'), @('Codex', 'codex'))) {
+    $Found = $Counts.($Pair[1])
+    if ($Found -eq 0) { throw ('The {0} text you typed does not match any of our usage files. Nothing was changed. Compare with your agenttalk capacity screen and run step 8 again.' -f $Pair[0]) }
+    '{0}: matches {1} usage file(s)' -f $Pair[0], $Found
+}
 $ToToml = { param($Value) '"' + ([string]$Value).Replace('\', '\\').Replace('"', '\"') + '"' }       # a TOML basic string: only \ and " need escaping
 $Rows = @"
 
@@ -338,11 +397,12 @@ account = $(& $ToToml $CodexAlias)
 "@
 [IO.File]::AppendAllText($ConfigPath, $Rows, $Utf8)           # the file keeps its private list
 Assert-PrivateAfter $ConfigPath $true
-Remove-Variable ClaudeText, CodexText, Rows
+Remove-Variable ClaudeName, ClaudeHome, CodexName, CodexHome, ClaudeText, CodexText, Rows
 'two rows written'
 ```
 
-It must print `two rows written`. If it says a text is not in the right form, copy that line again; nothing was changed.
+It must print the two `matches` lines and `two rows written`. If it says a part is not in the right form, or a text does not match any of our usage files, nothing was changed: compare with your agenttalk capacity screen
+and run step 8 again.
 
 ### Check after step 8 (step 9)
 
@@ -351,7 +411,7 @@ Script: `switchon-09-check-table.ps1`. The reporter's `status` reads the setting
 <!-- script: switchon-09-check-table.ps1 -->
 ```powershell
 '== Step 9: check the account table'
-$Json = & $Py -m quota_balancer reporter status --config $ConfigPath --json
+$Json = & $Py @PyFlags -m quota_balancer reporter status --config $ConfigPath --json
 if ($LASTEXITCODE -ne 0) { throw 'The settings are refused (see the sentence above). Nothing secret was shown. Tell the lead.' }
 $Readings = ($Json | ConvertFrom-Json).readings
 if (-not $Readings.configured) { throw 'The settings hold no account table.' }
@@ -367,32 +427,73 @@ It must print `claude -> claude-main`, `codex -> codex-main` and `table: ok`.
 
 ## Step 10 (window 1): the Leasewise server
 
-Open a **new PowerShell 7 window** and run `switchon-10-server.ps1`. It prints nothing while it works. Leave the window open; you stop it with Ctrl-C in that window (step 14 then shows what is still running).
+Open a **new PowerShell 7 window** and run `switchon-10-server.ps1`. Before it starts anything it looks at who listens on port 8443. If anything does, it stops with the process number and program name and starts nothing
+("Something on this machine already listens on port 8443 ..."): if that is window 1 from earlier, go back to that window; otherwise tell the lead. This also refuses a second step 10. If it cannot read the list, it stops too.
+Then it **starts the server itself** and writes down which program it started (in `server.json` in the live folder: the program's number and start time), before it waits. The server prints nothing while it works. Leave the window
+open; you stop it with Ctrl-C in that window (that ends the server too; step 14 then shows what is still running). When the server ends by itself, the window says either "Window 1's server has stopped." or "Window 1's server stopped
+with an error (code N). Tell the lead."
 
 <!-- script: switchon-10-server.ps1 -->
 ```powershell
-$ServeArgs = @('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)
-& $Py @ServeArgs
+$Holders = @(Get-PortListeners $PortNumber)
+if ($Holders.Count -gt 0) {
+    throw ('Something on this machine already listens on port {0} (process {1}, program {2}). Nothing was started. If it is window 1 from earlier, go back to that window; otherwise tell the lead.' -f $PortNumber, $Holders[0].ProcessId, $Holders[0].Name)
+}
+$RecordFile = Join-Path $LiveRoot 'server.json'
+if ((Test-Path -LiteralPath $RecordFile) -and -not (Test-Path -LiteralPath $RecordFile -PathType Leaf)) { throw "$RecordFile is not a file. Nothing was started. Tell the lead." }
+function Save-ServerRecord { param([string]$Text) [IO.File]::WriteAllText($RecordFile, $Text, $Utf8) }
+$Server = $null
+$Saved = $false
+try {
+    $Start = New-Object Diagnostics.ProcessStartInfo
+    $Start.FileName = $Py
+    foreach ($Word in @($PyFlags) + @(Get-ServeArgs)) { [void]$Start.ArgumentList.Add($Word) }      # one word at a time: Windows quoting is done by .NET, never by joining strings
+    $Start.UseShellExecute = $false                                                                  # no redirection: the server shares this window, as before
+    $Start.WorkingDirectory = $Src
+    $Server = [Diagnostics.Process]::Start($Start)
+    $Record = [ordered]@{ schema = 1; pid = $Server.Id; started_utc_ticks = $Server.StartTime.ToUniversalTime().Ticks; port = $PortNumber }
+    try { Save-ServerRecord ($Record | ConvertTo-Json) } catch { throw 'The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead.' }
+    $Saved = $true
+    while (-not $Server.WaitForExit(500)) { }                                                        # short slices, so Ctrl-C in this window still works
+}
+finally {
+    if ($Server -and -not $Server.HasExited) {
+        if (-not $Saved) { $Server.Kill($true); [void]$Server.WaitForExit(10000) }                  # no record: stop it at once, with everything it started
+        elseif (-not $Server.WaitForExit(5000)) { $Server.Kill($true) }                              # Ctrl-C reaches both; this only makes sure the server we started is gone
+    }
+}
+if ($Server.ExitCode -eq 0) { 'Window 1''s server has stopped.' }
+else { "Window 1's server stopped with an error (code $($Server.ExitCode)). Tell the lead." }
 ```
 
 ## Step 11 (window 2): the reporter
 
-A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. It prints one line per cycle, like
+A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is **the program step 10 started** (the one written down in `server.json`, still running, with the same start time, and
+your Python) **or the one program that program started in turn** (a virtual environment's `python.exe` starts the real interpreter as a second process that owns the port). It does not read any command line to decide this. If
+`server.json` is missing or wrong it says "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."; if anything else holds the port it says "Port 8443 is held by a program that is not window 1's
+Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." It also refuses to start when a reporter for the same settings is already running. The reporter prints one line per cycle, like
 `{"blocked": null, "journal": "ok", "new_events": 0, "sent": 2}`. Leave it open.
 
 <!-- script: switchon-11-reporter.ps1 -->
 ```powershell
+Assert-OurServerListens
+Assert-NoReporterRunning
 $RunArgs = @('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)
-& $Py @RunArgs
+& $Py @PyFlags @RunArgs
 ```
 
 `"blocked": "unreachable"` means the server (window 1) is not running. A reporter that stops at once with `CONFIG_...` is telling you a setting is wrong (see "If something goes wrong").
+
+**If window 1 or window 2 prints an error or closes by itself, stop.** Press Ctrl-C in the other window, start nothing again, and tell the lead which window it was and its last line (leave out any path that contains your
+user name). Never run step 10 or step 11 again while their windows are open; the scripts refuse that too.
 
 **After a restart of the machine**, nothing needs setting up again: run step 10, then step 11, in two new windows. The reporter keeps its own state and sends nothing twice.
 
 ## Step 12: record the baseline
 
-Run this once the reporter (step 11) has been running for a while, and **before** you ask the lead for the real turns. Script: `switchon-12-baseline.ps1`. It writes `baseline.json` with three things: a
+Wait **at least two minutes** after you started window 2, and until it has printed a line with `"sent"` greater than 0 (each line is one cycle of about 30 seconds, so such a line may appear once between lines that show 0). Then run this, **before** you ask the lead for the real turns. If every line still shows `"sent": 0`
+after five minutes, that is normal when no seat has had a turn in the last ten minutes (a figure counts for ten minutes only): go on anyway; the script then says "no accepted figure yet" for the account, and the real turns
+are what step 13 waits for. Script: `switchon-12-baseline.ps1`. It writes `baseline.json` with three things: a
 schema number, **this machine's clock** at that moment (UTC, in milliseconds), and for each account the newest figure Leasewise has accepted so far (or none). The done check counts only figures **observed after both**.
 Waiting does not prove that the reporter's delivery queue is empty: a figure that was observed before this step can still arrive after it, and because the check also compares the figure's own time with the
 clock time recorded here, such a late arrival cannot make it pass.
@@ -410,7 +511,7 @@ for alias in sys.argv[2:]:
     newest = conn.execute("SELECT MAX(w.observed_at) FROM windows w JOIN accounts a ON a.id = w.account_id WHERE a.alias = ?", (alias,)).fetchone()[0]
     print(alias + " " + str(int(newest or 0)))
 '@
-$Lines = @(& $Py -c $Question $Store $ClaudeAlias $CodexAlias)
+$Lines = @(& $Py @PyFlags -c $Question $Store $ClaudeAlias $CodexAlias)
 if ($LASTEXITCODE -ne 0 -or $Lines.Count -ne 2) { throw 'The store could not be read. Nothing was changed. Tell the lead.' }
 $Delivered = [ordered]@{}
 foreach ($Line in $Lines) {
@@ -440,10 +541,8 @@ it asks Leasewise's store and the reporter's status, and prints aliases and numb
 '== Step 13: the done check'
 $BaselineFile = Join-Path $LiveRoot 'baseline.json'
 if (-not (Test-Path -LiteralPath $BaselineFile -PathType Leaf)) { throw 'No baseline was recorded. Run step 12 first. Nothing was changed.' }
-function Test-Whole { param($Value) ($Value -is [int]) -or ($Value -is [long]) }
-function Test-Object { param($Item) ($null -ne $Item) -and ($Item.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') }       # PowerShell calls a list a custom object too, so the exact type is looked at
-function Test-HasAll { param($Item, [string[]]$Names) (Test-Object $Item) -and (@($Names | Where-Object { $Item.PSObject.Properties.Name -cnotcontains $_ }).Count -eq 0) }
-function Test-HasOnly { param($Item, [string[]]$Names) (Test-HasAll $Item $Names) -and (@($Item.PSObject.Properties).Count -eq $Names.Count) }
+function Get-Now { [DateTimeOffset]::UtcNow }                     # every reading of the clock goes through here
+$ClockBack = 'The clock moved back since step 12. Nothing was changed. Run step 12 again with -Again, then ask the lead for the two turns again.'
 $NotBaseline = 'The baseline is not the file step 12 made. Nothing was changed. Tell the lead.'
 try { $Base = Get-Content -LiteralPath $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { throw $NotBaseline }
 if (-not (Test-HasOnly $Base 'schema', 'cut_ms', 'delivered') -or -not (Test-Whole $Base.schema) -or $Base.schema -ne 1 -or -not (Test-Whole $Base.cut_ms) -or $Base.cut_ms -le 0 -or -not (Test-HasOnly $Base.delivered $ClaudeAlias, $CodexAlias)) { throw $NotBaseline }
@@ -454,7 +553,7 @@ foreach ($Alias in $ClaudeAlias, $CodexAlias) {
     $Delivered[$Alias] = if ($null -eq $Value) { [int64]0 } else { [int64]$Value }
 }
 $Cut = [int64]$Base.cut_ms
-if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $Cut - 30000) { throw 'The clock moved back since step 12. Nothing was changed. Run step 12 again with -Again, then ask the lead for the two turns again.' }
+if ((Get-Now).ToUnixTimeMilliseconds() -lt $Cut - 30000) { throw $ClockBack }
 $Question = @'
 import sqlite3, sys
 conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
@@ -467,14 +566,14 @@ $Deadline = (Get-Date).AddMinutes($WaitMinutes)
 do {
     $Problems = @()
     $Newest = @{}
-    $Lines = @(& $Py -c $Question $Store $ClaudeAlias $CodexAlias)
+    $Lines = @(& $Py @PyFlags -c $Question $Store $ClaudeAlias $CodexAlias)
     if ($LASTEXITCODE -ne 0) { $Problems += 'The store could not be read.' }
     else {
         foreach ($Line in $Lines) { if ($Line -cmatch '^([a-z0-9][a-z0-9-]*) ([0-9]+)$') { $Newest[$Matches[1]] = [int64]$Matches[2] } }
         if ($Lines.Count -ne 2 -or $Newest.Count -ne 2) { $Problems += 'The store gave an answer this step does not understand.' }
     }
     $Status = $null
-    $Json = & $Py -m quota_balancer reporter status --config $ConfigPath --json
+    $Json = & $Py @PyFlags -m quota_balancer reporter status --config $ConfigPath --json
     if ($LASTEXITCODE -ne 0) { $Problems += 'The reporter status could not be read (the reporter may never have run).' }
     else {
         try { $Parsed = ($Json | Out-String) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { $Parsed = $null }
@@ -487,6 +586,8 @@ do {
         }
         else { $Status = $Parsed }
     }
+    $Now = Get-Now                                       # a fresh reading, taken when the decision is made
+    if ($Now.ToUnixTimeMilliseconds() -lt $Cut - 30000) { throw $ClockBack }
     if ($Status) {
         $Have = @(@($R.sources) | ForEach-Object { if (Test-Object $_) { '{0} -> {1}' -f $_.provider, $_.account } else { '?' } } | Sort-Object)
         $Want = @(('claude -> ' + $ClaudeAlias), ('codex -> ' + $CodexAlias) | Sort-Object)
@@ -497,7 +598,7 @@ do {
         if ($null -eq $R.last_scan) { $Problems += 'The reporter has not scanned yet.' }
         elseif ($null -eq $When) { $Problems += 'The reporter''s last scan time could not be read.' }
         else {
-            $Age = ([DateTimeOffset]::UtcNow - $When).TotalSeconds
+            $Age = ($Now - $When).TotalSeconds
             if ($Age -gt 180) { $Problems += 'The reporter has not scanned in the last three minutes (is window 2 running?).' }
             elseif ($Age -lt -30) { $Problems += 'The reporter''s last scan lies more than 30 seconds ahead of this machine''s clock.' }
         }
@@ -520,26 +621,28 @@ if ($Problems.Count -gt 0) { throw ('Not done: ' + ($Problems -join ' ') + ' Not
 It must end with `PASSED`. The check fails closed: it passes only if **all** of this holds, and otherwise it says which part failed and that nothing was changed. It needs: the baseline file is the one step 12 wrote; **each account has an accepted figure observed after the baseline's clock time and after that account's newest figure at that time**; the reporter's status
 command succeeded and answered with a proper JSON object whose readings part is configured, lists exactly the two accounts and has a last-scan time that can be read; that last scan lies between three minutes
 ago and 30 seconds ahead of this machine's clock (the 30 seconds are the stated clock tolerance); every other command succeeded and its answer could be read; and the status shows no operator warning, no
-failed reading and no capture fault. "Scanned within three minutes" means the reporter ran recently; it does **not** prove the reporter is still running now. If it stops, it names what is missing; read "If something goes wrong".
+failed reading and no capture fault. The clock is read again, fresh, at the moment it decides: if it has moved back by more than 30 seconds since step 12 it says so instead of passing, and the scan age is measured against that same reading. "Scanned within three minutes" means the reporter ran recently; it does **not** prove the reporter is still running now. If it stops, it names what is missing; read "If something goes wrong".
 Then follow "Tell the lead".
 
 ## Step 14: see what is still running, and stop it
 
-Stop the windows yourself: press Ctrl-C in window 2, then in window 1. Then run `switchon-14-stopped.ps1`. It **only lists** what is still running from the live folder; it stops nothing.
+Stop the windows yourself: press Ctrl-C in window 2, then in window 1. Then run `switchon-14-stopped.ps1`. It reads the list of **all** processes on this machine and **only lists** those whose command line names the live folder, with process number and program name; it stops nothing.
 
 <!-- script: switchon-14-stopped.ps1 -->
 ```powershell
 '== Step 14: what is still running'
-Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + [WildcardPattern]::Escape($LiveRoot) + '*') } | Select-Object ProcessId, Name
+Get-LiveProcesses | Select-Object ProcessId, Name
 ```
 
 It prints nothing but its banner when everything has stopped (it may show its own PowerShell: ignore that). If a process is listed, go back to its window and press Ctrl-C there.
 
 ## Step 15: roll back (undo everything)
 
-Stop both windows first (step 14). The script `switchon-15-rollback.ps1` deletes `C:\lw\live`, and nothing else, after these checks: the folder holds the ownership marker this runbook wrote (and the marker is a plain file, not a link),
-**no link anywhere on the way to it or inside it** (it looks at every entry and never follows a link), it is the folder `names.json` names, and the agenttalk folder is neither the same folder nor inside it. If any check fails it
-deletes nothing and tells you. It never touches the agenttalk folder.
+Stop both windows first (step 14). The script `switchon-15-rollback.ps1` deletes `C:\lw\live`, and nothing else, after these checks: it runs step 14's check itself and refuses while window 1 or 2 is still running; the folder holds
+the ownership marker this runbook wrote (and the marker is a plain file, not a link); **no link anywhere on the way to it or inside it** (it looks at every entry and never follows a link); it is the folder `names.json`
+names; and the agenttalk folder is neither the same folder nor inside it. If `names.json` is missing (step 1 stopped early), it deletes only a folder that holds nothing but the marker. If any check fails it deletes nothing
+and tells you. It deletes everything else first, then `names.json`, then the marker, then the empty folder, so if a delete fails part way (a program still holds a file) the marker and `names.json` are still there and you can
+run it again. It never touches the agenttalk folder.
 
 <!-- script: switchon-15-rollback.ps1 -->
 ```powershell
@@ -547,10 +650,23 @@ deletes nothing and tells you. It never touches the agenttalk folder.
 Set-Location -LiteralPath (Split-Path -Parent $LiveRoot)           # leave the live folder (it is about to be deleted)
 Assert-Plain $LiveRoot
 Assert-NoLink $LiveRoot
-Assert-NoLink (Join-Path $LiveRoot '.owner.json')                  # the marker is a plain file, not a link, before it is read
-$Marker = Get-Content -LiteralPath (Join-Path $LiveRoot '.owner.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not (Test-Path -LiteralPath $LiveRoot -PathType Container)) { 'There is nothing to roll back: the folder does not exist.'; return }
+$Running = @(Get-LiveProcesses)                          # the same list as step 14, without this script's own process
+if ($Running.Count -gt 0) { throw ('Window 1 or 2 is still running (process {0}). Press Ctrl-C in it, then run step 15 again. Nothing was deleted.' -f $Running[0].ProcessId) }
+$MarkerFile = Join-Path $LiveRoot '.owner.json'
+Assert-NoLink $MarkerFile                                          # the marker is a plain file, not a link, before it is read
+if (-not (Test-Path -LiteralPath $MarkerFile -PathType Leaf)) { throw 'The folder holds no ownership marker, so it is not a folder this runbook made. Nothing was deleted. Tell the lead.' }
+$Marker = Get-Content -LiteralPath $MarkerFile -Raw -Encoding UTF8 | ConvertFrom-Json
 $Here = (Resolve-Path -LiteralPath $LiveRoot).ProviderPath
-if (($Marker.token -ne $Token) -or ($Marker.path -ne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
+if ($N) {
+    if (($Marker.token -cne $Token) -or ($Marker.path -cne $Here)) { throw 'This is not the folder this runbook made. Nothing was deleted.' }
+}
+else {                                                   # names.json is missing: only a folder that holds nothing but the marker may go
+    $Inside = @((New-Object IO.DirectoryInfo($Here)).GetFileSystemInfos())
+    if (($Marker.path -cne $Here) -or ([string]$Marker.token -cnotmatch '^[0-9a-f]{32}$') -or $Inside.Count -ne 1 -or $Inside[0].Name -cne '.owner.json') {
+        throw 'names.json is missing and the folder holds more than the ownership marker, so it cannot be told to be ours. Nothing was deleted. Tell the lead.'
+    }
+}
 $Links = 0                                               # a link anywhere inside: look at every entry, never go into a link
 $Pending = New-Object System.Collections.Generic.Stack[string]
 $Pending.Push($Here)
@@ -562,7 +678,15 @@ while ($Pending.Count -gt 0) {
 }
 if ($Links -gt 0) { throw 'The live folder contains a link. Nothing was deleted. Tell the lead.' }
 Assert-Separate                                          # the last look before the delete: the agenttalk folder is not the live folder and not inside it
-Remove-Item -LiteralPath $LiveRoot -Recurse -Force
+try {
+    foreach ($Child in @(Get-ChildItem -LiteralPath $LiveRoot -Force | Where-Object { $_.Name -cne '.owner.json' -and $_.Name -cne 'names.json' })) {
+        Remove-Item -LiteralPath $Child.FullName -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $NamesFile) { Remove-Item -LiteralPath $NamesFile -Force }
+    Remove-Item -LiteralPath $MarkerFile -Force
+    [IO.Directory]::Delete($LiveRoot)                    # not recursive: the folder is empty by now
+}
+catch { throw ('A file could not be deleted (is a program still using it?). The ownership marker and names.json are kept while anything else is left, so you can run step 15 again after closing it. Tell the lead if it fails again. ' + $_.Exception.Message) }
 Test-Path -LiteralPath $LiveRoot
 ```
 
@@ -576,19 +700,19 @@ Run `switchon-help-status.ps1`. It prints the reporter's readings status: closed
 <!-- script: switchon-help-status.ps1 -->
 ```powershell
 '== The readings status'
-& $Py -m quota_balancer reporter status --config $ConfigPath --json | ConvertFrom-Json | Select-Object -ExpandProperty readings | ConvertTo-Json -Depth 5
-& $Py -m quota_balancer reporter status --config $ConfigPath --json | ConvertFrom-Json | Select-Object -ExpandProperty operator_actions
+& $Py @PyFlags -m quota_balancer reporter status --config $ConfigPath --json | ConvertFrom-Json | Select-Object -ExpandProperty readings | ConvertTo-Json -Depth 5
+& $Py @PyFlags -m quota_balancer reporter status --config $ConfigPath --json | ConvertFrom-Json | Select-Object -ExpandProperty operator_actions
 ```
 
 The reporter's status raises three lines of its own for readings. What each means here:
 
 - **`FORBIDDEN: this machine is not an authorized reporter for the account`.** Leasewise refused a reading with 403. On this machine it means step 5 did not take effect (the placeholder seat or the project's
   accounts). Run step 6 again; if it passes and this line stays, tell the lead. Each refused reading fails for good, and later readings are still sent.
-- **`N seat file(s) name an agenttalk account that is not in readings.sources`.** A usage file in our agenttalk folder belongs to an account text that is not in your table. Two causes: the table has a typo
-  (it was checked for shape only), or a seat runs under another Claude or Codex folder, which has a different text. Run `agenttalk capacity` and compare with the table by eye. If the account is meant to
-  be reported, ask the lead; if not, ignore the line.
-- **`A seat file has not followed the documented capacity format for N scans in a row`.** A usage file breaks agenttalk's documented format, often because agenttalk was updated. Tell the lead which
-  agenttalk version runs; nothing else is needed.
+- **`N seat file(s) name an agenttalk account that is not in readings.sources`.** A usage file in our agenttalk folder belongs to an account text that is not in your table. Step 8 proved that both texts match a usage file when it wrote them, so this line means a seat runs under another
+  Windows user or another home folder than the two you typed. Run `agenttalk capacity` and compare the `home-` part and the name of each account line with what you typed. If the account is meant to be
+  reported, ask the lead; if not, ignore the line.
+- **`A seat file has not followed the documented capacity format for N scans in a row`.** A usage file breaks agenttalk's documented format, often because agenttalk was updated to a version that writes another format.
+  Tell the lead which agenttalk version runs; nothing else is needed.
 
 Other words in the status: `retrying` with `MALFORMED_RESPONSE` means Leasewise answered a success without a usable body and the reporter is sending the same figure again (harmless, repeated after the usual
 wait). `refused: ...` as a failure code means Leasewise rejected a reading for good; send the status to the lead.
@@ -605,7 +729,8 @@ show an account text. **Never send** `reporter.toml`, a usage file, the output o
 
 - The scripts only read agenttalk's files: the reporter opens `<bus>\state\*.capacity.json` read-only with the strict reader of card 7b (`quota_balancer/reporter/capacityreader.py`): at most 64 files, 16 KiB each, links skipped.
 - Settings: one `[[readings.sources]]` row per account (`bus_root`, `provider`, `agenttalk_account`, `account`); no `limit_events`, gateway or money-reader table, so none of those lanes runs. `poll_seconds = 30`.
-- Ports: Leasewise on `127.0.0.1:8443` (the identity header authenticates this machine; Leasewise refuses other addresses).
+- Ports: Leasewise on `127.0.0.1:8443` (the identity header authenticates this machine; Leasewise refuses other addresses). Step 10 lists the machine's listening TCP endpoints (IPv4 and IPv6, any address) and starts only
+  if none is on the port; step 11 requires exactly one, on `127.0.0.1`, owned by the process step 10 started and recorded in `server.json` (schema 1, pid, start time in ticks, port; the process must still run with that start time and be step 1's Python) or by its direct child started after it. No command line is read to identify the server.
 - Authorization: `http_api._authorized_reporter_for_account` accepts a machine that has a seat in a team whose project has the account (step 5's placeholder seat). Step 6 asks the same question of the store.
 - The done check needs: a store query and a status command that both succeed, a reporter scan in the last 180 seconds, exactly the two expected sources, an accepted observation per account later than both the clock time and the delivered maximum recorded in `baseline.json` (schema 1, checked field by field), a scan time between 180 seconds ago and 30 seconds ahead, and no operator line, failed reading or capture fault.
 - Flow after the done check: each window keeps its latest unsent figure, Leasewise gets at most one accepted figure per window every two minutes (a new reset time goes at once), and the gaps sentence of

@@ -231,3 +231,178 @@ none waiting or failed); with the reporter stopped and three minutes gone it fai
 named; a baseline from the future stopped step 13 with the clock message and `-Again` replaced it; the older cases (a stray variable, a partial set, overlapping roots, a saved bus that differs, a link in an
 ancestor, a linked source folder, a linked archive parent) each stopped with "Nothing was changed"; step 15 then printed `False` and the fake agenttalk folder was intact. The transcripts hold no user name,
 no placeholder account text and no identity value.
+
+
+## Card 7b-on2 (liaison cold read)
+
+The liaison (claude-agenttalk-lead) read the merged runbook cold, on the desktop, and returned FIX (commit `af33f1a`). The safety design passed: no policy change, no install, no writes outside the live folder, loopback only,
+no other team's files, no secret printed. Three things blocked it and six more were to be fixed before the run. The lead decided each one (order tk-e36437a82cac); this section builds exactly those, plus Codex's one MINOR
+from the last read. Two commits on top of `af33f1a`: the scripts with the rebuilt runbook, and the tests.
+
+### In plain words
+
+1. **Step 8 now asks for the parts, not for text the screen never shows.** `agenttalk capacity` prints a sentence, not the `claude:<name>:home-xxxxxxxx` text. The script asks for the name and the 8 characters (four masked
+   questions), puts the text together itself and then compares it with our own usage files, so a typo is found before anything is written.
+2. **The runbook names the agenttalk version** (0.99.0 or newer, every seat restarted, one turn done) and step 3 refuses unless both providers have a file the reporter can use.
+3. **Port 8443 is checked.** Step 10 will not start while anything listens on the port. Step 11 will not start the reporter (which carries the identity value) unless the only listener is window 1's own server.
+4. **Step 1 and step 15 can always undo each other**, step 15 will not delete while a window is running, and it deletes the marker last so a failed delete can be repeated.
+5. Smaller stops and wording (windows that fail, step 1's questions, step 5 twice, step 12's wait, the commit sentence, step 14's text), **Python without outside influence**, **privacy per Windows account**, and the clock
+   is read again when step 13 decides.
+
+### Finding by finding
+
+1. **Step 8 (blocking).** `switchon-08-table.ps1`: four masked questions (the name after "OS user" and the 8 characters of `home-xxxxxxxx`, for each provider; `home-` in front is optional; exactly 8 of 0-9 a-f; a name is 1 to 256
+   characters with no colon, no control character and no space at either end). The messages say which part is wrong and never show it. The assembled text must equal the `account` of a usable usage file of that provider; only a
+   count is printed ("Claude: matches 1 usage file(s)"). The reading of the usage files is one function, `Get-UsageAccounts`, in `switchon-common.ps1`, shared with step 3, with the reporter's limits (first 64 files by name, 16 KiB,
+   links skipped). A file counts as a match only if the reporter could use it (see 2). Rehearsal input now sets four parts (`LW_SWITCHON_CLAUDE_NAME`, `_CLAUDE_HOME`, `_CODEX_NAME`, `_CODEX_HOME`); all are in the guard's list, so
+   any one of them stops an operator's run. The troubleshooting line for "N seat file(s) name an agenttalk account that is not in readings.sources" now says that step 8 proved a match, so the line means a seat runs under another
+   Windows user or home folder.
+2. **agenttalk version (blocking).** "Before you start" names agenttalk 0.99.0 or newer, every seat restarted on it, one turn since. Step 3 counts, per provider, the files with `schema_version` exactly the whole number 2, `scope`
+   "account" and a non-empty `account` starting with `claude:` or `codex:` (as `capacityreader.py` accepts schema 2 only) and refuses if either provider has none; the runbook says that if a later agenttalk writes another format,
+   step 3 stops and the operator tells the lead.
+3. **Port 8443 (blocking).** `Get-PortListeners` (Get-NetTCPConnection, IPv4 and IPv6, any address, joined with the process list): step 10 stops with the process number and program name if anything listens, and also if the list
+   cannot be read (only the one error "nothing listens there" means none; a first draft treated every "not found" error as none, which a test with a missing cmdlet showed to be fail-open). Step 11 requires exactly one listener, on
+   `127.0.0.1`, whose command line has `quota_balancer`, `serve` and `--db` followed by exactly the store (case-insensitive), run by step 1's Python, directly or as the child of a launcher with the same command line; and it refuses a
+   second reporter for the same settings file. No server code changed.
+4. **Step 1 (before the run).** Order: ask and check; create the folder; write the marker and `names.json` at once; make the folder private and check it; make the subfolders. A privacy failure says "was made but could not be made
+   private. Nothing secret was written. Run step 15 to remove it, then tell the lead." Step 15 without `names.json` deletes only a folder whose marker names it and which holds nothing but the marker.
+5. **Step 15 (before the run).** It runs step 14's process check first (one shared function, leaving out its own process) and refuses while window 1 or 2 runs. Delete order: everything except the marker and `names.json`, then
+   `names.json`, then the marker, then the empty folder; a failure part way keeps the first two.
+6. **Windows that fail.** Steps 10 and 11 say: if a window prints an error or closes by itself, stop, press Ctrl-C in the other, start nothing again, tell the lead which window and its last line (without any path that holds your
+   user name); never run step 10 or 11 while their windows are open (the scripts refuse that now).
+7. **Wording and small stops.** (a) Step 1 asks three plain questions (not secret, so shown; quote marks are removed); the aliases stay fixed; rehearsal variables `LW_SWITCHON_PYTHON`, `_ARCHIVE`, `_SHA` are in the guard's list
+   (all set or none). (b) Step 12 waits two minutes and for a line with `"sent"` above 0; the reporter sends nothing when every usage file is older than ten minutes (a figure counts for ten minutes), so the text says: if every
+   line still shows 0 after five minutes, go on. (c) Step 5 refuses if the store already has an account or a machine. (d) The commit sentences read correctly both with the placeholder and in the hand-over copy. (e) Step 14's text
+   says it reads all processes and shows only those that name the live folder.
+8. **Python without outside influence.** One list, `$PyFlags = -E -s -B`, in `switchon-common.ps1`, used by every Python call (a drift test checks every call). `-I` was not used because the scripts run from the source folder.
+   `PYTHONDONTWRITEBYTECODE` is gone (`-E` ignores it; `-B` replaces it).
+9. **Privacy per Windows account.** Said plainly in the runbook: only your Windows account, SYSTEM and Administrators can open the folder; any program running under your Windows account can read it, including another team's seats
+   on this machine if they run under the same account (when the lead checked on 2026-10-09, only this team's seat wrappers were running on Laptop B, all under one account; the limit applies if another team's seats ever run here under it); what that exposes is the identity value (it only lets a program send readings to this machine's own Leasewise) and the account texts.
+10. **Clock (Codex's MINOR).** Step 13 reads the clock through one function, `Get-Now`, at the start and again, fresh, when it decides; the "clock moved back" check and the scan age use that fresh reading.
+
+### Stated limits (also in the runbook's "Limits that remain")
+
+- **Link race:** the live folder is private, so a link could appear between the check and its use only if the operator, SYSTEM or an Administrator made it.
+- **Port take-over:** the checks of steps 10 and 11 happen once, when the step starts. A program that took the port over after step 11's check would have to run under the operator's own Windows account (Windows refuses a second
+  binding of a port in use from another account; Microsoft's page "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE" describes this), and such a program can read the settings file anyway. On this machine, with two sockets on a scratch
+  port in the same account: when both set `SO_REUSEADDR` (which Python's `ThreadingHTTPServer`, the Leasewise server, does), the second bind succeeds and the connection I made reached the first; when only the second set it, or
+  only the first, or neither, the second bind was refused; with `SO_EXCLUSIVEADDRUSE` on the first the second was refused. So the server's own socket does not stop a same-account second listener; the start checks do. Nothing more is claimed.
+- **Look-alike:** a program of the operator's own account that imitates window 1's command line would pass step 11's check; it could read the settings file anyway.
+- Hard links are not detected (the scripts only write files they create).
+
+### What I saw with the venv launcher
+
+With `C:\lw\venv\Scripts\python.exe` as step 1's Python, window 1's socket belongs to a child process whose program is the base interpreter and whose parent is the launcher; both have the same command line. Step 11 accepted it
+(rehearsal and `test_our_own_server_is_accepted_including_through_the_venv_launcher`); the check accepts a child only when its parent is step 1's Python with the same command line. Step 14 lists both processes.
+
+### Not built
+
+The liaison's separate request to switch the agenttalk turn journal on for one seat (for the clock-skip measurement) is not part of this order; nothing here touches it.
+
+### How the red-first order was shown
+
+The new test file was run in a detached worktree at `af33f1a` (since removed): 41 of its 82 tests fail there (step 1's questions and privacy order, the clock seam, the whole port group, step 8's parts and typo, step 3's formats, step
+5 twice, step 15's cases, Python isolation, the rehearsal variables). Saved list: `red-on2-behaviour.txt` in the developer's scratch. The clock tests fail there on the missing `Get-Now` seam rather than on behaviour.
+
+### Rehearsal (scratch only, strict mode; `rehearsal4-part1.txt`, `rehearsal4-part2.txt`)
+
+Steps 0 to 15 with made-up data and the venv python. Step 1 on a pseudo console (three questions, answers shown), step 8 on a pseudo console (four masked questions, nothing typed visible, two `matches` lines). A stranger on the
+rehearsal port: step 10 and step 11 both refused, nothing started. Window 1 started; a second step 10 refused; window 2 started; a second step 11 refused. Idle seats (usage files an hour old): window 2 printed `"sent": 0`
+(so step 12's text allows going on); after fresh files one line showed `"sent": 4`. Baseline, the done check failing before new figures and for a figure observed before step 12 and delivered after it, passing after new figures.
+Step 14 listed the four processes; step 15 refused while they ran. Then the stray-variable, partial-answers, linked-package, clock-moved-back (`-Again`) and step-15 cases on a marker-only folder (removed) and a marker with
+something else (refused). Step 15 then printed `False`; the fake agenttalk folder was intact.
+
+
+### Fix round 1 (Codex delta tk-982c65ffad44)
+
+Codex read card 7b-on2 at `9914603` and returned FIX: one MAJOR and two MINOR points, all reproduced with synthetic data. The lead fixed the rules (order tk-0b8c734a7c0c); this section builds exactly those. Two commits on top
+of `9914603`: the scripts with the rebuilt runbook, and the tests.
+
+**In plain words.** Step 11 used to accept any program whose command line contained the right words, so an unrelated script given those words as arguments would have passed, and the identity value could have gone to it. It
+now accepts only the exact command that step 10 launches. Steps 3 and 8 used to copy the reporter's rules for reading the usage files in PowerShell, and the copy differed from the reporter (it counted links before dropping them,
+and checked the size before a separate full read). They now ask the reporter's own scan, so they cannot differ.
+
+1. **Step 11 checks the exact command (MAJOR).** `Assert-OurServerListens` in `switchon-common.ps1`. The listener's command line is split into words (an odd number of quote marks, or a process whose command line or program cannot
+   be read, is refused). The words after the program must equal, in order and with nothing before, between or after, `$PyFlags` followed by `Get-ServeArgs`: the one function step 10 also uses
+   (`-E -s -B -m quota_balancer --db <store> serve --host 127.0.0.1 --port <port>`); the store is compared as a Windows path ignoring case, every other word exactly. The program is one of two cases: (a) step 1's Python itself,
+   with its first word naming the same file; (b) when step 1's Python is a venv launcher (a `pyvenv.cfg` in the folder above its folder, inside `C:\lw`, not a link), the listener's program equals that file's `executable =`
+   value (or `home =` plus `python.exe`), its parent is step 1's Python, and the parent's command line is identical to the child's. No other child is accepted. The runbook and this record say the remaining limit once: a program
+   under the operator's own Windows account could copy this exact command line, for example from another folder; it could read the settings file anyway.
+2. **Steps 3 and 8 use the reporter's own scan (MINOR 2 and 3).** `Get-UsageAccounts` is gone. One small Python helper (a here-string in `switchon-common.ps1`, run with `$PyFlags` from the source folder like the other Leasewise
+   commands) calls `quota_balancer.reporter.capacityreader.scan(<agenttalk folder>, <now in ms>)`, which already applies `strictfile.walk` (entries bounded before collecting, links and folders dropped, names checked, then 64
+   files) and `strictfile.load_json` (reads at most 16,385 bytes). Step 3 gets, per provider, the number of accepted files whose account starts with `claude:` or `codex:`. Step 8 sends the two assembled texts on **standard input**
+   (JSON, non-ASCII escaped) and gets, per provider, how many accepted files have exactly that account. The answer is numbers only; on any problem the helper prints one fixed sentence and exits non-zero (it catches everything, so no
+   exception text can carry an account), and the step stops with a plain message. A folder that cannot be listed, or more entries or files than the reporter looks at, stops the step and says so. `scan` could be called cleanly this
+   way, so nothing is mirrored in PowerShell.
+3. **Record and runbook.** The runbook says step 11's exact check and its remaining limit, and that steps 3 and 8 use the reporter's own scan ("the very code the reporter runs"). The lead's rewording of the shared-account sentence
+   (`9914603`) is kept.
+
+**Tests** (`tests/test_switchon_behaviour.py`, `tests/test_switchon_scripts.py`). `ExactServerCommand`: a fake `quota_balancer` package in the working folder listens on the test port whatever it is given, so any command line can be
+tried; the exact command is accepted whatever the case of the store; refused: an unrelated script given the words and the exact store, `-c` mode, a trailing extra word, an extra word in the middle, a different flag order, a missing
+flag, another port number, another store, `serve` before `--db`; a copied venv launcher with a matching `pyvenv.cfg` is accepted (with `executable`, and with `home` only) and refused when the file names another interpreter; a
+child whose parent's command line differs is refused; a non-venv Python with a child is refused. `RealServerAcceptance` and the earlier real-server test cover the genuine direct and the genuine venv-launcher cases. `UsageFormat`:
+64 links that sort first plus two plain files are both counted; a file over 16 KiB and a valid small document followed by 20,000 blanks are not counted (and the same document without the blanks is); more than 64 files stops the
+step with the plain message; a broken scan stops the step with no account text and no traceback; the texts reach the scan on standard input only. The usage files in the tests are now complete synthetic fixtures of the reporter's
+format, because the reporter's own scan checks every field. The tests also pick a free port instead of a fixed one (another seat's test run was found holding the old one).
+
+**Red first.** The new test file was run on `9914603` (detached worktree, since removed): 6 of 92 tests fail there: the unrelated-script case, the venv child whose program is not the file's interpreter, the 64 earlier links, the
+more-than-64-files stop, the broken scan, and the texts-on-standard-input test. The others pass there too: the old code already refused a child whose parent's command line differs, a non-venv Python with a child, and any file over
+16 KiB (it checked the size). The new tests still pin those.
+
+**Rehearsal** (`rehearsal5-part1.txt`, `rehearsal5-part2.txt` in the developer's scratch): steps 0 to 15 in strict mode with the venv Python as before, and it adds an unrelated script holding the port with the exact store (refused; no reporter running afterwards).
+
+
+### Fix round 2 (Codex delta 2 tk-2d28eb122f76, fallback D-321)
+
+Codex read the card at `862f0a7` and returned FIX again, on step 11's listener check only (the two usage-scan findings were closed). Its MAJOR points: the check split the listener's command line into words in its own way, and Python
+splits it differently (`-m "quota_balancer"--db "<store>"` passes the word check, but Python runs the module `quota_balancer--db`); the store word was resolved in the checker's folder, so `..\store\inventory.db` named another
+database from another folder; and a drive-relative `executable = C:..\..\base\python.exe` in `pyvenv.cfg` counted as rooted. The lesson: reading another process's command line can never prove what that process runs. So the
+lead's pre-declared fallback (D-321) applies: **step 11 identifies the server by the process step 10 started and recorded, never by the text of a command line.** Two commits on top of `862f0a7`.
+
+**In plain words.** Step 10 now starts the server itself and writes down which program it started (its number and its start time) before it waits. Step 11 accepts only that program, or the one program it started in turn
+(a virtual environment's `python.exe` starts the real interpreter as a second process that owns the port). No command line is read to decide this, so no clever command line can pass.
+
+1. **Step 10 starts and records.** `switchon-10-server.ps1`: the port check stays first; then `System.Diagnostics.ProcessStartInfo` with `FileName` = step 1's Python, `ArgumentList` filled one word at a time from `$PyFlags` and
+   `Get-ServeArgs` (so .NET does the Windows quoting, never string joining), `UseShellExecute = $false`, no redirection (the server shares window 1 as before), working folder = the source folder. Before it waits it writes
+   `server.json` with exactly `schema` 1, `pid`, `started_utc_ticks` (from the process's `StartTime`) and `port`. It then waits in slices of 500 milliseconds (so Ctrl-C works); a `finally` gives the server five seconds to follow
+   Ctrl-C and then stops the process it started. When the server ends it says "Window 1's server has stopped." (exit code 0) or "Window 1's server stopped with an error (code N). Tell the lead." `server.json` is in the guard's
+   list of derived paths checked for links.
+2. **Step 11 checks only the record.** `Assert-OurServerListens` reads `server.json` strictly like the baseline (exactly the four fields, whole numbers, schema 1, this run's port); a missing or malformed file says "Window 1 was
+   not started by step 10 of this runbook. Start step 10 first. Nothing was started." The recorded process must still run with the recorded start time (a reused process number does not match) and its program must be step 1's Python
+   (a Windows path, ignoring case). Exactly one listener on the port, on `127.0.0.1`, owned by (a) the recorded process or (b) its direct child (its parent number is the recorded one and it started at or after the recorded
+   time); the child's program and command line are not looked at. Anything else gives the existing "not window 1's Leasewise server ... the identity value was not sent" stop; an unreadable process or port list stops the step.
+   All command-line parsing and the `pyvenv.cfg` logic are gone from the function. `Get-ServeArgs` stays as the single source of step 10's arguments. `Assert-NoReporterRunning` still reads command-line words because it can only
+   refuse (and a second reporter is also stopped by the reporter's own exclusive state lock); a comment says so. The strict-reading helpers (`Test-Whole`, `Test-Object`, `Test-HasAll`, `Test-HasOnly`) moved from step 13 into the
+   shared start.
+3. **Runbook.** Steps 10 and 11 say it in plain words; every sentence about the exact command-line check and `pyvenv.cfg` is gone.
+
+**Remaining limit, stated once:** a program under the operator's own Windows account could stop the server and take the port after step 11's check, or edit `server.json`. Such a program can read the settings file anyway: the
+shared-account limit already stated.
+
+**Tests** (`RecordedServer`, `Step10Starts` in `tests/test_switchon_behaviour.py`; the drift test). Accepted: the real server started by step 10 itself, with the base Python and through the venv launcher (the child owns the socket); a
+recorded launcher with a listening child; a recorded base interpreter that listens itself. Refused, each also proving that the real step 11 stops before it would start the reporter (a copy of step 11 whose last line only says it
+would start it): Codex's quoted-boundary command started by a test; the relative-store command; a stranger that is neither the recorded process nor its child; a grandchild; a recorded process that has ended; an edited or earlier
+start time; a recorded program that is not step 1's Python; two listeners (one on `::1`); a listener on every address; a missing record and fifteen malformed ones (not JSON, a list, `null`, an empty object, an extra field, the wrong
+port, schema 2, a text or negative or zero or fractional number, a missing field), all with the real listener present; a link in place of `server.json`. Step 10: it passes exactly the flags and the serve words through
+`ArgumentList` with a store path containing a space (the fake server reports its own arguments and flags), writes the record while the server still runs (checked with the server paused), the recorded start time equals the
+process's own; a clean exit, an exit with code 3 and a missing module (code 1) give the right messages; Ctrl-C through the pseudo console ends the script and the server, the port is free and step 14 lists nothing. The drift test
+pins that step 10 has no call operator, writes the record before `WaitForExit(500)`, shares `Get-ServeArgs` with step 11, and that no command-line text is left in `Assert-OurServerListens`.
+
+**Red first.** The new test file was run on `862f0a7` (detached worktree, since removed): 7 of 18 tests of the two new classes fail there (the quoted-boundary command, the missing and malformed records, the launcher and direct
+acceptances through a record, step 10's arguments and record, its messages, and Ctrl-C). The rest pass there too: the old check already refused the relative-store command (it resolved it in another folder), strangers and a
+grandchild.
+
+**Rehearsal** (`rehearsal6-part1.txt`, `rehearsal6-part2.txt`, strict mode, venv Python): a stranger on the port before any record (step 10 and step 11 refused; no reporter ran); an unrelated script holding the port (refused); window 1
+accepted through the venv launcher and its child, a second step 10 refused, window 2 up, a second step 11 refused; the baseline, the done check and step 14/15 as before; then, with the record of the stopped window 1 still in place,
+Codex's quoted-boundary stranger holding the port (step 11 refused, 0 reporter processes afterwards); then Ctrl-C in two pseudo consoles ended window 1 (the server's process was gone, the port free) and window 2, and step 14 listed
+nothing; the adversarial cases and step 15 as before.
+
+### Close-out (Codex delta 3 tk-505934ca5f9b)
+
+Codex's third read closed every listener-identity finding and found one new MAJOR in step 10: the script started the server and then built and wrote `server.json` before its `try`/`finally`, so if the write failed the cleanup
+never ran and an unrecorded server kept running (step 11 refused it, so nothing unsafe followed, but the operator could not simply retry). Step 10 now refuses first if `server.json` exists and is not a plain file ("... is not a
+file. Nothing was started. Tell the lead."); the start and the record are both inside the `try`; and if the record is not saved, the `finally` stops the server and everything it started at once (`Kill($true)`, then waits for it to be
+gone) and the operator reads "The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead." The normal path keeps its five seconds' grace after Ctrl-C. The record is
+written by a one-line function, `Save-ServerRecord`, which the test replaces with a failing one in a copy of the script (a test hook; no production check is weakened). Tests (`Step10Starts`): a folder at `server.json` starts nothing;
+a failing record write, run directly and through the venv launcher, leaves no server process (the process the script was handed is gone, the port is free, step 14 lists nothing) and gives the plain message; the normal path and Ctrl-C
+tests pass as before. Both new tests fail on `b914256` (the first with the raw .NET error after the server had started; the second at the missing seam).

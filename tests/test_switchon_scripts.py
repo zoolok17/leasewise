@@ -39,8 +39,8 @@ STEPS = [
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "86a173489b81e604b79932051d16a50cbf19e1014b47c12cc4812efa6e834fff",
-    GUARD: "7cf862672a3dba1e44210f71bfa5a514e02fd36500457fe04a4e555c235dac61",
+    COMMON: "0bca963b56dee86dce917034c4374507e8baf7d76d53483b712323a43bff3d77",
+    GUARD: "09f7065fafd9611026d5ddcd80b67faa7bf55aba1da6f9e6613cbf060bf4b71b",
 }
 
 
@@ -183,13 +183,16 @@ class Safety(unittest.TestCase):
                     self.assertTrue(match.group(0).startswith("http://127.0.0.1:"), (name, match.group(0)))
                 for match in re.finditer(r"\b[A-Za-z]:\\[^\s'\"\)]*", line):
                     text = match.group(0)
-                    self.assertTrue(text.lower().startswith("c:\\lw") or text.startswith("C:\\path\\to\\"), (name, text))
+                    self.assertTrue(text.lower().startswith("c:\\lw") or (name == "switchon-01-setup.ps1" and text == "C:\\Python313\\python.exe"), (name, text))
 
     def test_only_the_rollback_deletes_and_only_the_live_folder(self):
         for name, lines in self.all_code().items():
-            deletes = [line for line in lines if re.search(r"Remove-Item|\.Delete\(|rmdir|rd /s|del /|robocopy|takeown|icacls", line)]
+            deletes = [line for line in lines if re.search(r"Remove-Item|\.Delete\(|::Delete\(|rmdir|rd /s|del /|robocopy|takeown|icacls", line)]
             if name == "switchon-15-rollback.ps1":
-                self.assertEqual(deletes, ["Remove-Item -LiteralPath $LiveRoot -Recurse -Force"])
+                self.assertEqual([line.split("  #")[0].strip() for line in deletes],
+                                 ["Remove-Item -LiteralPath $Child.FullName -Recurse -Force",
+                                  "if (Test-Path -LiteralPath $NamesFile) { Remove-Item -LiteralPath $NamesFile -Force }",
+                                  "Remove-Item -LiteralPath $MarkerFile -Force", "[IO.Directory]::Delete($LiveRoot)"])
             else:
                 self.assertEqual(deletes, [], name)
 
@@ -198,7 +201,13 @@ class Safety(unittest.TestCase):
         self.assertLess(text.index("ReparsePoint"), text.index("Remove-Item"))
         self.assertLess(text.index(".owner.json"), text.index("Remove-Item"))
         self.assertLess(text.index("$Links -gt 0"), text.index("Remove-Item"))
-        self.assertLess(text.index("Assert-NoLink (Join-Path $LiveRoot '.owner.json')"), text.index("Get-Content"))     # the marker is no link before it is read
+        self.assertLess(text.index("Assert-NoLink $MarkerFile"), text.index("Get-Content"))                              # the marker is no link before it is read
+        self.assertLess(text.index("Get-LiveProcesses"), text.index("Remove-Item"))                                     # nothing is deleted while a window still runs
+        self.assertLess(text.index("Window 1 or 2 is still running"), text.index("Remove-Item"))
+        order = [text.index(word) for word in ("Remove-Item -LiteralPath $Child.FullName", "Remove-Item -LiteralPath $NamesFile", "Remove-Item -LiteralPath $MarkerFile",
+                                               "[IO.Directory]::Delete($LiveRoot)")]
+        self.assertEqual(order, sorted(order))                                # everything else, then names.json, then the marker, then the empty folder
+        self.assertIn("names.json is missing", text)
         self.assertLess(text.index("Assert-Separate"), text.index("Remove-Item"))                                       # the roots are checked again right before the delete
         self.assertLess(text.index("Assert-NoLink $LiveRoot"), text.index("Get-Content"))
         self.assertIn("Stack[string]", text)                                  # a walk that never enters a link
@@ -224,8 +233,8 @@ class Safety(unittest.TestCase):
 
     def test_the_account_texts_come_only_from_the_operator_and_go_only_into_the_private_settings(self):
         text = script_text("switchon-08-table.ps1")
-        self.assertEqual(len(re.findall(r"Read-Host", text)), 2)
-        self.assertEqual(len(re.findall(r"Read-Host -MaskInput", text)), 2)             # what is typed is never shown
+        self.assertEqual(len(re.findall(r"Read-Host", text)), 4)
+        self.assertEqual(len(re.findall(r"Read-Host -MaskInput", text)), 4)             # what is typed is never shown
         self.assertNotIn("-AsPlainText", text)
         self.assertIn("[IO.File]::AppendAllText($ConfigPath, $Rows, $Utf8)", text)
         self.assertLess(text.index("Assert-Private $ConfigPath $true"), text.index("Read-Host"))      # the file is checked BEFORE anything is asked
@@ -233,8 +242,11 @@ class Safety(unittest.TestCase):
         self.assertLess(text.index("-cnotmatch"), text.index("AppendAllText"))        # the shape is checked before anything is written
         self.assertLess(text.index("AppendAllText"), text.index("Assert-PrivateAfter $ConfigPath $true"))
         code = [line for line in text.split("\n") if not line.lstrip().startswith("#")]
-        self.assertEqual([line for line in code if "env:LW_SWITCHON_CLAUDE_TEXT" in line or "env:LW_SWITCHON_CODEX_TEXT" in line],
-                         ["    $ClaudeText = $env:LW_SWITCHON_CLAUDE_TEXT", "    $CodexText = $env:LW_SWITCHON_CODEX_TEXT"])
+        self.assertEqual([line for line in code if "env:LW_SWITCHON_" in line and "LW_SWITCHON_INPUT" not in line],
+                         ["    $ClaudeName, $ClaudeHome = $env:LW_SWITCHON_CLAUDE_NAME, $env:LW_SWITCHON_CLAUDE_HOME",
+                          "    $CodexName, $CodexHome = $env:LW_SWITCHON_CODEX_NAME, $env:LW_SWITCHON_CODEX_HOME"])
+        self.assertLess(text.index("Invoke-UsageScan"), text.index("AppendAllText"))   # a typo is found against our own usage files before anything is written
+        self.assertIn("does not match any of our usage files. Nothing was changed.", text)
         for name in STEPS:
             if name != "switchon-08-table.ps1":
                 self.assertNotIn("$ClaudeText", script_text(name))
@@ -252,7 +264,11 @@ class Safety(unittest.TestCase):
         self.assertLess(text.index("Assert-PrivateAfter $Store $false"), text.index("WriteAllText($ConfigPath"))
         self.assertLess(text.index("WriteAllText($ConfigPath"), text.index("Assert-PrivateAfter $ConfigPath $true"))
         setup = script_text("switchon-01-setup.ps1")
-        self.assertLess(setup.index("Protect-Path $LiveRoot $true"), setup.index("WriteAllText"))
+        self.assertLess(setup.index("WriteAllText((Join-Path $LiveRoot '.owner.json')"), setup.index("Protect-Path $LiveRoot $true"))    # the marker and names.json come first, at once
+        self.assertLess(setup.index("WriteAllText($Names"), setup.index("Protect-Path $LiveRoot $true"))
+        self.assertLess(setup.index("Assert-Private $LiveRoot $true"), setup.index("New-Item -ItemType Directory -Path $StateDir"))
+        self.assertIn("was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead.", setup)
+        self.assertNotIn("MaskInput", setup)                                  # nothing in step 1 is secret
         common = script_text(COMMON)
         self.assertIn("nothing secret has been written", common)
         self.assertIn("A secret HAS ALREADY BEEN WRITTEN", common)
@@ -262,13 +278,13 @@ class Safety(unittest.TestCase):
             for line in lines:
                 self.assertNotIn("--identity-ref", line, name)
         lines = [line for line in self.all_code()["switchon-07-settings.ps1"] if "identity-set" in line and "throw" not in line]
-        self.assertEqual(lines, ["$Id | & $Py -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true"])
+        self.assertEqual(lines, ["$Id | & $Py @PyFlags -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true"])
 
     def test_the_done_check_has_the_conditions_it_promises(self):
         text = script_text("switchon-13-done.ps1")
         for needle in ("baseline.json", "$Newest[$Alias] -le $Cut", "$Newest[$Alias] -le $Delivered[$Alias]", "$Age -gt 180", "$Age -lt -30", "$LASTEXITCODE -ne 0", "$R.sources",
                        "@($Status.operator_actions).Count -ne 0", "failed_permanent -ne 0", "capture_fault.count -ne 0", "mode=ro", "$WaitMinutes = 10",
-                       "ConvertFrom-Json -NoEnumerate", "'System.Management.Automation.PSCustomObject'", "$R.configured -ne $true", "lt $Cut - 30000",
+                       "ConvertFrom-Json -NoEnumerate", "Test-Object", "$R.configured -ne $true", "lt $Cut - 30000",
                        "The clock moved back since step 12", "step 12 again with -Again", "ask the lead for the two turns again", "Nothing was changed"):
             self.assertIn(needle, text, needle)
         self.assertEqual(text.count("$LASTEXITCODE -ne 0"), 2)                       # the store query and the status command
@@ -293,10 +309,75 @@ class Safety(unittest.TestCase):
     def test_only_the_server_listens_and_only_on_this_machine(self):
         for name, lines in self.all_code().items():
             for line in lines:
-                if "serve" in line and name != "switchon-10-server.ps1":
+                if "serve" in line and name not in ("switchon-10-server.ps1", COMMON):
                     self.assertNotIn("'serve'", line, name)
-        self.assertIn("'--host', '127.0.0.1'", script_text("switchon-10-server.ps1"))
+        self.assertIn("'--host', '127.0.0.1'", script_text(COMMON))
+        server, reporter = script_text("switchon-10-server.ps1"), script_text("switchon-11-reporter.ps1")
+        self.assertLess(server.index("Get-PortListeners $PortNumber"), server.index("[Diagnostics.Process]::Start"))       # nothing starts while anything listens on the port
+        self.assertIn("Something on this machine already listens on port", server)
+        self.assertLess(reporter.index("Assert-OurServerListens"), reporter.index("& $Py"))                    # the identity value is never sent to a stranger
+        self.assertLess(reporter.index("Assert-NoReporterRunning"), reporter.index("& $Py"))
+        common = script_text(COMMON)
+        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "$Rows[0].Address -cne '127.0.0.1'",
+                       "is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
+            self.assertIn(needle, common, needle)
         self.assertNotIn("0.0.0.0", "".join(script_text(name) for name in ALL))
+
+    def test_every_python_call_uses_the_one_shared_flag_list_and_none_depends_on_the_environment(self):
+        common = script_text(COMMON)
+        self.assertIn("$PyFlags = @('-E', '-s', '-B')", common)
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", "".join(script_text(name) for name in ALL))          # -E ignores it; -B replaces it
+        self.assertNotRegex(re.search(r"\$PyFlags = @\([^)]*\)", common).group(0), r"-I")                       # not -I: the scripts run from the source folder
+        calls = 0
+        for name, lines in self.all_code().items():
+            for line in lines:
+                if re.search(r"& \$Py\b", line):
+                    calls += 1
+                    self.assertIn("& $Py @PyFlags ", line, (name, line))
+        self.assertGreaterEqual(calls, 13)
+
+    def test_the_usage_files_are_counted_by_the_reporters_own_scan_through_one_shared_helper(self):
+        common = script_text(COMMON)
+        self.assertEqual(common.count("function Invoke-UsageScan"), 1)
+        self.assertNotIn("Get-UsageAccounts", "".join(script_text(name) for name in ALL))
+        for needle in ("from quota_balancer.reporter import capacityreader", "capacityreader.scan(sys.argv[1]", "found.folder_unreadable", "found.too_many_entries",
+                       "sys.stdin.read()", "USAGE_SCAN_FAILED", "except BaseException:", "ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii", "$Stdin | & $Py @PyFlags -c $UsageHelper $BusRoot $Mode"):
+            self.assertIn(needle, common, needle)
+        for copied in ("EnumerateFileSystemEntries", "16384", "Select-Object -First 64", "ReadAllText", "$Version -eq 2"):
+            self.assertNotIn(copied, common, copied)                              # no copy of the reporter's rules in PowerShell
+        self.assertNotIn("print(text", common)
+        for name in ("switchon-03-check.ps1", "switchon-08-table.ps1"):
+            self.assertIn("Invoke-UsageScan", script_text(name), name)
+        self.assertNotIn("Invoke-UsageScan", "".join(script_text(n) for n in STEPS if n not in ("switchon-03-check.ps1", "switchon-08-table.ps1")))
+        step8 = script_text("switchon-08-table.ps1")
+        self.assertIn("Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }", step8)      # the texts go in as data, never as an argument
+        self.assertLess(step8.index("Invoke-UsageScan"), step8.index("AppendAllText"))
+
+    def test_step_10_starts_and_records_the_server_and_step_11_accepts_only_that_process(self):
+        common, server = script_text(COMMON), script_text("switchon-10-server.ps1")
+        for needle in ("New-Object Diagnostics.ProcessStartInfo", "$Start.FileName = $Py", "foreach ($Word in @($PyFlags) + @(Get-ServeArgs)) { [void]$Start.ArgumentList.Add($Word) }",
+                       "$Start.UseShellExecute = $false", "$Start.WorkingDirectory = $Src", "[Diagnostics.Process]::Start($Start)", "started_utc_ticks = $Server.StartTime.ToUniversalTime().Ticks",
+                       "WaitForExit(500)", "Window 1''s server has stopped.", "stopped with an error (code $($Server.ExitCode)). Tell the lead."):
+            self.assertIn(needle, server, needle)
+        self.assertLess(server.index("server.json"), server.index("WaitForExit(500)"))                          # the record is written before the wait
+        self.assertLess(server.index("[Diagnostics.Process]::Start($Start)"), server.index("Save-ServerRecord ($Record"))
+        self.assertLess(server.index("Save-ServerRecord ($Record"), server.index("WaitForExit(500)"))
+        self.assertLess(server.index("$Server = $null"), server.index("try {"))                                  # the cleanup covers the start and the record
+        for needle in ("is not a file. Nothing was started. Tell the lead.", "The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead.",
+                       "if (-not $Saved) { $Server.Kill($true); [void]$Server.WaitForExit(10000) }", "elseif (-not $Server.WaitForExit(5000)) { $Server.Kill($true) }"):
+            self.assertIn(needle, server, needle)
+        self.assertNotIn("& $Py", server)                                                                        # no string joining, no call operator: .NET does the quoting
+        self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)         # the one list
+        body = common[common.index("function Assert-OurServerListens"):common.index("# Step 11's second start check")]
+        for banned in ("Split-CommandLine", "CommandLine", "pyvenv", "Get-ServeArgs", "IsPathRooted($Words"):
+            self.assertNotIn(banned, body, banned)                                  # no text of any command line is read to identify the server
+        for needle in ("server.json", "Test-HasOnly $Record 'schema', 'pid', 'started_utc_ticks', 'port'", "$Record.schema -ne 1", "$Record.port -ne $PortNumber",
+                       "[Diagnostics.Process]::GetProcessById", "$Started -ne [int64]$Record.started_utc_ticks", "-ine $Py", "$Rows.Count -ne 1",
+                       "$Rows[0].ProcessId -eq [int]$Record.pid", "$Rows[0].ParentId -ne [int]$Record.pid", "$ChildStarted -lt $Started",
+                       "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."):
+            self.assertIn(needle, body, needle)
+        self.assertIn("(Join-Path $LiveRoot 'server.json')", common)                                             # checked for links with the other derived paths
+        self.assertIn("also stopped by the reporter's own exclusive state lock", common)                        # why Assert-NoReporterRunning may still read words
 
     def test_the_reporter_is_started_with_the_private_settings_and_nothing_else(self):
         self.assertIn("@('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)", script_text("switchon-11-reporter.ps1"))
@@ -332,7 +413,7 @@ class Runbook(unittest.TestCase):
             self.assertIn(needle, self.text, needle)
 
     def test_the_operator_steps_say_who_runs_them_and_the_text_stays_on_the_screen(self):
-        self.assertIn("**copy them only from your own screen, only into this script's two", self.text)
+        self.assertIn("**type the parts only from your own screen, only into this script's four", self.text)
         self.assertIn("never into the repository, a message to the lead, a report or a chat", " ".join(self.text.split()))
         self.assertIn("**Never send** `reporter.toml`", self.text)
 

@@ -3,6 +3,14 @@
 # only for that: it grants and denies nothing. The block replaces Leasewise's inventory, which is empty at this point.
 . (Join-Path $PSScriptRoot 'switchon-common.ps1')
 '== Step 5: the two accounts and the allowed reporter'
+$Question = @'
+import sqlite3, sys
+conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+print(conn.execute("SELECT (SELECT COUNT(*) FROM accounts) + (SELECT COUNT(*) FROM machines)").fetchone()[0])
+'@
+$Have = & $Py @PyFlags -c $Question $Store                 # read-only: how many accounts and machines the store already has
+if ($LASTEXITCODE -ne 0 -or "$Have" -cnotmatch '^[0-9]+$') { throw 'The store could not be read. Nothing was changed. Tell the lead.' }
+if ([int]"$Have" -ne 0) { throw 'Step 5 was already done. Nothing was changed. Go on with step 6.' }
 $Inventory = @"
 {"version":2,
  "accounts":[{"alias":"$ClaudeAlias","vendor":"anthropic","kind":"subscription","budget_micro_eur":null},
@@ -17,8 +25,8 @@ $Inventory = @"
 "@
 $InventoryFile = Join-Path $LiveRoot 'inventory.json'    # inside the private folder: new files there inherit its private list
 Set-Content -LiteralPath $InventoryFile -Value $Inventory -Encoding ascii
-& $Py -m quota_balancer --db $Store config-import --file $InventoryFile
+& $Py @PyFlags -m quota_balancer --db $Store config-import --file $InventoryFile
 if ($LASTEXITCODE -ne 0) { throw 'config-import failed. Nothing else was changed. Tell the lead.' }
-& $Py -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
+& $Py @PyFlags -m quota_balancer --db $Store policy-ids --json | Out-File -Encoding ascii -LiteralPath $PolicyIds
 if ($LASTEXITCODE -ne 0) { throw 'policy-ids failed' }
 (Get-Content -LiteralPath $PolicyIds -Raw | ConvertFrom-Json).accounts | ForEach-Object { $_.alias }

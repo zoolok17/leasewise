@@ -15,7 +15,7 @@ $Bytes = New-Object byte[] 24
 $Rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $Rng.GetBytes($Bytes)
 $Id = ($Bytes | ForEach-Object { $_.ToString('x2') }) -join ''
-$Id | & $Py -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true
+$Id | & $Py @PyFlags -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true
 if ($LASTEXITCODE -ne 0) { throw 'identity-set failed' }
 Assert-PrivateAfter $Store $false                             # the store now holds the value: it must still be private
 
