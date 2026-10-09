@@ -39,7 +39,7 @@ STEPS = [
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "e8ec10f2a5b6b5ffd34d2f797b3789a974763387d60f4d53aacd11b481328796",
+    COMMON: "0bca963b56dee86dce917034c4374507e8baf7d76d53483b712323a43bff3d77",
     GUARD: "09f7065fafd9611026d5ddcd80b67faa7bf55aba1da6f9e6613cbf060bf4b71b",
 }
 
@@ -284,7 +284,7 @@ class Safety(unittest.TestCase):
         text = script_text("switchon-13-done.ps1")
         for needle in ("baseline.json", "$Newest[$Alias] -le $Cut", "$Newest[$Alias] -le $Delivered[$Alias]", "$Age -gt 180", "$Age -lt -30", "$LASTEXITCODE -ne 0", "$R.sources",
                        "@($Status.operator_actions).Count -ne 0", "failed_permanent -ne 0", "capture_fault.count -ne 0", "mode=ro", "$WaitMinutes = 10",
-                       "ConvertFrom-Json -NoEnumerate", "'System.Management.Automation.PSCustomObject'", "$R.configured -ne $true", "lt $Cut - 30000",
+                       "ConvertFrom-Json -NoEnumerate", "Test-Object", "$R.configured -ne $true", "lt $Cut - 30000",
                        "The clock moved back since step 12", "step 12 again with -Again", "ask the lead for the two turns again", "Nothing was changed"):
             self.assertIn(needle, text, needle)
         self.assertEqual(text.count("$LASTEXITCODE -ne 0"), 2)                       # the store query and the status command
@@ -313,13 +313,13 @@ class Safety(unittest.TestCase):
                     self.assertNotIn("'serve'", line, name)
         self.assertIn("'--host', '127.0.0.1'", script_text(COMMON))
         server, reporter = script_text("switchon-10-server.ps1"), script_text("switchon-11-reporter.ps1")
-        self.assertLess(server.index("Get-PortListeners $PortNumber"), server.index("& $Py"))                  # nothing starts while anything listens on the port
+        self.assertLess(server.index("Get-PortListeners $PortNumber"), server.index("[Diagnostics.Process]::Start"))       # nothing starts while anything listens on the port
         self.assertIn("Something on this machine already listens on port", server)
         self.assertLess(reporter.index("Assert-OurServerListens"), reporter.index("& $Py"))                    # the identity value is never sent to a stranger
         self.assertLess(reporter.index("Assert-NoReporterRunning"), reporter.index("& $Py"))
         common = script_text(COMMON)
-        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "$Row.ParentPath -ine $Py", "$Row.ParentCommandLine -cne $Row.CommandLine",
-                       "$Rows[0].Address -cne '127.0.0.1'", "is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
+        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "$Rows[0].Address -cne '127.0.0.1'",
+                       "is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
             self.assertIn(needle, common, needle)
         self.assertNotIn("0.0.0.0", "".join(script_text(name) for name in ALL))
 
@@ -334,7 +334,7 @@ class Safety(unittest.TestCase):
                 if re.search(r"& \$Py\b", line):
                     calls += 1
                     self.assertIn("& $Py @PyFlags ", line, (name, line))
-        self.assertGreaterEqual(calls, 14)
+        self.assertGreaterEqual(calls, 13)
 
     def test_the_usage_files_are_counted_by_the_reporters_own_scan_through_one_shared_helper(self):
         common = script_text(COMMON)
@@ -353,14 +353,25 @@ class Safety(unittest.TestCase):
         self.assertIn("Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }", step8)      # the texts go in as data, never as an argument
         self.assertLess(step8.index("Invoke-UsageScan"), step8.index("AppendAllText"))
 
-    def test_step_11_compares_the_exact_command_step_10_launches(self):
+    def test_step_10_starts_and_records_the_server_and_step_11_accepts_only_that_process(self):
         common, server = script_text(COMMON), script_text("switchon-10-server.ps1")
-        self.assertIn("$ServeArgs = Get-ServeArgs", server)                       # one list for both steps
-        self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)
-        for needle in ("$Want = @($PyFlags) + @(Get-ServeArgs)", "$Words.Count -ne ($Want.Count + 1)", "$Words[$Index + 1] -ceq $Want[$Index]", "-ieq $Store",
-                       "if ($Row.Path -ieq $Py) { return }", "$Row.ParentCommandLine -cne $Row.CommandLine", r"$Config -notlike 'C:\lw\*'", "executable", "-not $Row.CommandLine -or -not $Row.Path"):
-            self.assertIn(needle, common, needle)
-        self.assertNotIn("-contains 'serve'", common)                              # not a bag of words any more
+        for needle in ("New-Object Diagnostics.ProcessStartInfo", "$Start.FileName = $Py", "foreach ($Word in @($PyFlags) + @(Get-ServeArgs)) { [void]$Start.ArgumentList.Add($Word) }",
+                       "$Start.UseShellExecute = $false", "$Start.WorkingDirectory = $Src", "[Diagnostics.Process]::Start($Start)", "started_utc_ticks = $Server.StartTime.ToUniversalTime().Ticks",
+                       "WaitForExit(500)", "Window 1''s server has stopped.", "stopped with an error (code $($Server.ExitCode)). Tell the lead."):
+            self.assertIn(needle, server, needle)
+        self.assertLess(server.index("server.json"), server.index("WaitForExit(500)"))                          # the record is written before the wait
+        self.assertNotIn("& $Py", server)                                                                        # no string joining, no call operator: .NET does the quoting
+        self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)         # the one list
+        body = common[common.index("function Assert-OurServerListens"):common.index("# Step 11's second start check")]
+        for banned in ("Split-CommandLine", "CommandLine", "pyvenv", "Get-ServeArgs", "IsPathRooted($Words"):
+            self.assertNotIn(banned, body, banned)                                  # no text of any command line is read to identify the server
+        for needle in ("server.json", "Test-HasOnly $Record 'schema', 'pid', 'started_utc_ticks', 'port'", "$Record.schema -ne 1", "$Record.port -ne $PortNumber",
+                       "[Diagnostics.Process]::GetProcessById", "$Started -ne [int64]$Record.started_utc_ticks", "-ine $Py", "$Rows.Count -ne 1",
+                       "$Rows[0].ProcessId -eq [int]$Record.pid", "$Rows[0].ParentId -ne [int]$Record.pid", "$ChildStarted -lt $Started",
+                       "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."):
+            self.assertIn(needle, body, needle)
+        self.assertIn("(Join-Path $LiveRoot 'server.json')", common)                                             # checked for links with the other derived paths
+        self.assertIn("also stopped by the reporter's own exclusive state lock", common)                        # why Assert-NoReporterRunning may still read words
 
     def test_the_reporter_is_started_with_the_private_settings_and_nothing_else(self):
         self.assertIn("@('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)", script_text("switchon-11-reporter.ps1"))

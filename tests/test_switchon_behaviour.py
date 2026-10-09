@@ -610,6 +610,9 @@ LISTENER = ("import socket, sys, time\n"
             "s.listen(5)\n"
             "time.sleep(120)\n")
 SLEEPER = "import time; time.sleep(120)"
+BASE_PYTHON = Path(sys.base_prefix) / "python.exe"
+IS_VENV = sys.prefix != sys.base_prefix
+LISTENER_MODULE = "import socket, time\ns = socket.socket()\ns.bind(('127.0.0.1', %s))\ns.listen(5)\ntime.sleep(120)\n" % PORT
 
 
 class Processes(Base):
@@ -640,25 +643,6 @@ class Processes(Base):
             except OSError:
                 time.sleep(0.2)
         self.fail("the test listener did not start")
-
-    def our_server(self):
-        """Window 1 as step 10 starts it: the real Leasewise server, started by step 1's Python from the source folder."""
-        self.install_source()
-        (self.live / "store").mkdir(exist_ok=True)
-        store = self.live / "store" / "inventory.db"
-        init = subprocess.run([sys.executable, "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "init"], cwd=self.live / "src", capture_output=True, text=True)
-        self.assertEqual(init.returncode, 0, init.stderr)
-        process = self.start([sys.executable, "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "serve", "--host", "127.0.0.1", "--port", PORT],
-                             cwd=self.live / "src")
-        import socket
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
-                return process, store
-            except OSError:
-                time.sleep(0.3)
-        self.fail("the Leasewise server did not start")
 
     def check_function(self, text):
         return self.command(". '%s'; %s" % (COMMON, text))
@@ -853,13 +837,6 @@ class PortChecks(Processes):
         self.names()
         return trace
 
-    def test_step_10_starts_the_server_only_when_nothing_listens_on_the_port(self):
-        trace = self.trace_python()
-        done = self.run_script("switchon-10-server.ps1")
-        self.assertEqual(done.returncode, 0, self.said(done))
-        self.assertEqual(trace.read_text(encoding="ascii").strip(),
-                         "-E -s -B -m quota_balancer --db %s serve --host 127.0.0.1 --port %s" % (self.live / "store" / "inventory.db", PORT))
-
     def test_step_10_is_refused_while_anything_listens_on_the_port(self):
         trace = self.trace_python()
         holder = self.listen()
@@ -896,60 +873,6 @@ class PortChecks(Processes):
         self.assertIn("could not be read. Nothing was started. Tell the lead.", self.said(done))
         self.assertFalse(trace.exists())
 
-    def test_step_11_refuses_when_nothing_listens(self):
-        trace = self.trace_python()
-        done = self.run_script("switchon-11-reporter.ps1")
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("Nothing listens on port %s yet. Start window 1 (step 10) first" % PORT, self.said(done))
-        self.assertFalse(trace.exists())
-
-    def test_step_11_refuses_a_listener_that_is_not_window_1s_server_and_sends_nothing(self):
-        trace = self.trace_python()
-        self.listen()
-        done = self.run_script("switchon-11-reporter.ps1")
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("Port %s is held by a program that is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." % PORT,
-                      self.said(done))
-        self.assertFalse(trace.exists())                                                # the reporter (which carries the identity value) never started
-
-    def test_step_11_refuses_a_listener_with_the_right_words_but_another_store_or_another_address(self):
-        trace = self.trace_python()
-        other = self.tmp / "other.db"
-        for host, store in (("127.0.0.1", other), ("0.0.0.0", self.live / "store" / "inventory.db")):
-            holder = self.start([sys.executable, "-E", "-s", "-B", "-c", LISTENER, host, PORT, "-m", "quota_balancer", "--db", str(store), "serve"])
-            import socket
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                try:
-                    socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
-                    break
-                except OSError:
-                    time.sleep(0.2)
-            done = self.run_script("switchon-11-reporter.ps1")
-            self.assertNotEqual(done.returncode, 0, (host, store))
-            self.assertIn("is not window 1's Leasewise server", self.said(done), (host, store))
-            self.assertFalse(trace.exists())
-            self.stop(holder)
-
-    def test_our_own_server_is_accepted_including_through_the_venv_launcher(self):
-        server, store = self.our_server()
-        owner = self.command("$o = (Get-NetTCPConnection -State Listen -LocalPort %s).OwningProcess; $o; (Get-CimInstance Win32_Process | Where-Object ProcessId -eq $o).ParentProcessId" % PORT)
-        owner_id, owner_parent = (int(word) for word in owner.stdout.split())
-        done = self.check_function("Assert-OurServerListens; 'accepted'")
-        self.assertEqual(done.returncode, 0, self.said(done))
-        self.assertIn("accepted", done.stdout)
-        # Either Python owns the socket itself, or (a venv's python.exe is a launcher) a child owns it and the launcher is its parent: both were accepted above.
-        self.assertTrue(owner_id == server.pid or owner_parent == server.pid, (owner_id, owner_parent, server.pid))
-
-    def test_our_own_server_is_refused_when_step_1s_python_is_another_program(self):
-        self.our_server()
-        other = shutil.which("pwsh")
-        self.default_over = {"Py": other}
-        self.names()
-        done = self.check_function("Assert-OurServerListens; 'accepted'")
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("is not window 1's Leasewise server", self.said(done))
-
     def test_a_second_reporter_for_the_same_settings_is_refused_and_another_settings_file_is_not(self):
         trace = self.trace_python()
         config = self.live / "reporter.toml"
@@ -963,156 +886,288 @@ class PortChecks(Processes):
         self.assertFalse(trace.exists())
 
 
-BASE_PYTHON = Path(sys.base_prefix) / "python.exe"
-IS_VENV = sys.prefix != sys.base_prefix
-FAKE_SERVER = "import socket, time\ns = socket.socket()\ns.bind(('127.0.0.1', %s))\ns.listen(5)\ntime.sleep(120)\n" % PORT
-
-
-class ExactServerCommand(Processes):
-    """Step 11 accepts the command step 10 launches and nothing that merely contains its words. The 'server' here is a fake package in the working folder
-    that listens on the test port whatever it is given, so any command line can be tried."""
+class RecordedServer(Processes):
+    """Step 11 accepts only the process step 10 started and recorded in server.json, or that process's one direct child. Nothing about any command line matters."""
 
     def setUp(self):
         super().setUp()
-        self.names()
         self.install_source()
         (self.live / "store").mkdir(exist_ok=True)
         self.store = str(self.live / "store" / "inventory.db")
         self.fake = self.tmp / "fake"
-        (self.fake / "quota_balancer").mkdir(parents=True)
-        (self.fake / "quota_balancer" / "__init__.py").write_text("", encoding="ascii")
-        (self.fake / "quota_balancer" / "__main__.py").write_text(FAKE_SERVER, encoding="ascii")
-        (self.fake / "unrelated.py").write_text(FAKE_SERVER, encoding="ascii")
-
-    def exact(self, store=None, port=PORT):
-        return ["-E", "-s", "-B", "-m", "quota_balancer", "--db", store or self.store, "serve", "--host", "127.0.0.1", "--port", port]
-
-    def wait_listening(self):
-        import socket
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            try:
-                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
-                return
-            except OSError:
-                time.sleep(0.2)
-        self.fail("the test server did not start")
-
-    def serve(self, python, words):
-        process = self.start([str(python)] + words, cwd=str(self.fake))
-        self.wait_listening()
-        return process
+        self.fake.mkdir()
+        self.use_python(sys.executable)
+        self.safe = self.tmp / "scripts-safe"                                           # step 11 whose last line only says it WOULD start the reporter
+        shutil.copytree(SCRIPTS, self.safe)
+        reporter = self.safe / "switchon-11-reporter.ps1"
+        text = reporter.read_text(encoding="ascii")
+        self.assertIn("& $Py @PyFlags @RunArgs", text)
+        reporter.write_text(text.replace("& $Py @PyFlags @RunArgs", "'REPORTER WOULD START'"), encoding="ascii", newline="\n")
 
     def use_python(self, path):
         self.default_over = {"Py": str(path)}
         self.names()
 
+    def ticks_of(self, process_id):
+        done = self.command("(Get-Process -Id %d).StartTime.ToUniversalTime().Ticks" % process_id)
+        self.assertEqual(done.returncode, 0, self.said(done))
+        return int(done.stdout.strip())
+
+    def write_record(self, process, **over):
+        record = {"schema": 1, "pid": process.pid, "started_utc_ticks": self.ticks_of(process.pid), "port": int(PORT)}
+        record.update(over)
+        (self.live / "server.json").write_text(json.dumps(record), encoding="ascii")
+
+    def wait_listening(self, host="127.0.0.1"):
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                socket.create_connection((host, int(PORT)), timeout=1).close()
+                return
+            except OSError:
+                time.sleep(0.2)
+        self.fail("the test listener did not start")
+
+    def listener(self, python, host="127.0.0.1", extra=()):
+        process = self.start([str(python), "-E", "-s", "-B", "-c", LISTENER, host, PORT, *extra])
+        self.wait_listening("127.0.0.1" if host in ("0.0.0.0", "::") else host)
+        return process
+
+    def sleeper(self, python=None):
+        process = self.start([str(python or sys.executable), "-E", "-s", "-B", "-c", SLEEPER])
+        time.sleep(0.5)
+        return process
+
     def verdict(self):
         return self.check_function("Assert-OurServerListens; 'accepted'")
 
-    def assert_refused(self, label):
+    def accepted(self, label):
         done = self.verdict()
-        self.assertNotEqual(done.returncode, 0, label)
-        self.assertIn("is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead.", self.said(done), label)
-
-    def fake_venv(self, name, launcher, **lines):
-        """A folder shaped like a venv: Scripts\\python.exe (a copy of `launcher`) and a pyvenv.cfg with the given lines."""
-        folder = self.tmp / name
-        (folder / "Scripts").mkdir(parents=True)
-        python = folder / "Scripts" / "python.exe"
-        shutil.copy(launcher, python)
-        if lines:
-            (folder / "pyvenv.cfg").write_text("".join("%s = %s\n" % item for item in lines.items()), encoding="ascii")
-        return python
-
-    def test_the_exact_command_is_accepted_whatever_the_case_of_the_store_path(self):
-        self.use_python(sys.executable)
-        self.serve(sys.executable, self.exact(store=self.store.upper()))
-        done = self.verdict()
-        self.assertEqual(done.returncode, 0, self.said(done))
+        self.assertEqual(done.returncode, 0, (label, self.said(done)))
         self.assertIn("accepted", done.stdout)
 
-    def test_a_command_that_only_contains_the_words_is_refused(self):
-        exact = self.exact()
-        cases = {
-            "an unrelated script with the exact store": ["-E", "-s", "-B", str(self.fake / "unrelated.py"), "quota_balancer", "serve", "--db", self.store],
-            "-c mode": ["-E", "-s", "-B", "-c", FAKE_SERVER, "-m", "quota_balancer", "--db", self.store, "serve", "--host", "127.0.0.1", "--port", PORT],
-            "a trailing extra word": exact + ["extra"],
-            "an extra word in the middle": exact[:5] + ["extra"] + exact[5:],
-            "a different flag order": ["-s", "-E", "-B"] + exact[3:],
-            "a missing flag": exact[:2] + exact[3:],
-            "--port with another number": self.exact(port="18999"),
-            "another store": self.exact(store=str(self.tmp / "other.db")),
-            "serve before --db": exact[:5] + ["serve", "--db", self.store] + exact[8:],
-        }
-        self.use_python(sys.executable)
-        for label, words in cases.items():
-            process = self.serve(sys.executable, words)
-            self.assert_refused(label)
-            self.stop(process)
-            time.sleep(0.5)
+    def refused(self, label, message="is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
+        done = self.verdict()
+        self.assertNotEqual(done.returncode, 0, label)
+        self.assertIn(message, self.said(done), label)
+        step = self.run_script("switchon-11-reporter.ps1", scripts=self.safe)             # the step itself: it must stop before it would start the reporter
+        self.assertNotEqual(step.returncode, 0, label)
+        self.assertIn(message, self.said(step), label)
+        self.assertNotIn("REPORTER WOULD START", step.stdout, label)
 
-    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
-    def test_a_venv_launcher_and_its_one_base_interpreter_child_are_accepted_and_nothing_else(self):
-        launcher = self.fake_venv("fakevenv", sys.executable, home=str(BASE_PYTHON.parent), executable=str(BASE_PYTHON), version="3.13.7")
-        self.use_python(launcher)
-        process = self.serve(launcher, self.exact())                                   # the genuine venv case: the base interpreter is a child of the launcher
-        self.assertEqual(self.verdict().returncode, 0)
-        self.stop(process)
-        (launcher.parent.parent / "pyvenv.cfg").write_text("home = %s\nversion = 3.13.7\n" % BASE_PYTHON.parent, encoding="ascii")     # no executable line: home plus python.exe
-        process = self.serve(launcher, self.exact())
-        self.assertEqual(self.verdict().returncode, 0)
-        self.stop(process)
-        (launcher.parent.parent / "pyvenv.cfg").write_text("home = %s\nexecutable = %s\n" % (BASE_PYTHON.parent, self.tmp / "some-other-program.exe"), encoding="ascii")
-        process = self.serve(launcher, self.exact())                                   # the child is not the interpreter the file names
-        self.assert_refused("a venv child whose program is not the file's interpreter")
-        self.stop(process)
+    def test_a_venv_launcher_is_accepted_through_its_one_direct_child(self):
+        launcher = self.listener(sys.executable)                                       # a venv's python.exe starts the real interpreter as a child that owns the socket
+        self.write_record(launcher)
+        self.accepted("the launcher is recorded, its child listens")
 
-    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
-    def test_a_child_whose_parent_has_another_command_line_is_refused(self):
-        # step 1's Python is a real interpreter in a venv-shaped folder; it starts a child whose first word and program are right, but its own command line differs
-        python = self.fake_venv("fakevenv2", BASE_PYTHON, home=str(BASE_PYTHON.parent), executable=str(BASE_PYTHON))
-        self.use_python(python)
-        spawner = ("import subprocess, sys, time\n"
-                   "subprocess.Popen([sys.argv[1]] + sys.argv[3:], executable=sys.argv[2], cwd=r'%s')\n"
-                   "time.sleep(120)\n" % self.fake)
-        self.start([str(python), "-E", "-s", "-B", "-c", spawner, str(python), str(BASE_PYTHON)] + self.exact())
-        self.wait_listening()
-        self.assert_refused("a child whose parent's command line differs")
-
-    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
-    def test_a_non_venv_python_with_a_child_is_refused(self):
-        other = self.tmp / "other-python.exe"
-        shutil.copy(BASE_PYTHON, other)
+    def test_the_recorded_process_itself_is_accepted_for_a_launcher_that_listens_directly_too(self):
         self.use_python(BASE_PYTHON)
-        spawner = ("import subprocess, sys, time\n"
-                   "subprocess.Popen([sys.argv[1]] + sys.argv[3:], executable=sys.argv[2], cwd=r'%s')\n"
-                   "time.sleep(120)\n" % self.fake)
-        self.start([str(BASE_PYTHON), "-E", "-s", "-B", "-c", spawner, str(BASE_PYTHON), str(other)] + self.exact())
+        process = self.listener(BASE_PYTHON)
+        self.write_record(process)
+        self.accepted("the base interpreter is recorded and listens")
+
+    def test_codex_quoted_boundary_command_started_by_a_test_is_refused(self):
+        (self.fake / "quota_balancer--db.py").write_text(LISTENER_MODULE, encoding="ascii")
+        line = '"%s" -E -s -B -m "quota_balancer"--db "%s" serve --host 127.0.0.1 --port %s' % (BASE_PYTHON, self.store, PORT)
+        self.use_python(BASE_PYTHON)
+        self.start(line, cwd=str(self.fake))                                           # Python runs the module quota_balancer--db: it listens
         self.wait_listening()
-        self.assert_refused("a non-venv python with a child")
+        self.write_record(self.sleeper(BASE_PYTHON))                                   # a real, recorded process of the right program, but not the listener
+        self.refused("the quoted-boundary command")
+
+    def test_the_relative_store_command_is_refused(self):
+        (self.fake / "quota_balancer").mkdir()
+        (self.fake / "quota_balancer" / "__init__.py").write_text("", encoding="ascii")
+        (self.fake / "quota_balancer" / "__main__.py").write_text(LISTENER_MODULE, encoding="ascii")
+        self.use_python(BASE_PYTHON)
+        self.start([str(BASE_PYTHON), "-E", "-s", "-B", "-m", "quota_balancer", "--db", "..\\store\\inventory.db", "serve", "--host", "127.0.0.1", "--port", PORT], cwd=str(self.fake))
+        self.wait_listening()
+        self.write_record(self.sleeper(BASE_PYTHON))
+        self.refused("a relative store")
+
+    def test_a_listener_that_is_neither_the_recorded_process_nor_its_child_is_refused(self):
+        self.listener(sys.executable)                                                  # a stranger
+        self.write_record(self.sleeper())                                              # the recorded process is something else
+        self.refused("a stranger")
+
+    def test_a_grandchild_is_refused(self):
+        self.use_python(BASE_PYTHON)
+        chain = self.fake / "chain.py"
+        chain.write_text("import subprocess, sys, time\n"
+                         "level = int(sys.argv[1])\n"
+                         "if level:\n    subprocess.Popen([sys.executable, '-E', '-s', '-B', __file__, str(level - 1)])\n    time.sleep(120)\n"
+                         "else:\n" + "".join("    " + line + "\n" for line in LISTENER_MODULE.splitlines()), encoding="ascii")
+        top = self.start([str(BASE_PYTHON), "-E", "-s", "-B", str(chain), "2"])
+        self.wait_listening()
+        self.write_record(top)
+        self.refused("a grandchild of the recorded process")
+
+    def test_a_recorded_process_that_has_ended_is_refused(self):
+        self.listener(sys.executable)
+        short = self.start([sys.executable, "-E", "-s", "-B", "-c", "import time; time.sleep(2)"])
+        time.sleep(0.5)
+        self.write_record(short)
+        short.wait(20)
+        self.refused("an ended recorded process")
+
+    def test_a_recorded_start_time_that_does_not_match_is_refused(self):
+        process = self.listener(sys.executable)
+        self.write_record(process, started_utc_ticks=self.ticks_of(process.pid) + 1)   # an edited record
+        self.refused("an edited start time")
+        self.write_record(process, started_utc_ticks=self.ticks_of(process.pid) - 10_000_000)
+        self.refused("an earlier start time")
+
+    def test_a_recorded_process_that_is_not_step_1s_python_is_refused(self):
+        self.use_python(BASE_PYTHON)
+        self.write_record(self.listener(sys.executable))                               # the venv launcher is a different program from the base interpreter
+        self.refused("a recorded program that is not step 1's Python")
+
+    def test_two_listeners_are_refused(self):
+        process = self.listener(sys.executable)
+        self.write_record(process)
+        try:
+            self.listener(sys.executable, "::1")
+        except (OSError, AssertionError):
+            self.skipTest("this machine cannot listen on ::1")
+        self.refused("two listeners")
+
+    def test_a_listener_that_is_not_on_loopback_is_refused(self):
+        self.write_record(self.listener(sys.executable, "0.0.0.0"))
+        self.refused("a listener on every address")
+
+    def test_nothing_listening_is_said_plainly(self):
+        self.write_record(self.sleeper())
+        done = self.verdict()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("Nothing listens on port %s yet. Start window 1 (step 10) first" % PORT, self.said(done))
+
+    def test_a_missing_or_malformed_record_is_refused_even_with_the_real_listener_there(self):
+        process = self.listener(sys.executable)
+        message = "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."
+        self.refused("no record", message)
+        good = {"schema": 1, "pid": process.pid, "started_utc_ticks": self.ticks_of(process.pid), "port": int(PORT)}
+        cases = ["not json", "[]", "null", "{}", json.dumps(dict(good, extra=1)), json.dumps(dict(good, port=int(PORT) + 1)), json.dumps(dict(good, schema=2)),
+                 json.dumps(dict(good, pid=str(process.pid))), json.dumps(dict(good, pid=-1)), json.dumps(dict(good, pid=0)), json.dumps(dict(good, started_utc_ticks=0)),
+                 json.dumps(dict(good, port="%s" % PORT)), json.dumps({k: v for k, v in good.items() if k != "pid"}), json.dumps([good]), json.dumps(dict(good, pid=1.5))]
+        for text in cases:
+            (self.live / "server.json").write_text(text, encoding="ascii")
+            self.refused(text[:60], message)
+        (self.live / "server.json").write_text(json.dumps(good), encoding="ascii")
+        self.accepted("the good record")
+
+    def test_a_link_in_place_of_server_json_is_refused_before_anything_is_read(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.junction(self.live / "server.json", elsewhere)
+        done = self.run_script("switchon-11-reporter.ps1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("server.json is a link. Nothing was changed", self.said(done))
 
 
-class RealServerAcceptance(Processes):
-    def test_the_genuine_direct_case_is_accepted(self):
+class Step10Starts(Processes):
+    """Step 10 starts the server itself, with the exact words, and records the process before it waits."""
+
+    def setUp(self):
+        super().setUp()
+        self.live = self.tmp / "live space"                                            # a store path with a space in it
         self.default_over = {"Py": str(BASE_PYTHON)}
         self.names()
+        (self.live / "src" / "quota_balancer").mkdir(parents=True)
+        (self.live / "src" / "quota_balancer" / "__init__.py").write_text("", encoding="ascii")
+        self.out = self.tmp / "out.json"
+        self.release = self.tmp / "release.txt"
+
+    def fake_main(self, code):
+        (self.live / "src" / "quota_balancer" / "__main__.py").write_text(code, encoding="ascii")
+
+    def recording_main(self, exit_code=0):
+        self.fake_main("import json, os, sys, time\n"
+                       "open(r'%s', 'w').write(json.dumps({'argv': sys.argv[1:], 'pid': os.getpid(), 'cwd': os.getcwd(), 'ignore_env': sys.flags.ignore_environment,\n"
+                       "                                  'no_user_site': sys.flags.no_user_site, 'no_bytecode': sys.dont_write_bytecode}))\n"
+                       "while not os.path.exists(r'%s'):\n    time.sleep(0.1)\n"
+                       "sys.exit(%d)\n" % (self.out, self.release, exit_code))
+
+    def test_it_passes_exactly_the_flags_and_the_serve_words_and_records_the_process_before_it_waits(self):
+        self.recording_main()
+        step = self.start(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(SCRIPTS / "switchon-10-server.ps1")], env=self.env())
+        deadline = time.time() + 40
+        while time.time() < deadline and not ((self.live / "server.json").exists() and self.out.exists()):
+            time.sleep(0.2)
+        self.assertTrue((self.live / "server.json").exists(), "the record was not written while the server was still running")
+        self.assertIsNone(step.poll())                                                 # still waiting: the record came first
+        record = json.loads((self.live / "server.json").read_text(encoding="ascii"))
+        seen = json.loads(self.out.read_text(encoding="ascii"))
+        self.assertEqual(sorted(record), ["pid", "port", "schema", "started_utc_ticks"])
+        self.assertEqual((record["schema"], record["port"], record["pid"]), (1, int(PORT), seen["pid"]))
+        done = self.command("(Get-Process -Id %d).StartTime.ToUniversalTime().Ticks" % record["pid"])
+        self.assertEqual(int(done.stdout.strip()), record["started_utc_ticks"])
+        self.assertEqual(seen["argv"], ["--db", str(self.live / "store" / "inventory.db"), "serve", "--host", "127.0.0.1", "--port", PORT])    # the space survived
+        self.assertIn(" ", seen["argv"][1])
+        self.assertEqual((seen["ignore_env"], seen["no_user_site"], seen["no_bytecode"]), (1, 1, True))                                          # -E -s -B
+        self.assertEqual(os.path.normcase(seen["cwd"]), os.path.normcase(str(self.live / "src")))
+        self.release.write_text("go", encoding="ascii")
+        step.wait(30)
+
+    def test_a_server_that_stops_cleanly_or_with_an_error_is_said_plainly(self):
+        self.fake_main("import sys\nsys.exit(0)\n")
+        done = self.run_script("switchon-10-server.ps1")
+        self.assertEqual(done.returncode, 0, self.said(done))
+        self.assertIn("Window 1's server has stopped.", done.stdout)
+        self.fake_main("import sys\nsys.exit(3)\n")
+        done = self.run_script("switchon-10-server.ps1")
+        self.assertIn("Window 1's server stopped with an error (code 3). Tell the lead.", done.stdout)
+        (self.live / "src" / "quota_balancer" / "__main__.py").unlink()                # the module is missing: Python exits with 1
+        done = self.run_script("switchon-10-server.ps1")
+        self.assertIn("Window 1's server stopped with an error (code 1). Tell the lead.", done.stdout)
+
+    def test_the_real_server_started_by_step_10_is_accepted_directly_and_through_the_venv_launcher(self):
+        shutil.rmtree(self.live / "src")
+        self.install_source()
+        (self.live / "store").mkdir(exist_ok=True)
+        for python in (BASE_PYTHON, sys.executable):
+            self.default_over = {"Py": str(python)}
+            self.names()
+            store = self.live / "store" / "inventory.db"
+            if not store.exists():
+                init = subprocess.run([str(python), "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "init"], cwd=self.live / "src", capture_output=True, text=True)
+                self.assertEqual(init.returncode, 0, init.stderr)
+            step = self.start(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(SCRIPTS / "switchon-10-server.ps1")], env=self.env())
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                try:
+                    socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.3)
+            done = self.command(". '%s'; Assert-OurServerListens; 'accepted'" % COMMON)
+            self.assertEqual(done.returncode, 0, (str(python), self.said(done)))
+            self.stop(step)                                                             # the window's script and, with it, the server it started
+            time.sleep(1)
+
+    def test_ctrl_c_in_the_window_ends_the_script_and_the_server_and_step_14_lists_nothing(self):
+        from tests.switchon_console import run_in_console
+        shutil.rmtree(self.live / "src")
         self.install_source()
         (self.live / "store").mkdir(exist_ok=True)
         store = self.live / "store" / "inventory.db"
         init = subprocess.run([str(BASE_PYTHON), "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "init"], cwd=self.live / "src", capture_output=True, text=True)
         self.assertEqual(init.returncode, 0, init.stderr)
-        self.start([str(BASE_PYTHON), "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "serve", "--host", "127.0.0.1", "--port", PORT], cwd=self.live / "src")
-        import socket
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
-                break
-            except OSError:
-                time.sleep(0.3)
-        done = self.check_function("Assert-OurServerListens; 'accepted'")
-        self.assertEqual(done.returncode, 0, self.said(done))
+        self.private_live(config=False)
+        line = '"%s" -NoProfile -File "%s"' % (shutil.which("pwsh"), SCRIPTS / "switchon-10-server.ps1")
+        code, shown = run_in_console(line, ["\x03"], env=self.env(), cwd=str(self.tmp), first_delay=12.0, wait_seconds=40)
+        record = json.loads((self.live / "server.json").read_text(encoding="ascii"))
+        alive = subprocess.run(["tasklist", "/FI", "PID eq %d" % record["pid"], "/NH"], capture_output=True, text=True).stdout
+        if str(record["pid"]) in alive:                                                 # clean up the exact process this test started, then fail
+            subprocess.run(["taskkill", "/PID", str(record["pid"]), "/T", "/F"], capture_output=True)
+            self.fail("the server was still running after Ctrl-C")
+        try:
+            socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
+            self.fail("something still listens on the port")
+        except OSError:
+            pass
+        listed = self.run_script("switchon-14-stopped.ps1")
+        self.assertEqual(listed.returncode, 0, self.said(listed))
+        self.assertEqual(re.findall(r"^\s*(\d+)\s+(\S+)\s*$", listed.stdout, re.M), [])      # step 14 lists nothing
 
 
 class Step5Again(Base):
