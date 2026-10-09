@@ -176,3 +176,58 @@ Steps 0 to 7 as before; step 8 on a pseudo console: two rows of asterisks, `two 
 ... is present in this window"), a missing port ("needs all of its settings and LW_SWITCHON_PORT is missing"), a nested / enclosing / equal bus ("the same, or one lies inside the other"), a rollback with a nested bus (refused; the folder
 stayed), a saved bus that differs ("names.json was made for another ... port than this run uses"), a link in an ancestor, a linked source folder and a linked archive parent ("... is a link. Nothing was changed"), then the rollback
 (`False`; the fake agenttalk folder intact). No transcript holds a user name, a placeholder account text or an identity value.
+
+
+## Fix round 2 (D-315)
+
+Codex's delta read of fix round 1 (tk-539b98590527) still found two things: a link *inside* the checked source folder (a linked `quota_balancer` package) was imported by Python, and the baseline
+could be passed by a figure that was observed before step 12 but delivered after it. The lead fixed the rules (D-315, order tk-e9725fd73ff0); this section builds exactly those. Commits on top of `314eae7`:
+the scripts and runbook, the tests, and this record.
+
+### In plain words
+
+1. **One rule for links.** At the start of every step the scripts now look at *everything* inside the live folder, without ever entering a link. If any entry is a link, the step stops, says which one, and
+   changes nothing. This happens before any file is read and before Python starts, so a linked source package can no longer be imported.
+2. **The baseline remembers the time.** Step 12 now writes the machine's clock at that moment as well as the newest delivered figure per account.
+3. **The done check refuses unless everything is proven.** A figure counts only if it was observed after the clock time of step 12 *and* after the newest figure delivered at that time. The reporter's
+   status must be a proper JSON object with all the parts the check needs; its last scan must lie between three minutes ago and 30 seconds ahead of the clock.
+
+### Rule by rule
+
+1. **No link anywhere under the live folder.** `switchon-guard.ps1` has a new `Assert-NoLinkUnder`: a stack walk with `DirectoryInfo.GetFileSystemInfos()` (no `Get-ChildItem`), the root refused
+   before it is queued, every entry's reparse-point flag looked at before a folder is pushed, at most 50,000 entries (more is a stop with a plain message). It runs right after the existing ancestor and bus
+   checks and before `names.json` is read, so it precedes every Python command of every step. The rollback's own scan stays as a second look right before the delete. The runbook says it once ("How to run each step",
+   "No link anywhere in the live folder") with the remaining limit: the live folder is private, so a link could appear between the check and its use only if the operator, SYSTEM or an Administrator made it.
+2. **A time cut.** `baseline.json` is now `{"schema": 1, "cut_ms": <UTC milliseconds when step 12 ran>, "delivered": {"<alias>": <newest delivered observation or null>, ...}}`. The clock is read *before* the
+   store is asked. A second run refuses; `switchon-12-baseline.ps1 -Again` replaces the file (the runbook names it only for the clock case).
+3. **A fail-closed done check.** `switchon-13-done.ps1` passes only if: the baseline has exactly these fields (schema 1, whole numbers, exactly the two aliases, no extra field); each alias has an accepted
+   observation later than both `cut_ms` and its delivered maximum; the status command exits 0 and returns a JSON **object** (the exact type is checked, because PowerShell calls a list a "custom object"
+   too, which is how the first draft let `[]` through) with `readings` configured, `operator_actions` a list, `rows` and `capture_fault` with whole numbers, exactly the two expected sources and a last scan
+   that parses; the last scan lies between 180 s ago and 30 s ahead; every other command exits 0 and its answer parses; and there is no operator line, failed reading or capture fault. A clock more than 30 s
+   earlier than `cut_ms` stops with "The clock moved back since step 12 ... run step 12 again with -Again, then ask the lead for the two turns again".
+4. **Tests.** `tests/test_switchon_behaviour.py`: `Containment` (a linked package below a plain source folder, refused by four steps with a tracer proving Python never started and the evil package never
+   imported; a link at the reporter's database and at a store file; a link at depth; the 50,000 bound via a copy set to 5), `DoneCheck` (16: old rows; a figure observed before the cut but newer than the
+   delivered maximum, at the cut and one millisecond before it; both bounds; a scan 60 s and an hour ahead fail, 15 s ahead and 0 pass; unreadable scan times; `null`, lists, a list holding a good object,
+   text, nothing, and a dozen missing or mistyped parts; a malformed baseline in thirty-odd shapes, including the first version's file; the clock message and its 30 s tolerance; the baseline step; a plain rerun
+   refuses and leaves the file byte for byte, `-Again` replaces). `tests/test_switchon_scripts.py`: the guard walk and its order, the new done-check conditions, the runbook's new sentences (32 tests).
+5. **The default-path test** (minor) no longer opens `C:\lw\live`: it runs only the guard's final `else` branch (plain assignments, checked to contain no file-system command) and a second test shows a stray
+   variable stops the start before any folder is opened.
+6. **The pseudo-console helper** (minor): every handle, the pseudo console and the attribute list are released in a `finally`; the child is waited for by its own handle (`WaitForSingleObject`) and stopped by that
+   handle if it outlives the wait. A test counts the process's handles over four runs, one of which has to be stopped.
+7. **Wording.** The runbook no longer says that a minute of waiting proves anything (step 12 says waiting does not prove the delivery queue is empty and why the time cut makes that safe); "scanned within
+   three minutes" is explained as the reporter having run recently, not as still running; the stale sentence about unchanged privacy helpers is replaced.
+
+### How the red-first order was shown
+
+The new and changed behaviour tests were run, unchanged, in a detached worktree at `314eae7` (since removed): 18 of 50 fail there (the linked package, the database and store links, the deep link, the bound,
+the late figure, the future scan, the null and list statuses, the malformed baselines, the clock message, `-Again`, and the handle count; some of the `DoneCheck` failures are only because the baseline
+file changed shape). Saved list: `red-fix2-behaviour.txt` in the developer's scratch.
+
+### Rehearsal in strict mode (scratch only; `rehearsal3-part1.txt`, `rehearsal3-part2.txt`)
+
+Steps 0 to 15 as before. Step 12 printed the baseline time; a plain second run refused. Step 13 failed before any new figure. Then a figure was written whose observation time was 2 seconds *before* step 12 and
+delivered after it: the store held it (newest accepted figure after the baseline's delivered one, older than the cut) and step 13 still failed. After real-shaped new figures it passed (`PASSED`, rows sent 12,
+none waiting or failed); with the reporter stopped and three minutes gone it failed again. Then the adversarial cases: a linked package below the plain source folder was refused by steps 3 and 13 with the link
+named; a baseline from the future stopped step 13 with the clock message and `-Again` replaced it; the older cases (a stray variable, a partial set, overlapping roots, a saved bus that differs, a link in an
+ancestor, a linked source folder, a linked archive parent) each stopped with "Nothing was changed"; step 15 then printed `False` and the fake agenttalk folder was intact. The transcripts hold no user name,
+no placeholder account text and no identity value.
