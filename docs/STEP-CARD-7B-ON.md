@@ -231,3 +231,83 @@ none waiting or failed); with the reporter stopped and three minutes gone it fai
 named; a baseline from the future stopped step 13 with the clock message and `-Again` replaced it; the older cases (a stray variable, a partial set, overlapping roots, a saved bus that differs, a link in an
 ancestor, a linked source folder, a linked archive parent) each stopped with "Nothing was changed"; step 15 then printed `False` and the fake agenttalk folder was intact. The transcripts hold no user name,
 no placeholder account text and no identity value.
+
+
+## Card 7b-on2 (liaison cold read)
+
+The liaison (claude-agenttalk-lead) read the merged runbook cold, on the desktop, and returned FIX (commit `af33f1a`). The safety design passed: no policy change, no install, no writes outside the live folder, loopback only,
+no other team's files, no secret printed. Three things blocked it and six more were to be fixed before the run. The lead decided each one (order tk-e36437a82cac); this section builds exactly those, plus Codex's one MINOR
+from the last read. Two commits on top of `af33f1a`: the scripts with the rebuilt runbook, and the tests.
+
+### In plain words
+
+1. **Step 8 now asks for the parts, not for text the screen never shows.** `agenttalk capacity` prints a sentence, not the `claude:<name>:home-xxxxxxxx` text. The script asks for the name and the 8 characters (four masked
+   questions), puts the text together itself and then compares it with our own usage files, so a typo is found before anything is written.
+2. **The runbook names the agenttalk version** (0.99.0 or newer, every seat restarted, one turn done) and step 3 refuses unless both providers have a file the reporter can use.
+3. **Port 8443 is checked.** Step 10 will not start while anything listens on the port. Step 11 will not start the reporter (which carries the identity value) unless the only listener is window 1's own server.
+4. **Step 1 and step 15 can always undo each other**, step 15 will not delete while a window is running, and it deletes the marker last so a failed delete can be repeated.
+5. Smaller stops and wording (windows that fail, step 1's questions, step 5 twice, step 12's wait, the commit sentence, step 14's text), **Python without outside influence**, **privacy per Windows account**, and the clock
+   is read again when step 13 decides.
+
+### Finding by finding
+
+1. **Step 8 (blocking).** `switchon-08-table.ps1`: four masked questions (the name after "OS user" and the 8 characters of `home-xxxxxxxx`, for each provider; `home-` in front is optional; exactly 8 of 0-9 a-f; a name is 1 to 256
+   characters with no colon, no control character and no space at either end). The messages say which part is wrong and never show it. The assembled text must equal the `account` of a usable usage file of that provider; only a
+   count is printed ("Claude: matches 1 usage file(s)"). The reading of the usage files is one function, `Get-UsageAccounts`, in `switchon-common.ps1`, shared with step 3, with the reporter's limits (first 64 files by name, 16 KiB,
+   links skipped). A file counts as a match only if the reporter could use it (see 2). Rehearsal input now sets four parts (`LW_SWITCHON_CLAUDE_NAME`, `_CLAUDE_HOME`, `_CODEX_NAME`, `_CODEX_HOME`); all are in the guard's list, so
+   any one of them stops an operator's run. The troubleshooting line for "N seat file(s) name an agenttalk account that is not in readings.sources" now says that step 8 proved a match, so the line means a seat runs under another
+   Windows user or home folder.
+2. **agenttalk version (blocking).** "Before you start" names agenttalk 0.99.0 or newer, every seat restarted on it, one turn since. Step 3 counts, per provider, the files with `schema_version` exactly the whole number 2, `scope`
+   "account" and a non-empty `account` starting with `claude:` or `codex:` (as `capacityreader.py` accepts schema 2 only) and refuses if either provider has none; the runbook says that if a later agenttalk writes another format,
+   step 3 stops and the operator tells the lead.
+3. **Port 8443 (blocking).** `Get-PortListeners` (Get-NetTCPConnection, IPv4 and IPv6, any address, joined with the process list): step 10 stops with the process number and program name if anything listens, and also if the list
+   cannot be read (only the one error "nothing listens there" means none; a first draft treated every "not found" error as none, which a test with a missing cmdlet showed to be fail-open). Step 11 requires exactly one listener, on
+   `127.0.0.1`, whose command line has `quota_balancer`, `serve` and `--db` followed by exactly the store (case-insensitive), run by step 1's Python, directly or as the child of a launcher with the same command line; and it refuses a
+   second reporter for the same settings file. No server code changed.
+4. **Step 1 (before the run).** Order: ask and check; create the folder; write the marker and `names.json` at once; make the folder private and check it; make the subfolders. A privacy failure says "was made but could not be made
+   private. Nothing secret was written. Run step 15 to remove it, then tell the lead." Step 15 without `names.json` deletes only a folder whose marker names it and which holds nothing but the marker.
+5. **Step 15 (before the run).** It runs step 14's process check first (one shared function, leaving out its own process) and refuses while window 1 or 2 runs. Delete order: everything except the marker and `names.json`, then
+   `names.json`, then the marker, then the empty folder; a failure part way keeps the first two.
+6. **Windows that fail.** Steps 10 and 11 say: if a window prints an error or closes by itself, stop, press Ctrl-C in the other, start nothing again, tell the lead which window and its last line (without any path that holds your
+   user name); never run step 10 or 11 while their windows are open (the scripts refuse that now).
+7. **Wording and small stops.** (a) Step 1 asks three plain questions (not secret, so shown; quote marks are removed); the aliases stay fixed; rehearsal variables `LW_SWITCHON_PYTHON`, `_ARCHIVE`, `_SHA` are in the guard's list
+   (all set or none). (b) Step 12 waits two minutes and for a line with `"sent"` above 0; the reporter sends nothing when every usage file is older than ten minutes (a figure counts for ten minutes), so the text says: if every
+   line still shows 0 after five minutes, go on. (c) Step 5 refuses if the store already has an account or a machine. (d) The commit sentences read correctly both with the placeholder and in the hand-over copy. (e) Step 14's text
+   says it reads all processes and shows only those that name the live folder.
+8. **Python without outside influence.** One list, `$PyFlags = -E -s -B`, in `switchon-common.ps1`, used by every Python call (a drift test checks every call). `-I` was not used because the scripts run from the source folder.
+   `PYTHONDONTWRITEBYTECODE` is gone (`-E` ignores it; `-B` replaces it).
+9. **Privacy per Windows account.** Said plainly in the runbook: only your Windows account, SYSTEM and Administrators can open the folder; any program running under your Windows account can read it, including another team's seats
+   on this machine if they run under the same account (on Laptop B they do); what that exposes is the identity value (it only lets a program send readings to this machine's own Leasewise) and the account texts.
+10. **Clock (Codex's MINOR).** Step 13 reads the clock through one function, `Get-Now`, at the start and again, fresh, when it decides; the "clock moved back" check and the scan age use that fresh reading.
+
+### Stated limits (also in the runbook's "Limits that remain")
+
+- **Link race:** the live folder is private, so a link could appear between the check and its use only if the operator, SYSTEM or an Administrator made it.
+- **Port take-over:** the checks of steps 10 and 11 happen once, when the step starts. A program that took the port over after step 11's check would have to run under the operator's own Windows account (Windows refuses a second
+  binding of a port in use from another account; Microsoft's page "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE" describes this), and such a program can read the settings file anyway. On this machine, with two sockets on a scratch
+  port in the same account: when both set `SO_REUSEADDR` (which Python's `ThreadingHTTPServer`, the Leasewise server, does), the second bind succeeds and the connection I made reached the first; when only the second set it, or
+  only the first, or neither, the second bind was refused; with `SO_EXCLUSIVEADDRUSE` on the first the second was refused. So the server's own socket does not stop a same-account second listener; the start checks do. Nothing more is claimed.
+- **Look-alike:** a program of the operator's own account that imitates window 1's command line would pass step 11's check; it could read the settings file anyway.
+- Hard links are not detected (the scripts only write files they create).
+
+### What I saw with the venv launcher
+
+With `C:\lw\venv\Scripts\python.exe` as step 1's Python, window 1's socket belongs to a child process whose program is the base interpreter and whose parent is the launcher; both have the same command line. Step 11 accepted it
+(rehearsal and `test_our_own_server_is_accepted_including_through_the_venv_launcher`); the check accepts a child only when its parent is step 1's Python with the same command line. Step 14 lists both processes.
+
+### Not built
+
+The liaison's separate request to switch the agenttalk turn journal on for one seat (for the clock-skip measurement) is not part of this order; nothing here touches it.
+
+### How the red-first order was shown
+
+The new test file was run in a detached worktree at `af33f1a` (since removed): 41 of its 82 tests fail there (step 1's questions and privacy order, the clock seam, the whole port group, step 8's parts and typo, step 3's formats, step
+5 twice, step 15's cases, Python isolation, the rehearsal variables). Saved list: `red-on2-behaviour.txt` in the developer's scratch. The clock tests fail there on the missing `Get-Now` seam rather than on behaviour.
+
+### Rehearsal (scratch only, strict mode; `rehearsal4-part1.txt`, `rehearsal4-part2.txt`)
+
+Steps 0 to 15 with made-up data and the venv python. Step 1 on a pseudo console (three questions, answers shown), step 8 on a pseudo console (four masked questions, nothing typed visible, two `matches` lines). A stranger on the
+rehearsal port: step 10 and step 11 both refused, nothing started. Window 1 started; a second step 10 refused; window 2 started; a second step 11 refused. Idle seats (usage files an hour old): window 2 printed `"sent": 0`
+(so step 12's text allows going on); after fresh files one line showed `"sent": 4`. Baseline, the done check failing before new figures and for a figure observed before step 12 and delivered after it, passing after new figures.
+Step 14 listed the four processes; step 15 refused while they ran. Then the stray-variable, partial-answers, linked-package, clock-moved-back (`-Again`) and step-15 cases on a marker-only folder (removed) and a marker with
+something else (refused). Step 15 then printed `False`; the fake agenttalk folder was intact.
