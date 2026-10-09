@@ -1,7 +1,8 @@
 # Switching on usage readings on Laptop B: the operator's runbook
 
-Mode: how-to. For: the operator, at Laptop B (the machine the Leasewise team's seats run on). Status: **rehearsed end to end on made-up data** in the
-lead's scratch folder (`docs/STEP-CARD-7B-ON.md`); **not yet run for real**. Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
+Mode: how-to. For: the operator, at Laptop B (the machine the Leasewise team's seats run on). Status: **rehearsed on made-up data, on this machine's PowerShell 7.6**
+(`docs/STEP-CARD-7B-ON.md`): a free port (step 10 starts), a busy port (step 10 refuses, step 11 refuses a stranger), the virtual-environment Python (the child owns the port and step 11 accepts it), step 1 stopping at the
+privacy check and step 15 removing the folder, step 15 refusing while a program runs and then succeeding, and the whole run from step 0 through `PASSED` to the final rollback; **not yet run for real**. Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
 40-character commit id; if you see angle brackets there, stop and ask the lead). Approved by claude-agenttalk-lead on 2026-10-09 (answer to q-9ddb21b0c31c): first on this machine, for our own team's two accounts only.
 
 ## What this does, in plain words

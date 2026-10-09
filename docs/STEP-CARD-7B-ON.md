@@ -406,3 +406,38 @@ gone) and the operator reads "The server was started but its record could not be
 written by a one-line function, `Save-ServerRecord`, which the test replaces with a failing one in a copy of the script (a test hook; no production check is weakened). Tests (`Step10Starts`): a folder at `server.json` starts nothing;
 a failing record write, run directly and through the venv launcher, leaves no server process (the process the script was handed is gone, the port is free, step 14 lists nothing) and gives the plain message; the normal path and Ctrl-C
 tests pass as before. Both new tests fail on `b914256` (the first with the raw .NET error after the server had started; the second at the missing seam).
+
+## Card 7b-on3 (liaison re-read N1-N6)
+
+The liaison's desktop re-read of the merged runbook (card 7b-on2, `main` `6b3c77e`) said GO and listed six points; the lead took all six (order tk-c976f811aea5). Three commits on top of `6b3c77e`: the scripts and the rebuilt
+runbook, the tests, and the runbook's status line with this record.
+
+**In plain words.** A step that asks "does anything listen on this port?" now treats only one exact answer as "no". The runbook says what the scripts read and prints, asks for PowerShell 7.3 or newer (step 0 refuses an older
+one), step 1 no longer writes the file that holds the path of Python until the folder is private, and step 15's refusal names the program it found. The final version was rehearsed on this machine and the logs are kept.
+
+1. **N1, the listener list.** `Get-PortListeners` reads the error of `Get-NetTCPConnection -State Listen -LocalPort <port>` as "nothing listens" only when BOTH hold: its identifier matches `CmdletizationQuery_NotFound*,Get-NetTCPConnection`
+   (a prefix, because the same query without `-State Listen` says `..._NotFound_LocalPort,...`) and its exception is a `Microsoft.PowerShell.Cmdletization.Cim.CimJobException`. A missing command (same category, other identifier and
+   exception), access denied, a CIM error with another identifier and a binding error all stop the step (fail closed). Tests (`PortListNothing`): both identifier forms mean empty (the second is produced by the real cmdlet without
+   `-State Listen` in a copy of the shared start); a missing cmdlet, a CIM error with another identifier (`CimJob_BrokenCimSession`, produced with a made-up `-CimSession`) and a binding error each stop the step; the real server tests
+   still start step 10 on a real free port.
+2. **N3, what the scripts read.** One plain bullet in "What this does": steps 10, 11, 14 and 15 look at the list of all programs running on this machine (to find who holds the port, a second reporter, or a program using the live
+   folder); they print only process numbers and program names, never a command line; a program name shown by step 10's refusal may be passed to the lead. A runbook test checks the sentences.
+3. **N4, PowerShell version.** "Before you start" says PowerShell 7.3 or newer. Step 0 prints the version, then refuses an older one: "This needs PowerShell 7.3 or newer; this window runs <version>. Nothing was changed." The version
+   comes from one line (`$Version = $PSVersionTable.PSVersion`) that the test replaces in a copy; step 0 still reads nothing else. Test (`Step0Version`): 7.2.9, 7.0.0, 5.1 and 6.2 refused; 7.3.0, 7.6.6 and 8.0.0 pass; the real
+   version passes.
+4. **N5, `names.json` after privacy.** Step 1 now: checks the answers; creates the folder; writes only `.owner.json` (a random token and the folder path); makes the folder private and reads the access list back; only then writes
+   `names.json` (it holds the path of Python, which can contain the user name); then the subfolders. A privacy failure says "`C:\lw\live` was made and holds only the ownership marker (a random token and the folder path), but it could
+   not be made private. Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead." Tests: a privacy failure, both ways it can fail (the access list cannot be set; it reads back wrong), leaves a
+   folder holding exactly the marker (no `names.json`, no subfolder, no path of Python in the marker), and the real step 15 then removes it by its marker-only path; the drift test pins that the privacy check comes before the
+   `names.json` write and that step 1 writes exactly two files.
+5. **N6, step 15's wording.** "A program that uses the live folder is still running (process N, program X). If it is window 1 or 2, press Ctrl-C there; otherwise close that program. Then run step 15 again. Nothing was deleted."
+   The runbook text and the tests (the process number and `python.exe` are checked) follow.
+6. **N2, a recorded rehearsal of this version.** `C:\lw\scratch\claude-lw-developer-1\switchon\rehearsal7\` holds one log per case and `INDEX.md` (head, PowerShell 7.6.6, result, log file): (a) a free port, step 10 starts and a
+   second step 10 is refused; (b) a busy port, step 10 refuses and step 11 refuses a stranger; (c) the venv Python, the child owns the socket and step 11 accepts it, and its reporter then runs; (d) step 1 stopping at the privacy
+   check (simulated) and step 15 removing the folder; (e) step 15 refusing while a program runs and then succeeding; (f) the whole run, steps 0 to 15, through `PASSED` and the final rollback. All six passed. The logs were scrubbed
+   in two ways, and `INDEX.md` says so: the driver searched them for the Windows user name (from the environment), the typed name and home parts, a user-profile path, and the identity value (read from the settings file just
+   before the rollback), and a separate script searched all seven files again for the user name from both the environment and the operating system: no finding. The runbook's status line now says exactly this was rehearsed, on
+   made-up data, on this machine's PowerShell 7.6, and that it has not been run for real.
+
+**Red first.** The new behaviour tests were run on `6b3c77e` (detached worktree, since removed): the PowerShell-version test, the identifier-forms test, the privacy-failure test and the step 15 wording test fail there; the test that
+a missing command, another CIM error and a binding error stop the step passes there too (the old code compared the whole identifier, so it already stopped on them).
