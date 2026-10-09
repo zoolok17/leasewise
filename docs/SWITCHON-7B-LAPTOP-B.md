@@ -1,8 +1,11 @@
 # Switching on usage readings on Laptop B: the operator's runbook
 
 Mode: how-to. For: the operator, at Laptop B (the machine the Leasewise team's seats run on). Status: **rehearsed on made-up data, on this machine's PowerShell 7.6**
-(`docs/STEP-CARD-7B-ON.md`): a free port (step 10 starts), a busy port (step 10 refuses, step 11 refuses a stranger), the virtual-environment Python (the child owns the port and step 11 accepts it), step 1 stopping at the
-privacy check and step 15 removing the folder, step 15 refusing while a program runs and then succeeding, and the whole run from step 0 through `PASSED` to the final rollback; **not yet run for real**. Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
+(`docs/STEP-CARD-7B-ON.md`). On one commit, in an elevated window: a free port (step 10 starts), a busy port (step 10 refuses, step 11 refuses a stranger), the virtual-environment Python (the child owns the port and
+step 11 accepts it), step 1 stopping at the privacy check and step 15 removing the folder, step 15 refusing while a program runs and then succeeding, and the whole run from step 0 through `PASSED` to the final rollback.
+On a second commit, with the same scripts: the whole run in a **normal window** (started through the desktop shell, medium integrity), the whole run again with administrator rights switched off, and step 11's refusal
+of a second program on the port, of a stopped window 1's record and of a live process that is not listening. Both commits carry the same scripts as the installed commit, which changes only documents.
+**Not yet run for real.** Leasewise commit to install: `<COMMIT>` (in the copy the lead hands over, this is a
 40-character commit id; if you see angle brackets there, stop and ask the lead). Approved by claude-agenttalk-lead on 2026-10-09 (answer to q-9ddb21b0c31c): first on this machine, for our own team's two accounts only.
 
 ## What this does, in plain words
@@ -46,7 +49,7 @@ You will use **two extra PowerShell windows** at the end: window 1 runs the Leas
 
 ## How to run each step
 
-Every step is **one small script** in the `switchon-7b` folder. Run it like this, from any PowerShell 7 window (use the real path to the folder):
+Every step is **one small script** in the `switchon-7b` folder. Run it like this, from a normal PowerShell 7 window (not 'Run as administrator'; use the real path to the folder):
 
 ```
 pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
@@ -434,7 +437,7 @@ It must print `claude -> claude-main`, `codex -> codex-main` and `table: ok`.
 
 ## Step 10 (window 1): the Leasewise server
 
-Open a **new PowerShell 7 window** and run `switchon-10-server.ps1`. Before it starts anything it looks at who listens on port 8443. If anything does, it stops with the process number and program name and starts nothing
+Open a **new normal PowerShell 7 window** (not 'Run as administrator') and run `switchon-10-server.ps1`. Before it starts anything it looks at who listens on port 8443. If anything does, it stops with the process number and program name and starts nothing
 ("Something on this machine already listens on port 8443 ..."): if that is window 1 from earlier, go back to that window; otherwise tell the lead. This also refuses a second step 10. If it cannot read the list, it stops too.
 Then it **starts the server itself** and writes down which program it started (in `server.json` in the live folder: the program's number and start time), before it waits. The server prints nothing while it works. Leave the window
 open; you stop it with Ctrl-C in that window (that ends the server too; step 14 then shows what is still running). When the server ends by itself, the window says either "Window 1's server has stopped." or "Window 1's server stopped
@@ -475,10 +478,10 @@ else { "Window 1's server stopped with an error (code $($Server.ExitCode)). Tell
 
 ## Step 11 (window 2): the reporter
 
-A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is **the program step 10 started** (the one written down in `server.json`, still running, with the same start time, and
+A few seconds later, open another **new normal PowerShell 7 window** (not 'Run as administrator') and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is **the program step 10 started** (the one written down in `server.json`, still running, with the same start time, and
 your Python) **or the one program that program started in turn** (a virtual environment's `python.exe` starts the real interpreter as a second process that owns the port). It does not read any command line to decide this. If
 `server.json` is missing or wrong it says "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."; if anything else holds the port it says "Port 8443 is held by a program that is not window 1's
-Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." It also refuses to start when a reporter for the same settings is already running. The reporter prints one line per cycle, like
+Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." If another program also listens on the port, step 11 refuses even a working window 1 until that program is gone. It also refuses to start when a reporter for the same settings is already running. The reporter prints one line per cycle, like
 `{"blocked": null, "journal": "ok", "new_events": 0, "sent": 2}`. Leave it open.
 
 <!-- script: switchon-11-reporter.ps1 -->

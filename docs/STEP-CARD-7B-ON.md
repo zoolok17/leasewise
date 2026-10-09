@@ -441,3 +441,38 @@ one), step 1 no longer writes the file that holds the path of Python until the f
 
 **Red first.** The new behaviour tests were run on `6b3c77e` (detached worktree, since removed): the PowerShell-version test, the identifier-forms test, the privacy-failure test and the step 15 wording test fail there; the test that
 a missing command, another CIM error and a binding error stop the step passes there too (the old code compared the whole identifier, so it already stopped on them).
+
+## Card 7b-on4 (liaison re-read 2)
+
+The liaison's second desktop re-read of the merged runbook (card 7b-on3, `main` `2b6263d`) said GO and asked for five small points before the operator gets it (order tk-76d1b2959f56, continued as tk-9d7cd02b544a).
+Documents only: `git diff --name-only 2b6263d HEAD` lists `docs/STEP-CARD-7B-ON.md` and `docs/SWITCHON-7B-LAPTOP-B.md` and nothing else; no script or test changed.
+
+**The five points.**
+1. **A rehearsal in a normal window.** The earlier rehearsals ran in our seats' elevated sessions (window title "Administrator"), where a new folder is owned by the Administrators group; the operator will use a normal window.
+   `runas /trustlevel:0x20000` was tried first: it made Administrators "deny only" but left the integrity level at High, so it was not a normal window (kept as case f2, labelled as such). Case f2m then ran the whole
+   run through the desktop shell (`explorer.exe` handed a `.cmd` file to the running, non-elevated shell): its log opens with `IsInRole('Administrators')` = False and `whoami /groups` showing
+   `Mandatory Label\Medium Mandatory Level`.
+2. **Step 11's identity refusal with a valid `server.json`.** Cases g1, g2 and g3 (below).
+3. **One self-contained index** of every rehearsal: `C:\lw\scratch\claude-lw-developer-1\switchon\rehearsal8\INDEX.md` (commit, window kind, PowerShell version, result, file), with the notes that (d) simulates the privacy
+   failure with a copy of the shared script whose access-list function throws (it proves the recovery, not a real access-list error) and that (f) begins with a refused step 10 and 11 because the stranger of case (b) still held the port.
+4. **The runbook names the window kind** ("a normal PowerShell 7 window, not 'Run as administrator'") in "How to run each step" and steps 10 and 11, and its status line names the commits and window kinds exactly.
+5. **One sentence in step 11:** if another program also listens on the port, step 11 refuses even a working window 1 until that program is gone (see the g1 finding).
+
+**Every rehearsal case** (strict rehearsal mode, made-up data, a system-chosen loopback port, the venv launcher as step 1's Python, PowerShell 7.6.6, all PASS):
+- a free port; a busy port; the venv child accepted; step 1 stopping at the privacy check with step 15 removing the folder; step 15 refusing then succeeding; the whole run (cases a-f, elevated, on `5a29dd9`);
+- f2: the whole run with administrator rights switched off but High integrity (on `2b6263d`);
+- **f2m: the whole run in a normal, medium-integrity window (on `2b6263d`)**;
+- g1: window 1 running and recorded, a stranger also binds the port with `SO_REUSEADDR` on both: refused; g2: window 1 stopped, `server.json` valid but its process ended, a stranger on the port: refused;
+  g3: `server.json` names a live, non-listening process of step 1's Python with the right start time, a stranger listens: refused. Each log shows `server.json` passing the strict field check before step 11 runs
+  and that no reporter was running afterwards.
+`5a29dd9` and `2b6263d` carry the same scripts (only the two documentation files differ between them); the installed commit changes only documents too.
+
+**What differed without administrator rights (f2 and f2m against the elevated runs).** The owner of the folder step 1 makes and of the settings file step 7 writes is **the user** instead of the Administrators group;
+the access-list check passed in both (it allows you, SYSTEM and Administrators by identifier). The process-table reads (steps 10, 11, 14, 15) and the port-owner lookup answered without error. Nothing else differed.
+
+**The g1 finding.** When a stranger binds the same port after window 1 with `SO_REUSEADDR` on both sockets, the machine's listening-port table shows ONE row, and it is the later binder (the stranger), while a test
+connection is answered by the first binder (window 1). Step 11 therefore refuses (the single row is neither the recorded process nor its child). That is the safe direction; it also means step 11 refuses a working
+window 1 until the other program is gone, which the runbook now says.
+
+**Logs.** All eleven logs were searched in full, case-insensitively, for the Windows user name (from the environment and from the operating system, both non-empty), the typed name and home parts, a user-profile path,
+any 48-character hexadecimal value (the shape of the identity value, which no log prints) and, in the new logs, the real scratch path (written as `<scratch>`): no finding.
