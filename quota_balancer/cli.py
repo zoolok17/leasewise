@@ -103,8 +103,11 @@ def _build_parser():
         help="enroll/update a machine's HTTP identity allowlist entry (operator-only)",
     )
     identity.add_argument("--machine", required=True, help="machine alias")
-    identity.add_argument("--identity-ref", required=True,
-                          help="the opaque identity value the ingress presents")
+    identity.add_argument("--identity-ref", default=None,
+                          help="the opaque identity value the ingress presents (visible in the process list: "
+                               "prefer --identity-stdin)")
+    identity.add_argument("--identity-stdin", action="store_true",
+                          help="read the identity value from standard input (one line) instead of the command line")
     identity.add_argument("--enabled", required=True, type=_bool,
                           help="'true' or 'false'")
     clearer = sub.add_parser(
@@ -127,6 +130,17 @@ def _build_parser():
                        help="bind address; must be a literal loopback IP")
     serve.add_argument("--port", type=int, default=8443)
     return parser
+
+
+def _identity_value(args):
+    """The identity value: from --identity-ref, or one line of standard input (--identity-stdin), exactly one of the two.
+    A missing, doubled or empty value is the static INVALID_REQUEST; the value is never echoed."""
+    if args.identity_stdin == (args.identity_ref is not None):
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    value = sys.stdin.readline().rstrip("\r\n") if args.identity_stdin else args.identity_ref
+    if not value:
+        raise QuotaError(errors.CODE_INVALID_REQUEST, errors.MSG_INVALID_REQUEST)
+    return value
 
 
 def main(argv=None):
@@ -158,8 +172,7 @@ def main(argv=None):
             print(json.dumps({"adoption_id": gateway_adopt(args.db, args.gateway, args.evidence, args.resolve)},
                              separators=(",", ":")))
         elif args.verb == "identity-set":
-            set_machine_identity(args.db, args.machine, args.identity_ref,
-                                 args.enabled)
+            set_machine_identity(args.db, args.machine, _identity_value(args), args.enabled)
         elif args.verb == "block-clear":
             print(json.dumps(block_clear(
                 args.db, args.account, args.model, args.reason,
