@@ -311,3 +311,42 @@ rehearsal port: step 10 and step 11 both refused, nothing started. Window 1 star
 (so step 12's text allows going on); after fresh files one line showed `"sent": 4`. Baseline, the done check failing before new figures and for a figure observed before step 12 and delivered after it, passing after new figures.
 Step 14 listed the four processes; step 15 refused while they ran. Then the stray-variable, partial-answers, linked-package, clock-moved-back (`-Again`) and step-15 cases on a marker-only folder (removed) and a marker with
 something else (refused). Step 15 then printed `False`; the fake agenttalk folder was intact.
+
+
+### Fix round 1 (Codex delta tk-982c65ffad44)
+
+Codex read card 7b-on2 at `9914603` and returned FIX: one MAJOR and two MINOR points, all reproduced with synthetic data. The lead fixed the rules (order tk-0b8c734a7c0c); this section builds exactly those. Two commits on top
+of `9914603`: the scripts with the rebuilt runbook, and the tests.
+
+**In plain words.** Step 11 used to accept any program whose command line contained the right words, so an unrelated script given those words as arguments would have passed, and the identity value could have gone to it. It
+now accepts only the exact command that step 10 launches. Steps 3 and 8 used to copy the reporter's rules for reading the usage files in PowerShell, and the copy differed from the reporter (it counted links before dropping them,
+and checked the size before a separate full read). They now ask the reporter's own scan, so they cannot differ.
+
+1. **Step 11 checks the exact command (MAJOR).** `Assert-OurServerListens` in `switchon-common.ps1`. The listener's command line is split into words (an odd number of quote marks, or a process whose command line or program cannot
+   be read, is refused). The words after the program must equal, in order and with nothing before, between or after, `$PyFlags` followed by `Get-ServeArgs`: the one function step 10 also uses
+   (`-E -s -B -m quota_balancer --db <store> serve --host 127.0.0.1 --port <port>`); the store is compared as a Windows path ignoring case, every other word exactly. The program is one of two cases: (a) step 1's Python itself,
+   with its first word naming the same file; (b) when step 1's Python is a venv launcher (a `pyvenv.cfg` in the folder above its folder, inside `C:\lw`, not a link), the listener's program equals that file's `executable =`
+   value (or `home =` plus `python.exe`), its parent is step 1's Python, and the parent's command line is identical to the child's. No other child is accepted. The runbook and this record say the remaining limit once: a program
+   under the operator's own Windows account could copy this exact command line, for example from another folder; it could read the settings file anyway.
+2. **Steps 3 and 8 use the reporter's own scan (MINOR 2 and 3).** `Get-UsageAccounts` is gone. One small Python helper (a here-string in `switchon-common.ps1`, run with `$PyFlags` from the source folder like the other Leasewise
+   commands) calls `quota_balancer.reporter.capacityreader.scan(<agenttalk folder>, <now in ms>)`, which already applies `strictfile.walk` (entries bounded before collecting, links and folders dropped, names checked, then 64
+   files) and `strictfile.load_json` (reads at most 16,385 bytes). Step 3 gets, per provider, the number of accepted files whose account starts with `claude:` or `codex:`. Step 8 sends the two assembled texts on **standard input**
+   (JSON, non-ASCII escaped) and gets, per provider, how many accepted files have exactly that account. The answer is numbers only; on any problem the helper prints one fixed sentence and exits non-zero (it catches everything, so no
+   exception text can carry an account), and the step stops with a plain message. A folder that cannot be listed, or more entries or files than the reporter looks at, stops the step and says so. `scan` could be called cleanly this
+   way, so nothing is mirrored in PowerShell.
+3. **Record and runbook.** The runbook says step 11's exact check and its remaining limit, and that steps 3 and 8 use the reporter's own scan ("the very code the reporter runs"). The lead's rewording of the shared-account sentence
+   (`9914603`) is kept.
+
+**Tests** (`tests/test_switchon_behaviour.py`, `tests/test_switchon_scripts.py`). `ExactServerCommand`: a fake `quota_balancer` package in the working folder listens on the test port whatever it is given, so any command line can be
+tried; the exact command is accepted whatever the case of the store; refused: an unrelated script given the words and the exact store, `-c` mode, a trailing extra word, an extra word in the middle, a different flag order, a missing
+flag, another port number, another store, `serve` before `--db`; a copied venv launcher with a matching `pyvenv.cfg` is accepted (with `executable`, and with `home` only) and refused when the file names another interpreter; a
+child whose parent's command line differs is refused; a non-venv Python with a child is refused. `RealServerAcceptance` and the earlier real-server test cover the genuine direct and the genuine venv-launcher cases. `UsageFormat`:
+64 links that sort first plus two plain files are both counted; a file over 16 KiB and a valid small document followed by 20,000 blanks are not counted (and the same document without the blanks is); more than 64 files stops the
+step with the plain message; a broken scan stops the step with no account text and no traceback; the texts reach the scan on standard input only. The usage files in the tests are now complete synthetic fixtures of the reporter's
+format, because the reporter's own scan checks every field. The tests also pick a free port instead of a fixed one (another seat's test run was found holding the old one).
+
+**Red first.** The new test file was run on `9914603` (detached worktree, since removed): 6 of 92 tests fail there: the unrelated-script case, the venv child whose program is not the file's interpreter, the 64 earlier links, the
+more-than-64-files stop, the broken scan, and the texts-on-standard-input test. The others pass there too: the old code already refused a child whose parent's command line differs, a non-venv Python with a child, and any file over
+16 KiB (it checked the size). The new tests still pin those.
+
+**Rehearsal** (`rehearsal5-part1.txt`, `rehearsal5-part2.txt` in the developer's scratch): steps 0 to 15 in strict mode with the venv Python as before, and it adds an unrelated script holding the port with the exact store (refused; no reporter running afterwards).
