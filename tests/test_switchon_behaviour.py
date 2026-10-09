@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -29,7 +30,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "docs" / "switchon-7b"
 COMMON = SCRIPTS / "switchon-common.ps1"
-PORT = "18455"
+def _free_port():
+    """A port nobody listens on right now (another seat's test run may hold a fixed one): the system picks it."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return str(probe.getsockname()[1])
+
+
+PORT = _free_port()
 LOUD_CLAUDE = "claude:SYNTHETIC-LOUD-USER-5521:home-aaaaaaaa"
 LOUD_CODEX = "codex:SYNTHETIC-LOUD-USER-5521:home-bbbbbbbb"
 LOUD = "SYNTHETIC-LOUD-USER-5521"
@@ -73,10 +81,19 @@ class Base(unittest.TestCase):
         return env
 
     def usage(self, stem, who, **over):
-        """A usage file in the shape the reporter accepts (only the fields the scripts look at)."""
-        record = {"schema_version": 2, "scope": "account", "account": who}
-        record.update(over)
-        (self.bus / "state" / (stem + ".capacity.json")).write_text(json.dumps(record), encoding="ascii")
+        """A usage file the reporter's own reader accepts (a synthetic fixture of agenttalk 0.99.0's format), with fields changed by `over`."""
+        from tests.card7b2_fixtures import edited, put
+        base = "claude_stream_both" if who.startswith("claude:") else "codex_measured"
+        fields = dict(source_agent=stem, account=who)
+        fields.update(over)
+        put(str(self.bus / "state"), edited(base, **fields))
+
+    def junctions(self, folder, names, target):
+        """Many junctions in one PowerShell start (each is removed by the cleanup, never its target)."""
+        text = "; ".join("New-Item -ItemType Junction -Path '%s' -Target '%s' | Out-Null" % (Path(folder) / name, target) for name in names)
+        done = self.command(text)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.links.extend(Path(folder) / name for name in names)
 
     def install_source(self):
         """Leasewise's source in the live folder, as step 2 leaves it (a copy: a link there would be refused)."""
@@ -444,6 +461,7 @@ class RehearsalMode(Base):
 
     def test_a_complete_rehearsal_is_accepted(self):
         self.names()
+        self.install_source()
         done = self.run_script("switchon-03-check.ps1")
         self.assertEqual(done.returncode, 0, self.said(done))
         self.assertIn("2 usage file(s) found", done.stdout)
@@ -454,6 +472,10 @@ class RehearsalMode(Base):
 
 class Prompt(Base):
     """The real interactive branch of step 8, in a pseudo console, with loud markers."""
+
+    def setUp(self):
+        super().setUp()
+        self.install_source()
 
     def run_in_console(self, env, transcript=None):
         from tests.switchon_console import run_in_console
@@ -643,6 +665,10 @@ class Processes(Base):
 
 
 class Step8Parts(Base):
+    def setUp(self):
+        super().setUp()
+        self.install_source()
+
     def run8(self, **parts):
         return self.run_script("switchon-08-table.ps1", self.env(**dict(PARTS, **parts)))
 
@@ -714,6 +740,7 @@ class UsageFormat(Base):
     def setUp(self):
         super().setUp()
         self.names()
+        self.install_source()
 
     def test_a_good_pair_of_files_passes_and_only_counts_are_shown(self):
         done = self.step_3()
@@ -744,22 +771,71 @@ class UsageFormat(Base):
             (self.bus / "state" / "seat-a.capacity.json").write_text(text, encoding="ascii")
             self.refused("claude")
 
-    def test_a_file_over_16_kib_a_link_and_a_65th_file_are_ignored_as_the_reporter_ignores_them(self):
+    def test_a_file_over_16_kib_is_not_counted_and_so_is_one_that_only_starts_small(self):
+        from tests.card7b2_fixtures import edited, put
         state = self.bus / "state"
         (state / "seat-a.capacity.json").unlink()
         self.usage("seat-a", LOUD_CLAUDE, filler="x" * 17000)                           # over 16 KiB
         self.refused("claude")
         (state / "seat-a.capacity.json").unlink()
-        real = self.tmp / "real-seat.json"
-        real.write_text(json.dumps({"schema_version": 2, "scope": "account", "account": LOUD_CLAUDE}), encoding="ascii")
-        self.junction(state / "seat-link.capacity.json", self.tmp)                      # a link named like a usage file
-        self.refused("claude")
-        os.rmdir(state / "seat-link.capacity.json")
-        self.links.remove(state / "seat-link.capacity.json")
+        small = json.dumps(edited("claude_stream_both", source_agent="seat-a", account=LOUD_CLAUDE)).encode("utf-8")
+        put(str(state), None, stem="seat-a", raw=small + b" " * 20000)                  # a valid small document with 20,000 bytes of blanks after it
+        self.refused("claude")                                                          # the reporter's bounded read (16 KiB and one more byte) refuses it
+        put(str(state), None, stem="seat-a", raw=small)                                 # the same document without the blanks counts
+        self.assertEqual(self.step_3().returncode, 0)
+
+    def test_64_links_that_sort_first_do_not_hide_the_two_plain_files(self):
+        state = self.bus / "state"
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.junctions(state, ["a%02d.capacity.json" % number for number in range(64)], elsewhere)     # the reporter drops links BEFORE it keeps 64 files
+        done = self.step_3()
+        self.assertEqual(done.returncode, 0, self.said(done))
+        self.assertIn("claude: 1 usable usage file(s)", done.stdout)
+        self.assertIn("codex: 1 usable usage file(s)", done.stdout)
+
+    def test_more_usage_files_than_the_reporter_reads_stop_the_step_plainly(self):
         for number in range(64):
-            self.usage("a%02d" % number, "gemini:x:home-aaaaaaaa")                       # 64 files that sort first and are not usable
-        self.usage("z-last", LOUD_CLAUDE)                                               # the 66th by name: the reporter reads the first 64 only
-        self.refused("claude")
+            self.usage("a%02d" % number, "gemini:x:home-aaaaaaaa")
+        done = self.step_3()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("holds more entries or usage files than the reporter looks at (4096 entries, 64 files). Nothing was changed.", self.said(done))
+        self.assertNotIn(LOUD, done.stdout + done.stderr)
+
+    def test_an_unreadable_scan_stops_the_step_without_any_account_text(self):
+        scripts = self.tmp / "scripts-broken"
+        shutil.copytree(SCRIPTS, scripts)
+        common = scripts / "switchon-common.ps1"
+        text = common.read_text(encoding="ascii")
+        self.assertIn("found = capacityreader.scan(sys.argv[1]", text)
+        for broken, word in ((text.replace("found = capacityreader.scan(sys.argv[1]", "found = capacityreader.scan(None"), "could not be checked"),
+                             (text.replace("answer[provider] = sum(1 for text in accounts if text.startswith(provider", "answer[provider] = sum(1 for text in accounts if text.nothing(provider"),
+                              "could not be checked")):
+            common.write_text(broken, encoding="ascii", newline="\n")
+            done = self.run_script("switchon-03-check.ps1", scripts=scripts)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn(word, self.said(done))
+            self.assertNotIn(LOUD, done.stdout + done.stderr)                           # the exception names an account text in memory; nothing of it is printed
+            self.assertNotIn("Traceback", done.stdout + done.stderr)
+
+    def test_the_texts_reach_the_scan_on_standard_input_only(self):
+        trace = self.tmp / "python-calls.jsonl"
+        shim = self.tmp / "tracer.ps1"
+        shim.write_text('$in = @($input)\n'
+                        '$line = [ordered]@{ argv = @($args); stdin = ($in -join "`n") } | ConvertTo-Json -Compress\n'
+                        '[IO.File]::AppendAllText("%s", $line + "`n")\n'
+                        '$in | & "%s" @args\nexit $LASTEXITCODE\n' % (trace, sys.executable), encoding="ascii")
+        self.default_over = {"Py": str(shim)}
+        self.private_live()
+        self.install_source()
+        done = self.run_script("switchon-08-table.ps1", self.env(**PARTS))
+        self.assertEqual(done.returncode, 0, self.said(done))
+        calls = [json.loads(line) for line in trace.read_text(encoding="ascii").splitlines()]
+        scans = [call for call in calls if any("USAGE_SCAN_FAILED" in word for word in call["argv"])]
+        self.assertEqual(len(scans), 1)
+        self.assertNotIn(LOUD, " ".join(scans[0]["argv"]))                              # not on a command line
+        self.assertIn(LOUD, scans[0]["stdin"])                                          # on standard input
+        self.assertNotIn(LOUD, done.stdout + done.stderr)
 
 
 class PortChecks(Processes):
@@ -885,6 +961,158 @@ class PortChecks(Processes):
         self.assertNotEqual(done.returncode, 0)
         self.assertRegex(self.said(done), r"A reporter for this settings file is already running \(process \d+\)\. Nothing was started\.")
         self.assertFalse(trace.exists())
+
+
+BASE_PYTHON = Path(sys.base_prefix) / "python.exe"
+IS_VENV = sys.prefix != sys.base_prefix
+FAKE_SERVER = "import socket, time\ns = socket.socket()\ns.bind(('127.0.0.1', %s))\ns.listen(5)\ntime.sleep(120)\n" % PORT
+
+
+class ExactServerCommand(Processes):
+    """Step 11 accepts the command step 10 launches and nothing that merely contains its words. The 'server' here is a fake package in the working folder
+    that listens on the test port whatever it is given, so any command line can be tried."""
+
+    def setUp(self):
+        super().setUp()
+        self.names()
+        self.install_source()
+        (self.live / "store").mkdir(exist_ok=True)
+        self.store = str(self.live / "store" / "inventory.db")
+        self.fake = self.tmp / "fake"
+        (self.fake / "quota_balancer").mkdir(parents=True)
+        (self.fake / "quota_balancer" / "__init__.py").write_text("", encoding="ascii")
+        (self.fake / "quota_balancer" / "__main__.py").write_text(FAKE_SERVER, encoding="ascii")
+        (self.fake / "unrelated.py").write_text(FAKE_SERVER, encoding="ascii")
+
+    def exact(self, store=None, port=PORT):
+        return ["-E", "-s", "-B", "-m", "quota_balancer", "--db", store or self.store, "serve", "--host", "127.0.0.1", "--port", port]
+
+    def wait_listening(self):
+        import socket
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
+                return
+            except OSError:
+                time.sleep(0.2)
+        self.fail("the test server did not start")
+
+    def serve(self, python, words):
+        process = self.start([str(python)] + words, cwd=str(self.fake))
+        self.wait_listening()
+        return process
+
+    def use_python(self, path):
+        self.default_over = {"Py": str(path)}
+        self.names()
+
+    def verdict(self):
+        return self.check_function("Assert-OurServerListens; 'accepted'")
+
+    def assert_refused(self, label):
+        done = self.verdict()
+        self.assertNotEqual(done.returncode, 0, label)
+        self.assertIn("is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead.", self.said(done), label)
+
+    def fake_venv(self, name, launcher, **lines):
+        """A folder shaped like a venv: Scripts\\python.exe (a copy of `launcher`) and a pyvenv.cfg with the given lines."""
+        folder = self.tmp / name
+        (folder / "Scripts").mkdir(parents=True)
+        python = folder / "Scripts" / "python.exe"
+        shutil.copy(launcher, python)
+        if lines:
+            (folder / "pyvenv.cfg").write_text("".join("%s = %s\n" % item for item in lines.items()), encoding="ascii")
+        return python
+
+    def test_the_exact_command_is_accepted_whatever_the_case_of_the_store_path(self):
+        self.use_python(sys.executable)
+        self.serve(sys.executable, self.exact(store=self.store.upper()))
+        done = self.verdict()
+        self.assertEqual(done.returncode, 0, self.said(done))
+        self.assertIn("accepted", done.stdout)
+
+    def test_a_command_that_only_contains_the_words_is_refused(self):
+        exact = self.exact()
+        cases = {
+            "an unrelated script with the exact store": ["-E", "-s", "-B", str(self.fake / "unrelated.py"), "quota_balancer", "serve", "--db", self.store],
+            "-c mode": ["-E", "-s", "-B", "-c", FAKE_SERVER, "-m", "quota_balancer", "--db", self.store, "serve", "--host", "127.0.0.1", "--port", PORT],
+            "a trailing extra word": exact + ["extra"],
+            "an extra word in the middle": exact[:5] + ["extra"] + exact[5:],
+            "a different flag order": ["-s", "-E", "-B"] + exact[3:],
+            "a missing flag": exact[:2] + exact[3:],
+            "--port with another number": self.exact(port="18999"),
+            "another store": self.exact(store=str(self.tmp / "other.db")),
+            "serve before --db": exact[:5] + ["serve", "--db", self.store] + exact[8:],
+        }
+        self.use_python(sys.executable)
+        for label, words in cases.items():
+            process = self.serve(sys.executable, words)
+            self.assert_refused(label)
+            self.stop(process)
+            time.sleep(0.5)
+
+    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
+    def test_a_venv_launcher_and_its_one_base_interpreter_child_are_accepted_and_nothing_else(self):
+        launcher = self.fake_venv("fakevenv", sys.executable, home=str(BASE_PYTHON.parent), executable=str(BASE_PYTHON), version="3.13.7")
+        self.use_python(launcher)
+        process = self.serve(launcher, self.exact())                                   # the genuine venv case: the base interpreter is a child of the launcher
+        self.assertEqual(self.verdict().returncode, 0)
+        self.stop(process)
+        (launcher.parent.parent / "pyvenv.cfg").write_text("home = %s\nversion = 3.13.7\n" % BASE_PYTHON.parent, encoding="ascii")     # no executable line: home plus python.exe
+        process = self.serve(launcher, self.exact())
+        self.assertEqual(self.verdict().returncode, 0)
+        self.stop(process)
+        (launcher.parent.parent / "pyvenv.cfg").write_text("home = %s\nexecutable = %s\n" % (BASE_PYTHON.parent, self.tmp / "some-other-program.exe"), encoding="ascii")
+        process = self.serve(launcher, self.exact())                                   # the child is not the interpreter the file names
+        self.assert_refused("a venv child whose program is not the file's interpreter")
+        self.stop(process)
+
+    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
+    def test_a_child_whose_parent_has_another_command_line_is_refused(self):
+        # step 1's Python is a real interpreter in a venv-shaped folder; it starts a child whose first word and program are right, but its own command line differs
+        python = self.fake_venv("fakevenv2", BASE_PYTHON, home=str(BASE_PYTHON.parent), executable=str(BASE_PYTHON))
+        self.use_python(python)
+        spawner = ("import subprocess, sys, time\n"
+                   "subprocess.Popen([sys.argv[1]] + sys.argv[3:], executable=sys.argv[2], cwd=r'%s')\n"
+                   "time.sleep(120)\n" % self.fake)
+        self.start([str(python), "-E", "-s", "-B", "-c", spawner, str(python), str(BASE_PYTHON)] + self.exact())
+        self.wait_listening()
+        self.assert_refused("a child whose parent's command line differs")
+
+    @unittest.skipUnless(IS_VENV, "needs the tests to run in a virtual environment")
+    def test_a_non_venv_python_with_a_child_is_refused(self):
+        other = self.tmp / "other-python.exe"
+        shutil.copy(BASE_PYTHON, other)
+        self.use_python(BASE_PYTHON)
+        spawner = ("import subprocess, sys, time\n"
+                   "subprocess.Popen([sys.argv[1]] + sys.argv[3:], executable=sys.argv[2], cwd=r'%s')\n"
+                   "time.sleep(120)\n" % self.fake)
+        self.start([str(BASE_PYTHON), "-E", "-s", "-B", "-c", spawner, str(BASE_PYTHON), str(other)] + self.exact())
+        self.wait_listening()
+        self.assert_refused("a non-venv python with a child")
+
+
+class RealServerAcceptance(Processes):
+    def test_the_genuine_direct_case_is_accepted(self):
+        self.default_over = {"Py": str(BASE_PYTHON)}
+        self.names()
+        self.install_source()
+        (self.live / "store").mkdir(exist_ok=True)
+        store = self.live / "store" / "inventory.db"
+        init = subprocess.run([str(BASE_PYTHON), "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "init"], cwd=self.live / "src", capture_output=True, text=True)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        self.start([str(BASE_PYTHON), "-E", "-s", "-B", "-m", "quota_balancer", "--db", str(store), "serve", "--host", "127.0.0.1", "--port", PORT], cwd=self.live / "src")
+        import socket
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.3)
+        done = self.check_function("Assert-OurServerListens; 'accepted'")
+        self.assertEqual(done.returncode, 0, self.said(done))
 
 
 class Step5Again(Base):

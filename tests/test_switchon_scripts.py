@@ -39,7 +39,7 @@ STEPS = [
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "e201af2cb87a555157e61bbb990023e06a90cb6a0dd6f3ecaddf6b9fb7cef0be",
+    COMMON: "e8ec10f2a5b6b5ffd34d2f797b3789a974763387d60f4d53aacd11b481328796",
     GUARD: "09f7065fafd9611026d5ddcd80b67faa7bf55aba1da6f9e6613cbf060bf4b71b",
 }
 
@@ -245,7 +245,7 @@ class Safety(unittest.TestCase):
         self.assertEqual([line for line in code if "env:LW_SWITCHON_" in line and "LW_SWITCHON_INPUT" not in line],
                          ["    $ClaudeName, $ClaudeHome = $env:LW_SWITCHON_CLAUDE_NAME, $env:LW_SWITCHON_CLAUDE_HOME",
                           "    $CodexName, $CodexHome = $env:LW_SWITCHON_CODEX_NAME, $env:LW_SWITCHON_CODEX_HOME"])
-        self.assertLess(text.index("Get-UsageAccounts"), text.index("AppendAllText"))   # a typo is found against our own usage files before anything is written
+        self.assertLess(text.index("Invoke-UsageScan"), text.index("AppendAllText"))   # a typo is found against our own usage files before anything is written
         self.assertIn("does not match any of our usage files. Nothing was changed.", text)
         for name in STEPS:
             if name != "switchon-08-table.ps1":
@@ -311,14 +311,14 @@ class Safety(unittest.TestCase):
             for line in lines:
                 if "serve" in line and name not in ("switchon-10-server.ps1", COMMON):
                     self.assertNotIn("'serve'", line, name)
-        self.assertIn("'--host', '127.0.0.1'", script_text("switchon-10-server.ps1"))
+        self.assertIn("'--host', '127.0.0.1'", script_text(COMMON))
         server, reporter = script_text("switchon-10-server.ps1"), script_text("switchon-11-reporter.ps1")
         self.assertLess(server.index("Get-PortListeners $PortNumber"), server.index("& $Py"))                  # nothing starts while anything listens on the port
         self.assertIn("Something on this machine already listens on port", server)
         self.assertLess(reporter.index("Assert-OurServerListens"), reporter.index("& $Py"))                    # the identity value is never sent to a stranger
         self.assertLess(reporter.index("Assert-NoReporterRunning"), reporter.index("& $Py"))
         common = script_text(COMMON)
-        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "-ine $Store", "$Row.ParentPath -ieq $Py", "$Row.ParentCommandLine -ieq $Row.CommandLine",
+        for needle in ("Get-NetTCPConnection -State Listen", "CmdletizationQuery_NotFound,Get-NetTCPConnection", "$Row.ParentPath -ine $Py", "$Row.ParentCommandLine -cne $Row.CommandLine",
                        "$Rows[0].Address -cne '127.0.0.1'", "is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."):
             self.assertIn(needle, common, needle)
         self.assertNotIn("0.0.0.0", "".join(script_text(name) for name in ALL))
@@ -336,14 +336,31 @@ class Safety(unittest.TestCase):
                     self.assertIn("& $Py @PyFlags ", line, (name, line))
         self.assertGreaterEqual(calls, 14)
 
-    def test_the_usage_files_are_read_by_one_shared_function_with_the_reporters_limits(self):
+    def test_the_usage_files_are_counted_by_the_reporters_own_scan_through_one_shared_helper(self):
         common = script_text(COMMON)
-        self.assertEqual(common.count("function Get-UsageAccounts"), 1)
-        for needle in ("*.capacity.json", "Select-Object -First 64", "$Info.Length -gt 16384", "ReparsePoint", "$Version -eq 2", "-ceq 'account'"):
+        self.assertEqual(common.count("function Invoke-UsageScan"), 1)
+        self.assertNotIn("Get-UsageAccounts", "".join(script_text(name) for name in ALL))
+        for needle in ("from quota_balancer.reporter import capacityreader", "capacityreader.scan(sys.argv[1]", "found.folder_unreadable", "found.too_many_entries",
+                       "sys.stdin.read()", "USAGE_SCAN_FAILED", "except BaseException:", "ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii", "$Stdin | & $Py @PyFlags -c $UsageHelper $BusRoot $Mode"):
             self.assertIn(needle, common, needle)
+        for copied in ("EnumerateFileSystemEntries", "16384", "Select-Object -First 64", "ReadAllText", "$Version -eq 2"):
+            self.assertNotIn(copied, common, copied)                              # no copy of the reporter's rules in PowerShell
+        self.assertNotIn("print(text", common)
         for name in ("switchon-03-check.ps1", "switchon-08-table.ps1"):
-            self.assertIn("Get-UsageAccounts", script_text(name), name)
-        self.assertNotIn("Get-UsageAccounts", "".join(script_text(n) for n in STEPS if n not in ("switchon-03-check.ps1", "switchon-08-table.ps1")))
+            self.assertIn("Invoke-UsageScan", script_text(name), name)
+        self.assertNotIn("Invoke-UsageScan", "".join(script_text(n) for n in STEPS if n not in ("switchon-03-check.ps1", "switchon-08-table.ps1")))
+        step8 = script_text("switchon-08-table.ps1")
+        self.assertIn("Invoke-UsageScan 'match' @{ claude = $ClaudeText; codex = $CodexText }", step8)      # the texts go in as data, never as an argument
+        self.assertLess(step8.index("Invoke-UsageScan"), step8.index("AppendAllText"))
+
+    def test_step_11_compares_the_exact_command_step_10_launches(self):
+        common, server = script_text(COMMON), script_text("switchon-10-server.ps1")
+        self.assertIn("$ServeArgs = Get-ServeArgs", server)                       # one list for both steps
+        self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)
+        for needle in ("$Want = @($PyFlags) + @(Get-ServeArgs)", "$Words.Count -ne ($Want.Count + 1)", "$Words[$Index + 1] -ceq $Want[$Index]", "-ieq $Store",
+                       "if ($Row.Path -ieq $Py) { return }", "$Row.ParentCommandLine -cne $Row.CommandLine", "$Config -notlike 'C:\lw\*'", "executable", "-not $Row.CommandLine -or -not $Row.Path"):
+            self.assertIn(needle, common, needle)
+        self.assertNotIn("-contains 'serve'", common)                              # not a bag of words any more
 
     def test_the_reporter_is_started_with_the_private_settings_and_nothing_else(self):
         self.assertIn("@('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)", script_text("switchon-11-reporter.ps1"))
