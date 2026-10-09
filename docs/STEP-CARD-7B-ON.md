@@ -396,3 +396,13 @@ grandchild.
 accepted through the venv launcher and its child, a second step 10 refused, window 2 up, a second step 11 refused; the baseline, the done check and step 14/15 as before; then, with the record of the stopped window 1 still in place,
 Codex's quoted-boundary stranger holding the port (step 11 refused, 0 reporter processes afterwards); then Ctrl-C in two pseudo consoles ended window 1 (the server's process was gone, the port free) and window 2, and step 14 listed
 nothing; the adversarial cases and step 15 as before.
+
+### Close-out (Codex delta 3 tk-505934ca5f9b)
+
+Codex's third read closed every listener-identity finding and found one new MAJOR in step 10: the script started the server and then built and wrote `server.json` before its `try`/`finally`, so if the write failed the cleanup
+never ran and an unrecorded server kept running (step 11 refused it, so nothing unsafe followed, but the operator could not simply retry). Step 10 now refuses first if `server.json` exists and is not a plain file ("... is not a
+file. Nothing was started. Tell the lead."); the start and the record are both inside the `try`; and if the record is not saved, the `finally` stops the server and everything it started at once (`Kill($true)`, then waits for it to be
+gone) and the operator reads "The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead." The normal path keeps its five seconds' grace after Ctrl-C. The record is
+written by a one-line function, `Save-ServerRecord`, which the test replaces with a failing one in a copy of the script (a test hook; no production check is weakened). Tests (`Step10Starts`): a folder at `server.json` starts nothing;
+a failing record write, run directly and through the venv launcher, leaves no server process (the process the script was handed is gone, the port is free, step 14 lists nothing) and gives the plain message; the normal path and Ctrl-C
+tests pass as before. Both new tests fail on `b914256` (the first with the raw .NET error after the server had started; the second at the missing seam).
