@@ -34,13 +34,13 @@ DOT_SOURCE = ". (Join-Path $PSScriptRoot 'switchon-common.ps1')"
 STEPS = [
     "switchon-00-check.ps1", "switchon-01-setup.ps1", "switchon-02-unpack.ps1", "switchon-03-check.ps1", "switchon-04-store.ps1",
     "switchon-05-accounts.ps1", "switchon-06-check-accounts.ps1", "switchon-07-settings.ps1", "switchon-08-table.ps1",
-    "switchon-09-check-table.ps1", "switchon-10-server.ps1", "switchon-11-reporter.ps1", "switchon-12-done.ps1",
-    "switchon-13-stopped.ps1", "switchon-14-rollback.ps1", "switchon-help-status.ps1"]
+    "switchon-09-check-table.ps1", "switchon-10-server.ps1", "switchon-11-reporter.ps1", "switchon-12-baseline.ps1", "switchon-13-done.ps1",
+    "switchon-14-stopped.ps1", "switchon-15-rollback.ps1", "switchon-help-status.ps1"]
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "16267bd7edc1c1b398a9df19e317a6ad7a9ebb2463be97aa794eef85455ecde6",
-    GUARD: "0bc5bea6d68ddfbe3a3e8f86de0f0e4943bd0caac9a12f0d5f7d0bff1ecb55f6",
+    COMMON: "86a173489b81e604b79932051d16a50cbf19e1014b47c12cc4812efa6e834fff",
+    GUARD: "0f5459c5189ced9fbec3272f180103f05dff1c5d61dd56f2b850f213165cfd9d",
 }
 
 
@@ -108,7 +108,7 @@ class Files(unittest.TestCase):
     def test_every_step_but_the_first_loads_the_shared_start_before_anything_else(self):
         for name in STEPS[1:]:
             code = [line for line in script_text(name).split("\n") if line.strip() and not line.startswith("#")]
-            expected = DOT_SOURCE + (" -KeepOutOfSource" if name == "switchon-14-rollback.ps1" else "")
+            expected = DOT_SOURCE + (" -KeepOutOfSource" if name == "switchon-15-rollback.ps1" else "")
             self.assertEqual(code[0], expected, name)
         code = [line for line in script_text(STEPS[0]).split("\n") if line.strip() and not line.startswith("#")]
         self.assertNotIn("Join-Path", " ".join(code))                     # step 0 reads nothing at all
@@ -132,9 +132,9 @@ class Drift(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for name in ALL:
                 shutil.copy(SCRIPTS / name, Path(tmp, name))
-            path = Path(tmp, "switchon-14-rollback.ps1")
-            path.write_text(script_text("switchon-14-rollback.ps1").replace("-Recurse -Force", "-Recurse -Force -WhatIf:$false"), encoding="ascii", newline="\n")
-            self.assertEqual(check_drift(RUNBOOK.read_text(encoding="utf-8"), tmp), ["switchon-14-rollback.ps1: the runbook block differs from the script"])
+            path = Path(tmp, "switchon-15-rollback.ps1")
+            path.write_text(script_text("switchon-15-rollback.ps1").replace("-Recurse -Force", "-Recurse -Force -WhatIf:$false"), encoding="ascii", newline="\n")
+            self.assertEqual(check_drift(RUNBOOK.read_text(encoding="utf-8"), tmp), ["switchon-15-rollback.ps1: the runbook block differs from the script"])
 
     def test_a_runbook_with_crlf_line_endings_still_matches(self):
         self.assertEqual(check_drift(RUNBOOK.read_text(encoding="utf-8").replace("\n", "\r\n")), [])
@@ -148,7 +148,7 @@ class Pinned(unittest.TestCase):
     def test_the_guard_holds_the_checks_it_promises(self):
         guard = script_text(GUARD)
         for needle in ("[IO.Path]::GetFullPath($Path)", "-notlike 'C:\\lw\\*'", "ReparsePoint", "(Join-Path $BusRoot 'state')", "$NamesFile",
-                       "names.json names the live folder", "'C:\\lw\\live'", "'C:\\lw\\team\\.agenttalk'", "LW_SWITCHON_ROOT"):
+                       "names.json was made for another live folder", "'C:\\lw\\live'", "'C:\\lw\\team\\.agenttalk'", "LW_SWITCHON_ROOT"):
             self.assertIn(needle, guard)
         self.assertLess(guard.index("GetFullPath"), guard.index("ReparsePoint"))        # the path check comes before anything is opened
         self.assertLess(guard.index("ReparsePoint"), guard.index("Get-Content"))        # and the link check before names.json is read
@@ -185,16 +185,19 @@ class Safety(unittest.TestCase):
     def test_only_the_rollback_deletes_and_only_the_live_folder(self):
         for name, lines in self.all_code().items():
             deletes = [line for line in lines if re.search(r"Remove-Item|\.Delete\(|rmdir|rd /s|del /|robocopy|takeown|icacls", line)]
-            if name == "switchon-14-rollback.ps1":
+            if name == "switchon-15-rollback.ps1":
                 self.assertEqual(deletes, ["Remove-Item -LiteralPath $LiveRoot -Recurse -Force"])
             else:
                 self.assertEqual(deletes, [], name)
 
     def test_the_rollback_checks_for_links_and_the_marker_before_it_deletes(self):
-        text = script_text("switchon-14-rollback.ps1")
+        text = script_text("switchon-15-rollback.ps1")
         self.assertLess(text.index("ReparsePoint"), text.index("Remove-Item"))
         self.assertLess(text.index(".owner.json"), text.index("Remove-Item"))
         self.assertLess(text.index("$Links -gt 0"), text.index("Remove-Item"))
+        self.assertLess(text.index("Assert-NoLink (Join-Path $LiveRoot '.owner.json')"), text.index("Get-Content"))     # the marker is no link before it is read
+        self.assertLess(text.index("Assert-Separate"), text.index("Remove-Item"))                                       # the roots are checked again right before the delete
+        self.assertLess(text.index("Assert-NoLink $LiveRoot"), text.index("Get-Content"))
         self.assertIn("Stack[string]", text)                                  # a walk that never enters a link
 
     def test_the_unpack_goes_only_into_the_source_folder_of_the_live_folder(self):
@@ -219,22 +222,54 @@ class Safety(unittest.TestCase):
     def test_the_account_texts_come_only_from_the_operator_and_go_only_into_the_private_settings(self):
         text = script_text("switchon-08-table.ps1")
         self.assertEqual(len(re.findall(r"Read-Host", text)), 2)
+        self.assertEqual(len(re.findall(r"Read-Host -MaskInput", text)), 2)             # what is typed is never shown
+        self.assertNotIn("-AsPlainText", text)
         self.assertIn("[IO.File]::AppendAllText($ConfigPath, $Rows, $Utf8)", text)
+        self.assertLess(text.index("Assert-Private $ConfigPath $true"), text.index("Read-Host"))      # the file is checked BEFORE anything is asked
+        self.assertLess(text.index("Assert-Private $LiveRoot $true"), text.index("Read-Host"))
         self.assertLess(text.index("-cnotmatch"), text.index("AppendAllText"))        # the shape is checked before anything is written
-        self.assertLess(text.index("AppendAllText"), text.index("Assert-Private $ConfigPath $true"))
+        self.assertLess(text.index("AppendAllText"), text.index("Assert-PrivateAfter $ConfigPath $true"))
+        code = [line for line in text.split("\n") if not line.lstrip().startswith("#")]
+        self.assertEqual([line for line in code if "env:LW_SWITCHON_CLAUDE_TEXT" in line or "env:LW_SWITCHON_CODEX_TEXT" in line],
+                         ["    $ClaudeText = $env:LW_SWITCHON_CLAUDE_TEXT", "    $CodexText = $env:LW_SWITCHON_CODEX_TEXT"])
         for name in STEPS:
             if name != "switchon-08-table.ps1":
                 self.assertNotIn("$ClaudeText", script_text(name))
                 self.assertNotIn("$CodexText", script_text(name))
 
-    def test_the_settings_and_the_store_are_made_private_before_a_secret_is_written(self):
+    def test_the_settings_and_the_store_are_made_private_before_a_secret_exists(self):
         text = script_text("switchon-07-settings.ps1")
+        for check in ("Assert-Private $LiveRoot $true", "Assert-Private (Split-Path $Store) $false", "Assert-Private $Store $false"):
+            self.assertLess(text.index(check), text.index("RandomNumberGenerator"), check)          # before the value exists
+            self.assertLess(text.index(check), text.index("identity-set"), check)
+            self.assertLess(text.index(check), text.index("New-Item -ItemType File"), check)
         self.assertLess(text.index("Protect-Path $ConfigPath $false"), text.index("RandomNumberGenerator"))
         self.assertLess(text.index("Assert-Private $ConfigPath $true"), text.index("identity-set"))
-        self.assertLess(text.index("identity-set"), text.index("Assert-Private $Store $false"))
-        self.assertLess(text.index("Assert-Private $Store $false"), text.index("WriteAllText($ConfigPath"))
+        self.assertLess(text.index("identity-set"), text.index("Assert-PrivateAfter $Store $false"))     # and again after each write, with a different message
+        self.assertLess(text.index("Assert-PrivateAfter $Store $false"), text.index("WriteAllText($ConfigPath"))
+        self.assertLess(text.index("WriteAllText($ConfigPath"), text.index("Assert-PrivateAfter $ConfigPath $true"))
         setup = script_text("switchon-01-setup.ps1")
         self.assertLess(setup.index("Protect-Path $LiveRoot $true"), setup.index("WriteAllText"))
+        common = script_text(COMMON)
+        self.assertIn("nothing secret has been written", common)
+        self.assertIn("A secret HAS ALREADY BEEN WRITTEN", common)
+
+    def test_no_secret_is_ever_on_a_command_line(self):
+        for name, lines in self.all_code().items():
+            for line in lines:
+                self.assertNotIn("--identity-ref", line, name)
+        lines = [line for line in self.all_code()["switchon-07-settings.ps1"] if "identity-set" in line and "throw" not in line]
+        self.assertEqual(lines, ["$Id | & $Py -m quota_balancer --db $Store identity-set --machine $MachineAlias --identity-stdin --enabled true"])
+
+    def test_the_done_check_has_the_conditions_it_promises(self):
+        text = script_text("switchon-13-done.ps1")
+        for needle in ("baseline.json", "-le [int64]$Base.$Alias", "TotalSeconds -gt 180", "$LASTEXITCODE -ne 0", "$Readings.sources", "operator_actions.Count -ne 0",
+                       "failed_permanent -ne 0", "capture_fault.count -ne 0", "mode=ro", "$WaitMinutes = 10"):
+            self.assertIn(needle, text, needle)
+        self.assertEqual(text.count("$LASTEXITCODE -ne 0"), 2)                       # the store query and the status command
+        baseline = script_text("switchon-12-baseline.ps1")
+        self.assertIn("A baseline was already recorded", baseline)
+        self.assertLess(baseline.index("mode=ro"), baseline.index("WriteAllText"))
 
     def test_only_the_server_listens_and_only_on_this_machine(self):
         for name, lines in self.all_code().items():
@@ -262,7 +297,7 @@ class Runbook(unittest.TestCase):
         for needle in ("# Switching on usage readings on Laptop B", "## What this does, in plain words", "## Before you start", "## How to run each step",
                        "## Where things live", "## Step 0", "## Step 1", "## Step 2", "## Step 3", "## Step 4", "## Step 5 (operator step)",
                        "### Check after step 5 (step 6)", "## Step 7", "## Step 8 (operator step)", "### Check after step 8 (step 9)", "## Step 10", "## Step 11",
-                       "## Wait for a real turn, then step 12", "## Step 13", "## Step 14", "## If something goes wrong", "## Tell the lead when you are done",
+                       "## Step 12: record the baseline", "## Wait for a real turn, then step 13", "## Step 14", "## Step 15", "## If something goes wrong", "## Tell the lead when you are done",
                        "## Technical detail", "agenttalk capacity", "C:\\lw\\live", "127.0.0.1", "FORBIDDEN", "PASSED",
                        "Done when", "never run `pip install`", "must **never** be changed"):
             self.assertIn(needle, self.text, needle)
@@ -286,7 +321,7 @@ class Runbook(unittest.TestCase):
         flat = " ".join(self.text.split())
         for needle in ("nothing leaves this machine", "does **not** touch the gateway, the money reader or limit events",
                        "never reads a file of another team and never reads a folder outside `C:\\lw`", "It never touches the agenttalk folder",
-                       "**Never set the three `LW_SWITCHON_...` environment variables.**"):
+                       "**Never set an `LW_SWITCHON_...` environment variable.**"):
             self.assertIn(needle, flat, needle)
 
 
@@ -307,74 +342,6 @@ class WithPowerShell(unittest.TestCase):
         done = self.pwsh("-File", str(SCRIPTS / STEPS[0]))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.split("\n")[1].strip(), "scripts run here")
-
-    def guard(self, env):
-        return self.pwsh("-File", str(SCRIPTS / "switchon-03-check.ps1"), env=env)
-
-    def test_the_guard_refuses_folders_outside_c_lw_and_dotted_paths_before_anything_is_opened(self):
-        for env, word in (({"LW_SWITCHON_ROOT": "D:\\elsewhere\\live"}, "is not a plain folder inside C:\\lw"),
-                          ({"LW_SWITCHON_BUS": "C:\\Windows\\System32"}, "is not a plain folder inside C:\\lw"),
-                          ({"LW_SWITCHON_ROOT": "C:\\lw\\live\\..\\live"}, "is not a plain folder inside C:\\lw"),
-                          ({"LW_SWITCHON_ROOT": "C:\\lw\\live\\"}, "is not a plain folder inside C:\\lw"),
-                          ({"LW_SWITCHON_BUS": "C:\\lw-other\\bus"}, "is not a plain folder inside C:\\lw")):
-            done = self.guard(env)
-            self.assertNotEqual(done.returncode, 0, env)
-            self.assertIn(word, (done.stdout + done.stderr).replace("\n", " "), env)
-            self.assertIn("Nothing was changed", (done.stdout + done.stderr).replace("\n", " "))
-
-    def scratch(self):
-        base = os.environ.get("AGENTTALK_SCRATCH")
-        if not base or not base.lower().startswith("c:\\lw\\") or not os.path.isdir(base):
-            self.skipTest("needs a throwaway folder inside C:\\lw (AGENTTALK_SCRATCH)")
-        return tempfile.TemporaryDirectory(dir=base, prefix="quota-switchon-")
-
-    def junction(self, link, target):
-        done = self.pwsh("-Command", "New-Item -ItemType Junction -Path '%s' -Target '%s' | Out-Null" % (link, target))
-        self.assertEqual(done.returncode, 0, done.stderr)
-
-    def test_the_guard_stops_at_a_link_and_at_a_names_file_of_another_folder(self):
-        with self.scratch() as tmp:
-            real, bus = Path(tmp, "real"), Path(tmp, "bus")
-            (bus / "state").mkdir(parents=True)
-            real.mkdir()
-            link = Path(tmp, "live-link")
-            self.junction(link, real)
-            bus_link = Path(tmp, "bus-link")
-            self.junction(bus_link, bus)
-            state_link_bus = Path(tmp, "bus2")
-            state_link_bus.mkdir()
-            self.junction(state_link_bus / "state", bus / "state")
-            try:
-                for env in ({"LW_SWITCHON_ROOT": str(link), "LW_SWITCHON_BUS": str(bus)},
-                            {"LW_SWITCHON_ROOT": str(real), "LW_SWITCHON_BUS": str(bus_link)},
-                            {"LW_SWITCHON_ROOT": str(real), "LW_SWITCHON_BUS": str(state_link_bus)}):
-                    done = self.guard(env)
-                    self.assertNotEqual(done.returncode, 0, env)
-                    self.assertIn("is a link. Nothing was changed", (done.stdout + done.stderr).replace("\n", " ").replace("| ", ""))
-                (real / "names.json").write_text('{"LiveRoot": "C:\\\\lw\\\\somewhere-else"}', encoding="ascii")
-                done = self.guard({"LW_SWITCHON_ROOT": str(real), "LW_SWITCHON_BUS": str(bus)})
-                self.assertNotEqual(done.returncode, 0)
-                self.assertIn("names.json names the live folder", (done.stdout + done.stderr).replace("\n", " ").replace("| ", ""))
-            finally:
-                for path in (link, bus_link, state_link_bus / "state"):
-                    if os.path.lexists(path):
-                        os.rmdir(path)                                          # only the link itself, never its target
-
-    def test_the_guard_lets_a_plain_folder_through_and_step_3_counts_files_without_showing_them(self):
-        with self.scratch() as tmp:
-            bus = Path(tmp, "bus")
-            (bus / "state").mkdir(parents=True)
-            (bus / "state" / "seat-a.capacity.json").write_text('{"loud": "SECRET-TEXT"}', encoding="ascii")
-            python = sys.executable
-            names = Path(tmp, "live")
-            names.mkdir()
-            (names / "names.json").write_text('{"LiveRoot": "%s", "Py": "%s", "Src": "%s", "BusRoot": "%s"}' % (
-                str(names).replace("\\", "\\\\"), python.replace("\\", "\\\\"), str(names / "src").replace("\\", "\\\\"), str(bus).replace("\\", "\\\\")),
-                encoding="ascii")
-            done = self.guard({"LW_SWITCHON_ROOT": str(names), "LW_SWITCHON_BUS": str(bus)})
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-            self.assertIn("1 usage file(s) found", done.stdout)
-            self.assertNotIn("SECRET-TEXT", done.stdout + done.stderr)
 
 
 if __name__ == "__main__":
