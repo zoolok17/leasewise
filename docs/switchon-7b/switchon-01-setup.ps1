@@ -30,16 +30,17 @@ if ([IO.Path]::GetExtension($Archive) -ne '.zip') { throw 'The archive must be a
 if (Test-Path -LiteralPath $LiveRoot) { throw "The folder $LiveRoot already exists. Nothing was changed. If an earlier run made it, roll it back with step 15; otherwise tell the lead." }
 New-Item -ItemType Directory -Path $LiveRoot | Out-Null  # no -Force: an existing folder is an error
 
-# The marker and names.json come first, at once: neither holds a secret, and step 15 can remove the folder from them whatever happens next.
+# Only the ownership marker comes first (a random token and the folder path, nothing personal): step 15 can remove the folder from it whatever happens next.
+# names.json holds the path of Python, which can contain your user name, so it is written only after the folder has been made private and checked.
 $Token = [guid]::NewGuid().ToString('N')                 # random
 $Here = (Resolve-Path -LiteralPath $LiveRoot).ProviderPath
 [IO.File]::WriteAllText((Join-Path $LiveRoot '.owner.json'), (ConvertTo-Json @{ token = $Token; path = $Here }), $Utf8)
+try { Protect-Path $LiveRoot $true; Assert-Private $LiveRoot $true }
+catch { throw "$LiveRoot was made and holds only the ownership marker (a random token and the folder path), but it could not be made private. Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead." }
 $Saved = [ordered]@{                                     # only these names are ever read back; every path is recomputed from LiveRoot and BusRoot
     LiveRoot = $LiveRoot; BusRoot = $BusRoot; Port = $PortNumber; Token = $Token; Py = $Py; Archive = $Archive; ExpectedSha = $ExpectedSha
     MachineAlias = $MachineAlias; ClaudeAlias = $ClaudeAlias; CodexAlias = $CodexAlias; ProjectAlias = $ProjectAlias
 }
 [IO.File]::WriteAllText($Names, ($Saved | ConvertTo-Json -Depth 3), $Utf8)
-try { Protect-Path $LiveRoot $true; Assert-Private $LiveRoot $true }
-catch { throw "$LiveRoot was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead." }
 New-Item -ItemType Directory -Path $StateDir, $Journal, (Split-Path $Store) | Out-Null
 Test-Path -LiteralPath $Names

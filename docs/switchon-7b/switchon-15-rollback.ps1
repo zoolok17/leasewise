@@ -10,7 +10,7 @@ Assert-Plain $LiveRoot
 Assert-NoLink $LiveRoot
 if (-not (Test-Path -LiteralPath $LiveRoot -PathType Container)) { 'There is nothing to roll back: the folder does not exist.'; return }
 $Running = @(Get-LiveProcesses)                          # the same list as step 14, without this script's own process
-if ($Running.Count -gt 0) { throw ('Window 1 or 2 is still running (process {0}). Press Ctrl-C in it, then run step 15 again. Nothing was deleted.' -f $Running[0].ProcessId) }
+if ($Running.Count -gt 0) { throw ('A program that uses the live folder is still running (process {0}, program {1}). If it is window 1 or 2, press Ctrl-C there; otherwise close that program. Then run step 15 again. Nothing was deleted.' -f $Running[0].ProcessId, $Running[0].Name) }
 $MarkerFile = Join-Path $LiveRoot '.owner.json'
 Assert-NoLink $MarkerFile                                          # the marker is a plain file, not a link, before it is read
 if (-not (Test-Path -LiteralPath $MarkerFile -PathType Leaf)) { throw 'The folder holds no ownership marker, so it is not a folder this runbook made. Nothing was deleted. Tell the lead.' }

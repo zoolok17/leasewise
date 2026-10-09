@@ -326,25 +326,28 @@ class Containment(Base):
         saved = json.loads((self.live / "names.json").read_text(encoding="ascii"))
         self.assertEqual((saved["Py"], saved["Archive"], saved["ExpectedSha"]), (sys.executable, str(real / "a.zip"), "c" * 64))
 
-    def test_a_privacy_failure_in_step_1_leaves_the_marker_and_names_json_and_step_15_removes_the_folder(self):
+    def test_a_privacy_failure_in_step_1_leaves_only_the_marker_and_step_15_removes_the_folder(self):
         real = self.tmp / "real-archives"
         real.mkdir()
         (real / "a.zip").write_bytes(b"PK")
-        scripts = self.tmp / "scripts-private-fails"
-        shutil.copytree(SCRIPTS, scripts)
-        common = scripts / "switchon-common.ps1"
-        common.write_text(common.read_text(encoding="ascii").replace("function Protect-Path {", "function Protect-Path {\n    throw 'simulated: the access list cannot be set'", 1),
-                          encoding="ascii", newline="\n")
-        done = self.run_script("switchon-01-setup.ps1", self.step_1_env(sys.executable, str(real / "a.zip")), scripts=scripts)
-        self.assertNotEqual(done.returncode, 0)
-        said = self.said(done)
-        self.assertIn("was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead.", said)
-        self.assertNotIn("nothing was changed", said.lower().replace("nothing secret was written", ""))     # the old, untrue sentence is gone
-        self.assertEqual(sorted(p.name for p in self.live.iterdir()), [".owner.json", "names.json"])
-        self.assertTrue(json.loads((self.live / ".owner.json").read_text(encoding="ascii"))["token"])
-        again = self.run_script("switchon-15-rollback.ps1")                              # the real step 15, with the real privacy helpers
-        self.assertEqual(again.returncode, 0, self.said(again))
-        self.assertFalse(self.live.exists())
+        # two ways the privacy step can fail: the access list cannot be set, or it reads back wrong
+        for breaker in ("function Protect-Path {", "function Assert-Private {"):
+            scripts = self.tmp / "scripts-private-fails"
+            shutil.rmtree(scripts, ignore_errors=True)
+            shutil.copytree(SCRIPTS, scripts)
+            common = scripts / "switchon-common.ps1"
+            common.write_text(common.read_text(encoding="ascii").replace(breaker, breaker + "\n    throw 'simulated: the folder is not private'", 1), encoding="ascii", newline="\n")
+            done = self.run_script("switchon-01-setup.ps1", self.step_1_env(sys.executable, str(real / "a.zip")), scripts=scripts)
+            self.assertNotEqual(done.returncode, 0, breaker)
+            said = self.said(done)
+            self.assertIn("was made and holds only the ownership marker (a random token and the folder path), but it could not be made private. "
+                          "Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead.", said)
+            self.assertNotIn("simulated", said)
+            self.assertEqual(sorted(p.name for p in self.live.iterdir()), [".owner.json"], breaker)         # only the marker: no names.json (the path of Python), no subfolder
+            self.assertNotIn(sys.executable, (self.live / ".owner.json").read_text(encoding="ascii"))
+            again = self.run_script("switchon-15-rollback.ps1")                          # the real step 15, with the real privacy helpers: the marker-only path
+            self.assertEqual(again.returncode, 0, self.said(again))
+            self.assertFalse(self.live.exists())
 
     def test_a_linked_marker_is_refused_by_the_rollback_and_nothing_is_deleted(self):
         self.private_live(config=False)
@@ -1208,6 +1211,63 @@ class Step10Starts(Processes):
         self.assertEqual(re.findall(r"^\s*(\d+)\s+(\S+)\s*$", listed.stdout, re.M), [])      # step 14 lists nothing
 
 
+class Step0Version(Base):
+    def run_with(self, version):
+        scripts = self.tmp / "scripts-version"
+        shutil.rmtree(scripts, ignore_errors=True)
+        shutil.copytree(SCRIPTS, scripts)
+        step = scripts / "switchon-00-check.ps1"
+        text = step.read_text(encoding="ascii")
+        seam = "$Version = $PSVersionTable.PSVersion"
+        self.assertIn(seam, text)
+        step.write_text(text.replace(seam, "$Version = [version]'%s'" % version), encoding="ascii", newline="\n")
+        return self.run_script("switchon-00-check.ps1", scripts=scripts)
+
+    def test_an_older_powershell_is_refused_and_this_one_or_a_newer_one_passes(self):
+        for version in ("7.2.9", "7.0.0", "5.1.19041", "6.2.14"):
+            done = self.run_with(version)
+            self.assertNotEqual(done.returncode, 0, version)
+            self.assertIn("This needs PowerShell 7.3 or newer; this window runs %s. Nothing was changed." % version, self.said(done))
+            self.assertNotIn("scripts run here", done.stdout)
+        for version in ("7.3.0", "7.6.6", "8.0.0"):
+            done = self.run_with(version)
+            self.assertEqual(done.returncode, 0, (version, self.said(done)))
+            self.assertIn("scripts run here", done.stdout)
+        real = self.run_script("switchon-00-check.ps1")                                 # this machine's own PowerShell, no seam
+        self.assertEqual(real.returncode, 0, self.said(real))
+
+
+class PortListNothing(Base):
+    """Only the CIM layer's 'no connection matches' answer means nothing listens; its identifier has two forms, and every other error stops the step."""
+
+    CALL = "Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop"
+
+    def listeners(self, call):
+        scripts = self.tmp / "scripts-list"
+        shutil.rmtree(scripts, ignore_errors=True)
+        shutil.copytree(SCRIPTS, scripts)
+        common = scripts / "switchon-common.ps1"
+        text = common.read_text(encoding="ascii")
+        self.assertIn(self.CALL, text)
+        common.write_text(text.replace(self.CALL, call), encoding="ascii", newline="\n")
+        self.names()
+        return self.command(". '%s'; @(Get-PortListeners %s).Count" % (common, PORT))
+
+    def test_both_identifier_forms_of_no_match_mean_nothing_listens(self):
+        for call in (self.CALL, "Get-NetTCPConnection -LocalPort $Port -ErrorAction Stop"):           # ..._NotFound and ..._NotFound_LocalPort
+            done = self.listeners(call)
+            self.assertEqual(done.returncode, 0, (call, self.said(done)))
+            self.assertEqual(done.stdout.strip(), "0", call)
+
+    def test_a_missing_command_another_cim_error_and_a_binding_error_stop_the_step(self):
+        for call in ("Get-NetTCPConnectionBroken -State Listen -LocalPort $Port -ErrorAction Stop",                                    # a missing command: same category, other identifier
+                     "Get-NetTCPConnection -State Listen -LocalPort $Port -CimSession 'no-such-computer-lw' -ErrorAction Stop",         # a CIM error with another identifier
+                     "Get-NetTCPConnection -State NoSuchState -LocalPort $Port -ErrorAction Stop"):                                    # not a CIM error at all
+            done = self.listeners(call)
+            self.assertNotEqual(done.returncode, 0, call)
+            self.assertIn("could not be read. Nothing was started. Tell the lead.", self.said(done), call)
+
+
 class Step5Again(Base):
     def test_a_second_run_is_refused_and_the_store_is_unchanged(self):
         self.private_live(config=False)
@@ -1264,8 +1324,8 @@ class Step15Safety(Processes):
         time.sleep(1)
         done = self.run_script("switchon-15-rollback.ps1")
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("Window 1 or 2 is still running (process ", self.said(done))
-        self.assertIn("Press Ctrl-C in it, then run step 15 again. Nothing was deleted.", self.said(done))
+        self.assertRegex(self.said(done), r"A program that uses the live folder is still running \(process \d+, program python\.exe\)\. ")
+        self.assertIn("If it is window 1 or 2, press Ctrl-C there; otherwise close that program. Then run step 15 again. Nothing was deleted.", self.said(done))
         self.assertTrue((self.live / "keep.txt").exists())
         self.assertTrue((self.live / ".owner.json").exists())
         self.stop(runner)
