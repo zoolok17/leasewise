@@ -66,7 +66,7 @@ pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
   another team's seats on this machine if they run under the same account. When the lead checked on 9 October 2026, only this team's seats were running here; if another team's seats ever run here under your account, this limit applies to them. What that exposes: the identity value (it only lets a program send readings to this
   machine's own Leasewise) and the account texts. The scripts cannot change this.
 - **Limits that remain, stated plainly.** (1) The live folder is private, so a link could appear between the check and its use only if you, SYSTEM or an Administrator made it. (2) The port checks of steps 10 and 11
-  happen once, when you start: a program that took the port over *after* step 11's check would have to run under your own Windows account (Windows refuses a second program from another account on a port that is
+  happen once, when you start: a program that stopped the server and took the port over *after* step 11's check, or that edited `server.json`, would have to run under your own Windows account (Windows refuses a second program from another account on a port that is
   in use; Microsoft's page "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE" describes this), and a program under your own account can read the settings file anyway. The Leasewise server itself is unchanged. (3) Hard links
   are not detected; the scripts only write files they create.
 - **If a script stops with a message, read it.** Each message says whether anything was changed. The scripts never print a secret, an account text, a user name or a seat name.
@@ -429,7 +429,9 @@ It must print `claude -> claude-main`, `codex -> codex-main` and `table: ok`.
 
 Open a **new PowerShell 7 window** and run `switchon-10-server.ps1`. Before it starts anything it looks at who listens on port 8443. If anything does, it stops with the process number and program name and starts nothing
 ("Something on this machine already listens on port 8443 ..."): if that is window 1 from earlier, go back to that window; otherwise tell the lead. This also refuses a second step 10. If it cannot read the list, it stops too.
-The server prints nothing while it works. Leave the window open; you stop it with Ctrl-C in that window (step 14 then shows what is still running).
+Then it **starts the server itself** and writes down which program it started (in `server.json` in the live folder: the program's number and start time), before it waits. The server prints nothing while it works. Leave the window
+open; you stop it with Ctrl-C in that window (that ends the server too; step 14 then shows what is still running). When the server ends by itself, the window says either "Window 1's server has stopped." or "Window 1's server stopped
+with an error (code N). Tell the lead."
 
 <!-- script: switchon-10-server.ps1 -->
 ```powershell
@@ -437,19 +439,30 @@ $Holders = @(Get-PortListeners $PortNumber)
 if ($Holders.Count -gt 0) {
     throw ('Something on this machine already listens on port {0} (process {1}, program {2}). Nothing was started. If it is window 1 from earlier, go back to that window; otherwise tell the lead.' -f $PortNumber, $Holders[0].ProcessId, $Holders[0].Name)
 }
-$ServeArgs = Get-ServeArgs                               # the exact words step 11 expects
-& $Py @PyFlags @ServeArgs
+$Start = New-Object Diagnostics.ProcessStartInfo
+$Start.FileName = $Py
+foreach ($Word in @($PyFlags) + @(Get-ServeArgs)) { [void]$Start.ArgumentList.Add($Word) }      # one word at a time: Windows quoting is done by .NET, never by joining strings
+$Start.UseShellExecute = $false                                                                  # no redirection: the server shares this window, as before
+$Start.WorkingDirectory = $Src
+$Server = [Diagnostics.Process]::Start($Start)
+$Record = [ordered]@{ schema = 1; pid = $Server.Id; started_utc_ticks = $Server.StartTime.ToUniversalTime().Ticks; port = $PortNumber }
+[IO.File]::WriteAllText((Join-Path $LiveRoot 'server.json'), ($Record | ConvertTo-Json), $Utf8)
+try {
+    while (-not $Server.WaitForExit(500)) { }                                                    # short slices, so Ctrl-C in this window still works
+}
+finally {
+    if (-not $Server.HasExited) { if (-not $Server.WaitForExit(5000)) { $Server.Kill($true) } } # Ctrl-C reaches both; this only makes sure the server we started is gone
+}
+if ($Server.ExitCode -eq 0) { 'Window 1''s server has stopped.' }
+else { "Window 1's server stopped with an error (code $($Server.ExitCode)). Tell the lead." }
 ```
 
 ## Step 11 (window 2): the reporter
 
-A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is window 1's Leasewise server **started with exactly the command step 10 launches**: your Python,
-then `-E -s -B -m quota_balancer --db`, the store, `serve --host 127.0.0.1 --port 8443`, in that order, with no word before, between or after (the store is compared as a Windows path, ignoring capitals; every other word
-exactly). A program that merely contains these words (for example a different script given them as arguments) is refused. The program must be your Python itself, or, when your Python is a virtual environment's launcher
-(a `pyvenv.cfg` in the folder above it, inside `C:\lw`), the one base interpreter that file names, started by that launcher with the identical command line; nothing else is accepted, and a program whose command line or path
-cannot be read is refused. Otherwise it says "Port 8443 is held by a program that is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." It also refuses to start when
-a reporter for the same settings is already running. What this cannot tell apart: a program under your own Windows account that copies this exact command line, for example from another folder; such a program could read the
-settings file anyway. The reporter prints one line per cycle, like
+A few seconds later, open another **new PowerShell 7 window** and run `switchon-11-reporter.ps1`. Before it starts the reporter it checks that exactly one program listens on port 8443, on `127.0.0.1`, and that it is **the program step 10 started** (the one written down in `server.json`, still running, with the same start time, and
+your Python) **or the one program that program started in turn** (a virtual environment's `python.exe` starts the real interpreter as a second process that owns the port). It does not read any command line to decide this. If
+`server.json` is missing or wrong it says "Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started."; if anything else holds the port it says "Port 8443 is held by a program that is not window 1's
+Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead." It also refuses to start when a reporter for the same settings is already running. The reporter prints one line per cycle, like
 `{"blocked": null, "journal": "ok", "new_events": 0, "sent": 2}`. Leave it open.
 
 <!-- script: switchon-11-reporter.ps1 -->
@@ -521,10 +534,6 @@ $BaselineFile = Join-Path $LiveRoot 'baseline.json'
 if (-not (Test-Path -LiteralPath $BaselineFile -PathType Leaf)) { throw 'No baseline was recorded. Run step 12 first. Nothing was changed.' }
 function Get-Now { [DateTimeOffset]::UtcNow }                     # every reading of the clock goes through here
 $ClockBack = 'The clock moved back since step 12. Nothing was changed. Run step 12 again with -Again, then ask the lead for the two turns again.'
-function Test-Whole { param($Value) ($Value -is [int]) -or ($Value -is [long]) }
-function Test-Object { param($Item) ($null -ne $Item) -and ($Item.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') }       # PowerShell calls a list a custom object too, so the exact type is looked at
-function Test-HasAll { param($Item, [string[]]$Names) (Test-Object $Item) -and (@($Names | Where-Object { $Item.PSObject.Properties.Name -cnotcontains $_ }).Count -eq 0) }
-function Test-HasOnly { param($Item, [string[]]$Names) (Test-HasAll $Item $Names) -and (@($Item.PSObject.Properties).Count -eq $Names.Count) }
 $NotBaseline = 'The baseline is not the file step 12 made. Nothing was changed. Tell the lead.'
 try { $Base = Get-Content -LiteralPath $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { throw $NotBaseline }
 if (-not (Test-HasOnly $Base 'schema', 'cut_ms', 'delivered') -or -not (Test-Whole $Base.schema) -or $Base.schema -ne 1 -or -not (Test-Whole $Base.cut_ms) -or $Base.cut_ms -le 0 -or -not (Test-HasOnly $Base.delivered $ClaudeAlias, $CodexAlias)) { throw $NotBaseline }
@@ -712,7 +721,7 @@ show an account text. **Never send** `reporter.toml`, a usage file, the output o
 - The scripts only read agenttalk's files: the reporter opens `<bus>\state\*.capacity.json` read-only with the strict reader of card 7b (`quota_balancer/reporter/capacityreader.py`): at most 64 files, 16 KiB each, links skipped.
 - Settings: one `[[readings.sources]]` row per account (`bus_root`, `provider`, `agenttalk_account`, `account`); no `limit_events`, gateway or money-reader table, so none of those lanes runs. `poll_seconds = 30`.
 - Ports: Leasewise on `127.0.0.1:8443` (the identity header authenticates this machine; Leasewise refuses other addresses). Step 10 lists the machine's listening TCP endpoints (IPv4 and IPv6, any address) and starts only
-  if none is on the port; step 11 requires exactly one, on `127.0.0.1`, owned by window 1's server (command line and program checked; a venv launcher's child accepted only with the launcher as parent and the same command line).
+  if none is on the port; step 11 requires exactly one, on `127.0.0.1`, owned by the process step 10 started and recorded in `server.json` (schema 1, pid, start time in ticks, port; the process must still run with that start time and be step 1's Python) or by its direct child started after it. No command line is read to identify the server.
 - Authorization: `http_api._authorized_reporter_for_account` accepts a machine that has a seat in a team whose project has the account (step 5's placeholder seat). Step 6 asks the same question of the store.
 - The done check needs: a store query and a status command that both succeed, a reporter scan in the last 180 seconds, exactly the two expected sources, an accepted observation per account later than both the clock time and the delivered maximum recorded in `baseline.json` (schema 1, checked field by field), a scan time between 180 seconds ago and 30 seconds ahead, and no operator line, failed reading or capture fault.
 - Flow after the done check: each window keeps its latest unsent figure, Leasewise gets at most one accepted figure per window every two minutes (a new reset time goes at once), and the gaps sentence of

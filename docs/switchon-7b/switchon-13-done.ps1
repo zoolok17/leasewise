@@ -15,10 +15,6 @@ $BaselineFile = Join-Path $LiveRoot 'baseline.json'
 if (-not (Test-Path -LiteralPath $BaselineFile -PathType Leaf)) { throw 'No baseline was recorded. Run step 12 first. Nothing was changed.' }
 function Get-Now { [DateTimeOffset]::UtcNow }                     # every reading of the clock goes through here
 $ClockBack = 'The clock moved back since step 12. Nothing was changed. Run step 12 again with -Again, then ask the lead for the two turns again.'
-function Test-Whole { param($Value) ($Value -is [int]) -or ($Value -is [long]) }
-function Test-Object { param($Item) ($null -ne $Item) -and ($Item.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') }       # PowerShell calls a list a custom object too, so the exact type is looked at
-function Test-HasAll { param($Item, [string[]]$Names) (Test-Object $Item) -and (@($Names | Where-Object { $Item.PSObject.Properties.Name -cnotcontains $_ }).Count -eq 0) }
-function Test-HasOnly { param($Item, [string[]]$Names) (Test-HasAll $Item $Names) -and (@($Item.PSObject.Properties).Count -eq $Names.Count) }
 $NotBaseline = 'The baseline is not the file step 12 made. Nothing was changed. Tell the lead.'
 try { $Base = Get-Content -LiteralPath $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { throw $NotBaseline }
 if (-not (Test-HasOnly $Base 'schema', 'cut_ms', 'delivered') -or -not (Test-Whole $Base.schema) -or $Base.schema -ne 1 -or -not (Test-Whole $Base.cut_ms) -or $Base.cut_ms -le 0 -or -not (Test-HasOnly $Base.delivered $ClaudeAlias, $CodexAlias)) { throw $NotBaseline }

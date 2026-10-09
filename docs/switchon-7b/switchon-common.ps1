@@ -59,7 +59,7 @@ if ($N) {
     $ConfigPath = Join-Path $LiveRoot 'reporter.toml'
     $Names = $NamesFile
     $BaseUrl = 'http://127.0.0.1:{0}' -f $PortNumber
-    foreach ($Derived in $Src, $Store, $StateDir, $Journal, $PolicyIds, $ConfigPath, (Join-Path $LiveRoot '.owner.json'), (Join-Path $LiveRoot 'baseline.json')) {
+    foreach ($Derived in $Src, $Store, $StateDir, $Journal, $PolicyIds, $ConfigPath, (Join-Path $LiveRoot '.owner.json'), (Join-Path $LiveRoot 'baseline.json'), (Join-Path $LiveRoot 'server.json')) {
         if (Test-Path -LiteralPath $Derived) { Assert-NoLink $Derived }
     }
     if (-not $KeepOutOfSource -and (Test-Path -LiteralPath $Src)) { Set-Location -LiteralPath $Src }   # run every Leasewise command from inside the source folder (after step 3)
@@ -112,6 +112,13 @@ function Invoke-UsageScan {
     $Counts
 }
 
+# Strict reading of the small JSON files the scripts write (the baseline, server.json): an object is looked at by its exact type (PowerShell calls a list a custom
+# object too), with exactly the expected fields and whole numbers.
+function Test-Whole { param($Value) ($Value -is [int]) -or ($Value -is [long]) }
+function Test-Object { param($Item) ($null -ne $Item) -and ($Item.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') }
+function Test-HasAll { param($Item, [string[]]$Names) (Test-Object $Item) -and (@($Names | Where-Object { $Item.PSObject.Properties.Name -cnotcontains $_ }).Count -eq 0) }
+function Test-HasOnly { param($Item, [string[]]$Names) (Test-HasAll $Item $Names) -and (@($Item.PSObject.Properties).Count -eq $Names.Count) }
+
 # Every process on this machine whose command line names the live folder, leaving out this script's own process (ids and program names are all that is shown).
 function Get-LiveProcesses {
     $Needle = $LiveRoot + [string][char]92
@@ -132,7 +139,7 @@ function Get-PortListeners {
         $Owner = $All | Where-Object { $_.ProcessId -eq $Row.OwningProcess } | Select-Object -First 1
         $Parent = if ($Owner) { $All | Where-Object { $_.ProcessId -eq $Owner.ParentProcessId } | Select-Object -First 1 }
         [pscustomobject]@{
-            Address = [string]$Row.LocalAddress; ProcessId = [int]$Row.OwningProcess; Name = $(if ($Owner) { $Owner.Name } else { 'unknown' })
+            Address = [string]$Row.LocalAddress; ProcessId = [int]$Row.OwningProcess; ParentId = $(if ($Owner) { [int]$Owner.ParentProcessId }); Name = $(if ($Owner) { $Owner.Name } else { 'unknown' })
             Path = $(if ($Owner) { [string]$Owner.ExecutablePath }); CommandLine = $(if ($Owner) { [string]$Owner.CommandLine })
             ParentPath = $(if ($Parent) { [string]$Parent.ExecutablePath }); ParentCommandLine = $(if ($Parent) { [string]$Parent.CommandLine })
         }
@@ -149,38 +156,35 @@ function Split-CommandLine {
     @([regex]::Matches($Text, '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
 }
 
-# Step 11's start check: the only program that listens on the port is window 1's Leasewise server, found by the exact command step 10 launches: step 1's Python
-# followed, in order and with nothing before, between or after, by $PyFlags and Get-ServeArgs (every word compared exactly; the store compared as a Windows path,
-# ignoring case), listening on 127.0.0.1. The program is either (a) step 1's Python itself, or (b) when step 1's Python is a venv launcher (a pyvenv.cfg in the folder
-# above its folder, inside C:\lw), the base interpreter that file names, started by that launcher with the identical command line. A process whose command line or
-# program cannot be read is refused. What this cannot tell apart: a program under the operator's own Windows account that copies this exact command line.
+# Step 11's start check: the only program that listens on the port is the process step 10 started and recorded in server.json (never the text of a command line, which
+# cannot prove what a process runs). server.json is read strictly (exactly schema 1, pid, started_utc_ticks, port; whole numbers; this run's port). The recorded process
+# must still run, with the recorded start time (a reused process number does not match), and its program must be step 1's Python. Exactly one program listens on the port,
+# on 127.0.0.1, and it is either that process or a direct child of it started after it (a venv's python.exe starts the real interpreter as a child, and the child owns the
+# socket). Anything else is refused; a process or port list that cannot be read stops the step. What this cannot tell apart: a program under the operator's own Windows
+# account that stops the server and takes the port after this check, or edits server.json.
 function Assert-OurServerListens {
+    $NotRecorded = 'Window 1 was not started by step 10 of this runbook. Start step 10 first. Nothing was started.'
+    $RecordFile = Join-Path $LiveRoot 'server.json'
+    if (-not (Test-Path -LiteralPath $RecordFile -PathType Leaf)) { throw $NotRecorded }
+    try { $Record = Get-Content -LiteralPath $RecordFile -Raw -Encoding UTF8 | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { throw $NotRecorded }
+    if (-not (Test-HasOnly $Record 'schema', 'pid', 'started_utc_ticks', 'port') -or -not (Test-Whole $Record.schema) -or $Record.schema -ne 1 -or -not (Test-Whole $Record.pid) -or $Record.pid -le 0 `
+            -or -not (Test-Whole $Record.started_utc_ticks) -or $Record.started_utc_ticks -le 0 -or -not (Test-Whole $Record.port) -or $Record.port -ne $PortNumber) { throw $NotRecorded }
     $Rows = @(Get-PortListeners $PortNumber)
     if ($Rows.Count -eq 0) { throw "Nothing listens on port $PortNumber yet. Start window 1 (step 10) first and wait a few seconds. Nothing was started." }
     $NotOurs = "Port $PortNumber is held by a program that is not window 1's Leasewise server. Nothing was started, and the identity value was not sent. Tell the lead."
+    try { $Server = [Diagnostics.Process]::GetProcessById([int]$Record.pid); $Started = $Server.StartTime.ToUniversalTime().Ticks } catch { throw $NotOurs }       # it has ended, or cannot be read
+    if ($Started -ne [int64]$Record.started_utc_ticks) { throw $NotOurs }
+    $Program = [string](Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f [int]$Record.pid)).ExecutablePath
+    if (-not $Program -or -not [IO.Path]::IsPathRooted($Program) -or [IO.Path]::GetFullPath($Program) -ine $Py) { throw $NotOurs }
     if ($Rows.Count -ne 1 -or $Rows[0].Address -cne '127.0.0.1') { throw $NotOurs }
-    $Row = $Rows[0]
-    if (-not $Row.CommandLine -or -not $Row.Path -or (($Row.CommandLine.Length - $Row.CommandLine.Replace('"', '').Length) % 2) -ne 0) { throw $NotOurs }
-    $Words = @(Split-CommandLine $Row.CommandLine)
-    $Want = @($PyFlags) + @(Get-ServeArgs)
-    if ($Words.Count -ne ($Want.Count + 1) -or -not [IO.Path]::IsPathRooted($Words[0]) -or [IO.Path]::GetFullPath($Words[0]) -ine $Py) { throw $NotOurs }
-    for ($Index = 0; $Index -lt $Want.Count; $Index++) {
-        $Same = if ($Want[$Index] -ceq $Store) { [IO.Path]::GetFullPath($Words[$Index + 1]) -ieq $Store } else { $Words[$Index + 1] -ceq $Want[$Index] }
-        if (-not $Same) { throw $NotOurs }
-    }
-    if ($Row.Path -ieq $Py) { return }                                                                  # (a) step 1's Python itself
-    $Config = Join-Path (Split-Path -Parent (Split-Path -Parent $Py)) 'pyvenv.cfg'                      # (b) a venv launcher and its one child
-    if ($Config -notlike 'C:\lw\*' -or -not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw $NotOurs }
-    try { Assert-NoLink $Config } catch { throw $NotOurs }
-    $Lines = @(Get-Content -LiteralPath $Config -Encoding UTF8)
-    $Executable = @($Lines | Where-Object { $_ -match '^\s*executable\s*=\s*(.+?)\s*$' } | ForEach-Object { $Matches[1] }) | Select-Object -First 1
-    $HomeFolder = @($Lines | Where-Object { $_ -match '^\s*home\s*=\s*(.+?)\s*$' } | ForEach-Object { $Matches[1] }) | Select-Object -First 1
-    $Base = if ($Executable) { $Executable } elseif ($HomeFolder) { Join-Path $HomeFolder 'python.exe' } else { $null }
-    if (-not $Base -or -not [IO.Path]::IsPathRooted($Base) -or $Row.Path -ine [IO.Path]::GetFullPath($Base)) { throw $NotOurs }
-    if ($Row.ParentPath -ine $Py -or -not $Row.ParentCommandLine -or $Row.ParentCommandLine -cne $Row.CommandLine) { throw $NotOurs }
+    if ($Rows[0].ProcessId -eq [int]$Record.pid) { return }                                             # (a) the recorded process itself
+    if ($Rows[0].ParentId -ne [int]$Record.pid) { throw $NotOurs }                                      # (b) its direct child, started after it
+    try { $Child = [Diagnostics.Process]::GetProcessById($Rows[0].ProcessId); $ChildStarted = $Child.StartTime.ToUniversalTime().Ticks } catch { throw $NotOurs }
+    if ($ChildStarted -lt $Started) { throw $NotOurs }
 }
 
-# Step 11's second start check: no reporter for this settings file is running already.
+# Step 11's second start check: no reporter for this settings file is running already. This one only REFUSES, so reading command-line words is enough here (a
+# second reporter is also stopped by the reporter's own exclusive state lock).
 function Assert-NoReporterRunning {
     foreach ($Process in @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine })) {
         $Words = @(Split-CommandLine $Process.CommandLine)
