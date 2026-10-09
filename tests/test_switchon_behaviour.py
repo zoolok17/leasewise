@@ -1108,6 +1108,44 @@ class Step10Starts(Processes):
         self.release.write_text("go", encoding="ascii")
         step.wait(30)
 
+    def test_a_folder_in_place_of_server_json_is_refused_before_anything_is_started(self):
+        self.fake_main("open(r'%s', 'w').write('started')\n" % self.out)               # the fake server notes that it ran, and ends
+        (self.live / "server.json").mkdir()
+        done = self.run_script("switchon-10-server.ps1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("server.json is not a file. Nothing was started. Tell the lead.", self.said(done))
+        self.assertFalse(self.out.exists(), "a server was started")                    # the fake server writes this file the moment it runs
+
+    def test_a_record_that_cannot_be_saved_stops_the_server_that_was_just_started(self):
+        # a copy of step 10 whose record writer fails (the test hook: the production code is not weakened); it also notes the pid of the server it was handed
+        self.fake_main("import socket, time\ns = socket.socket()\ns.bind(('127.0.0.1', %s))\ns.listen(5)\ntime.sleep(120)\n" % PORT)
+        scripts = self.tmp / "scripts-no-record"
+        shutil.copytree(SCRIPTS, scripts)
+        step = scripts / "switchon-10-server.ps1"
+        text = step.read_text(encoding="ascii")
+        hook = "function Save-ServerRecord { param([string]$Text) [IO.File]::WriteAllText($RecordFile, $Text, $Utf8) }"
+        self.assertIn(hook, text)
+        seen = self.tmp / "started-pid.txt"
+        broken = "function Save-ServerRecord { param([string]$Text) [IO.File]::WriteAllText('%s', [string]$Server.Id); throw 'simulated: the disk is full' }" % seen
+        step.write_text(text.replace(hook, broken), encoding="ascii", newline="\n")
+        for python in (BASE_PYTHON, sys.executable):                                    # directly, and through the venv launcher (a tree of two)
+            seen.unlink(missing_ok=True)
+            self.default_over = {"Py": str(python)}
+            self.names()
+            done = self.run_script("switchon-10-server.ps1", scripts=scripts)
+            self.assertNotEqual(done.returncode, 0, str(python))
+            said = self.said(done)
+            self.assertIn("The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead.", said)
+            self.assertNotIn("simulated", said)                                         # the plain sentence, not the raw error
+            self.assertFalse((self.live / "server.json").exists())
+            pid = int(seen.read_text(encoding="ascii"))                                 # the server did start ...
+            listed = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"], capture_output=True, text=True).stdout
+            self.assertNotIn(str(pid), listed)                                          # ... and is gone
+            with self.assertRaises(OSError):
+                socket.create_connection(("127.0.0.1", int(PORT)), timeout=1).close()    # the port is free
+            left = self.run_script("switchon-14-stopped.ps1")
+            self.assertEqual(re.findall(r"^\s*(\d+)\s+(\S+)\s*$", left.stdout, re.M), [], str(python))      # nothing of the tree is left
+
     def test_a_server_that_stops_cleanly_or_with_an_error_is_said_plainly(self):
         self.fake_main("import sys\nsys.exit(0)\n")
         done = self.run_script("switchon-10-server.ps1")

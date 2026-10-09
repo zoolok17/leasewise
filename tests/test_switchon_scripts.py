@@ -360,6 +360,12 @@ class Safety(unittest.TestCase):
                        "WaitForExit(500)", "Window 1''s server has stopped.", "stopped with an error (code $($Server.ExitCode)). Tell the lead."):
             self.assertIn(needle, server, needle)
         self.assertLess(server.index("server.json"), server.index("WaitForExit(500)"))                          # the record is written before the wait
+        self.assertLess(server.index("[Diagnostics.Process]::Start($Start)"), server.index("Save-ServerRecord ($Record"))
+        self.assertLess(server.index("Save-ServerRecord ($Record"), server.index("WaitForExit(500)"))
+        self.assertLess(server.index("$Server = $null"), server.index("try {"))                                  # the cleanup covers the start and the record
+        for needle in ("is not a file. Nothing was started. Tell the lead.", "The server was started but its record could not be saved, so it was stopped again. Nothing else was changed. Tell the lead.",
+                       "if (-not $Saved) { $Server.Kill($true); [void]$Server.WaitForExit(10000) }", "elseif (-not $Server.WaitForExit(5000)) { $Server.Kill($true) }"):
+            self.assertIn(needle, server, needle)
         self.assertNotIn("& $Py", server)                                                                        # no string joining, no call operator: .NET does the quoting
         self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)         # the one list
         body = common[common.index("function Assert-OurServerListens"):common.index("# Step 11's second start check")]
