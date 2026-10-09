@@ -3,6 +3,8 @@
 #   * the live folder or the agenttalk folder is not a plain path inside C:\lw (dots, forward slashes, a trailing backslash, another drive);
 #   * ANY existing folder on the way down from C:\lw to the live folder, its names.json, the agenttalk folder or its state folder is a link
 #     (a junction or symbolic link): a link in an ancestor is as bad as a link at the end;
+#   * ANY entry anywhere below the live folder is a link (the source package, the store, the state folder, the reporter's database, the settings):
+#     the whole folder is walked without following links, at most 50,000 entries, before anything is read and before any Python command;
 #   * the live folder and the agenttalk folder are the same, or one lies inside the other;
 #   * names.json names a live folder, an agenttalk folder or a port other than the ones this run was checked with.
 # Rehearsal (the lead's test run in a scratch folder) happens only when LW_SWITCHON_REHEARSAL is exactly "yes", and then ALL of
@@ -35,6 +37,22 @@ function Assert-PythonFile {
     if (($Path -ne [IO.Path]::GetFullPath($Path)) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'The Python path is not the full path of an existing file. Nothing was changed.' }
     if ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The Python path is a link. Nothing was changed. Tell the lead.' }
 }
+function Assert-NoLinkUnder {
+    param([string]$Root)                                                 # every entry under the live folder; a link is never entered, and the walk is bounded
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    if ((New-Object IO.DirectoryInfo($Root)).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$Root is a link. Nothing was changed. Tell the lead." }
+    $Seen = 0
+    $Pending = New-Object System.Collections.Generic.Stack[string]
+    $Pending.Push($Root)
+    while ($Pending.Count -gt 0) {
+        foreach ($Entry in (New-Object IO.DirectoryInfo($Pending.Pop())).GetFileSystemInfos()) {
+            $Seen++
+            if ($Seen -gt 50000) { throw 'The live folder holds more than 50,000 entries, which it never should. Nothing was changed. Tell the lead.' }
+            if ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$($Entry.FullName) is a link. Nothing was changed. Tell the lead." }
+            if ($Entry -is [IO.DirectoryInfo]) { $Pending.Push($Entry.FullName) }
+        }
+    }
+}
 function Assert-Separate {
     $Live = $LiveRoot.ToLowerInvariant() + [char]92
     $Bus = $BusRoot.ToLowerInvariant() + [char]92
@@ -66,6 +84,7 @@ foreach ($Path in $LiveRoot, $BusRoot) { Assert-Plain $Path }
 Assert-Separate
 $NamesFile = Join-Path $LiveRoot 'names.json'
 foreach ($Item in $LiveRoot, $NamesFile, $BusRoot, (Join-Path $BusRoot 'state')) { Assert-NoLink $Item }
+Assert-NoLinkUnder $LiveRoot                                   # then everything below the live folder, before anything is read or any Python runs
 $N = $null
 if (Test-Path -LiteralPath $NamesFile) {
     $Saved = Get-Content -LiteralPath $NamesFile -Raw -Encoding UTF8 | ConvertFrom-Json

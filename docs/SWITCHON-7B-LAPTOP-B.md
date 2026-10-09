@@ -53,6 +53,10 @@ pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
   folder, its `state` folder, the archive or any file a step uses is a link; if a path is outside `C:\lw`; if the live folder and the agenttalk folder are the same or one lies inside the other;
   or if `names.json` was made for another folder or port. Only a short list of names is read back from `names.json`; every path is worked out again each time. If you ever see "is a link" or "is not a
   plain path inside C:\lw", stop and tell the lead.
+- **No link anywhere in the live folder.** At the start of every step, before anything is read and before any Python command runs, the entry check also walks the **whole** live folder
+  (never following a link) and stops if any entry in it is a link: a junction, a symbolic link or any other kind. That one rule covers the source package, the store, the state folder, the reporter's
+  database and the settings. It stops with a message too if the folder holds more than 50,000 entries, which it never should. The remaining limit, stated plainly: the live folder is private (only you,
+  SYSTEM and Administrators can write in it), so a link could appear between the check and its use only if one of those made it.
 - **If a script stops with a message, read it.** Each message says whether anything was changed. The scripts never print a secret, an account text, a user name or a seat name.
 - **Never set an `LW_SWITCHON_...` environment variable.** They exist only for the lead's test run in a scratch folder, which needs a switch and all of its settings together. If one is present
   in your window the scripts stop at once with a plain message and change nothing: close that window and open a new one.
@@ -388,14 +392,17 @@ $RunArgs = @('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)
 
 ## Step 12: record the baseline
 
-Run this once the reporter (step 11) has been running for about a minute, and **before** you ask the lead for the real turns. Script: `switchon-12-baseline.ps1`. For each account it records the newest figure
-Leasewise has accepted so far (or "none yet") in `baseline.json`. The done check counts only figures **newer** than this, so figures that were already there cannot make it pass.
+Run this once the reporter (step 11) has been running for a while, and **before** you ask the lead for the real turns. Script: `switchon-12-baseline.ps1`. It writes `baseline.json` with three things: a
+schema number, **this machine's clock** at that moment (UTC, in milliseconds), and for each account the newest figure Leasewise has accepted so far (or none). The done check counts only figures **observed after both**.
+Waiting does not prove that the reporter's delivery queue is empty: a figure that was observed before this step can still arrive after it, and because the check also compares the figure's own time with the
+clock time recorded here, such a late arrival cannot make it pass.
 
 <!-- script: switchon-12-baseline.ps1 -->
 ```powershell
 '== Step 12: record the baseline'
 $BaselineFile = Join-Path $LiveRoot 'baseline.json'
-if (Test-Path -LiteralPath $BaselineFile) { throw 'A baseline was already recorded. Nothing was changed. If the real turns failed and you must start over, tell the lead.' }
+if ((Test-Path -LiteralPath $BaselineFile) -and -not $Again) { throw 'A baseline was already recorded. Nothing was changed. Run step 12 with -Again only if step 13 told you the clock moved back.' }
+$Cut = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $Question = @'
 import sqlite3, sys
 conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
@@ -405,18 +412,23 @@ for alias in sys.argv[2:]:
 '@
 $Lines = @(& $Py -c $Question $Store $ClaudeAlias $CodexAlias)
 if ($LASTEXITCODE -ne 0 -or $Lines.Count -ne 2) { throw 'The store could not be read. Nothing was changed. Tell the lead.' }
-$Base = [ordered]@{}
-foreach ($Line in $Lines) { $Parts = $Line -split ' '; $Base[$Parts[0]] = [int64]$Parts[1] }
-if ((@($Base.Keys) -join ',') -cne ($ClaudeAlias + ',' + $CodexAlias)) { throw 'The store did not answer for exactly the two accounts. Nothing was changed. Tell the lead.' }
-[IO.File]::WriteAllText($BaselineFile, ($Base | ConvertTo-Json), $Utf8)
-foreach ($Alias in $Base.Keys) {
-    if ($Base[$Alias] -eq 0) { '{0}: no accepted figure yet' -f $Alias }
-    else { '{0}: newest accepted figure so far was observed at {1}' -f $Alias, [DateTimeOffset]::FromUnixTimeMilliseconds($Base[$Alias]).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }
+$Delivered = [ordered]@{}
+foreach ($Line in $Lines) {
+    if ($Line -cnotmatch '^([a-z0-9][a-z0-9-]*) ([0-9]+)$') { throw 'The store gave an answer this step does not understand. Nothing was changed. Tell the lead.' }
+    $Delivered[$Matches[1]] = if ([int64]$Matches[2] -eq 0) { $null } else { [int64]$Matches[2] }
 }
-'baseline recorded. Now ask the lead for one real turn of a Claude seat and one of the Codex seat, then run step 13.'
+if ((@($Delivered.Keys) -join ',') -cne ($ClaudeAlias + ',' + $CodexAlias)) { throw 'The store did not answer for exactly the two accounts. Nothing was changed. Tell the lead.' }
+$Record = [ordered]@{ schema = 1; cut_ms = $Cut; delivered = $Delivered }
+[IO.File]::WriteAllText($BaselineFile, ($Record | ConvertTo-Json -Depth 4), $Utf8)
+foreach ($Alias in $Delivered.Keys) {
+    if ($null -eq $Delivered[$Alias]) { '{0}: no accepted figure yet' -f $Alias }
+    else { '{0}: newest accepted figure so far was observed at {1}' -f $Alias, [DateTimeOffset]::FromUnixTimeMilliseconds($Delivered[$Alias]).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }
+}
+'baseline recorded at {0} UTC. Now ask the lead for one real turn of a Claude seat and one of the Codex seat, then run step 13.' -f [DateTimeOffset]::FromUnixTimeMilliseconds($Cut).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
 ```
 
-It must print one line per account and `baseline recorded`. It refuses to record a second baseline (tell the lead if you must start over).
+It must print one line per account and `baseline recorded at ...`. It refuses to record a second baseline. The one case where you run it again is the clock case: if step 13 says "The clock moved back
+since step 12", run `switchon-12-baseline.ps1 -Again` (the `-Again` switch replaces the baseline), then ask the lead for the two turns again. Use `-Again` for nothing else.
 
 ## Wait for a real turn, then step 13: the done check
 
@@ -427,9 +439,22 @@ it asks Leasewise's store and the reporter's status, and prints aliases and numb
 ```powershell
 '== Step 13: the done check'
 $BaselineFile = Join-Path $LiveRoot 'baseline.json'
-if (-not (Test-Path -LiteralPath $BaselineFile)) { throw 'No baseline was recorded. Run step 12 first. Nothing was changed.' }
-$Base = Get-Content -LiteralPath $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json
-foreach ($Alias in $ClaudeAlias, $CodexAlias) { if ($null -eq $Base.$Alias) { throw 'The baseline is not the file step 12 made. Nothing was changed. Tell the lead.' } }
+if (-not (Test-Path -LiteralPath $BaselineFile -PathType Leaf)) { throw 'No baseline was recorded. Run step 12 first. Nothing was changed.' }
+function Test-Whole { param($Value) ($Value -is [int]) -or ($Value -is [long]) }
+function Test-Object { param($Item) ($null -ne $Item) -and ($Item.GetType().FullName -ceq 'System.Management.Automation.PSCustomObject') }       # PowerShell calls a list a custom object too, so the exact type is looked at
+function Test-HasAll { param($Item, [string[]]$Names) (Test-Object $Item) -and (@($Names | Where-Object { $Item.PSObject.Properties.Name -cnotcontains $_ }).Count -eq 0) }
+function Test-HasOnly { param($Item, [string[]]$Names) (Test-HasAll $Item $Names) -and (@($Item.PSObject.Properties).Count -eq $Names.Count) }
+$NotBaseline = 'The baseline is not the file step 12 made. Nothing was changed. Tell the lead.'
+try { $Base = Get-Content -LiteralPath $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { throw $NotBaseline }
+if (-not (Test-HasOnly $Base 'schema', 'cut_ms', 'delivered') -or -not (Test-Whole $Base.schema) -or $Base.schema -ne 1 -or -not (Test-Whole $Base.cut_ms) -or $Base.cut_ms -le 0 -or -not (Test-HasOnly $Base.delivered $ClaudeAlias, $CodexAlias)) { throw $NotBaseline }
+$Delivered = @{}
+foreach ($Alias in $ClaudeAlias, $CodexAlias) {
+    $Value = $Base.delivered.$Alias
+    if ($null -ne $Value -and (-not (Test-Whole $Value) -or $Value -lt 0)) { throw $NotBaseline }
+    $Delivered[$Alias] = if ($null -eq $Value) { [int64]0 } else { [int64]$Value }
+}
+$Cut = [int64]$Base.cut_ms
+if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $Cut - 30000) { throw 'The clock moved back since step 12. Nothing was changed. Run step 12 again with -Again, then ask the lead for the two turns again.' }
 $Question = @'
 import sqlite3, sys
 conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
@@ -444,35 +469,58 @@ do {
     $Newest = @{}
     $Lines = @(& $Py -c $Question $Store $ClaudeAlias $CodexAlias)
     if ($LASTEXITCODE -ne 0) { $Problems += 'The store could not be read.' }
-    else { foreach ($Line in $Lines) { $Parts = $Line -split ' '; $Newest[$Parts[0]] = [int64]$Parts[1] } }
+    else {
+        foreach ($Line in $Lines) { if ($Line -cmatch '^([a-z0-9][a-z0-9-]*) ([0-9]+)$') { $Newest[$Matches[1]] = [int64]$Matches[2] } }
+        if ($Lines.Count -ne 2 -or $Newest.Count -ne 2) { $Problems += 'The store gave an answer this step does not understand.' }
+    }
+    $Status = $null
     $Json = & $Py -m quota_balancer reporter status --config $ConfigPath --json
-    if ($LASTEXITCODE -ne 0) { $Problems += 'The reporter status could not be read (the reporter may never have run).'; $Status = $null }
-    else { $Status = $Json | ConvertFrom-Json }
+    if ($LASTEXITCODE -ne 0) { $Problems += 'The reporter status could not be read (the reporter may never have run).' }
+    else {
+        try { $Parsed = ($Json | Out-String) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { $Parsed = $null }
+        $R = if (Test-HasAll $Parsed 'readings') { $Parsed.readings } else { $null }
+        if (-not (Test-Object $Parsed)) { $Problems += 'The reporter status is not a JSON object.' }
+        elseif (-not (Test-HasAll $Parsed 'operator_actions') -or $Parsed.operator_actions -isnot [array] -or -not (Test-HasAll $R 'configured', 'sources', 'last_scan', 'rows', 'capture_fault') `
+                -or -not (Test-HasAll $R.rows 'sent', 'pending', 'failed_permanent') -or -not (Test-HasAll $R.capture_fault 'count') `
+                -or -not (Test-Whole $R.rows.sent) -or -not (Test-Whole $R.rows.pending) -or -not (Test-Whole $R.rows.failed_permanent) -or -not (Test-Whole $R.capture_fault.count)) {
+            $Problems += 'The reporter status is missing a part this check needs (readings, operator_actions, rows or capture_fault).'
+        }
+        else { $Status = $Parsed }
+    }
     if ($Status) {
-        $Readings = $Status.readings
-        $Have = @($Readings.sources | ForEach-Object { '{0} -> {1}' -f $_.provider, $_.account } | Sort-Object)
+        $Have = @(@($R.sources) | ForEach-Object { if (Test-Object $_) { '{0} -> {1}' -f $_.provider, $_.account } else { '?' } } | Sort-Object)
         $Want = @(('claude -> ' + $ClaudeAlias), ('codex -> ' + $CodexAlias) | Sort-Object)
-        if (-not $Readings.configured -or ($Have -join ';') -cne ($Want -join ';')) { $Problems += 'The settings do not list exactly the two expected accounts.' }
-        if (-not $Readings.last_scan) { $Problems += 'The reporter has not scanned yet.' }
-        elseif (([DateTimeOffset]::UtcNow - $(if ($Readings.last_scan -is [datetime]) { [DateTimeOffset]$Readings.last_scan } else { [DateTimeOffset]::Parse([string]$Readings.last_scan, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) })).TotalSeconds -gt 180) { $Problems += 'The reporter has not scanned in the last three minutes (is window 2 running?).' }
-        if ($Status.operator_actions.Count -ne 0 -or $Readings.rows.failed_permanent -ne 0 -or $Readings.capture_fault.count -ne 0) { $Problems += 'The reporter shows a warning.' }
+        if ($R.configured -ne $true -or ($Have -join ';') -cne ($Want -join ';')) { $Problems += 'The settings do not list exactly the two expected accounts.' }
+        $When = $null
+        if ($R.last_scan -is [datetime]) { $When = [DateTimeOffset]$R.last_scan }
+        elseif ($R.last_scan -is [string]) { $Read = [DateTimeOffset]::MinValue; if ([DateTimeOffset]::TryParse($R.last_scan, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$Read)) { $When = $Read } }
+        if ($null -eq $R.last_scan) { $Problems += 'The reporter has not scanned yet.' }
+        elseif ($null -eq $When) { $Problems += 'The reporter''s last scan time could not be read.' }
+        else {
+            $Age = ([DateTimeOffset]::UtcNow - $When).TotalSeconds
+            if ($Age -gt 180) { $Problems += 'The reporter has not scanned in the last three minutes (is window 2 running?).' }
+            elseif ($Age -lt -30) { $Problems += 'The reporter''s last scan lies more than 30 seconds ahead of this machine''s clock.' }
+        }
+        if (@($Status.operator_actions).Count -ne 0 -or $R.rows.failed_permanent -ne 0 -or $R.capture_fault.count -ne 0) { $Problems += 'The reporter shows a warning.' }
     }
     foreach ($Alias in $ClaudeAlias, $CodexAlias) {
-        if (-not $Newest.ContainsKey($Alias) -or $Newest[$Alias] -le [int64]$Base.$Alias) { $Problems += ('{0}: no accepted figure newer than the baseline yet.' -f $Alias) }
+        if (-not $Newest.ContainsKey($Alias) -or $Newest[$Alias] -le $Cut -or $Newest[$Alias] -le $Delivered[$Alias]) { $Problems += ('{0}: no accepted figure observed after the baseline yet.' -f $Alias) }
     }
     if ($Problems.Count -gt 0 -and (Get-Date) -lt $Deadline) { 'waiting: ' + ($Problems -join ' '); Start-Sleep -Seconds 20 }
 } until ($Problems.Count -eq 0 -or (Get-Date) -ge $Deadline)
 foreach ($Alias in $ClaudeAlias, $CodexAlias) {
-    '{0}: newest accepted figure {1}; baseline {2}' -f $Alias, $Newest[$Alias], $Base.$Alias
+    '{0}: newest accepted figure {1}; at the baseline {2}; baseline time {3}' -f $Alias, $Newest[$Alias], $Delivered[$Alias], $Cut
 }
-if ($Status) { 'reporter: rows sent={0} waiting={1} failed={2}; capture faults={3}' -f $Status.readings.rows.sent, $Status.readings.rows.pending, $Status.readings.rows.failed_permanent, $Status.readings.capture_fault.count }
+if ($Status) { 'reporter: rows sent={0} waiting={1} failed={2}; capture faults={3}' -f $R.rows.sent, $R.rows.pending, $R.rows.failed_permanent, $R.capture_fault.count }
 if ($Status) { foreach ($Line in $Status.operator_actions) { '!! ' + $Line } }
-if ($Problems.Count -gt 0) { throw ('Not done: ' + ($Problems -join ' ') + ' See "If something goes wrong".') }
+if ($Problems.Count -gt 0) { throw ('Not done: ' + ($Problems -join ' ') + ' Nothing was changed. See "If something goes wrong".') }
 'PASSED'
 ```
 
-It must end with `PASSED`. That means all of this holds: every command it ran succeeded; the reporter scanned within the last three minutes (so window 2 is running); the settings list exactly the two accounts;
-**each account has an accepted figure newer than the baseline**; and the status shows no operator warning, no failed reading and no capture fault. If it stops, it names what is missing; read "If something goes wrong".
+It must end with `PASSED`. The check fails closed: it passes only if **all** of this holds, and otherwise it says which part failed and that nothing was changed. It needs: the baseline file is the one step 12 wrote; **each account has an accepted figure observed after the baseline's clock time and after that account's newest figure at that time**; the reporter's status
+command succeeded and answered with a proper JSON object whose readings part is configured, lists exactly the two accounts and has a last-scan time that can be read; that last scan lies between three minutes
+ago and 30 seconds ahead of this machine's clock (the 30 seconds are the stated clock tolerance); every other command succeeded and its answer could be read; and the status shows no operator warning, no
+failed reading and no capture fault. "Scanned within three minutes" means the reporter ran recently; it does **not** prove the reporter is still running now. If it stops, it names what is missing; read "If something goes wrong".
 Then follow "Tell the lead".
 
 ## Step 14: see what is still running, and stop it
@@ -559,7 +607,7 @@ show an account text. **Never send** `reporter.toml`, a usage file, the output o
 - Settings: one `[[readings.sources]]` row per account (`bus_root`, `provider`, `agenttalk_account`, `account`); no `limit_events`, gateway or money-reader table, so none of those lanes runs. `poll_seconds = 30`.
 - Ports: Leasewise on `127.0.0.1:8443` (the identity header authenticates this machine; Leasewise refuses other addresses).
 - Authorization: `http_api._authorized_reporter_for_account` accepts a machine that has a seat in a team whose project has the account (step 5's placeholder seat). Step 6 asks the same question of the store.
-- The done check needs: a store query and a status command that both succeed, a reporter scan in the last 180 seconds, exactly the two expected sources, an accepted observation per account newer than `baseline.json`, and no operator line, failed reading or capture fault.
+- The done check needs: a store query and a status command that both succeed, a reporter scan in the last 180 seconds, exactly the two expected sources, an accepted observation per account later than both the clock time and the delivered maximum recorded in `baseline.json` (schema 1, checked field by field), a scan time between 180 seconds ago and 30 seconds ahead, and no operator line, failed reading or capture fault.
 - Flow after the done check: each window keeps its latest unsent figure, Leasewise gets at most one accepted figure per window every two minutes (a new reset time goes at once), and the gaps sentence of
   `reporter status` says what readings cannot do.
-- The scripts' safety checks are copied from the money-reader trial (`docs/TRIAL-R1-READER-4.md`): the privacy helpers are unchanged; the guard is adapted to `C:\lw`. `tests/test_switchon_scripts.py` keeps every block identical to its script and pins the shared start and the guard.
+- The scripts' safety checks are copied from the money-reader trial (`docs/TRIAL-R1-READER-4.md`): the guard is new for this card (`C:\lw`, every ancestor, the whole live folder, the rehearsal mode) and the privacy helpers were rewritten in fix round 1 (`Assert-Private` before a write, `Assert-PrivateAfter` after one). `tests/test_switchon_scripts.py` keeps every block identical to its script and pins the shared start and the guard.
