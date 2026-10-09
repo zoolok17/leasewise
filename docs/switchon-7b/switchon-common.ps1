@@ -131,7 +131,11 @@ function Get-PortListeners {
     param([int]$Port)
     try { $Rows = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop) }
     catch {
-        if ($_.FullyQualifiedErrorId -cne 'CmdletizationQuery_NotFound,Get-NetTCPConnection') { throw "The list of programs that listen on port $Port could not be read. Nothing was started. Tell the lead." }      # only "nothing listens there" means none
+        # Only the answer "no connection matches" means none: its identifier starts with CmdletizationQuery_NotFound (the property name may follow it, so a prefix is
+        # matched) AND it comes from the CIM layer. A missing command has the same category (ObjectNotFound) but another identifier and exception; it, access denied and every
+        # other error stop the step.
+        $Nothing = $_.FullyQualifiedErrorId -clike 'CmdletizationQuery_NotFound*,Get-NetTCPConnection' -and $_.Exception.GetType().FullName -ceq 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException'
+        if (-not $Nothing) { throw "The list of programs that listen on port $Port could not be read. Nothing was started. Tell the lead." }
         $Rows = @()
     }
     $All = @(Get-CimInstance Win32_Process)

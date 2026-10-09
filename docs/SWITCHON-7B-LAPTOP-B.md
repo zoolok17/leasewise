@@ -15,7 +15,9 @@ those figures, but until now nothing carried them to it. This runbook switches t
 - it **only reads** agenttalk's files, and only the usage files in our team's own agenttalk folder (`C:\lw\team\.agenttalk\state`). It never reads a
   file of another team and never reads a folder outside `C:\lw`;
 - **nothing leaves this machine.** No figure crosses to another machine in this first step;
-- it does **not** touch the gateway, the money reader or limit events, and it changes nothing in agenttalk or in any seat. Seats run exactly as before.
+- it does **not** touch the gateway, the money reader or limit events, and it changes nothing in agenttalk or in any seat. Seats run exactly as before;
+- steps 10, 11, 14 and 15 **look at the list of all programs running on this machine**, to find who holds the port, whether a second reporter is running, or whether a program is using the live folder. They print only
+  process numbers and program names, never a command line. If step 10 refuses because another program holds the port, its name is shown; you may pass that to the lead.
 
 Everything lives in **one new folder**, `C:\lw\live`. Deleting that folder (step 15) undoes it. You install nothing: never run `pip install` for this.
 
@@ -28,7 +30,7 @@ for one real turn of a Claude seat and of the Codex seat (the lead can give each
 
 You need all of these. If one is missing, stop.
 
-1. **PowerShell 7** (`pwsh`). The scripts were rehearsed with it. Windows PowerShell 5.1 was **not** rehearsed with them and refused scripts on our machines earlier. The machine's
+1. **PowerShell 7.3 or newer** (`pwsh`); older versions pass quoted arguments to Python differently, and step 0 refuses them. The scripts were rehearsed with 7.6. Windows PowerShell 5.1 was **not** rehearsed with them and refused scripts on our machines earlier. The machine's
    script policy decides what may run, and it must **never** be changed. If the check in step 0 says scripts cannot run, stop and tell the lead.
 2. **Python 3.11 or newer**, with its full path (for example the team's `C:\lw\venv\Scripts\python.exe`). Leasewise needs no other package.
 3. **agenttalk 0.99.0 or newer** on this machine, with **every seat restarted on it and one turn done since**. Older agenttalk writes usage files without the account text this feature needs. Step 3 checks that
@@ -96,10 +98,12 @@ Script: `switchon-00-check.ps1`. It changes nothing.
 <!-- script: switchon-00-check.ps1 -->
 ```powershell
 'PowerShell ' + $PSVersionTable.PSVersion.ToString()
+$Version = $PSVersionTable.PSVersion
+if ([version]('{0}.{1}' -f $Version.Major, $Version.Minor) -lt [version]'7.3') { throw "This needs PowerShell 7.3 or newer; this window runs $($Version.ToString()). Nothing was changed." }
 'scripts run here'
 ```
 
-It must print `PowerShell 7...` and `scripts run here`. If the machine refuses it, stop and tell the lead.
+It must print `PowerShell 7...` and `scripts run here`. If it says "This needs PowerShell 7.3 or newer", open a newer PowerShell 7 and run it again; nothing was changed. If the machine refuses the script, stop and tell the lead.
 
 ## Step 1: choose the names, then make the private folder
 
@@ -139,24 +143,26 @@ if ([IO.Path]::GetExtension($Archive) -ne '.zip') { throw 'The archive must be a
 if (Test-Path -LiteralPath $LiveRoot) { throw "The folder $LiveRoot already exists. Nothing was changed. If an earlier run made it, roll it back with step 15; otherwise tell the lead." }
 New-Item -ItemType Directory -Path $LiveRoot | Out-Null  # no -Force: an existing folder is an error
 
-# The marker and names.json come first, at once: neither holds a secret, and step 15 can remove the folder from them whatever happens next.
+# Only the ownership marker comes first (a random token and the folder path, nothing personal): step 15 can remove the folder from it whatever happens next.
+# names.json holds the path of Python, which can contain your user name, so it is written only after the folder has been made private and checked.
 $Token = [guid]::NewGuid().ToString('N')                 # random
 $Here = (Resolve-Path -LiteralPath $LiveRoot).ProviderPath
 [IO.File]::WriteAllText((Join-Path $LiveRoot '.owner.json'), (ConvertTo-Json @{ token = $Token; path = $Here }), $Utf8)
+try { Protect-Path $LiveRoot $true; Assert-Private $LiveRoot $true }
+catch { throw "$LiveRoot was made and holds only the ownership marker (a random token and the folder path), but it could not be made private. Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead." }
 $Saved = [ordered]@{                                     # only these names are ever read back; every path is recomputed from LiveRoot and BusRoot
     LiveRoot = $LiveRoot; BusRoot = $BusRoot; Port = $PortNumber; Token = $Token; Py = $Py; Archive = $Archive; ExpectedSha = $ExpectedSha
     MachineAlias = $MachineAlias; ClaudeAlias = $ClaudeAlias; CodexAlias = $CodexAlias; ProjectAlias = $ProjectAlias
 }
 [IO.File]::WriteAllText($Names, ($Saved | ConvertTo-Json -Depth 3), $Utf8)
-try { Protect-Path $LiveRoot $true; Assert-Private $LiveRoot $true }
-catch { throw "$LiveRoot was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead." }
 New-Item -ItemType Directory -Path $StateDir, $Journal, (Split-Path $Store) | Out-Null
 Test-Path -LiteralPath $Names
 ```
 
 It checks the three values (Python must be one plain file; the archive must be a `.zip` file inside `C:\lw` with no link on its way), refuses a folder that already exists (nothing is changed), creates
-`C:\lw\live`, **at once** writes the ownership marker and the short list of names (neither holds a secret; step 15 needs them), and only then makes the folder **private** and reads the access list back by security
-identifier. If that fails it says "`C:\lw\live` was made but could not be made private. Nothing secret was written. Run step 15 to remove it, then tell the lead." It must print `True`.
+`C:\lw\live`, writes **only** the ownership marker (a random token and the folder path, nothing personal; step 15 needs it), makes the folder **private** and reads the access list back by security identifier, and only
+then writes the short list of names (`names.json`; it holds the path of Python, which can contain your user name). If the privacy step fails it says "`C:\lw\live` was made and holds only the ownership marker (a random token
+and the folder path), but it could not be made private. Nothing secret and none of your answers were written. Run step 15 to remove it, then tell the lead." It must print `True`.
 If it says the folder already exists, an earlier run made it: roll that back with step 15, or tell the lead. **Do not choose another folder.**
 
 ## Step 2: check the archive, then unpack it
@@ -638,7 +644,8 @@ It prints nothing but its banner when everything has stopped (it may show its ow
 
 ## Step 15: roll back (undo everything)
 
-Stop both windows first (step 14). The script `switchon-15-rollback.ps1` deletes `C:\lw\live`, and nothing else, after these checks: it runs step 14's check itself and refuses while window 1 or 2 is still running; the folder holds
+Stop both windows first (step 14). The script `switchon-15-rollback.ps1` deletes `C:\lw\live`, and nothing else, after these checks: it runs step 14's check itself and refuses while any program that uses the live folder is still running ("A program that uses the live folder is still running (process N, program X). If it is window 1 or 2, press
+Ctrl-C there; otherwise close that program. Then run step 15 again. Nothing was deleted."); the folder holds
 the ownership marker this runbook wrote (and the marker is a plain file, not a link); **no link anywhere on the way to it or inside it** (it looks at every entry and never follows a link); it is the folder `names.json`
 names; and the agenttalk folder is neither the same folder nor inside it. If `names.json` is missing (step 1 stopped early), it deletes only a folder that holds nothing but the marker. If any check fails it deletes nothing
 and tells you. It deletes everything else first, then `names.json`, then the marker, then the empty folder, so if a delete fails part way (a program still holds a file) the marker and `names.json` are still there and you can
@@ -652,7 +659,7 @@ Assert-Plain $LiveRoot
 Assert-NoLink $LiveRoot
 if (-not (Test-Path -LiteralPath $LiveRoot -PathType Container)) { 'There is nothing to roll back: the folder does not exist.'; return }
 $Running = @(Get-LiveProcesses)                          # the same list as step 14, without this script's own process
-if ($Running.Count -gt 0) { throw ('Window 1 or 2 is still running (process {0}). Press Ctrl-C in it, then run step 15 again. Nothing was deleted.' -f $Running[0].ProcessId) }
+if ($Running.Count -gt 0) { throw ('A program that uses the live folder is still running (process {0}, program {1}). If it is window 1 or 2, press Ctrl-C there; otherwise close that program. Then run step 15 again. Nothing was deleted.' -f $Running[0].ProcessId, $Running[0].Name) }
 $MarkerFile = Join-Path $LiveRoot '.owner.json'
 Assert-NoLink $MarkerFile                                          # the marker is a plain file, not a link, before it is read
 if (-not (Test-Path -LiteralPath $MarkerFile -PathType Leaf)) { throw 'The folder holds no ownership marker, so it is not a folder this runbook made. Nothing was deleted. Tell the lead.' }
