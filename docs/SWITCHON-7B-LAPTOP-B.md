@@ -68,6 +68,7 @@ pwsh -NoProfile -File 'C:\lw\switchon-7b\switchon-04-store.ps1'
 | The reporter's settings (private: identity value and the account texts) | `C:\lw\live\reporter.toml` |
 | The reporter's own state | `C:\lw\live\state` |
 | The names every script reads | `C:\lw\live\names.json` |
+| The baseline of step 12 | `C:\lw\live\baseline.json` |
 | **Read only**: our team's agenttalk folder | `C:\lw\team\.agenttalk\state` |
 
 Nothing is put in `%LOCALAPPDATA%`, your user profile or any other team's folder.
