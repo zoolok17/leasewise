@@ -358,7 +358,7 @@ class Safety(unittest.TestCase):
         self.assertIn("$ServeArgs = Get-ServeArgs", server)                       # one list for both steps
         self.assertIn("@('-m', 'quota_balancer', '--db', $Store, 'serve', '--host', '127.0.0.1', '--port', [string]$PortNumber)", common)
         for needle in ("$Want = @($PyFlags) + @(Get-ServeArgs)", "$Words.Count -ne ($Want.Count + 1)", "$Words[$Index + 1] -ceq $Want[$Index]", "-ieq $Store",
-                       "if ($Row.Path -ieq $Py) { return }", "$Row.ParentCommandLine -cne $Row.CommandLine", "$Config -notlike 'C:\lw\*'", "executable", "-not $Row.CommandLine -or -not $Row.Path"):
+                       "if ($Row.Path -ieq $Py) { return }", "$Row.ParentCommandLine -cne $Row.CommandLine", r"$Config -notlike 'C:\lw\*'", "executable", "-not $Row.CommandLine -or -not $Row.Path"):
             self.assertIn(needle, common, needle)
         self.assertNotIn("-contains 'serve'", common)                              # not a bag of words any more
 
