@@ -1,0 +1,6 @@
+# Step 11, window 2: the reporter. Start it a few seconds after window 1. It prints one line per cycle, like
+# {"blocked": null, "journal": "ok", "new_events": 0, "sent": 2}. Stop it with Ctrl-C (step 13).
+# After a restart of the machine, run step 10 and then this script again; the reporter's state is kept and nothing is repeated.
+. (Join-Path $PSScriptRoot 'switchon-common.ps1')
+$RunArgs = @('-m', 'quota_balancer', 'reporter', 'run', '--config', $ConfigPath)
+& $Py @RunArgs
