@@ -1,24 +1,40 @@
-# Step 8 (operator step): the account table. Copy each account's text from your own screen (the line `agenttalk capacity` prints for it) when asked.
-# It holds your Windows user name, so the question does NOT show what you type (it is masked), and the text goes only into the private settings file.
-# The script first checks that the settings file is private, then asks; it checks the SHAPE of each text and says which one is wrong without showing it,
-# and it writes nothing unless both are right.
+# Step 8 (operator step): the account table. On your own screen, `agenttalk capacity` prints one line per account like
+#   claude account of OS user <name> (home-xxxxxxxx), 2 seats: ...
+# The script asks for two parts of that line for each account: the name after "OS user" and the 8 characters of home-xxxxxxxx. The questions do NOT show what you
+# type (they are masked), because the name is your Windows user name. The script puts the parts together as <provider>:<name>:home-<8 characters> (the text agenttalk
+# writes into its usage files), checks the shape of each part and says which one is wrong without showing it, and then checks the result against our own usage files:
+# a typo is found before anything is written. The text goes only into the private settings file, and nothing is written unless both accounts are right.
 . (Join-Path $PSScriptRoot 'switchon-common.ps1')
 '== Step 8: the account table'
 Assert-Private $LiveRoot $true                           # before anything is asked or written
 Assert-Private $ConfigPath $true
 if ((Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8) -match '\[\[readings\.sources\]\]') { throw 'The account table is already in the settings file. Nothing was changed. Tell the lead.' }
 if ($env:LW_SWITCHON_INPUT -ceq 'env') {                 # the lead's test run only (the guard allows it in rehearsal mode and nowhere else)
-    $ClaudeText = $env:LW_SWITCHON_CLAUDE_TEXT
-    $CodexText = $env:LW_SWITCHON_CODEX_TEXT
+    $ClaudeName, $ClaudeHome = $env:LW_SWITCHON_CLAUDE_NAME, $env:LW_SWITCHON_CLAUDE_HOME
+    $CodexName, $CodexHome = $env:LW_SWITCHON_CODEX_NAME, $env:LW_SWITCHON_CODEX_HOME
 }
 else {
-    $ClaudeText = Read-Host -MaskInput 'Claude account text, as agenttalk capacity prints it (it is not shown as you type)'
-    $CodexText = Read-Host -MaskInput 'Codex account text, as agenttalk capacity prints it (it is not shown as you type)'
+    $ClaudeName = Read-Host -MaskInput 'Claude: the name after "OS user" (it is not shown as you type)'
+    $ClaudeHome = Read-Host -MaskInput 'Claude: the 8 characters of home-xxxxxxxx (it is not shown as you type)'
+    $CodexName = Read-Host -MaskInput 'Codex: the name after "OS user" (it is not shown as you type)'
+    $CodexHome = Read-Host -MaskInput 'Codex: the 8 characters of home-xxxxxxxx (it is not shown as you type)'
 }
-$Shape = '^{0}:.+:home-[0-9a-f]{{8}}$'
-if ($ClaudeText -cnotmatch ($Shape -f 'claude')) { throw 'The Claude text is not in the form claude:<user>:home-<8 characters 0-9 a-f>. Nothing was changed. Copy it again.' }
-if ($CodexText -cnotmatch ($Shape -f 'codex')) { throw 'The Codex text is not in the form codex:<user>:home-<8 characters 0-9 a-f>. Nothing was changed. Copy it again.' }
-if ($ClaudeText -eq $CodexText) { throw 'The two texts are the same. Nothing was changed. Copy them again.' }
+function Join-AccountText {
+    param([string]$Provider, [string]$Label, [string]$Name, [string]$Home8)
+    if ($Name.Length -lt 1 -or $Name.Length -gt 256 -or $Name -cmatch '[\p{Cc}:]' -or $Name -cne $Name.Trim()) {
+        throw "The $Label name is not in the allowed form (1 to 256 characters, no colon, no control character, no space at either end). Nothing was changed. Run step 8 again."
+    }
+    if ($Home8 -cnotmatch '^(home-)?([0-9a-f]{8})$') { throw "The $Label home part must be exactly 8 characters 0-9 and a-f, with or without home- in front. Nothing was changed. Run step 8 again." }
+    '{0}:{1}:home-{2}' -f $Provider, $Name, $Matches[2]
+}
+$ClaudeText = Join-AccountText 'claude' 'Claude' $ClaudeName $ClaudeHome
+$CodexText = Join-AccountText 'codex' 'Codex' $CodexName $CodexHome
+$Usage = @(Get-UsageAccounts)                            # the same files the reporter reads; compared in memory, only counted on screen
+foreach ($Pair in @(@('Claude', $ClaudeText), @('Codex', $CodexText))) {
+    $Found = @($Usage | Where-Object { $_.Account -ceq $Pair[1] }).Count
+    if ($Found -eq 0) { throw ('The {0} text you typed does not match any of our usage files. Nothing was changed. Compare with your agenttalk capacity screen and run step 8 again.' -f $Pair[0]) }
+    '{0}: matches {1} usage file(s)' -f $Pair[0], $Found
+}
 $ToToml = { param($Value) '"' + ([string]$Value).Replace('\', '\\').Replace('"', '\"') + '"' }       # a TOML basic string: only \ and " need escaping
 $Rows = @"
 
@@ -36,5 +52,5 @@ account = $(& $ToToml $CodexAlias)
 "@
 [IO.File]::AppendAllText($ConfigPath, $Rows, $Utf8)           # the file keeps its private list
 Assert-PrivateAfter $ConfigPath $true
-Remove-Variable ClaudeText, CodexText, Rows
+Remove-Variable ClaudeName, ClaudeHome, CodexName, CodexHome, ClaudeText, CodexText, Rows
 'two rows written'

@@ -2,7 +2,7 @@
 # value) and lists each row by provider and Leasewise alias only. It never prints an account text.
 . (Join-Path $PSScriptRoot 'switchon-common.ps1')
 '== Step 9: check the account table'
-$Json = & $Py -m quota_balancer reporter status --config $ConfigPath --json
+$Json = & $Py @PyFlags -m quota_balancer reporter status --config $ConfigPath --json
 if ($LASTEXITCODE -ne 0) { throw 'The settings are refused (see the sentence above). Nothing secret was shown. Tell the lead.' }
 $Readings = ($Json | ConvertFrom-Json).readings
 if (-not $Readings.configured) { throw 'The settings hold no account table.' }

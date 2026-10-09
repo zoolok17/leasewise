@@ -15,7 +15,7 @@ for alias in sys.argv[2:]:
     newest = conn.execute("SELECT MAX(w.observed_at) FROM windows w JOIN accounts a ON a.id = w.account_id WHERE a.alias = ?", (alias,)).fetchone()[0]
     print(alias + " " + str(int(newest or 0)))
 '@
-$Lines = @(& $Py -c $Question $Store $ClaudeAlias $CodexAlias)
+$Lines = @(& $Py @PyFlags -c $Question $Store $ClaudeAlias $CodexAlias)
 if ($LASTEXITCODE -ne 0 -or $Lines.Count -ne 2) { throw 'The store could not be read. Nothing was changed. Tell the lead.' }
 $Delivered = [ordered]@{}
 foreach ($Line in $Lines) {

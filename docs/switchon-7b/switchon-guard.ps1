@@ -8,10 +8,11 @@
 #   * the live folder and the agenttalk folder are the same, or one lies inside the other;
 #   * names.json names a live folder, an agenttalk folder or a port other than the ones this run was checked with.
 # Rehearsal (the lead's test run in a scratch folder) happens only when LW_SWITCHON_REHEARSAL is exactly "yes", and then ALL of
-# LW_SWITCHON_ROOT, LW_SWITCHON_BUS, LW_SWITCHON_PORT and LW_SWITCHON_INPUT are required and both folders must lie inside C:\lw\scratch.
+# LW_SWITCHON_ROOT, LW_SWITCHON_BUS, LW_SWITCHON_PORT and LW_SWITCHON_INPUT are required (input "env" also takes the four test parts, "prompt" none; the three step-1 answers are all set or none) and both folders must lie inside C:\lw\scratch.
 # For the operator any rehearsal variable stops the step: they are never silently accepted.
 # It leaves $LiveRoot, $BusRoot, $PortNumber, $NamesFile, $N (the checked saved names, or nothing before step 1 has run) and the functions below.
-$RehearsalNames = 'LW_SWITCHON_REHEARSAL', 'LW_SWITCHON_ROOT', 'LW_SWITCHON_BUS', 'LW_SWITCHON_PORT', 'LW_SWITCHON_INPUT', 'LW_SWITCHON_CLAUDE_TEXT', 'LW_SWITCHON_CODEX_TEXT'
+$RehearsalNames = 'LW_SWITCHON_REHEARSAL', 'LW_SWITCHON_ROOT', 'LW_SWITCHON_BUS', 'LW_SWITCHON_PORT', 'LW_SWITCHON_INPUT', 'LW_SWITCHON_CLAUDE_NAME', 'LW_SWITCHON_CLAUDE_HOME',
+    'LW_SWITCHON_CODEX_NAME', 'LW_SWITCHON_CODEX_HOME', 'LW_SWITCHON_PYTHON', 'LW_SWITCHON_ARCHIVE', 'LW_SWITCHON_SHA'
 $RehearsalSet = @($RehearsalNames | Where-Object { Test-Path -LiteralPath ('Env:' + $_) })
 function Assert-Plain {
     param([string]$Path)
@@ -62,10 +63,12 @@ if ($env:LW_SWITCHON_REHEARSAL -ceq 'yes') {
     foreach ($Name in 'LW_SWITCHON_ROOT', 'LW_SWITCHON_BUS', 'LW_SWITCHON_PORT', 'LW_SWITCHON_INPUT') {
         if (-not (Test-Path -LiteralPath ('Env:' + $Name))) { throw "Rehearsal mode needs all of its settings and $Name is missing. Nothing was changed." }
     }
-    $Texts = @('LW_SWITCHON_CLAUDE_TEXT', 'LW_SWITCHON_CODEX_TEXT' | Where-Object { Test-Path -LiteralPath ('Env:' + $_) })
-    if ($env:LW_SWITCHON_INPUT -ceq 'env') { if ($Texts.Count -ne 2) { throw 'Rehearsal input "env" needs both test texts. Nothing was changed.' } }
-    elseif ($env:LW_SWITCHON_INPUT -ceq 'prompt') { if ($Texts.Count -ne 0) { throw 'Rehearsal input "prompt" must not set the test texts. Nothing was changed.' } }
+    $Parts = @('LW_SWITCHON_CLAUDE_NAME', 'LW_SWITCHON_CLAUDE_HOME', 'LW_SWITCHON_CODEX_NAME', 'LW_SWITCHON_CODEX_HOME' | Where-Object { Test-Path -LiteralPath ('Env:' + $_) })
+    if ($env:LW_SWITCHON_INPUT -ceq 'env') { if ($Parts.Count -ne 4) { throw 'Rehearsal input "env" needs all four test parts. Nothing was changed.' } }
+    elseif ($env:LW_SWITCHON_INPUT -ceq 'prompt') { if ($Parts.Count -ne 0) { throw 'Rehearsal input "prompt" must not set the test parts. Nothing was changed.' } }
     else { throw 'LW_SWITCHON_INPUT must be "env" or "prompt". Nothing was changed.' }
+    $Answers = @('LW_SWITCHON_PYTHON', 'LW_SWITCHON_ARCHIVE', 'LW_SWITCHON_SHA' | Where-Object { Test-Path -LiteralPath ('Env:' + $_) })
+    if ($Answers.Count -ne 0 -and $Answers.Count -ne 3) { throw 'The rehearsal answers for step 1 (PYTHON, ARCHIVE, SHA) are all set or none is. Nothing was changed.' }
     if ($env:LW_SWITCHON_PORT -notmatch '^[0-9]{4,5}$' -or [int]$env:LW_SWITCHON_PORT -lt 1024 -or [int]$env:LW_SWITCHON_PORT -gt 65535 -or [int]$env:LW_SWITCHON_PORT -eq 8443) { throw 'The rehearsal port must be 1024 to 65535 and not 8443. Nothing was changed.' }
     $LiveRoot = $env:LW_SWITCHON_ROOT
     $BusRoot = $env:LW_SWITCHON_BUS

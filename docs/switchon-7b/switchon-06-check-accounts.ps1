@@ -15,6 +15,6 @@ for alias in sys.argv[3:]:
     bad += row is None
 sys.exit(1 if bad else 0)
 '@
-& $Py -c $Question $Store $MachineAlias $ClaudeAlias $CodexAlias
+& $Py @PyFlags -c $Question $Store $MachineAlias $ClaudeAlias $CodexAlias
 if ($LASTEXITCODE -ne 0) { throw 'This machine is not an allowed reporter for both accounts. Do not go on. Tell the lead.' }
 'both accounts: allowed'
