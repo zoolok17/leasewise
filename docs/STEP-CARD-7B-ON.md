@@ -350,3 +350,49 @@ more-than-64-files stop, the broken scan, and the texts-on-standard-input test. 
 16 KiB (it checked the size). The new tests still pin those.
 
 **Rehearsal** (`rehearsal5-part1.txt`, `rehearsal5-part2.txt` in the developer's scratch): steps 0 to 15 in strict mode with the venv Python as before, and it adds an unrelated script holding the port with the exact store (refused; no reporter running afterwards).
+
+
+### Fix round 2 (Codex delta 2 tk-2d28eb122f76, fallback D-321)
+
+Codex read the card at `862f0a7` and returned FIX again, on step 11's listener check only (the two usage-scan findings were closed). Its MAJOR points: the check split the listener's command line into words in its own way, and Python
+splits it differently (`-m "quota_balancer"--db "<store>"` passes the word check, but Python runs the module `quota_balancer--db`); the store word was resolved in the checker's folder, so `..\store\inventory.db` named another
+database from another folder; and a drive-relative `executable = C:..\..\base\python.exe` in `pyvenv.cfg` counted as rooted. The lesson: reading another process's command line can never prove what that process runs. So the
+lead's pre-declared fallback (D-321) applies: **step 11 identifies the server by the process step 10 started and recorded, never by the text of a command line.** Two commits on top of `862f0a7`.
+
+**In plain words.** Step 10 now starts the server itself and writes down which program it started (its number and its start time) before it waits. Step 11 accepts only that program, or the one program it started in turn
+(a virtual environment's `python.exe` starts the real interpreter as a second process that owns the port). No command line is read to decide this, so no clever command line can pass.
+
+1. **Step 10 starts and records.** `switchon-10-server.ps1`: the port check stays first; then `System.Diagnostics.ProcessStartInfo` with `FileName` = step 1's Python, `ArgumentList` filled one word at a time from `$PyFlags` and
+   `Get-ServeArgs` (so .NET does the Windows quoting, never string joining), `UseShellExecute = $false`, no redirection (the server shares window 1 as before), working folder = the source folder. Before it waits it writes
+   `server.json` with exactly `schema` 1, `pid`, `started_utc_ticks` (from the process's `StartTime`) and `port`. It then waits in slices of 500 milliseconds (so Ctrl-C works); a `finally` gives the server five seconds to follow
+   Ctrl-C and then stops the process it started. When the server ends it says "Window 1's server has stopped." (exit code 0) or "Window 1's server stopped with an error (code N). Tell the lead." `server.json` is in the guard's
+   list of derived paths checked for links.
+2. **Step 11 checks only the record.** `Assert-OurServerListens` reads `server.json` strictly like the baseline (exactly the four fields, whole numbers, schema 1, this run's port); a missing or malformed file says "Window 1 was
+   not started by step 10 of this runbook. Start step 10 first. Nothing was started." The recorded process must still run with the recorded start time (a reused process number does not match) and its program must be step 1's Python
+   (a Windows path, ignoring case). Exactly one listener on the port, on `127.0.0.1`, owned by (a) the recorded process or (b) its direct child (its parent number is the recorded one and it started at or after the recorded
+   time); the child's program and command line are not looked at. Anything else gives the existing "not window 1's Leasewise server ... the identity value was not sent" stop; an unreadable process or port list stops the step.
+   All command-line parsing and the `pyvenv.cfg` logic are gone from the function. `Get-ServeArgs` stays as the single source of step 10's arguments. `Assert-NoReporterRunning` still reads command-line words because it can only
+   refuse (and a second reporter is also stopped by the reporter's own exclusive state lock); a comment says so. The strict-reading helpers (`Test-Whole`, `Test-Object`, `Test-HasAll`, `Test-HasOnly`) moved from step 13 into the
+   shared start.
+3. **Runbook.** Steps 10 and 11 say it in plain words; every sentence about the exact command-line check and `pyvenv.cfg` is gone.
+
+**Remaining limit, stated once:** a program under the operator's own Windows account could stop the server and take the port after step 11's check, or edit `server.json`. Such a program can read the settings file anyway: the
+shared-account limit already stated.
+
+**Tests** (`RecordedServer`, `Step10Starts` in `tests/test_switchon_behaviour.py`; the drift test). Accepted: the real server started by step 10 itself, with the base Python and through the venv launcher (the child owns the socket); a
+recorded launcher with a listening child; a recorded base interpreter that listens itself. Refused, each also proving that the real step 11 stops before it would start the reporter (a copy of step 11 whose last line only says it
+would start it): Codex's quoted-boundary command started by a test; the relative-store command; a stranger that is neither the recorded process nor its child; a grandchild; a recorded process that has ended; an edited or earlier
+start time; a recorded program that is not step 1's Python; two listeners (one on `::1`); a listener on every address; a missing record and fifteen malformed ones (not JSON, a list, `null`, an empty object, an extra field, the wrong
+port, schema 2, a text or negative or zero or fractional number, a missing field), all with the real listener present; a link in place of `server.json`. Step 10: it passes exactly the flags and the serve words through
+`ArgumentList` with a store path containing a space (the fake server reports its own arguments and flags), writes the record while the server still runs (checked with the server paused), the recorded start time equals the
+process's own; a clean exit, an exit with code 3 and a missing module (code 1) give the right messages; Ctrl-C through the pseudo console ends the script and the server, the port is free and step 14 lists nothing. The drift test
+pins that step 10 has no call operator, writes the record before `WaitForExit(500)`, shares `Get-ServeArgs` with step 11, and that no command-line text is left in `Assert-OurServerListens`.
+
+**Red first.** The new test file was run on `862f0a7` (detached worktree, since removed): 7 of 18 tests of the two new classes fail there (the quoted-boundary command, the missing and malformed records, the launcher and direct
+acceptances through a record, step 10's arguments and record, its messages, and Ctrl-C). The rest pass there too: the old check already refused the relative-store command (it resolved it in another folder), strangers and a
+grandchild.
+
+**Rehearsal** (`rehearsal6-part1.txt`, `rehearsal6-part2.txt`, strict mode, venv Python): a stranger on the port before any record (step 10 and step 11 refused; no reporter ran); an unrelated script holding the port (refused); window 1
+accepted through the venv launcher and its child, a second step 10 refused, window 2 up, a second step 11 refused; the baseline, the done check and step 14/15 as before; then, with the record of the stopped window 1 still in place,
+Codex's quoted-boundary stranger holding the port (step 11 refused, 0 reporter processes afterwards); then Ctrl-C in two pseudo consoles ended window 1 (the server's process was gone, the port free) and window 2, and step 14 listed
+nothing; the adversarial cases and step 15 as before.
