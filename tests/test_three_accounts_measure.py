@@ -9,7 +9,9 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -553,6 +555,187 @@ class StorePromiseWording(unittest.TestCase):
         record_text = (ROOT / "docs" / "STEP-CARD-3ACC-0.md").read_text(encoding="utf-8")
         self.assertIn(plain(measure.STORE_PROMISE), plain(stdout.getvalue()))
         self.assertIn(plain(measure.STORE_PROMISE), plain(record_text))
+
+
+class SingleCollector(Scratch):
+    """Fix round 2 (D-351): exactly one collector writes a history folder; a second one is refused at once and never waits."""
+
+    REFUSAL = "another collect is running on this history folder; nothing done"
+
+    def setUp(self):
+        super().setUp()
+        self.history = self.tmp / "history"
+
+    def export(self, exported_at, rows=None):
+        return Collect.export(self, exported_at, rows=rows, name="copy-%d.json" % exported_at)
+
+    def receipt(self):
+        path = self.history / "receipts.json"
+        if not path.exists():
+            return 0
+        return json.loads(path.read_text(encoding="utf-8"))["last_accepted"].get("desk-top", 0)
+
+    def rows(self):
+        path = self.history / "observations.jsonl"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def test_two_overlapping_collectors_never_move_the_accepted_time_backwards(self):
+        T = DAY0
+        reached, release, outcome, seen = threading.Event(), threading.Event(), {}, []
+        original = measure.write_receipts
+
+        def held_write(path, receipts):
+            if threading.current_thread().name == "older-call":
+                reached.set()
+                release.wait(20)
+            original(path, receipts)
+
+        def older():
+            outcome["older"] = measure.collect(self.export(T + 2000, rows=[]), str(self.history), now=T + 2100, user_name=USER)
+
+        with mock.patch.object(measure, "write_receipts", held_write):
+            worker = threading.Thread(target=older, name="older-call")
+            worker.start()
+            try:
+                self.assertTrue(reached.wait(20))
+                code, line = measure.collect(self.export(T + 3000, rows=[]), str(self.history), now=T + 3100, user_name=USER)
+                seen.append(self.receipt())
+            finally:
+                release.set()
+                worker.join(30)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(code, 2, line)
+        self.assertIn(self.REFUSAL, line)
+        self.assertEqual(outcome["older"][0], 0)
+        seen.append(self.receipt())
+        # a later, non-empty copy: accepted only if it is newer than everything accepted before
+        measure.collect(self.export(T + 2500), str(self.history), now=T + 3200, user_name=USER)
+        seen.append(self.receipt())
+        self.assertEqual(seen, sorted(seen), "the accepted time went backwards: %r" % seen)
+        if self.receipt() == T + 3000:
+            self.assertEqual(self.rows(), [])
+        else:
+            self.assertEqual(self.receipt(), T + 2500)
+
+    def test_a_held_lock_makes_collect_refuse_with_no_change_and_no_traceback(self):
+        self.history.mkdir()
+        (self.history / "receipts.json").write_text(json.dumps({"receipts_version": 1, "last_accepted": {"desk-top": DAY0 + 10}}), encoding="utf-8")
+        before = (self.history / "receipts.json").read_bytes()
+        with measure.single_collector(self.history) as held:
+            self.assertTrue(held)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = measure.main(["collect", "--in", self.export(DAY0 + 1000), "--history", str(self.history)])
+        self.assertEqual(code, 2)
+        self.assertIn(self.REFUSAL, stdout.getvalue())
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn(str(self.tmp), stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(self.rows(), [])
+        self.assertEqual((self.history / "receipts.json").read_bytes(), before)
+
+    def test_the_lock_is_let_go_after_each_collect_and_the_file_is_never_deleted(self):
+        code, line = measure.collect(self.export(DAY0 + 1000), str(self.history), now=DAY0 + 1100, user_name=USER)
+        self.assertEqual(code, 0, line)
+        self.assertTrue((self.history / ".collect.lock").exists())
+        code, _line = measure.collect(self.export(DAY0 + 2000), str(self.history), now=DAY0 + 2100, user_name=USER)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.receipt(), DAY0 + 2000)
+        self.assertTrue((self.history / ".collect.lock").exists())
+
+    def child(self):
+        """A process that takes the lock, says so, waits for its input to close and then ends without letting go, as a crash would."""
+        tools = str(Path(measure.__file__).resolve().parent)
+        code = ("import os, sys, pathlib\nsys.path.insert(0, sys.argv[1])\nimport measure\n"
+                "cm = measure.single_collector(pathlib.Path(sys.argv[2]))\n"
+                "print('held' if cm.__enter__() else 'refused', flush=True)\n"
+                "sys.stdin.read()\nos._exit(0)\n")
+        self.history.mkdir(exist_ok=True)
+        proc = subprocess.Popen([sys.executable, "-I", "-c", code, tools, str(self.history)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertEqual(proc.stdout.readline().strip(), "held")
+        return proc
+
+    def test_another_process_holding_the_lock_refuses_collect_and_a_finished_process_does_not(self):
+        proc = self.child()
+        code, line = measure.collect(self.export(DAY0 + 1000), str(self.history), now=DAY0 + 1100, user_name=USER)
+        self.assertEqual(code, 2, line)
+        self.assertEqual(self.rows(), [])
+        proc.stdin.close()                                          # the child ends without unlocking: a crash
+        self.assertEqual(proc.wait(30), 0)
+        proc.stdout.close()
+        code, line = measure.collect(self.export(DAY0 + 1000), str(self.history), now=DAY0 + 1100, user_name=USER)
+        self.assertEqual(code, 0, line)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_a_receipt_on_disk_that_is_newer_is_never_replaced_by_an_older_one(self):
+        self.history.mkdir()
+        original = measure.read_receipts
+        calls = []
+
+        def racing(path):
+            result = original(path)
+            calls.append(1)
+            if len(calls) == 1:                                     # after the first read, something else moves the receipt on
+                measure.write_receipts(path, {"desk-top": DAY0 + 5000})
+            return result
+
+        with mock.patch.object(measure, "read_receipts", racing):
+            code, line = measure.collect(self.export(DAY0 + 1000, rows=[]), str(self.history), now=DAY0 + 1100, user_name=USER)
+        self.assertEqual(code, 0, line)
+        self.assertEqual(self.receipt(), DAY0 + 5000)
+
+
+class ArgumentErrors(Scratch):
+    """Fix round 2 (D-351): an argument error prints one generic sentence with no value from the command line, and exits 3."""
+
+    CANARY = str(Path("C:/Users/canary-private-person/secret-folder-91c2"))
+    SENTENCE = "not done: the command line is not valid; see --help"
+
+    def call(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = measure.main(argv)
+            except SystemExit as why:
+                code = why.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def check(self, argv):
+        code, out, err = self.call(argv)
+        self.assertEqual(code, 3, argv)
+        self.assertIn(self.SENTENCE, out + err)
+        for text in (out, err):
+            self.assertNotIn("canary", text.casefold())
+            self.assertNotIn("secret-folder", text)
+            self.assertNotIn("Traceback", text)
+
+    def test_an_unknown_option_followed_by_a_private_path(self):
+        self.check(["collect", "--in", "x", "--history", "y", "--bogus", self.CANARY])
+        self.check(["--bogus", self.CANARY, "report"])
+
+    def test_a_missing_required_option(self):
+        self.check(["collect", "--history", self.CANARY])
+        self.check(["from-store", "--db", self.CANARY, "--labels", self.CANARY])
+        self.check(["report", "--observations", self.CANARY, "--from", "2026-10-12"])
+
+    def test_a_missing_or_unknown_subcommand(self):
+        self.check([])
+        self.check([self.CANARY])
+        self.check(["collect-canary-private", self.CANARY])
+
+    def test_a_stray_value_after_a_complete_command(self):
+        self.check(["report", "--observations", self.CANARY, "--from", "2026-10-12", "--to", "2026-10-13", "extra-" + self.CANARY])
+
+    def test_a_bad_date_that_gets_past_the_parser_prints_no_value_either(self):
+        code, out, err = self.call(["report", "--observations", self.CANARY, "--from", "canary-not-a-date", "--to", "canary-2"])
+        self.assertEqual(code, 3)
+        self.assertNotIn("canary", (out + err).casefold())
+
+    def test_help_still_prints_the_usage_and_exits_zero(self):
+        for argv in (["--help"], ["from-store", "--help"], ["collect", "--help"], ["report", "--help"]):
+            code, out, _err = self.call(argv)
+            self.assertEqual(code, 0, argv)
+            self.assertIn("usage:", out)
 
 
 if __name__ == "__main__":

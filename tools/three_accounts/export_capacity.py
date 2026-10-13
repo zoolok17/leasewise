@@ -343,13 +343,31 @@ def summary(counts):
     return ", ".join("%s=%d" % (key, counts[key]) for key in COUNT_KEYS)
 
 
+ARGUMENT_SENTENCE = "not done: the command line is not valid; see --help"
+
+
+class ArgumentProblem(Exception):
+    """A command-line error. It carries nothing: argparse's own text would repeat the value the person typed, which may be a private path."""
+
+
+class QuietParser(argparse.ArgumentParser):
+    """Sub-parsers made by `add_subparsers` use the same class, so every argument error ends here and never prints a value."""
+
+    def error(self, message):
+        raise ArgumentProblem
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = QuietParser(description=__doc__.split("\n")[0])
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--labels", required=True)
     parser.add_argument("--machine", required=True)
     parser.add_argument("--out", required=True)
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except ArgumentProblem:
+        print(ARGUMENT_SENTENCE)
+        return 3
     try:
         code, line = run(args.state_dir, args.labels, args.machine, args.out)
     except BadArguments as why:

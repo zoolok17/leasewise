@@ -76,7 +76,7 @@ python <folder>\export_capacity.py --state-dir <agenttalk state folder> --labels
 ```
 
 It prints one line of counts, for example `written: 2 row(s); files=1, used=1, old_format=0, ...`, and exits 0; exit 2 means it refused and wrote nothing; exit 3 means a
-problem with the arguments or the table.
+problem with the arguments (a generic sentence) or the table.
 
 **Lead, on Laptop B:**
 
@@ -86,7 +86,7 @@ python tools\three_accounts\measure.py from-store --db C:\lw\live\store\inventor
 python tools\three_accounts\measure.py report --observations <history folder>\observations.jsonl <history folder>\store.jsonl --from 2026-10-12 --to 2026-10-18
 ```
 
-Add `--json` to `report` for a machine-readable result. `from-store` and `report` change nothing in Leasewise; `collect` writes only into the history folder.
+Add `--json` to `report` for a machine-readable result. `from-store` and `report` change nothing in Leasewise; `collect` writes only into the history folder (the usage rows, `receipts.json` and the empty lock file `.collect.lock`).
 
 ## The label table
 
@@ -132,10 +132,20 @@ prints an account text, a path or a file's content. The program also never write
   one generic sentence and exits 3: no path, no exception text, no traceback. The temporary file of every write is created exclusively under an unpredictable
   name, so it can never be an existing file, and only that file is removed on a failure. A time is accepted only if it is a real calendar moment written in ASCII digits.
 - The export's exit codes: 0 written, 2 refused, 3 a problem with the arguments or the table.
+- **Fix round 2 additions (decision D-351):**
+  - **One collector at a time.** Exactly one `collect` writes a history folder. It takes a lock on `<history>/.collect.lock` for the whole sequence (read the
+    receipts, check, append the rows, write the receipts). The lock is the operating system's own (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere), so it
+    is let go when the process ends, even after a crash; the file is never created as a marker and never deleted by the tool, so a leftover file blocks no one.
+  - **A second collector is refused, never made to wait.** It prints `collect: another collect is running on this history folder; nothing done`, exits 2,
+    appends nothing and leaves `receipts.json` as it was. Run it again a moment later.
+  - **Defence in depth.** Under the lock, the receipt written is the larger of the one on disk and the new one, so the accepted time of a machine never decreases.
+  - **Argument errors print no value.** A command line that is not valid (an unknown option, a missing option, a missing or unknown subcommand, a stray value)
+    prints one generic sentence, `not done: the command line is not valid; see --help`, and exits 3, in both programs. It never repeats what was typed.
+    `--help` still prints the full help and exits 0.
 
 ## Tests
 
-`tests/test_three_accounts_export.py` (21) and `tests/test_three_accounts_measure.py` (21). Fixtures are complete documents built from exactly the reader's 27 listed
+`tests/test_three_accounts_export.py` (35) and `tests/test_three_accounts_measure.py` (47). Fixtures are complete documents built from exactly the reader's 27 listed
 keys plus `plan_type` and `limit_id`, checked equal to `quota_balancer.reporter.capacityreader` and accepted by its own `read_capacity`; every account text and user
 name is made up. They cover: the export of mapped files; the newest figure across seats; per-window observed times and the fallback; old-format files counted, not
 failed; each counted kind; the input bounds; each unsafe-value refusal writing nothing; an atomic write that leaves no partial or temporary file after a failure;

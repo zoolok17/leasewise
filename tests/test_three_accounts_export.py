@@ -426,5 +426,50 @@ class CalendarDates(unittest.TestCase):
         self.assertEqual((usable, counts["refused"]), ([], 1))
 
 
+class ArgumentErrors(Folder):
+    """Fix round 2 (D-351): an argument error prints one generic sentence with no value from the command line, and exits 3."""
+
+    CANARY = str(Path("C:/Users/canary-private-person/secret-folder-91c2"))
+    SENTENCE = "not done: the command line is not valid; see --help"
+
+    def call(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = ec.main(argv)
+            except SystemExit as why:
+                code = why.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def check(self, argv):
+        code, out, err = self.call(argv)
+        self.assertEqual(code, 3, argv)
+        self.assertIn(self.SENTENCE, out + err)
+        for text in (out, err):
+            self.assertNotIn("canary", text.casefold())
+            self.assertNotIn("secret-folder", text)
+            self.assertNotIn("Traceback", text)
+        self.assertFalse(self.out.exists())
+
+    def full(self):
+        return ["--state-dir", str(self.state), "--labels", str(self.labels), "--machine", "desk-top", "--out", str(self.out)]
+
+    def test_an_unknown_option_followed_by_a_private_path(self):
+        self.check(self.full() + ["--bogus", self.CANARY])
+        self.check(["--bogus", self.CANARY])
+
+    def test_a_missing_required_option(self):
+        self.check(["--state-dir", self.CANARY])
+        self.check(["--labels", self.CANARY, "--machine", "desk-top", "--out", str(self.out)])
+
+    def test_a_stray_value_after_a_complete_command(self):
+        self.check(self.full() + [self.CANARY])
+
+    def test_help_still_prints_the_usage_and_exits_zero(self):
+        code, out, _err = self.call(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("usage:", out)
+
+
 if __name__ == "__main__":
     unittest.main()

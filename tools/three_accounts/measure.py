@@ -13,8 +13,8 @@ An observation record is one line of JSON:
      "exported_at", "seen_at", "copy_age_s"}      (times are epoch seconds, UTC)
 It holds no account text, no user name and no path. Output of every command is numbers and labels only.
 """
-import argparse
 import calendar
+import contextlib
 import datetime
 import json
 import os
@@ -42,6 +42,7 @@ WEEKLY = "seven_day"
 MAX_HISTORY_BYTES = 50_000_000         # a week of 5-minute copies is far smaller; a bigger file is not ours
 MAX_RECEIPT_BYTES = 65_536             # the receipts file holds one number per machine
 RECEIPTS_NAME = "receipts.json"
+LOCK_NAME = ".collect.lock"            # exactly one collector writes a history folder
 
 
 class Problem(Exception):
@@ -148,6 +149,45 @@ def write_receipts(path, receipts):
     ec.write_atomic(path, json.dumps({"receipts_version": 1, "last_accepted": receipts}, indent=2, sort_keys=True) + "\n")
 
 
+@contextlib.contextmanager
+def single_collector(history):
+    """Holds the folder's lock for the block and yields True, or yields False at once if another process (or thread) holds it; it never waits.
+
+    The lock is taken through the operating system on a file that is never deleted, so it is let go when the process ends, even after a crash,
+    and a leftover file does not block anyone.
+    """
+    with open(history / LOCK_NAME, "ab") as handle:
+        try:
+            _lock(handle)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _unlock(handle)
+
+
+if os.name == "nt":
+    import msvcrt
+
+    def _lock(handle):
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+    def _unlock(handle):
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock(handle):
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(handle):
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def collect(copy_path, history_dir, now=None, user_name=None):
     """-> (exit code, one line of counts). Appends the copy's rows when its export time is newer than the last one accepted.
 
@@ -160,6 +200,14 @@ def collect(copy_path, history_dir, now=None, user_name=None):
         return 2, "collect: the copy did not pass the checks; nothing appended (bad=1)"
     history = Path(history_dir)
     history.mkdir(parents=True, exist_ok=True)
+    with single_collector(history) as held:
+        if not held:
+            return 2, "collect: another collect is running on this history folder; nothing done"
+        return _collect_locked(data, history, now)
+
+
+def _collect_locked(data, history, now):
+    """The whole sequence (read the receipts, check, append, write the receipts) runs while this process holds the folder's lock."""
     target = history / "observations.jsonl"
     receipts_path = history / RECEIPTS_NAME
     receipts = read_receipts(receipts_path)
@@ -172,7 +220,10 @@ def collect(copy_path, history_dir, now=None, user_name=None):
     if lines:
         with open(target, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(lines)
-    receipts[machine] = data["exported_at"]
+    # Defence in depth: whatever happened, the accepted time of a machine never goes down.
+    current = read_receipts(receipts_path)
+    receipts = {name: max(receipts.get(name, 0), current.get(name, 0)) for name in set(receipts) | set(current)}
+    receipts[machine] = max(receipts.get(machine, 0), data["exported_at"])
     write_receipts(receipts_path, receipts)
     return 0, "collect: appended=%d, copy_age_s=%d, old_format=%d, unmapped=%d" % (len(data["rows"]), max(0, now - data["exported_at"]),
                                                                                     data["counts"]["old_format"], data["counts"]["unmapped"])
@@ -360,7 +411,7 @@ def report_command(paths, day_from, day_to, as_json):
 # ---------------------------------------------------------------- command line
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = ec.QuietParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("collect")
     one.add_argument("--in", dest="copy", required=True)
@@ -374,7 +425,11 @@ def main(argv=None):
     three.add_argument("--from", dest="day_from", required=True)
     three.add_argument("--to", dest="day_to", required=True)
     three.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except ec.ArgumentProblem:
+        print(ec.ARGUMENT_SENTENCE)
+        return 3
     try:
         if args.command == "collect":
             code, line = collect(args.copy, args.history)
