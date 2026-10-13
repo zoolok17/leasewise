@@ -3,6 +3,7 @@
 The fixtures are complete schema-2 documents built from exactly the reader's key list plus the two tolerated keys, so they stay in step
 with `quota_balancer.reporter.capacityreader`. Every account text and user name is made up; nothing here touches a real state folder.
 """
+import calendar
 import contextlib
 import io
 import json
@@ -307,6 +308,122 @@ class Writing(Folder):
             code = ec.main(["--state-dir", str(self.state), "--labels", str(self.labels), "--machine", "desk-top", "--out", str(self.out)])
         self.assertEqual(code, 3)
         self.assertNotIn("nonsense", stdout.getvalue())
+
+
+class QuietFailures(Folder):
+    """Fix round 1: a failure prints one generic sentence, never a path, an exception text or a traceback; and no value can make a validator crash."""
+
+    CANARY = "canary-private-folder-7f3a"
+
+    def call(self, main, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_an_integer_percentage_far_beyond_a_float_is_refused_not_a_crash(self):
+        self.put(doc(primary_used_percent=10 ** 400))
+        code, line = self.run_export()
+        self.assertEqual(code, 0, line)
+        counts = self.exported()["counts"]
+        self.assertEqual((counts["refused"], counts["used"]), (1, 0))
+
+    def test_no_json_type_or_magnitude_in_a_checked_field_can_crash_the_reader(self):
+        values = [True, False, "text", "", [1], {"a": 1}, 10 ** 400, -(10 ** 400), 10 ** 30, 1.5, -1, -0.5, 1e308, 1001, 0]
+        fields = ["primary_used_percent", "primary_resets_at", "primary_observed_at", "secondary_used_percent", "secondary_resets_at", "secondary_observed_at",
+                  "observed_at", "schema_version", "confidence", "source", "scope", "account", "primary_window_minutes", "source_agent", "reason"]
+        total = 0
+        for field in fields:
+            for value in values:
+                for path in list(self.state.iterdir()):
+                    path.unlink()
+                self.put(doc(**{field: value}))
+                code, line = self.run_export()                    # must not raise
+                self.assertEqual(code, 0, (field, value, line))
+                counts = self.exported()["counts"]
+                self.assertEqual(counts["files"], 1, (field, value))
+                total += 1
+        self.assertEqual(total, len(fields) * len(values))
+
+    def test_a_schema_version_that_only_equals_two_is_not_version_two(self):
+        for version in (2.0, True, "2", 1, 3):
+            for path in list(self.state.iterdir()):
+                path.unlink()
+            self.put(doc(schema_version=version))
+            self.run_export()
+            self.assertEqual(self.exported()["counts"]["old_format"], 1, version)
+
+    def test_a_file_operation_that_fails_prints_a_generic_sentence_with_no_path(self):
+        self.put(doc())
+        missing = self.tmp / self.CANARY / "export.json"                   # the output folder does not exist
+        code, out, err = self.call(ec.main, ["--state-dir", str(self.state), "--labels", str(self.labels), "--machine", "desk-top", "--out", str(missing)])
+        self.assertEqual(code, 3)
+        self.assertIn("a file operation failed", out)
+        for text in (out, err):
+            self.assertNotIn(self.CANARY, text)
+            self.assertNotIn("Traceback", text)
+            self.assertNotIn(str(self.tmp), text)
+        self.assertFalse((self.tmp / self.CANARY).exists())
+
+    def test_an_unexpected_failure_is_a_generic_sentence_too(self):
+        self.put(doc())
+        with mock.patch.object(ec, "run", side_effect=RuntimeError("detail with " + self.CANARY)):
+            code, out, err = self.call(ec.main, ["--state-dir", str(self.state), "--labels", str(self.labels), "--machine", "desk-top", "--out", str(self.out)])
+        self.assertEqual(code, 3)
+        for text in (out, err):
+            self.assertNotIn(self.CANARY, text)
+            self.assertNotIn("Traceback", text)
+
+    def test_the_output_is_not_written_through_a_name_that_already_exists(self):
+        self.put(doc())
+        precious = self.tmp / "precious.txt"
+        precious.write_bytes(b"do not touch me")
+        guess = self.tmp / (".%s.%d.tmp" % (self.out.name, os.getpid()))        # the name the first build used
+        os.link(precious, guess)                                                # a hard link to another file at that predictable name
+        bystander = self.tmp / ".write-fixed.tmp"
+        bystander.write_bytes(b"bystander")
+        before = {p.name: p.read_bytes() for p in self.tmp.iterdir() if p.is_file()}
+        code, line = self.run_export()
+        self.assertEqual(code, 0, line)
+        self.assertEqual(precious.read_bytes(), b"do not touch me")
+        self.assertEqual(guess.read_bytes(), b"do not touch me")
+        for name, content in before.items():
+            self.assertEqual((self.tmp / name).read_bytes(), content, name)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), sorted(set(before) | {"export.json"} | {"state"}))
+        os.unlink(guess)                                                         # the link, inside this test's own folder
+
+    def test_a_forced_failure_removes_only_the_file_it_made(self):
+        self.put(doc())
+        other = self.tmp / "other.json"
+        other.write_bytes(b"other")
+        before = sorted((p.name, p.read_bytes()) for p in self.tmp.iterdir() if p.is_file())
+        with mock.patch.object(ec.os, "replace", side_effect=OSError("boom")):
+            code, out, err = self.call(ec.main, ["--state-dir", str(self.state), "--labels", str(self.labels), "--machine", "desk-top", "--out", str(self.out)])
+        self.assertEqual(code, 3)
+        self.assertEqual(sorted((p.name, p.read_bytes()) for p in self.tmp.iterdir() if p.is_file()), before)
+
+
+class CalendarDates(unittest.TestCase):
+    def test_only_real_calendar_moments_are_accepted(self):
+        for text in ("2026-02-29T00:00:00Z", "2026-02-30T00:00:00Z", "2026-04-31T10:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z", "2026-05-00T00:00:00Z",
+                     "2026-05-10T24:00:00Z", "2026-05-10T10:60:00Z", "2026-05-10T10:00:60Z", "1969-12-31T23:59:59Z"):
+            self.assertIsNone(ec.parse_time(text), text)
+        self.assertEqual(ec.parse_time("2028-02-29T12:00:00Z"), calendar.timegm((2028, 2, 29, 12, 0, 0)))          # a real leap day
+        self.assertEqual(ec.parse_time("2026-10-12T00:00:00Z"), calendar.timegm((2026, 10, 12, 0, 0, 0)))
+
+    def test_digits_of_other_scripts_are_refused(self):
+        arabic = "٢٠٢٦-10-12T00:00:00Z"                            # "2026" written with Arabic-Indic digits
+        fullwidth = "２０２６-10-12T00:00:00Z"
+        for text in (arabic, fullwidth, "2026-10-1٢T00:00:00Z"):
+            self.assertIsNone(ec.parse_time(text), repr(text))
+
+    def test_an_impossible_date_in_a_file_makes_the_file_refused(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("AGENTTALK_SCRATCH") or None) as folder:
+            state = Path(folder) / "state"
+            state.mkdir()
+            (state / "unit-1.capacity.json").write_text(json.dumps(doc(primary_observed_at="2026-02-30T00:00:00Z")), encoding="utf-8")
+            usable, counts = ec.read_state_folder(str(state))
+        self.assertEqual((usable, counts["refused"]), ([], 1))
 
 
 if __name__ == "__main__":

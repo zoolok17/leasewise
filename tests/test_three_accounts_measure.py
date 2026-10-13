@@ -314,5 +314,231 @@ class CommandLine(Scratch):
             self.assertEqual(measure.main(["report", "--observations", path, "--from", "2026-10-18", "--to", "2026-10-12"]), 3)
 
 
+class QuietFailures(Scratch):
+    """Fix round 1: one generic sentence, never a path, an exception text or a traceback; the output name is never written through an existing file."""
+
+    CANARY = "canary-private-folder-7f3a"
+
+    def call(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = measure.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_quiet(self, out, err):
+        for text in (out, err):
+            self.assertNotIn(self.CANARY, text)
+            self.assertNotIn("Traceback", text)
+            self.assertNotIn(str(self.tmp), text)
+
+    def test_collect_with_a_history_parent_that_is_a_file_prints_no_path(self):
+        copy = Collect.export(self, DAY0 + 1000)
+        blocker = self.tmp / self.CANARY
+        blocker.write_text("a file where a folder is needed", encoding="utf-8")
+        code, out, err = self.call(["collect", "--in", copy, "--history", str(blocker / "history")])
+        self.assertEqual(code, 3)
+        self.assertIn("a file operation failed", out)
+        self.assert_quiet(out, err)
+        self.assertEqual(blocker.read_text(encoding="utf-8"), "a file where a folder is needed")
+
+    def test_from_store_with_a_missing_output_folder_prints_no_path_and_writes_nothing(self):
+        db = FromStore.build(self)
+        labels = self.tmp / "aliases.json"
+        labels.write_text(json.dumps({"main-one": "A"}), encoding="utf-8")
+        code, out, err = self.call(["from-store", "--db", str(db), "--labels", str(labels), "--out", str(self.tmp / self.CANARY / "store.jsonl")])
+        self.assertEqual(code, 3)
+        self.assert_quiet(out, err)
+        self.assertFalse((self.tmp / self.CANARY).exists())
+
+    def test_an_unexpected_failure_is_a_generic_sentence_too(self):
+        path = self.write_jsonl("obs.jsonl", [])
+        with mock.patch.object(measure, "report_command", side_effect=RuntimeError("detail with " + self.CANARY)):
+            code, out, err = self.call(["report", "--observations", path, "--from", "2026-10-12", "--to", "2026-10-12"])
+        self.assertEqual(code, 3)
+        self.assert_quiet(out, err)
+
+    def test_from_store_never_writes_through_a_name_that_already_exists(self):
+        db = FromStore.build(self)
+        labels = self.tmp / "aliases.json"
+        labels.write_text(json.dumps({"main-one": "A"}), encoding="utf-8")
+        out = self.tmp / "store.jsonl"
+        precious = self.tmp / "precious.txt"
+        precious.write_bytes(b"do not touch me")
+        guess = self.tmp / (".%s.%d.tmp" % (out.name, os.getpid()))
+        os.link(precious, guess)
+        before = {p.name: p.read_bytes() for p in self.tmp.iterdir() if p.is_file()}
+        code, _line = measure.from_store(str(db), str(labels), str(out), now=DAY0)
+        self.assertEqual(code, 0)
+        for name, content in before.items():
+            self.assertEqual((self.tmp / name).read_bytes(), content, name)
+        self.assertTrue(out.exists())
+        os.unlink(guess)
+
+
+class WalStore(Scratch):
+    """The live store is in WAL mode. Reading it read-only may leave SQLite's own `-wal` and `-shm` beside it, and nothing else."""
+
+    def build(self, rows):
+        path = self.tmp / "inventory.db"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            "CREATE TABLE machines(id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE);"
+            "CREATE TABLE accounts(id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE);"
+            "CREATE TABLE readings(event_id TEXT PRIMARY KEY, machine_id TEXT, account_id TEXT, seat_id TEXT, kind TEXT, observed_at INTEGER, received_at INTEGER, payload TEXT);"
+            "INSERT INTO machines VALUES('m1','laptop-b');INSERT INTO accounts VALUES('a1','main-one');")
+        self.add(conn, rows)
+        return path, conn
+
+    @staticmethod
+    def add(conn, rows):
+        for number, (observed, bps) in enumerate(rows):
+            payload = json.dumps({"windows": [{"key": "five_hour", "used_bps": bps, "resets_at": (observed + 3 * HOUR) * 1000}], "confidence": "observed",
+                                  "source_stale": False, "covered_seq": None})
+            conn.execute("INSERT INTO readings VALUES(?, 'm1', 'a1', NULL, 'cli_window', ?, 0, ?)", ("w%d-%d" % (observed, number), observed * 1000, payload))
+        conn.commit()
+
+    def labels(self):
+        path = self.tmp / "aliases.json"
+        path.write_text(json.dumps({"main-one": "A"}), encoding="utf-8")
+        return str(path)
+
+    def listing(self):
+        return {p.name: p.stat().st_size for p in self.tmp.iterdir()}
+
+    def test_a_wal_store_with_no_side_files_gets_at_most_the_two_side_files_and_stays_byte_identical(self):
+        path, conn = self.build([(DAY0 + 600, 1000)])
+        conn.close()                                                               # a clean close checkpoints: no -wal or -shm remains
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["inventory.db"])
+        before_bytes = hashlib.sha256(path.read_bytes()).hexdigest()
+        before = set(self.listing())
+        code, line = measure.from_store(str(path), self.labels(), str(self.tmp / "out.jsonl"), now=DAY0)
+        self.assertEqual(code, 0, line)
+        after = set(self.listing())
+        self.assertLessEqual(after - before, {"inventory.db-wal", "inventory.db-shm", "out.jsonl", "aliases.json"})
+        self.assertEqual(before - after, set())
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before_bytes)
+        self.assertEqual(len((self.tmp / "out.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_a_committed_row_that_is_still_in_the_wal_is_read_and_nothing_new_appears(self):
+        path, conn = self.build([(DAY0 + 600, 1000)])
+        try:
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            self.add(conn, [(DAY0 + 1200, 2500)])                                # committed, but left in the WAL by the open writer
+            self.assertTrue((self.tmp / "inventory.db-wal").exists())
+            db_before = hashlib.sha256(path.read_bytes()).hexdigest()
+            names_before = set(self.listing())
+            labels = self.labels()
+            names_before.add("aliases.json")
+            code, line = measure.from_store(str(path), labels, str(self.tmp / "out.jsonl"), now=DAY0)
+            self.assertEqual(code, 0, line)
+            records = [json.loads(x) for x in (self.tmp / "out.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(sorted(r["used_percent"] for r in records), [10.0, 25.0])      # the WAL row is read
+            self.assertEqual(set(self.listing()) - names_before, {"out.jsonl"})              # the side files already existed; nothing else is new
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), db_before)
+        finally:
+            conn.close()
+
+
+class ExpiryAndFalls(unittest.TestCase):
+    def test_a_figure_observed_a_minute_before_its_reset_is_unknown_at_the_reset(self):
+        rec = record(observed=DAY0 + 29 * 60, resets=DAY0 + 30 * 60)           # observed 00:29, resets 00:30
+        self.assertEqual(measure.classify([rec], DAY0 + 29 * 60 + 30)[0], "fresh")
+        self.assertEqual(measure.classify([rec], DAY0 + 30 * 60)[0], "unknown")         # at the boundary the period has ended: not fresh
+        self.assertEqual(measure.classify([rec], DAY0 + 31 * 60)[0], "unknown")
+        info = measure.build_report([rec], "2026-10-12", "2026-10-12")["labels"]["A"]["windows"]["five_hour"]
+        self.assertEqual((info["fresh"], info["floor"]), (0, 0))                       # the 00:30 sample is not fresh
+
+    def test_a_figure_observed_at_or_after_its_own_reset_is_never_fresh_or_floor_and_is_counted(self):
+        late = record(observed=DAY0 + 3600, resets=DAY0 + 3600)                       # observed exactly at its reset
+        later = record(observed=DAY0 + 4000, resets=DAY0 + 3000, machine="other-box")  # observed after its reset
+        for boundary in (DAY0 + 3600, DAY0 + 5400, DAY0 + 7200):
+            self.assertEqual(measure.classify([late], boundary)[0], "unknown")
+        info = measure.build_report([late, later], "2026-10-12", "2026-10-12")["labels"]["A"]["windows"]["five_hour"]
+        self.assertEqual((info["fresh"], info["floor"]), (0, 0))
+        self.assertEqual(info["already_reset"], 2)
+
+    def test_a_lower_figure_observed_after_the_earlier_ones_reset_is_not_a_fall_within_one_period(self):
+        r1 = DAY0 + 3 * DAY
+        earlier = record(window="seven_day", used=80.0, observed=r1 - HOUR, resets=r1)
+        after_reset = record(window="seven_day", used=3.0, observed=r1 + 60, resets=r1)       # the same reset time, observed after it had passed
+        self.assertEqual(measure.switch_flags("A", measure.distinct([earlier, after_reset])), [])
+        within = record(window="seven_day", used=3.0, observed=r1 - 60, resets=r1)            # the same, observed while the period was live
+        flags = measure.switch_flags("A", measure.distinct([earlier, within]))
+        self.assertEqual([f["reason"] for f in flags], ["used percentage fell within one reset period"])
+
+    def test_the_old_boundary_at_a_reset_case_still_holds(self):
+        rec = record(observed=DAY0 + 8 * HOUR, resets=DAY0 + 10 * HOUR)
+        self.assertEqual(measure.classify([rec], DAY0 + 10 * HOUR - 1800)[0], "floor")
+        self.assertEqual(measure.classify([rec], DAY0 + 10 * HOUR)[0], "unknown")
+
+
+class Receipts(Scratch):
+    def export(self, exported_at, rows=True):
+        return Collect.export(self, exported_at, rows=None if rows else [], name="copy-%d.json" % exported_at)
+
+    def lines(self):
+        path = self.tmp / "history" / "observations.jsonl"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def test_an_accepted_empty_copy_moves_the_last_accepted_time_forward(self):
+        history = str(self.tmp / "history")
+        T = DAY0
+        code, line = measure.collect(self.export(T + 2000, rows=False), history, now=T + 2100, user_name=USER)
+        self.assertEqual(code, 0, line)
+        self.assertEqual(self.lines(), [])                                          # no usage observation is invented
+        receipts = json.loads((self.tmp / "history" / "receipts.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipts["last_accepted"], {"desk-top": T + 2000})
+        code, line = measure.collect(self.export(T + 1000), history, now=T + 2200, user_name=USER)
+        self.assertEqual(code, 0)
+        self.assertIn("appended=0", line)
+        self.assertEqual(self.lines(), [])                                          # the older, non-empty copy is refused
+        code, _line = measure.collect(self.export(T + 3000), history, now=T + 3100, user_name=USER)
+        self.assertEqual(len(self.lines()), 2)
+        receipts = json.loads((self.tmp / "history" / "receipts.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipts["last_accepted"], {"desk-top": T + 3000})
+
+    def test_a_damaged_receipts_file_is_refused_with_a_generic_sentence_and_nothing_is_appended(self):
+        history = self.tmp / "history"
+        history.mkdir()
+        for text in ("not json", "[]", "{}", json.dumps({"receipts_version": 2, "last_accepted": {}}), json.dumps({"receipts_version": 1, "last_accepted": {"A B": 5}}),
+                     json.dumps({"receipts_version": 1, "last_accepted": {"desk-top": "late"}}), '{"receipts_version": 1, "receipts_version": 1, "last_accepted": {}}'):
+            (history / "receipts.json").write_text(text, encoding="utf-8")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = measure.main(["collect", "--in", self.export(DAY0 + 1000), "--history", str(history)])
+            self.assertEqual(code, 3, text[:30])
+            self.assertIn("receipts file", stdout.getvalue())
+            self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
+            self.assertNotIn(str(self.tmp), stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(self.lines(), [])
+
+    def test_the_receipt_and_the_rows_never_disagree_after_a_rerun(self):
+        history = str(self.tmp / "history")
+        measure.collect(self.export(DAY0 + 1000), history, now=DAY0 + 1100, user_name=USER)
+        (self.tmp / "history" / "receipts.json").unlink()                           # the receipt is lost: the rows still hold the last time
+        code, line = measure.collect(self.export(DAY0 + 1000), history, now=DAY0 + 1200, user_name=USER)
+        self.assertEqual(code, 0)
+        self.assertIn("appended=0", line)
+        self.assertEqual(len(self.lines()), 2)
+
+
+class ReportWording(Scratch):
+    def test_per_window_unknown_counts_sit_next_to_the_pooled_decision_and_no_stop_is_not_called_proof(self):
+        records = []
+        t = DAY0 + 27 * 60
+        while t < DAY0 + DAY:
+            records.append(record("A", "five_hour", observed=t, resets=t + 3 * HOUR))        # a covered five-hour window
+            t += 1800
+        records.append(record("A", "seven_day", observed=DAY0 + HOUR, resets=DAY0 + 6 * HOUR))      # a weekly window that is mostly unknown
+        text = measure.render(measure.build_report(measure.distinct(records), "2026-10-12", "2026-10-12"))
+        self.assertIn("both windows pooled", text)
+        self.assertIn("(no stop signal)", text)
+        self.assertIn("five_hour", text)
+        self.assertIn("seven_day", text)
+        self.assertRegex(text, r"seven_day\s+observations=1 fresh=1 floor=9 unknown=38 \(79% unknown\)")
+        self.assertIn("'no stop signal' does not show that each window is reliable", text)
+
+
 if __name__ == "__main__":
     unittest.main()

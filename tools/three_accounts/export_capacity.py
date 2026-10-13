@@ -15,12 +15,14 @@ Exit codes: 0 written; 2 refused (nothing written); 3 a problem with the argumen
 """
 import argparse
 import calendar
+import datetime
 import getpass
 import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 
 EXPORT_VERSION = 1
@@ -108,7 +110,12 @@ def _is_whole(value, low, high):
 
 
 def _is_number(value):
-    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= MAX_PERCENT
+    """A percentage: an int or a float (never a bool) between 0 and MAX_PERCENT. An int is range-checked as an int, before anything turns it into a float."""
+    if type(value) is int:
+        return 0 <= value <= MAX_PERCENT
+    if type(value) is float:
+        return math.isfinite(value) and 0 <= value <= MAX_PERCENT
+    return False
 
 
 def parse_time(text):
@@ -119,12 +126,13 @@ def parse_time(text):
     if found is None:
         return None
     year, month, day, hour, minute, second = (int(part) for part in found.groups())
-    if not (1970 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60 and second < 60):
+    if not 1970 <= year <= 2099:
         return None
     try:
-        return calendar.timegm((year, month, day, hour, minute, second))
-    except (ValueError, OverflowError):
+        moment = datetime.datetime(year, month, day, hour, minute, second)    # refuses 2026-02-30, month 13, hour 24 and the like
+    except ValueError:
         return None
+    return calendar.timegm(moment.timetuple())
 
 
 def figures_of(data):
@@ -132,7 +140,8 @@ def figures_of(data):
 
     -> ("figures", {window: (used_percent, resets_at, observed_at)}) | ("old_format"|"unknown_confidence"|"other_source"|"refused", None)
     """
-    if data.get("schema_version") != SCHEMA_VERSION or type(data.get("account")) is not str:
+    version = data.get("schema_version")
+    if type(version) is not int or version != SCHEMA_VERSION or type(data.get("account")) is not str:
         return "old_format", None
     if not LISTED_KEYS <= set(data) or not set(data) <= LISTED_KEYS | TOLERATED_KEYS:
         return "refused", None
@@ -262,7 +271,10 @@ def forbidden_values(obj, user_name):
 def check_export(document, user_name=None):
     """Raise Refused unless `document` is exactly an export of known words, labels and numbers with nothing unsafe in it."""
     if user_name is None:
-        user_name = getpass.getuser().lower()
+        try:
+            user_name = getpass.getuser().lower()
+        except Exception:                          # no way to know the local name: refuse rather than guess
+            raise Refused("user name unknown") from None
     if type(document) is not dict or tuple(sorted(document)) != tuple(sorted(TOP_KEYS)):
         raise Refused("shape")
     if document["export_version"] != EXPORT_VERSION or type(document["machine"]) is not str or MACHINE_RE.match(document["machine"]) is None:
@@ -286,11 +298,15 @@ def check_export(document, user_name=None):
 
 
 def write_atomic(path, text):
-    """Write `text` to a temporary file beside `path`, then rename it into place. No half file ever has the final name."""
+    """Write `text` to a new temporary file beside `path`, then rename it into place. No half file ever has the final name.
+
+    The temporary file is created exclusively with an unpredictable name (so it can never be a file that already exists, such as a link
+    to another file), and on a failure only that file is removed.
+    """
     folder = os.path.dirname(os.path.abspath(path))
-    temp = os.path.join(folder, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+    descriptor, temp = tempfile.mkstemp(prefix=".write-", suffix=".tmp", dir=folder)
     try:
-        with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -340,7 +356,10 @@ def main(argv=None):
         print("not exported: %s" % why)
         return 3
     except OSError:
-        print("not exported: the output file could not be written")
+        print("not exported: a file operation failed (no details are shown)")
+        return 3
+    except Exception:                              # last resort: never a traceback, which would carry a path
+        print("not exported: an unexpected problem (no details are shown)")
         return 3
     print(line)
     return code

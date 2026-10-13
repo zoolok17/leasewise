@@ -37,6 +37,8 @@ SWITCH_RESET_TOLERANCE_S = 300         # one weekly reset time normally differs 
 PERCENT_FALL_TOLERANCE = 1.0           # a percentage is rounded, so a fall of up to one point inside one reset period is noise
 WEEKLY = "seven_day"
 MAX_HISTORY_BYTES = 50_000_000         # a week of 5-minute copies is far smaller; a bigger file is not ours
+MAX_RECEIPT_BYTES = 65_536             # the receipts file holds one number per machine
+RECEIPTS_NAME = "receipts.json"
 
 
 class Problem(Exception):
@@ -116,8 +118,39 @@ def _load_export(path):
         return "unreadable", None
 
 
+def read_receipts(path):
+    """-> {machine: exported_at of the last copy accepted}. A missing file is no receipts; a damaged one is a plain Problem."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RECEIPT_BYTES + 1)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise Problem("the receipts file in the history folder cannot be read; nothing was appended") from None
+    try:
+        if len(raw) > MAX_RECEIPT_BYTES:
+            raise ValueError("too large")
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=ec._pairs, parse_constant=ec._constant)
+        if type(data) is not dict or tuple(sorted(data)) != ("last_accepted", "receipts_version") or data["receipts_version"] != 1 or type(data["last_accepted"]) is not dict:
+            raise ValueError("shape")
+        for machine, exported in data["last_accepted"].items():
+            if type(machine) is not str or ec.MACHINE_RE.match(machine) is None or not ec._is_whole(exported, 1, ec.MAX_EPOCH):
+                raise ValueError("entry")
+    except (ValueError, RecursionError):
+        raise Problem("the receipts file in the history folder is damaged; nothing was appended") from None
+    return dict(data["last_accepted"])
+
+
+def write_receipts(path, receipts):
+    ec.write_atomic(path, json.dumps({"receipts_version": 1, "last_accepted": receipts}, indent=2, sort_keys=True) + "\n")
+
+
 def collect(copy_path, history_dir, now=None, user_name=None):
-    """-> (exit code, one line of counts). Appends the copy's rows when its export time is newer than the last one kept."""
+    """-> (exit code, one line of counts). Appends the copy's rows when its export time is newer than the last one accepted.
+
+    The last accepted export time of each machine is kept in `receipts.json`, apart from the usage rows, so that an accepted copy with no
+    rows still moves it forward; no usage observation is ever invented.
+    """
     now = int(time.time() if now is None else now)
     data = check_copy(copy_path, user_name)
     if data is None:
@@ -125,14 +158,19 @@ def collect(copy_path, history_dir, now=None, user_name=None):
     history = Path(history_dir)
     history.mkdir(parents=True, exist_ok=True)
     target = history / "observations.jsonl"
+    receipts_path = history / RECEIPTS_NAME
+    receipts = read_receipts(receipts_path)
     kept, _bad = read_jsonl(target)
-    last = max((rec["exported_at"] for rec in kept if rec["machine"] == data["machine"]), default=0)
+    machine = data["machine"]
+    last = max([receipts.get(machine, 0)] + [rec["exported_at"] for rec in kept if rec["machine"] == machine])
     if data["exported_at"] <= last:
-        return 0, "collect: not newer than the last copy kept; nothing appended (appended=0, older=1)"
-    lines = "".join(json.dumps(observation(data["machine"], row, data["exported_at"], now), sort_keys=True) + "\n" for row in data["rows"])
+        return 0, "collect: not newer than the last copy accepted; nothing appended (appended=0, older=1)"
+    lines = "".join(json.dumps(observation(machine, row, data["exported_at"], now), sort_keys=True) + "\n" for row in data["rows"])
     if lines:
         with open(target, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(lines)
+    receipts[machine] = data["exported_at"]
+    write_receipts(receipts_path, receipts)
     return 0, "collect: appended=%d, copy_age_s=%d, old_format=%d, unmapped=%d" % (len(data["rows"]), max(0, now - data["exported_at"]),
                                                                                     data["counts"]["old_format"], data["counts"]["unmapped"])
 
@@ -212,11 +250,11 @@ def classify(history, boundary):
         latest = rec
     if latest is None:
         return "unknown", None
+    if latest["resets_at"] <= boundary:
+        return "unknown", None                  # its period has ended (also a figure observed at or after its own reset): reset since, no new figure
     if boundary - latest["observed_at"] <= FRESH_WINDOW_S:
         return "fresh", latest
-    if latest["resets_at"] > boundary:
-        return "floor", latest                  # an older figure whose reset time is still ahead: "at least X%"
-    return "unknown", None                      # reset since, no new figure
+    return "floor", latest                      # an older figure whose reset time is still ahead: "at least X%"
 
 
 def distinct(records):
@@ -234,7 +272,8 @@ def switch_flags(label, history):
         if moved > SWITCH_RESET_TOLERANCE_S and earlier["resets_at"] > later["observed_at"]:
             flags.append({"label": label, "kind": "possible switch", "reason": "weekly reset time changed before the earlier one passed",
                           "at": later["observed_at"], "moved_s": moved})
-        elif moved <= SWITCH_RESET_TOLERANCE_S and later["used_percent"] < earlier["used_percent"] - PERCENT_FALL_TOLERANCE:
+        elif (moved <= SWITCH_RESET_TOLERANCE_S and later["observed_at"] < earlier["resets_at"]          # the earlier period must still be live at the later figure
+              and later["used_percent"] < earlier["used_percent"] - PERCENT_FALL_TOLERANCE):
             flags.append({"label": label, "kind": "possible switch", "reason": "used percentage fell within one reset period",
                           "at": later["observed_at"], "fell_points": round(earlier["used_percent"] - later["used_percent"], 2)})
     return flags
@@ -264,7 +303,9 @@ def build_report(records, day_from, day_to):
                 days.setdefault(day, {"fresh": 0, "floor": 0, "unknown": 0})[kind] += 1
                 if kind == "floor":
                     floors[day] = rec["used_percent"]            # the last floor of the day, "at least X%"
-            entry["windows"][window] = {"observations": len(in_period), "samples": sum(tally.values()), **tally, "days": days, "last_floor_by_day": floors}
+            already_reset = sum(1 for r in in_period if r["observed_at"] >= r["resets_at"])      # figures observed at or after their own reset: counted, never fresh or floor
+            entry["windows"][window] = {"observations": len(in_period), "samples": sum(tally.values()), **tally, "days": days, "last_floor_by_day": floors,
+                                        "unknown_share": round(tally["unknown"] / sum(tally.values()), 4) if sum(tally.values()) else 1.0, "already_reset": already_reset}
             entry["samples"] += sum(tally.values())
             entry["unknown"] += tally["unknown"]
             if window == WEEKLY:
@@ -279,17 +320,23 @@ def render(report):
     lines = ["Period %s to %s (UTC); samples every %d minutes" % (report["from"], report["to"], SAMPLE_STEP_S // 60)]
     for label, entry in report["labels"].items():
         lines.append("")
-        lines.append("Label %s: %d samples, %.0f%% unknown%s" % (label, entry["samples"], 100 * entry["unknown_share"], "  ** STOP SIGNAL **" if entry["stop_signal"] else ""))
+        lines.append("Label %s: %d samples, %.0f%% unknown (both windows pooled)%s" % (label, entry["samples"], 100 * entry["unknown_share"],
+                                                                                 "  ** STOP SIGNAL **" if entry["stop_signal"] else "  (no stop signal)"))
         for window, info in entry["windows"].items():
-            lines.append("  %-9s observations=%d fresh=%d floor=%d unknown=%d" % (window, info["observations"], info["fresh"], info["floor"], info["unknown"]))
+            lines.append("  %-9s observations=%d fresh=%d floor=%d unknown=%d (%.0f%% unknown)%s" % (
+                window, info["observations"], info["fresh"], info["floor"], info["unknown"], 100 * info["unknown_share"],
+                "  already-reset figures=%d" % info["already_reset"] if info["already_reset"] else ""))
             for day, counts in info["days"].items():
                 note = ""
                 if day in info["last_floor_by_day"]:
                     note = "   at least %.1f%% (last floor of the day)" % info["last_floor_by_day"][day]
                 lines.append("    %s fresh=%d floor=%d unknown=%d%s" % (day, counts["fresh"], counts["floor"], counts["unknown"], note))
+    lines.append("")
+    lines.append("Reading this: the stop decision pools both windows of a label, so 'no stop signal' does not show that each window is reliable;")
+    lines.append("read each window's own unknown count above. A figure whose reset time has passed is never counted as fresh or as a floor.")
     if report["flags"]:
         lines.append("")
-        lines.append("Possible switches:")
+        lines.append("Possible switches (a flag is only a possibility and does not assign a label by itself):")
         for flag in report["flags"]:
             when = datetime.datetime.fromtimestamp(flag["at"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
             lines.append("  label %s at %s UTC: %s" % (flag["label"], when, flag["reason"]))
@@ -341,6 +388,12 @@ def main(argv=None):
         return 3
     except ValueError:
         print("not done: a date must look like 2026-10-12")
+        return 3
+    except OSError:
+        print("not done: a file operation failed (no details are shown)")
+        return 3
+    except Exception:                              # last resort: never a traceback, which would carry a path
+        print("not done: an unexpected problem (no details are shown)")
         return 3
 
 

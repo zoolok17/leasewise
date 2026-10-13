@@ -48,6 +48,11 @@ Output shape (times are epoch seconds, UTC):
   nothing and says so.
 - **`from-store --db <inventory.db> --labels <aliases.json> --out <file.jsonl>`** opens the store with `file:...?mode=ro` only, takes Laptop B's `cli_window`
   readings for the aliases in the table, converts basis points to percent and milliseconds to seconds, and writes the same records (machine `laptop-b`, source
+  `leasewise-store`). It rewrites `--out` completely each time, so it can be run again. **The promise (narrowed in fix round 1, decision D-348):** the database
+  file itself stays byte-identical and nothing is written through the connection; because the live store is in WAL mode, SQLite itself may leave its own
+  `<db>-wal` and `<db>-shm` files beside it, and nothing else is created. `immutable=1` is deliberately not used (it can miss committed WAL data on a live
+  database) and the database is never copied.
+  readings for the aliases in the table, converts basis points to percent and milliseconds to seconds, and writes the same records (machine `laptop-b`, source
   `leasewise-store`). It rewrites `--out` completely each time, so it can be run again.
 - **`report --observations <file>... --from YYYY-MM-DD --to YYYY-MM-DD [--json]`** samples every half hour (:00 and :30 UTC) per label, window and day:
   - **fresh**: a figure observed within the 600 seconds before the boundary;
@@ -56,7 +61,10 @@ Output shape (times are epoch seconds, UTC):
 
   A label with any observation in the period is "in use"; if more than half of its samples (both windows together) are unknown it gets **STOP SIGNAL**.
   The **switch detector** looks at the weekly window only, between two consecutive distinct observations of one label: the reset time changes by more than
-  300 seconds while the earlier one had not passed, or the percentage falls by more than one point within one reset period. A normal reset passing is not flagged.
+  300 seconds while the earlier one had not passed, or the percentage falls by more than one point while the earlier reset period is still live at the later
+  figure. A normal reset passing is not flagged. A figure whose reset time is at or before the boundary (including one observed at or after its own reset) is never
+  fresh or a floor: it is unknown, and the report counts such figures as `already-reset figures`. The report prints each window's own unknown count next to the
+  pooled stop decision; "no stop signal" is not proof that both windows are reliable.
   Every threshold is a named constant at the top of the file with a one-line reason.
 
 ## The exact command lines
@@ -109,7 +117,8 @@ prints an account text, a path or a file's content. The program also never write
   floors unless a reading lands just before a boundary. Read the report with that in mind.
 - The stop rule pools both windows of a label; a label that only ever reports one window can reach "stop signal" for that reason.
 - All times are UTC; the sample grid is fixed at :00 and :30.
-- Two subscriptions that happen to share the same weekly reset time cannot be told apart by it: a switch between them would not be flagged.
+- Two subscriptions that happen to share the same weekly reset time cannot be told apart by their reset time; a fall of more than one point inside the same reset
+  period can still flag such a switch. A flag is only a **possible** switch: the detector never assigns a label by itself.
 - This covers Claude only. Nothing here goes live: no timer, no copy job, no change to the server or the reporter.
 
 ## Choices the brief did not settle
@@ -120,6 +129,10 @@ prints an account text, a path or a file's content. The program also never write
 - Records from the store carry `seats: null` (a store reading has no seat count) and `copy_age_s: 0`.
 - `collect` decides "newer" per machine by the export time of the last copy kept.
 - A percentage fall of one point or less inside one reset period is treated as rounding, not a switch.
+- **Fix round 1 additions:** `collect` keeps a per-machine receipt of the last accepted export time in `<history>/receipts.json` (written with the same safe writer),
+  so an accepted copy with no rows still moves it forward; a damaged receipts file stops `collect` with a plain sentence. Every failure of either program prints
+  one generic sentence and exits 3: no path, no exception text, no traceback. The temporary file of every write is created exclusively under an unpredictable
+  name, so it can never be an existing file, and only that file is removed on a failure. A time is accepted only if it is a real calendar moment written in ASCII digits.
 - The export's exit codes: 0 written, 2 refused, 3 a problem with the arguments or the table.
 
 ## Tests
