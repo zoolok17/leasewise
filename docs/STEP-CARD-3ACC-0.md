@@ -117,6 +117,10 @@ prints an account text, a path or a file's content. The program also never write
 - All times are UTC; the sample grid is fixed at :00 and :30.
 - Two subscriptions that happen to share the same weekly reset time cannot be told apart by their reset time; a fall of more than one point inside the same reset
   period can still flag such a switch. A flag is only a **possible** switch: the detector never assigns a label by itself.
+- **A usage file swapped for a link between listing and opening is followed** (lead decision D-352, residual risk R-021). The export skips links and folders
+  when it lists the state folder, then opens each file by name, so a link put in its place in between is read. The reporter's own reader
+  works the same way (`quota_balancer/reporter/strictfile.py`: `walk` skips links, `load_json` then opens by name). It is accepted because only the user who runs the seats can write that folder, every read
+  is bounded in size, and the output holds only allowlisted figures that are checked for private text before anything is written.
 - This covers Claude only. Nothing here goes live: no timer, no copy job, no change to the server or the reporter.
 
 ## Choices the brief did not settle
