@@ -540,5 +540,20 @@ class ReportWording(Scratch):
         self.assertIn("'no stop signal' does not show that each window is reliable", text)
 
 
+def plain(text):
+    """Wording only: no Markdown marks, line breaks (also one after a hyphen, as the help wrapper may make) or case."""
+    return " ".join(text.replace("`", "").replace("*", "").split()).replace("- ", "-").casefold()
+
+
+class StorePromiseWording(unittest.TestCase):
+    def test_the_step_record_and_the_help_text_state_the_read_only_promise_in_the_same_words(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):
+            measure.main(["from-store", "--help"])
+        record_text = (ROOT / "docs" / "STEP-CARD-3ACC-0.md").read_text(encoding="utf-8")
+        self.assertIn(plain(measure.STORE_PROMISE), plain(stdout.getvalue()))
+        self.assertIn(plain(measure.STORE_PROMISE), plain(record_text))
+
+
 if __name__ == "__main__":
     unittest.main()

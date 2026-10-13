@@ -51,9 +51,7 @@ Output shape (times are epoch seconds, UTC):
   `leasewise-store`). It rewrites `--out` completely each time, so it can be run again. **The promise (narrowed in fix round 1, decision D-348):** the database
   file itself stays byte-identical and nothing is written through the connection; because the live store is in WAL mode, SQLite itself may leave its own
   `<db>-wal` and `<db>-shm` files beside it, and nothing else is created. `immutable=1` is deliberately not used (it can miss committed WAL data on a live
-  database) and the database is never copied.
-  readings for the aliases in the table, converts basis points to percent and milliseconds to seconds, and writes the same records (machine `laptop-b`, source
-  `leasewise-store`). It rewrites `--out` completely each time, so it can be run again.
+  database) and the database is never copied. `from-store --help` prints the same promise.
 - **`report --observations <file>... --from YYYY-MM-DD --to YYYY-MM-DD [--json]`** samples every half hour (:00 and :30 UTC) per label, window and day:
   - **fresh**: a figure observed within the 600 seconds before the boundary;
   - **floor**: an older figure whose reset time is still ahead (read "at least X%");

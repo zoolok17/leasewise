@@ -1,6 +1,7 @@
 """Measure how well Laptop B can know each subscription's use (three-accounts step 0).
 
-Three commands, Python 3.11+ standard library only, nothing written except the file named by `--out` / `--history`:
+Three commands, Python 3.11+ standard library only, nothing written except the file named by `--out` / `--history`
+(for `from-store` on a WAL-mode store, see STORE_PROMISE):
 
     collect     keep the desktop's exported copy as observation records, only if it is newer than the last one kept
     from-store  turn this machine's readings in the Leasewise store into the same observation records (read-only)
@@ -28,6 +29,8 @@ import export_capacity as ec  # noqa: E402  (the same rules check the desktop's 
 STORE_MACHINE = "laptop-b"             # the machine whose store readings this command turns into records
 STORE_SOURCE = "leasewise-store"
 STORE_WINDOWS = {"five_hour": "five_hour", "seven_day": "seven_day"}
+STORE_PROMISE = ("the database file itself stays byte-identical and nothing is written through the connection; because the live store is in WAL "
+                 "mode, SQLite itself may leave its own <db>-wal and <db>-shm files beside it, and nothing else is created.")  # same words as the step record (D-348)
 OBSERVATION_KEYS = ("machine", "label", "window", "used_percent", "resets_at", "observed_at", "source", "seats", "exported_at", "seen_at", "copy_age_s")
 
 SAMPLE_STEP_S = 1800                   # the half-hour grid the stop rule is counted on (:00 and :30 UTC)
@@ -178,7 +181,7 @@ def collect(copy_path, history_dir, now=None, user_name=None):
 # ---------------------------------------------------------------- from-store
 
 def from_store(db_path, labels_path, out_path, now=None):
-    """-> (exit code, one line of counts). The store is opened read-only and never written."""
+    """-> (exit code, one line of counts). The store is opened read-only; STORE_PROMISE says exactly what that leaves on disk."""
     try:
         with open(labels_path, "rb") as handle:
             table = json.loads(handle.read(65_537).decode("utf-8"), object_pairs_hook=ec._pairs)
@@ -362,7 +365,7 @@ def main(argv=None):
     one = sub.add_parser("collect")
     one.add_argument("--in", dest="copy", required=True)
     one.add_argument("--history", required=True)
-    two = sub.add_parser("from-store")
+    two = sub.add_parser("from-store", description="Read-only promise: " + STORE_PROMISE)
     two.add_argument("--db", required=True)
     two.add_argument("--labels", required=True)
     two.add_argument("--out", required=True)
