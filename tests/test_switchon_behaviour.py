@@ -142,8 +142,9 @@ class Base(unittest.TestCase):
         self.assertEqual(done.returncode, 0, self.said(done))
 
     def open_to_everyone(self, path):
-        text = ("$a = Get-Acl -LiteralPath '%s'; $a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("
-                "(New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Read', 'Allow'))); Set-Acl -LiteralPath '%s' -AclObject $a" % (path, path))
+        text = ("$i = Get-Item -LiteralPath '%s' -Force; $a = [IO.FileSystemAclExtensions]::GetAccessControl($i, [Security.AccessControl.AccessControlSections]::Access); "
+                "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("
+                "(New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Read', 'Allow'))); [IO.FileSystemAclExtensions]::SetAccessControl($i, $a)" % path)
         done = self.command(text)
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -554,6 +555,37 @@ class Prompt(Base):
 
 class PrivacyBeforeWriting(Base):
     ENV_TEXTS = PARTS
+
+    def test_protect_path_leaves_the_current_user_system_and_administrators_and_nothing_inherited(self):
+        """The comparison with the allowed identifiers happens inside PowerShell; only counts and true/false leave it (no identifier, no user name)."""
+        folder, item = self.tmp / "private folder", self.tmp / "private-file.txt"
+        folder.mkdir()
+        item.write_text("x", encoding="ascii")
+        script = (
+            "$Sections = [Security.AccessControl.AccessControlSections]; "
+            "function Owner($p) { [IO.FileSystemAclExtensions]::GetAccessControl((Get-Item -LiteralPath $p -Force), $Sections::Owner).GetOwner([Security.Principal.SecurityIdentifier]).Value }; "
+            "function Report($p, $OwnerBefore, $Flags) { "
+            "$a = [IO.FileSystemAclExtensions]::GetAccessControl((Get-Item -LiteralPath $p -Force), $Sections::Access); "
+            "$r = @($a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])); "
+            "$ids = @($r | ForEach-Object { $_.IdentityReference.Value }); "
+            "$r.Count; "
+            "(($ids.Count -eq 3) -and -not (Compare-Object $ids $Allowed)); "
+            "(@($r | Where-Object { $_.AccessControlType -ne 'Allow' -or $_.FileSystemRights -ne 'FullControl' }).Count -eq 0); "
+            "(@($r | Where-Object { $_.IsInherited }).Count -eq 0); "
+            "$a.AreAccessRulesProtected; "
+            "(@($r | Where-Object { [string]$_.InheritanceFlags -ne $Flags }).Count -eq 0); "
+            "(@($r | Where-Object { [string]$_.PropagationFlags -ne 'None' }).Count -eq 0); "
+            "((Owner $p) -eq $OwnerBefore) }; "
+            ". '%s'; $f = '%s'; $i = '%s'; $fo = Owner $f; $io = Owner $i; Protect-Path $f $true; Protect-Path $i $false; "
+            "Report $f $fo 'ContainerInherit, ObjectInherit'; Report $i $io 'None'" % (COMMON, folder, item))
+        done = self.command(script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.split()
+        self.assertEqual(len(lines), 16, "expected two reports of eight lines")
+        for kind, shown in (("folder", lines[:8]), ("file", lines[8:])):
+            self.assertEqual(shown, ["3"] + ["True"] * 7, kind)
+            # in order: rule count; exactly the current user, SYSTEM and Administrators; all Allow and FullControl; none inherited;
+            # protected (nothing inherited from the folder above); right inheritance flags; no propagation flags; owner unchanged
 
     def test_step_8_refuses_an_open_settings_file_before_asking_and_changes_no_byte(self):
         self.private_live()

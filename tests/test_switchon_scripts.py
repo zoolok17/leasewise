@@ -39,7 +39,7 @@ STEPS = [
 ALL = STEPS + [COMMON, GUARD]
 # SHA-256 of the approved text of the two pinned files (line endings normalised to LF).
 APPROVED = {
-    COMMON: "b1aabd8527bd44384dba89c830f4ba001a6014724cccad90643aa4d0421506f5",
+    COMMON: "f9356d0d8d8f1aa32b37ec74690b8f83fc98eb969ecaad77cfc3f53ea8495f04",
     GUARD: "09f7065fafd9611026d5ddcd80b67faa7bf55aba1da6f9e6613cbf060bf4b71b",
 }
 

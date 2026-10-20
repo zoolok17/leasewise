@@ -299,7 +299,7 @@ def from_store(db_path, labels_path, out_path, now=None):
 # ---------------------------------------------------------------- now
 
 SOURCE_NAMES = {STORE_MACHINE: "Laptop B store", DESKTOP_MACHINE: "desktop copy"}
-NOW_FOOTER = ("A 5-hour figure needs recent work by a seat on that subscription: each reading counts as fresh for 10 minutes only, then as 'at least'.",
+NOW_FOOTER = ("A 5-hour figure needs a recent reading from a seat on that subscription: it is fresh for up to 10 minutes, then 'at least' until its reset, and unknown after the reset until a new reading.",
               "'At least' is a floor: the real figure may be higher.",
               "Use outside agenttalk cannot be separated from agent work with the readings available.",
               "Advice only: nothing is reserved, refused or enforced.")

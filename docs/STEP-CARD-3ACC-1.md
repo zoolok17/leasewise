@@ -42,7 +42,7 @@ Under the rows you may also see:
 - **Coverage.** `coverage incomplete: a machine that does not report also uses this subscription` appears under each label named with `--incomplete-coverage`. It names
   no machine and no team.
 - **Skipped lines.** `(N unreadable history line(s) skipped)`: lines of the history file that could not be read, for example a last line the collector was still writing.
-- **A footer** of four fixed sentences: a 5-hour figure needs recent work by a seat on that subscription (each reading counts as fresh for 10 minutes only, then as "at least"); "at least" is a floor; use outside agenttalk cannot be separated from
+- **A footer** of four fixed sentences: a 5-hour figure needs a recent reading from a seat on that subscription (it is fresh for up to 10 minutes, then "at least" until its reset, and unknown after the reset until a new reading); "at least" is a floor; use outside agenttalk cannot be separated from
   agent work; and the table is advice only.
 
 ## The lead's command
@@ -87,7 +87,7 @@ Exit codes: 0 printed; 3 a problem with the arguments, the alias table or the st
 ## Known limits
 
 - **A has figures only when Laptop B's seats run a turn.** Between turns A's row grows old, then becomes a floor, then unknown.
-- **The 5-hour window needs a working seat.** With no working seat on a subscription its 5-hour figure is old or unknown, by design.
+- **The 5-hour window needs recent readings.** A reading counts as fresh for 10 minutes, then as 'at least' until its reset; after the reset, the row is unknown until a seat on that subscription reports again.
 - **A has a second user that does not report.** Since 2026-10-18 another machine also uses A. The real use of A may be higher than any figure; `--incomplete-coverage A`
   says so in the table.
 - **The desktop copy's age bounds B.** B's figures are only as new as the last accepted copy; check the desktop copy line first.

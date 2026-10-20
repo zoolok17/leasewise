@@ -23,7 +23,7 @@ from test_three_accounts_measure import DAY, DAY0, HOUR, record  # noqa: E402
 NOW = DAY0 + 3 * DAY + 12 * HOUR                    # a Thursday, 12:00 UTC
 ALIAS_ONE = "zz-alias-one"
 ALIAS_TWO = "zz-alias-two"
-FOOTER = ("A 5-hour figure needs recent work by a seat on that subscription: each reading counts as fresh for 10 minutes only, then as 'at least'.",
+FOOTER = ("A 5-hour figure needs a recent reading from a seat on that subscription: it is fresh for up to 10 minutes, then 'at least' until its reset, and unknown after the reset until a new reading.",
           "'At least' is a floor: the real figure may be higher.",
           "Use outside agenttalk cannot be separated from agent work with the readings available.",
           "Advice only: nothing is reserved, refused or enforced.")

@@ -11,15 +11,16 @@ $Me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $Allowed = @($Me, 'S-1-5-18', 'S-1-5-32-544')
 function Protect-Path {
     param([string]$Path, [bool]$Folder)
-    $Acl = Get-Acl -LiteralPath $Path
+    $Item = Get-Item -LiteralPath $Path -Force
+    $Acl = [IO.FileSystemAclExtensions]::GetAccessControl($Item, [Security.AccessControl.AccessControlSections]::Access)   # the access list only: writing back the owner or audit parts needs an administrator privilege
     $Acl.SetAccessRuleProtection($true, $false)                          # nothing inherited from the folder above
-    foreach ($Rule in @($Acl.Access)) { [void]$Acl.RemoveAccessRule($Rule) }
+    foreach ($Rule in @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) { [void]$Acl.RemoveAccessRule($Rule) }     # by identifier: the .Access shortcut is empty on this kind of object
     $Flags = if ($Folder) { 'ContainerInherit,ObjectInherit' } else { 'None' }
     foreach ($Sid in $Allowed) {
         $Who = New-Object Security.Principal.SecurityIdentifier($Sid)
         $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($Who, 'FullControl', $Flags, 'None', 'Allow')))
     }
-    Set-Acl -LiteralPath $Path -AclObject $Acl
+    [IO.FileSystemAclExtensions]::SetAccessControl($Item, $Acl)
 }
 function Assert-Private {
     param([string]$Path, [bool]$OwnList)                                  # $OwnList: the item has its own list and inherits nothing
