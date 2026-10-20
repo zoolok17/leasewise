@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from test_three_accounts_measure import DAY, DAY0, HOUR, record  # noqa: E402
 NOW = DAY0 + 3 * DAY + 12 * HOUR                    # a Thursday, 12:00 UTC
 ALIAS_ONE = "zz-alias-one"
 ALIAS_TWO = "zz-alias-two"
-FOOTER = ("The 5-hour figure exists only while a seat on that subscription is working; with no working seat it is old or unknown.",
+FOOTER = ("A 5-hour figure needs recent work by a seat on that subscription: each reading counts as fresh for 10 minutes only, then as 'at least'.",
           "'At least' is a floor: the real figure may be higher.",
           "Use outside agenttalk cannot be separated from agent work with the readings available.",
           "Advice only: nothing is reserved, refused or enforced.")
@@ -90,7 +91,7 @@ class NowCase(unittest.TestCase):
 
 
 def weekday_time(epoch):
-    return time.strftime("%a %H:%M UTC", time.gmtime(epoch))
+    return time.strftime("%a %Y-%m-%d %H:%M UTC", time.gmtime(epoch))
 
 
 class Shape(NowCase):
@@ -116,7 +117,7 @@ class Wordings(NowCase):
     def test_fresh(self):
         self.store(ALIAS_ONE, NOW - 180, five=1200, week=3000)
         rows = self.rows(self.table(), "A")
-        self.assertIn("12% (fresh, 3 min old); resets " + weekday_time(NOW - 180 + 3 * HOUR) + "; from laptop-b", rows[0])
+        self.assertIn("12% (fresh, 3 min old); resets " + weekday_time(NOW - 180 + 3 * HOUR) + "; from Laptop B store", rows[0])
         self.assertIn("30% (fresh, 3 min old)", rows[1])
 
     def test_fresh_at_exactly_600_seconds_and_floor_one_second_later(self):
@@ -129,7 +130,7 @@ class Wordings(NowCase):
 
     def test_floor(self):
         self.store(ALIAS_ONE, NOW - (2 * HOUR + 10 * 60), five=4500, reset5=NOW + HOUR)
-        self.assertIn("at least 45% (2 h 10 min old); resets " + weekday_time(NOW + HOUR) + "; from laptop-b", self.rows(self.table(), "A")[0])
+        self.assertIn("at least 45% (2 h 10 min old); resets " + weekday_time(NOW + HOUR) + "; from Laptop B store", self.rows(self.table(), "A")[0])
 
     def test_a_decimal_percentage_keeps_one_decimal(self):
         self.store(ALIAS_ONE, NOW - 60, five=1250)
@@ -162,14 +163,14 @@ class Sources(NowCase):
         self.write_history([record(label="A", window="five_hour", used=33.0, resets=NOW + HOUR, observed=NOW - 100, machine="desktop")], receipt=NOW - 100)
         row = self.rows(self.table(), "A")[0]
         self.assertIn("33% (fresh, 1 min old)", row)
-        self.assertTrue(row.endswith("from desktop"), row)
+        self.assertTrue(row.endswith("from desktop copy"), row)
 
     def test_the_store_wins_when_it_is_newer(self):
         self.store(ALIAS_ONE, NOW - 100, five=3000)
         self.write_history([record(label="A", window="five_hour", used=33.0, resets=NOW + HOUR, observed=NOW - 1000, machine="desktop")], receipt=NOW - 100)
         row = self.rows(self.table(), "A")[0]
         self.assertIn("30% (fresh, 1 min old)", row)
-        self.assertTrue(row.endswith("from laptop-b"), row)
+        self.assertTrue(row.endswith("from Laptop B store"), row)
 
     def test_b_comes_from_the_history_alone_and_c_has_nothing(self):
         self.write_history([record(label="B", window="seven_day", used=61.0, resets=NOW + DAY, observed=NOW - 30, machine="desktop")], receipt=NOW - 30)
@@ -206,11 +207,12 @@ class DesktopCopy(NowCase):
         self.assertIn("desktop copy late (120 min)", self.table().splitlines())
 
     def test_missing_or_unreadable_receipts_say_so_and_the_table_still_prints(self):
-        unreadable = "desktop history unreadable: B can only be old or unknown"
+        unreadable = "desktop copy time unknown (its receipt is missing or unreadable)"
         self.write_history([])
         self.assertIn(unreadable, self.table().splitlines())                                  # no receipts file
         for text in ("not json", "[]", json.dumps({"receipts_version": 1, "last_accepted": {"other-box": 5}}),
-                     json.dumps({"receipts_version": 2, "last_accepted": {"desktop": 5}})):
+                     json.dumps({"receipts_version": 2, "last_accepted": {"desktop": 5}}),
+                     '{"receipts_version": true, "last_accepted": {"desktop": 5}}'):
             self.db.unlink()
             self.readings.clear()
             (self.history / "receipts.json").write_text(text, encoding="utf-8")
@@ -221,7 +223,7 @@ class DesktopCopy(NowCase):
     def test_a_missing_history_folder_is_the_same_as_no_history(self):
         self.build_store()
         text = measure.now_command(str(self.db), str(self.labels), str(self.tmp / "no-such-history"), (), now=NOW)
-        self.assertIn("desktop history unreadable: B can only be old or unknown", text)
+        self.assertIn("desktop copy time unknown (its receipt is missing or unreadable)", text)
         self.assertFalse((self.tmp / "no-such-history").exists())
 
 
@@ -331,6 +333,125 @@ class ReadOnlyAndPrivate(NowCase):
             code = measure.main(["now", "--db", "x", "--labels", "y", "--history", "z", "--now", "canary-value"])
         self.assertEqual(code, 3)
         self.assertNotIn("canary", stdout.getvalue() + stderr.getvalue())
+
+
+class ReadFixes(NowCase):
+    """Fix round 1 of the build: what the first read found."""
+
+    def test_a_machine_name_from_the_history_is_never_printed(self):
+        self.write_history([record(label="B", window="five_hour", used=10.0, resets=NOW + HOUR, observed=NOW - 60, machine="private-canary-user")], receipt=NOW - 60)
+        text = self.table()
+        self.assertNotIn("private-canary-user", text)
+        self.assertTrue(self.rows(text, "B")[0].endswith("from another machine"), self.rows(text, "B")[0])
+
+    def test_the_two_known_machines_have_fixed_source_names(self):
+        self.store(ALIAS_ONE, NOW - 60, five=100)
+        self.write_history([record(label="B", window="five_hour", used=10.0, resets=NOW + HOUR, observed=NOW - 60, machine="desktop")], receipt=NOW - 60)
+        text = self.table()
+        self.assertTrue(self.rows(text, "A")[0].endswith("from Laptop B store"))
+        self.assertTrue(self.rows(text, "B")[0].endswith("from desktop copy"))
+
+    def test_the_real_command_line_leaves_no_cache_file_beside_the_tool(self):
+        copy = self.tmp / "tool-copy"
+        copy.mkdir()
+        for name in ("measure.py", "export_capacity.py"):
+            (copy / name).write_bytes((ROOT / "tools" / "three_accounts" / name).read_bytes())
+        self.write_history([], receipt=NOW - 60)
+        self.build_store()
+        before = sorted(p.name for p in copy.rglob("*"))
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+        done = subprocess.run([sys.executable, "-I", str(copy / "measure.py"), "now", "--db", str(self.db), "--labels", str(self.labels), "--history", str(self.history),
+                               "--now", str(NOW)], capture_output=True, text=True, timeout=60, env=env, check=False)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("Label A", done.stdout)
+        self.assertEqual(sorted(p.name for p in copy.rglob("*")), before)
+        self.assertFalse((copy / "__pycache__").exists())
+
+    def test_invalid_utf8_in_the_history_costs_one_line_not_the_table(self):
+        good = json.dumps(record(label="B", window="five_hour", used=40.0, resets=NOW + HOUR, observed=NOW - 3600, machine="desktop")) + "\n"
+        (self.history / "observations.jsonl").write_bytes(good.encode("utf-8") + b'{"machine": "desktop", "label": "\xff\xfe"}\n')
+        self.write_history_receipt(NOW - 60)
+        text = self.table()
+        self.assertIn("at least 40% (1 h 0 min old)", self.rows(text, "B")[0])
+        self.assertIn("(1 unreadable history line(s) skipped)", text)
+
+    def write_history_receipt(self, exported):
+        (self.history / "receipts.json").write_text(json.dumps({"receipts_version": 1, "last_accepted": {"desktop": exported}}), encoding="utf-8")
+
+    def test_report_also_counts_an_undecodable_line_and_keeps_the_rest(self):
+        good = json.dumps(record(label="B", window="five_hour", used=40.0, resets=NOW + HOUR, observed=NOW - 3600, machine="desktop")) + "\n"
+        path = self.history / "observations.jsonl"
+        path.write_bytes(good.encode("utf-8") + b"\xff\xfe not text\n")
+        records, bad = measure.read_jsonl(path)
+        self.assertEqual((len(records), bad), (1, 1))
+
+    def test_the_date_sentence_belongs_to_report_only(self):
+        self.build_store()
+        with mock.patch.object(measure, "now_command", side_effect=ValueError("canary")):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = measure.main(["now", "--db", str(self.db), "--labels", str(self.labels), "--history", str(self.history)])
+        self.assertEqual(code, 3)
+        self.assertNotIn("date", stdout.getvalue())
+        self.assertNotIn("canary", stdout.getvalue())
+        with mock.patch.object(measure, "report_command", side_effect=ValueError("canary")):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = measure.main(["report", "--observations", "x", "--from", "2026-10-12", "--to", "2026-10-13"])
+        self.assertEqual((code, stdout.getvalue().strip()), (3, "not done: a date must look like 2026-10-12"))
+
+    def test_missing_receipts_do_not_contradict_a_fresh_b_row(self):
+        self.write_history([record(label="B", window="five_hour", used=22.0, resets=NOW + HOUR, observed=NOW - 30, machine="desktop")])
+        text = self.table()
+        self.assertIn("22% (fresh, 0 min old)", self.rows(text, "B")[0])
+        self.assertIn("desktop copy time unknown (its receipt is missing or unreadable)", text.splitlines())
+        self.assertNotIn("B can only be old or unknown", text)
+
+    def test_resets_one_and_eight_days_ago_read_differently(self):
+        shown = []
+        for days in (1, 8):
+            self.readings.clear()
+            if self.db.exists():
+                self.db.unlink()
+            self.store(ALIAS_ONE, NOW - 9 * DAY, five=900, reset5=NOW - days * DAY)
+            shown.append(self.rows(self.table(), "A")[0])
+        self.assertNotEqual(shown[0], shown[1])
+        self.assertIn(time.strftime("%Y-%m-%d", time.gmtime(NOW - DAY)), shown[0])
+        self.assertIn(time.strftime("%Y-%m-%d", time.gmtime(NOW - 8 * DAY)), shown[1])
+
+    def test_a_future_reset_also_carries_its_date(self):
+        self.store(ALIAS_ONE, NOW - 60, five=100, reset5=NOW + 2 * DAY)
+        self.assertIn(time.strftime("%a %Y-%m-%d", time.gmtime(NOW + 2 * DAY)), self.rows(self.table(), "A")[0])
+
+    def test_a_percentage_is_cut_and_never_rounded_up(self):
+        for bps, expected in ((1236, "at least 12.3%"), (1200, "at least 12%"), (9999, "at least 99.9%"), (1250, "at least 12.5%"), (5, "at least 0.0%")):
+            self.readings.clear()
+            if self.db.exists():
+                self.db.unlink()
+            self.store(ALIAS_ONE, NOW - HOUR, five=bps)
+            row = self.rows(self.table(), "A")[0]
+            self.assertIn(expected.replace("0.0%", "0%") if bps == 5 else expected, row, bps)
+        self.assertNotIn("100", row)
+        self.assertEqual(measure._percent_text(99.99), "99.9%")
+        self.assertEqual(measure._percent_text(12.36), "12.3%")
+        self.assertEqual(measure._percent_text(12.0), "12%")
+
+    def test_a_receipts_version_of_true_is_not_version_one(self):
+        path = self.history / "receipts.json"
+        path.write_text('{"receipts_version": true, "last_accepted": {"desktop": 5}}', encoding="utf-8")
+        with self.assertRaises(measure.Problem):
+            measure.read_receipts(path)
+        path.write_text('{"receipts_version": 1.0, "last_accepted": {"desktop": 5}}', encoding="utf-8")
+        with self.assertRaises(measure.Problem):
+            measure.read_receipts(path)
+
+    def test_a_copy_time_ahead_of_the_clock_is_said_so(self):
+        self.write_history([], receipt=NOW + 61)
+        self.assertIn("desktop copy time is ahead of this machine's clock", self.table().splitlines())
+
+    def test_a_copy_time_up_to_a_minute_ahead_is_drift_not_a_problem(self):
+        self.write_history([], receipt=NOW + 60)
+        self.assertIn("desktop copy 0 min old", self.table().splitlines())
 
 
 class FromStoreIsUnchanged(unittest.TestCase):

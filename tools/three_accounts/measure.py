@@ -17,6 +17,7 @@ It holds no account text, no user name and no path. Output of every command is n
 import calendar
 import contextlib
 import datetime
+import decimal
 import json
 import os
 import sqlite3
@@ -24,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+sys.dont_write_bytecode = True         # the import below must not leave a cache file beside the tool (the read-only commands write nothing)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import export_capacity as ec  # noqa: E402  (the same rules check the desktop's copy)
 
@@ -45,6 +47,7 @@ MAX_RECEIPT_BYTES = 65_536             # the receipts file holds one number per 
 RECEIPTS_NAME = "receipts.json"
 DESKTOP_MACHINE = "desktop"            # the machine name the desktop's export carries
 DESKTOP_LATE_S = 900                   # a copy older than 15 minutes is "late" (design section 2): three missed 5-minute copies
+COPY_CLOCK_SKEW_S = 60                 # a copy time up to a minute ahead is clock drift between machines; more than that is a clock problem worth saying
 SWITCH_LOOKBACK_S = 7 * 86400          # the table shows a possible switch only if it happened in the last 7 days
 LOCK_NAME = ".collect.lock"            # exactly one collector writes a history folder
 
@@ -85,12 +88,12 @@ def read_jsonl(path):
         return records, bad
     if size > MAX_HISTORY_BYTES:
         raise Problem("an observation file is larger than expected")
-    with open(path, encoding="utf-8") as handle:
+    with open(path, "rb") as handle:
         for line in handle:
             if not line.strip():
                 continue
             try:
-                rec = json.loads(line, object_pairs_hook=ec._pairs, parse_constant=ec._constant)
+                rec = json.loads(line.decode("utf-8"), object_pairs_hook=ec._pairs, parse_constant=ec._constant)
             except (ValueError, RecursionError):
                 bad += 1
                 continue
@@ -139,7 +142,7 @@ def read_receipts(path):
         if len(raw) > MAX_RECEIPT_BYTES:
             raise ValueError("too large")
         data = json.loads(raw.decode("utf-8"), object_pairs_hook=ec._pairs, parse_constant=ec._constant)
-        if type(data) is not dict or tuple(sorted(data)) != ("last_accepted", "receipts_version") or data["receipts_version"] != 1 or type(data["last_accepted"]) is not dict:
+        if type(data) is not dict or tuple(sorted(data)) != ("last_accepted", "receipts_version") or type(data["receipts_version"]) is not int or data["receipts_version"] != 1 or type(data["last_accepted"]) is not dict:
             raise ValueError("shape")
         for machine, exported in data["last_accepted"].items():
             if type(machine) is not str or ec.MACHINE_RE.match(machine) is None or not ec._is_whole(exported, 1, ec.MAX_EPOCH):
@@ -295,7 +298,8 @@ def from_store(db_path, labels_path, out_path, now=None):
 
 # ---------------------------------------------------------------- now
 
-NOW_FOOTER = ("The 5-hour figure exists only while a seat on that subscription is working; with no working seat it is old or unknown.",
+SOURCE_NAMES = {STORE_MACHINE: "Laptop B store", DESKTOP_MACHINE: "desktop copy"}
+NOW_FOOTER = ("A 5-hour figure needs recent work by a seat on that subscription: each reading counts as fresh for 10 minutes only, then as 'at least'.",
               "'At least' is a floor: the real figure may be higher.",
               "Use outside agenttalk cannot be separated from agent work with the readings available.",
               "Advice only: nothing is reserved, refused or enforced.")
@@ -312,11 +316,18 @@ def _minutes_text(seconds):
 
 
 def _percent_text(value):
-    return ("%.1f" % value).rstrip("0").rstrip(".") + "%"
+    """One decimal, cut and never rounded up: a floor must not read higher than the figure kept (12.36 shows 12.3, 99.99 shows 99.9)."""
+    cut = decimal.Decimal(str(value)).quantize(decimal.Decimal("0.1"), rounding=decimal.ROUND_DOWN)
+    return format(cut, "f").rstrip("0").rstrip(".") + "%"
 
 
 def _when_text(epoch):
-    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%a %H:%M UTC")
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%a %Y-%m-%d %H:%M UTC")
+
+
+def _source_text(machine):
+    """Only fixed names are printed; a machine name read from a file never is."""
+    return SOURCE_NAMES.get(machine, "another machine")
 
 
 def now_cell(history, now):
@@ -330,7 +341,7 @@ def now_cell(history, now):
     age = _minutes_text(now - rec["observed_at"])
     figure = _percent_text(rec["used_percent"])
     words = "%s (fresh, %s old)" % (figure, age) if kind == "fresh" else "at least %s (%s old)" % (figure, age)
-    return "%s; resets %s; from %s" % (words, _when_text(rec["resets_at"]), rec["machine"])
+    return "%s; resets %s; from %s" % (words, _when_text(rec["resets_at"]), _source_text(rec["machine"]))
 
 
 def desktop_copy_line(history_dir, now):
@@ -339,7 +350,9 @@ def desktop_copy_line(history_dir, now):
     except Problem:
         exported = None
     if exported is None:
-        return "desktop history unreadable: B can only be old or unknown"
+        return "desktop copy time unknown (its receipt is missing or unreadable)"
+    if exported - now > COPY_CLOCK_SKEW_S:
+        return "desktop copy time is ahead of this machine's clock"
     age = max(0, now - exported)
     if age > DESKTOP_LATE_S:
         return "desktop copy late (%d min)" % (age // 60)
@@ -548,7 +561,7 @@ def main(argv=None):
         print("not done: %s" % why)
         return 3
     except ValueError:
-        print("not done: a date must look like 2026-10-12")
+        print("not done: a date must look like 2026-10-12" if args.command == "report" else "not done: a value in the files could not be read (no details are shown)")
         return 3
     except OSError:
         print("not done: a file operation failed (no details are shown)")
