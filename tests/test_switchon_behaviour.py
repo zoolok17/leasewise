@@ -142,8 +142,9 @@ class Base(unittest.TestCase):
         self.assertEqual(done.returncode, 0, self.said(done))
 
     def open_to_everyone(self, path):
-        text = ("$a = Get-Acl -LiteralPath '%s'; $a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("
-                "(New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Read', 'Allow'))); Set-Acl -LiteralPath '%s' -AclObject $a" % (path, path))
+        text = ("$i = Get-Item -LiteralPath '%s' -Force; $a = [IO.FileSystemAclExtensions]::GetAccessControl($i, [Security.AccessControl.AccessControlSections]::Access); "
+                "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("
+                "(New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Read', 'Allow'))); [IO.FileSystemAclExtensions]::SetAccessControl($i, $a)" % path)
         done = self.command(text)
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -554,6 +555,26 @@ class Prompt(Base):
 
 class PrivacyBeforeWriting(Base):
     ENV_TEXTS = PARTS
+
+    def test_protect_path_leaves_the_current_user_system_and_administrators_and_nothing_inherited(self):
+        folder, item = self.tmp / "private folder", self.tmp / "private-file.txt"
+        folder.mkdir()
+        item.write_text("x", encoding="ascii")
+        show = ("function Show($p) { $a = (Get-Acl -LiteralPath $p); [pscustomobject]@{protected = $a.AreAccessRulesProtected; rules = @($a.Access | ForEach-Object { [pscustomobject]@{"
+                "sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights; "
+                "inherited = $_.IsInherited; flags = [string]$_.InheritanceFlags; propagation = [string]$_.PropagationFlags } }) } }; ")
+        done = self.command(". '%s'; Protect-Path '%s' $true; Protect-Path '%s' $false; %s"
+                            "ConvertTo-Json -Depth 5 -Compress @{me = $Me; folder = (Show '%s'); file = (Show '%s')}" % (COMMON, folder, item, show, folder, item))
+        self.assertEqual(done.returncode, 0, self.said(done))
+        result = json.loads(done.stdout)
+        expected = {result["me"], "S-1-5-18", "S-1-5-32-544"}
+        for kind, flags in (("folder", "ContainerInherit, ObjectInherit"), ("file", "None")):
+            shown = result[kind]
+            self.assertTrue(shown["protected"], kind)                                            # nothing inherited from the folder above
+            self.assertEqual({rule["sid"] for rule in shown["rules"]}, expected, kind)           # exactly these three, by identifier
+            self.assertEqual(len(shown["rules"]), 3, kind)
+            for rule in shown["rules"]:
+                self.assertEqual((rule["type"], rule["rights"], rule["inherited"], rule["flags"], rule["propagation"]), ("Allow", "FullControl", False, flags, "None"), kind)
 
     def test_step_8_refuses_an_open_settings_file_before_asking_and_changes_no_byte(self):
         self.private_live()

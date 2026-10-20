@@ -277,10 +277,11 @@ try {
     New-Item -ItemType Directory -Path $AclProbe | Out-Null
     Protect-Path $AclProbe $true
     Assert-Private $AclProbe $true                                  # private: passes
-    $ProbeAcl = Get-Acl -LiteralPath $AclProbe
+    $ProbeItem = Get-Item -LiteralPath $AclProbe -Force
+    $ProbeAcl = [IO.FileSystemAclExtensions]::GetAccessControl($ProbeItem, [Security.AccessControl.AccessControlSections]::Access)     # the access list only, as Protect-Path does
     $UsersGroup = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
     $ProbeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($UsersGroup, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    Set-Acl -LiteralPath $AclProbe -AclObject $ProbeAcl
+    [IO.FileSystemAclExtensions]::SetAccessControl($ProbeItem, $ProbeAcl)
     $Caught = $false
     try { Assert-Private $AclProbe $true } catch { $Caught = ($_.Exception.Message -like 'Someone else can open*') }
     if (-not $Caught) { throw 'the privacy check did not catch a folder that the Users group can open' }
