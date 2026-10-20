@@ -557,24 +557,35 @@ class PrivacyBeforeWriting(Base):
     ENV_TEXTS = PARTS
 
     def test_protect_path_leaves_the_current_user_system_and_administrators_and_nothing_inherited(self):
+        """The comparison with the allowed identifiers happens inside PowerShell; only counts and true/false leave it (no identifier, no user name)."""
         folder, item = self.tmp / "private folder", self.tmp / "private-file.txt"
         folder.mkdir()
         item.write_text("x", encoding="ascii")
-        show = ("function Show($p) { $a = (Get-Acl -LiteralPath $p); [pscustomobject]@{protected = $a.AreAccessRulesProtected; rules = @($a.Access | ForEach-Object { [pscustomobject]@{"
-                "sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights; "
-                "inherited = $_.IsInherited; flags = [string]$_.InheritanceFlags; propagation = [string]$_.PropagationFlags } }) } }; ")
-        done = self.command(". '%s'; Protect-Path '%s' $true; Protect-Path '%s' $false; %s"
-                            "ConvertTo-Json -Depth 5 -Compress @{me = $Me; folder = (Show '%s'); file = (Show '%s')}" % (COMMON, folder, item, show, folder, item))
-        self.assertEqual(done.returncode, 0, self.said(done))
-        result = json.loads(done.stdout)
-        expected = {result["me"], "S-1-5-18", "S-1-5-32-544"}
-        for kind, flags in (("folder", "ContainerInherit, ObjectInherit"), ("file", "None")):
-            shown = result[kind]
-            self.assertTrue(shown["protected"], kind)                                            # nothing inherited from the folder above
-            self.assertEqual({rule["sid"] for rule in shown["rules"]}, expected, kind)           # exactly these three, by identifier
-            self.assertEqual(len(shown["rules"]), 3, kind)
-            for rule in shown["rules"]:
-                self.assertEqual((rule["type"], rule["rights"], rule["inherited"], rule["flags"], rule["propagation"]), ("Allow", "FullControl", False, flags, "None"), kind)
+        script = (
+            "$Sections = [Security.AccessControl.AccessControlSections]; "
+            "function Owner($p) { [IO.FileSystemAclExtensions]::GetAccessControl((Get-Item -LiteralPath $p -Force), $Sections::Owner).GetOwner([Security.Principal.SecurityIdentifier]).Value }; "
+            "function Report($p, $OwnerBefore, $Flags) { "
+            "$a = [IO.FileSystemAclExtensions]::GetAccessControl((Get-Item -LiteralPath $p -Force), $Sections::Access); "
+            "$r = @($a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])); "
+            "$ids = @($r | ForEach-Object { $_.IdentityReference.Value }); "
+            "$r.Count; "
+            "(($ids.Count -eq 3) -and -not (Compare-Object $ids $Allowed)); "
+            "(@($r | Where-Object { $_.AccessControlType -ne 'Allow' -or $_.FileSystemRights -ne 'FullControl' }).Count -eq 0); "
+            "(@($r | Where-Object { $_.IsInherited }).Count -eq 0); "
+            "$a.AreAccessRulesProtected; "
+            "(@($r | Where-Object { [string]$_.InheritanceFlags -ne $Flags }).Count -eq 0); "
+            "(@($r | Where-Object { [string]$_.PropagationFlags -ne 'None' }).Count -eq 0); "
+            "((Owner $p) -eq $OwnerBefore) }; "
+            ". '%s'; $f = '%s'; $i = '%s'; $fo = Owner $f; $io = Owner $i; Protect-Path $f $true; Protect-Path $i $false; "
+            "Report $f $fo 'ContainerInherit, ObjectInherit'; Report $i $io 'None'" % (COMMON, folder, item))
+        done = self.command(script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lines = done.stdout.split()
+        self.assertEqual(len(lines), 16, "expected two reports of eight lines")
+        for kind, shown in (("folder", lines[:8]), ("file", lines[8:])):
+            self.assertEqual(shown, ["3"] + ["True"] * 7, kind)
+            # in order: rule count; exactly the current user, SYSTEM and Administrators; all Allow and FullControl; none inherited;
+            # protected (nothing inherited from the folder above); right inheritance flags; no propagation flags; owner unchanged
 
     def test_step_8_refuses_an_open_settings_file_before_asking_and_changes_no_byte(self):
         self.private_live()
