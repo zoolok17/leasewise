@@ -1,10 +1,11 @@
 """Measure how well Laptop B can know each subscription's use (three-accounts step 0).
 
-Three commands, Python 3.11+ standard library only, nothing written except the file named by `--out` / `--history`
+Four commands, Python 3.11+ standard library only, nothing written except the file named by `--out` / `--history`
 (for `from-store` on a WAL-mode store, see STORE_PROMISE):
 
     collect     keep the desktop's exported copy as observation records, only if it is newer than the last one kept
     from-store  turn this machine's readings in the Leasewise store into the same observation records (read-only)
+    now         one table: the newest figure of each label and window, its age and reset time (read-only, writes nothing)
     report      for each label and window, how many half-hourly samples had a fresh figure, an old figure that is
                 still a floor, or nothing; plus a "possible switch" flag where a weekly reset time moved
 
@@ -42,6 +43,9 @@ WEEKLY = "seven_day"
 MAX_HISTORY_BYTES = 50_000_000         # a week of 5-minute copies is far smaller; a bigger file is not ours
 MAX_RECEIPT_BYTES = 65_536             # the receipts file holds one number per machine
 RECEIPTS_NAME = "receipts.json"
+DESKTOP_MACHINE = "desktop"            # the machine name the desktop's export carries
+DESKTOP_LATE_S = 900                   # a copy older than 15 minutes is "late" (design section 2): three missed 5-minute copies
+SWITCH_LOOKBACK_S = 7 * 86400          # the table shows a possible switch only if it happened in the last 7 days
 LOCK_NAME = ".collect.lock"            # exactly one collector writes a history folder
 
 
@@ -231,8 +235,8 @@ def _collect_locked(data, history, now):
 
 # ---------------------------------------------------------------- from-store
 
-def from_store(db_path, labels_path, out_path, now=None):
-    """-> (exit code, one line of counts). The store is opened read-only; STORE_PROMISE says exactly what that leaves on disk."""
+def read_store(db_path, labels_path, seen_at):
+    """-> (observation records, number skipped). The store is opened read-only; STORE_PROMISE says exactly what that leaves on disk."""
     try:
         with open(labels_path, "rb") as handle:
             table = json.loads(handle.read(65_537).decode("utf-8"), object_pairs_hook=ec._pairs)
@@ -241,7 +245,6 @@ def from_store(db_path, labels_path, out_path, now=None):
     if type(table) is not dict or not all(type(k) is str and v in ec.LABELS for k, v in table.items()):
         raise Problem("the alias table must map an account alias to exactly A, B or C")
     uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-    seen_at = int(time.time() if now is None else now)
     records = []
     skipped = 0
     try:
@@ -280,9 +283,100 @@ def from_store(db_path, labels_path, out_path, now=None):
         raise Problem("the store could not be read") from None
     finally:
         conn.close()
+    return records, skipped
+
+
+def from_store(db_path, labels_path, out_path, now=None):
+    """-> (exit code, one line of counts). Writes the store's readings as observation records to `out_path`."""
+    records, skipped = read_store(db_path, labels_path, int(time.time() if now is None else now))
     text = "".join(json.dumps(rec, sort_keys=True) + "\n" for rec in records)
     ec.write_atomic(out_path, text)
     return 0, "from-store: records=%d, skipped=%d" % (len(records), skipped)
+
+# ---------------------------------------------------------------- now
+
+NOW_FOOTER = ("The 5-hour figure exists only while a seat on that subscription is working; with no working seat it is old or unknown.",
+              "'At least' is a floor: the real figure may be higher.",
+              "Use outside agenttalk cannot be separated from agent work with the readings available.",
+              "Advice only: nothing is reserved, refused or enforced.")
+
+
+def _minutes_text(seconds):
+    minutes = max(0, int(seconds)) // 60
+    if minutes < 60:
+        return "%d min" % minutes
+    if minutes < 24 * 60:
+        return "%d h %d min" % divmod(minutes, 60)
+    hours = minutes // 60
+    return "%d d %d h" % divmod(hours, 24)
+
+
+def _percent_text(value):
+    return ("%.1f" % value).rstrip("0").rstrip(".") + "%"
+
+
+def _when_text(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%a %H:%M UTC")
+
+
+def now_cell(history, now):
+    """-> the words for one label and window at `now`, from its observations sorted by observed_at."""
+    kind, rec = classify(history, now)
+    if kind == "unknown":
+        past = [r for r in history if r["observed_at"] <= now]
+        if not past:
+            return "unknown: no reading recorded"
+        return "unknown: reset since %s, no new reading" % _when_text(past[-1]["resets_at"])
+    age = _minutes_text(now - rec["observed_at"])
+    figure = _percent_text(rec["used_percent"])
+    words = "%s (fresh, %s old)" % (figure, age) if kind == "fresh" else "at least %s (%s old)" % (figure, age)
+    return "%s; resets %s; from %s" % (words, _when_text(rec["resets_at"]), rec["machine"])
+
+
+def desktop_copy_line(history_dir, now):
+    try:
+        exported = read_receipts(Path(history_dir) / RECEIPTS_NAME).get(DESKTOP_MACHINE)
+    except Problem:
+        exported = None
+    if exported is None:
+        return "desktop history unreadable: B can only be old or unknown"
+    age = max(0, now - exported)
+    if age > DESKTOP_LATE_S:
+        return "desktop copy late (%d min)" % (age // 60)
+    return "desktop copy %d min old" % (age // 60)
+
+
+def now_command(db_path, labels_path, history_dir, incomplete=(), now=None):
+    """The 'now' table as text. Reads the store and two files of the history folder; writes nothing."""
+    now = int(time.time() if now is None else now)
+    for label in incomplete:
+        if label not in ec.LABELS:
+            raise Problem("--incomplete-coverage must be A, B or C")
+    store, _skipped = read_store(db_path, labels_path, now)
+    kept, bad = read_jsonl(Path(history_dir) / "observations.jsonl")
+    grouped = {}
+    for rec in distinct(store + kept):
+        grouped.setdefault((rec["label"], rec["window"]), []).append(rec)
+    when = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%a %Y-%m-%d %H:%M UTC")
+    lines = ["Usage now, %s" % when]
+    for label in sorted(ec.LABELS):
+        lines.append("")
+        lines.append("Label %s" % label)
+        for window in ec.WINDOWS:
+            lines.append("  %-9s %s" % (window, now_cell(grouped.get((label, window), []), now)))
+        flagged = sorted({datetime.datetime.fromtimestamp(f["at"], datetime.timezone.utc).strftime("%Y-%m-%d")
+                          for f in switch_flags(label, grouped.get((label, WEEKLY), [])) if now - SWITCH_LOOKBACK_S <= f["at"] <= now})
+        for day in flagged:
+            lines.append("  possible switch on %s: which subscription this is, is uncertain (the lead confirms it in the accounts note)" % day)
+        if label in incomplete:
+            lines.append("  coverage incomplete: a machine that does not report also uses this subscription")
+    lines.append("")
+    lines.append(desktop_copy_line(history_dir, now))
+    if bad:
+        lines.append("(%d unreadable history line(s) skipped)" % bad)
+    lines.append("")
+    lines.extend(NOW_FOOTER)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- report
@@ -420,6 +514,12 @@ def main(argv=None):
     two.add_argument("--db", required=True)
     two.add_argument("--labels", required=True)
     two.add_argument("--out", required=True)
+    now_parser = sub.add_parser("now", description="One table of the newest figure for each label and window. Reads the store (read-only) and the history folder; writes nothing.")
+    now_parser.add_argument("--db", required=True)
+    now_parser.add_argument("--labels", required=True)
+    now_parser.add_argument("--history", required=True)
+    now_parser.add_argument("--incomplete-coverage", action="append", default=[], metavar="LABEL")
+    now_parser.add_argument("--now", type=int)
     three = sub.add_parser("report")
     three.add_argument("--observations", nargs="+", required=True)
     three.add_argument("--from", dest="day_from", required=True)
@@ -439,6 +539,9 @@ def main(argv=None):
             code, line = from_store(args.db, args.labels, args.out)
             print(line)
             return code
+        if args.command == "now":
+            print(now_command(args.db, args.labels, args.history, args.incomplete_coverage, args.now))
+            return 0
         print(report_command(args.observations, args.day_from, args.day_to, args.json))
         return 0
     except Problem as why:
