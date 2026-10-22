@@ -6,6 +6,7 @@ import hashlib
 import io
 import re
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -229,7 +230,7 @@ class LabelInDoubt(ExplainCase):
     def test_the_may_be_clause_needs_exactly_matching_reset_times(self):
         self.a_readings()
         shifted = self.misfiled()
-        shifted[0]["resets_at"] = SATURDAY_01 + 60
+        shifted[0]["resets_at"] = SATURDAY_01 + 600
         self.put(self.b_series() + shifted)
         _default, lines = self.run_both(now=NOW21)
         self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
@@ -406,18 +407,133 @@ class IdentityHint(ExplainCase):
         self.assertIn(self.CLAUSE, self.t3())
 
     def test_the_same_weekly_but_a_different_five_hour_reset_gives_no_clause(self):
-        self.fixture(five_resets=FIVE_1530 + 60)
+        self.fixture(five_resets=FIVE_1530 + 600)
         self.assertNotIn("may be", self.t3())
 
     def test_a_missing_five_hour_reading_gives_no_clause(self):
         self.fixture(with_five=False)
         self.assertNotIn("may be", self.t3())
 
+    def test_the_tolerance_is_five_minutes_like_the_series_rule(self):
+        self.fixture(five_resets=FIVE_1530 + 300)
+        self.assertIn(self.CLAUSE, self.t3())
+        self.db.unlink()
+        self.readings.clear()
+        self.fixture(five_resets=FIVE_1530 + 301)
+        self.assertNotIn("may be", self.t3())
+
+    def test_an_older_doubtful_reading_that_matched_cannot_supply_the_hint_when_the_newest_five_hour_reading_differs(self):
+        """The first reviewer sequence: B's 06:00 pair matched A's, but B's newest 5-hour reading (08:00) has a different reset time."""
+        self.store(ALIAS_ONE, at(5, 0), five=800, week=4100, reset5=FIVE_1530, reset7=SATURDAY_01)
+        self.put([record(label="B", window="seven_day", used=90.0, resets=FRIDAY_21, observed=at(1, 0), machine="desktop"),
+                  record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(6, 0), machine="desktop"),
+                  record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(6, 0), machine="desktop"),
+                  record(label="B", window="five_hour", used=7.0, resets=FIVE_1530 + 3600, observed=at(8, 0), machine="desktop")])
+        _default, lines = self.run_both(now=at(9, 0))
+        t3 = next(line for line in lines if line.startswith("B: a possible switch"))
+        self.assertNotIn("may be", t3)
+
+    def test_the_same_pair_with_the_newest_five_hour_reading_equal_does_give_the_hint(self):
+        self.store(ALIAS_ONE, at(5, 0), five=800, week=4100, reset5=FIVE_1530, reset7=SATURDAY_01)
+        self.put([record(label="B", window="seven_day", used=90.0, resets=FRIDAY_21, observed=at(1, 0), machine="desktop"),
+                  record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(6, 0), machine="desktop"),
+                  record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(6, 0), machine="desktop"),
+                  record(label="B", window="five_hour", used=7.0, resets=FIVE_1530, observed=at(8, 0), machine="desktop")])
+        _default, lines = self.run_both(now=at(9, 0))
+        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def test_the_other_label_whose_newest_readings_became_doubtful_cannot_supply_the_hint(self):
+        """The second reviewer sequence: A's older pair matched B's, but A's newest weekly reading has a different reset time and is itself in doubt."""
+        self.a_readings()                                                                              # A: weekly Sat 01:00, 5-hour 15:30 at 10:35 (trusted)
+        self.store(ALIAS_ONE, at(15, 0), week=4200, reset7=SATURDAY_01 + 3 * HOUR)                     # A's newest weekly reading does not fit its own series
+        self.put(self.b_series() + self.misfiled())
+        _default, lines = self.run_both(now=NOW21)
+        self.assertTrue(any(line.startswith("A: a possible switch") for line in lines), lines)
+        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def test_two_newest_readings_with_different_reset_times_at_one_instant_give_no_hint(self):
+        self.a_readings()
+        self.put(self.b_series() + self.misfiled() + [record(label="B", window="seven_day", used=61.0, resets=SATURDAY_01 + 3 * HOUR, observed=at(14, 48, 58), machine="desktop-two")])
+        _default, lines = self.run_both(now=NOW21)
+        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def test_two_newest_readings_with_agreeing_reset_times_at_one_instant_still_give_the_hint(self):
+        self.a_readings()
+        self.put(self.b_series() + self.misfiled() + [record(label="B", window="seven_day", used=61.0, resets=SATURDAY_01 + 100, observed=at(14, 48, 58), machine="desktop-two")])
+        _default, lines = self.run_both(now=NOW21)
+        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def reading(self, label, window, resets, hour, used=20.0):
+        return record(label=label, window=window, resets=resets, observed=at(hour, 0), used=used, machine="desktop")
+
+    def test_reviewer_sequence_one_an_older_doubtful_reading_cannot_supply_the_hint_after_the_newest_five_hour_reading_came_back_trusted(self):
+        """B falls into doubt, its 5-hour reading of that time matches A's, B then returns to its own series (a trusted 5-hour reading with another reset),
+        and a later weekly misfit opens a second doubt: B's newest 5-hour reading is the trusted one, so nothing in doubt can be matched with A's."""
+        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
+                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 2, 60.0), self.reading("B", "five_hour", at(6, 0), 2),
+                  self.reading("B", "seven_day", FRIDAY_21, 3, 91.0), self.reading("B", "five_hour", at(8, 0), 3), self.reading("B", "seven_day", SATURDAY_01, 4, 61.0)])
+        _default, lines = self.run_both(now=at(4, 1))
+        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def test_reviewer_sequence_two_the_other_labels_older_trusted_pair_cannot_supply_the_hint(self):
+        """A's older weekly and 5-hour readings matched B's, but A's newest ones (Friday, 09:00) are different and in doubt."""
+        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
+                  self.reading("A", "seven_day", FRIDAY_21, 3), self.reading("A", "five_hour", at(9, 0), 3),
+                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 4, 60.0), self.reading("B", "five_hour", at(6, 0), 4)])
+        _default, lines = self.run_both(now=at(4, 1))
+        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
+
+    def test_the_positive_case_on_the_same_shape_still_gives_the_hint(self):
+        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
+                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 4, 60.0), self.reading("B", "five_hour", at(6, 0), 4)])
+        _default, lines = self.run_both(now=at(4, 1))
+        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
+
     def test_the_other_label_must_have_both_trusted_readings_too(self):
         self.store(ALIAS_ONE, at(10, 35), week=4100, reset7=SATURDAY_01)                              # A has no 5-hour reading to compare with
         self.put(self.b_series() + [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop"),
                                     record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(14, 48, 58), machine="desktop")])
         self.assertNotIn("may be", self.t3())
+
+
+class Speed(ExplainCase):
+    """A week of readings every five minutes in both windows, for all three labels, must explain quickly (it once took about 50 seconds)."""
+
+    WEEK_START = D
+    STEP = 300
+
+    def week(self, readings_per_window):
+        rows = []
+        for label in "ABC":
+            for number in range(readings_per_window):
+                observed = self.WEEK_START + number * self.STEP
+                rows.append(record(label=label, window="seven_day", used=min(99.0, number / 25), resets=self.WEEK_START + 8 * DAY, observed=observed, machine="desktop"))
+                rows.append(record(label=label, window="five_hour", used=min(99.0, (number % 60) / 2), resets=observed + 3 * HOUR, observed=observed, machine="desktop"))
+        return rows
+
+    def test_a_full_week_of_five_minute_readings_in_both_windows_explains_in_under_three_seconds(self):
+        # Bound: after the fix a week (2,016 readings per window and label) takes a fraction of a second on this machine; the old code took about 50 seconds.
+        # 3 seconds leaves ample room for a slow shared machine and still fails loudly on any return of the slowdown.
+        count = 2016
+        self.put(self.week(count), receipt=self.WEEK_START + count * self.STEP)
+        self.build_store()
+        started = time.monotonic()
+        text = measure.now_command(str(self.db), str(self.labels), str(self.history), now=self.WEEK_START + count * self.STEP, explain=True)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3.0, "explaining a week of readings took %.1f s" % elapsed)
+        self.assertIn("For A: If this reading and its label are right", text)
+
+    def test_the_index_gives_the_same_answers_as_the_plain_rule_for_every_reading(self):
+        weekly = [record(label="B", window="seven_day", used=1.0, resets=FRIDAY_21 + (SATURDAY_01 - FRIDAY_21) * (n % 2), observed=at(n // 2, 0), machine="m%d" % n) for n in range(12)]
+        eligible, _episode = measure.doubt_walk("B", weekly)
+        index = measure.eligibility_index(weekly, eligible)
+        for hour in range(-1, 8):
+            for minute in (0, 30):
+                five = record(label="B", window="five_hour", observed=at(0, 0) + hour * HOUR + minute * 60)
+                instants = [w["observed_at"] for w in weekly if w["observed_at"] <= five["observed_at"]]
+                expected = True if not instants else all(ok for w, ok in zip(weekly, eligible, strict=True) if w["observed_at"] == max(instants))
+                self.assertEqual(measure.index_eligible("five_hour", five, index), expected, (hour, minute))
+                self.assertEqual(measure.reading_eligible("five_hour", five, weekly, eligible), expected)
 
 
 class CannotTell(ExplainCase):

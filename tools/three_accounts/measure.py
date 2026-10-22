@@ -14,6 +14,7 @@ An observation record is one line of JSON:
      "exported_at", "seen_at", "copy_age_s"}      (times are epoch seconds, UTC)
 It holds no account text, no user name and no path. Output of every command is numbers and labels only.
 """
+import bisect
 import calendar
 import contextlib
 import datetime
@@ -402,7 +403,7 @@ def doubt_walk(label, weekly):
             else:
                 later = misfits[0]
                 earlier = previous if previous is not None else next(r for r in group if r not in misfits)
-                flag = {"label": label, "kind": "possible switch", "reason": "weekly reset time changed before the earlier one passed",
+                flag = {"label": label, "kind": "possible switch", "reason": "weekly reset time does not fit the label's own series",
                         "at": later["observed_at"], "moved_s": abs(later["resets_at"] - earlier["resets_at"])}
             episode = {"flag": flag, "anchor": anchor, "earlier": earlier, "later": later}
             good = False
@@ -416,15 +417,29 @@ def doubt_walk(label, weekly):
     return [verdict[id(r)] for r in weekly], episode
 
 
-def reading_eligible(window, rec, weekly, eligible):
+def eligibility_index(weekly, eligible):
+    """-> (weekly verdict by id, sorted weekly instants, verdict of each instant): built once, so asking about each reading costs a lookup, not a scan.
+    The verdict of an instant is False when any weekly reading with that time is in doubt."""
+    by_id = {id(rec): ok for rec, ok in zip(weekly, eligible, strict=True)}
+    per_instant = {}
+    for rec, ok in zip(weekly, eligible, strict=True):
+        per_instant[rec["observed_at"]] = per_instant.get(rec["observed_at"], True) and ok
+    instants = sorted(per_instant)
+    return by_id, instants, [per_instant[t] for t in instants]
+
+
+def index_eligible(window, rec, index):
     """A weekly reading is eligible as `doubt_walk` says. A 5-hour reading has no weekly series of its own, so it follows the label's latest weekly reading at
     its time (all of them, when several share that time)."""
+    by_id, instants, states = index
     if window == WEEKLY:
-        return next(ok for other, ok in zip(weekly, eligible, strict=True) if other is rec)
-    instants = [other["observed_at"] for other in weekly if other["observed_at"] <= rec["observed_at"]]
-    if not instants:
-        return True
-    return all(ok for other, ok in zip(weekly, eligible, strict=True) if other["observed_at"] == max(instants))
+        return by_id[id(rec)]
+    at = bisect.bisect_right(instants, rec["observed_at"])
+    return states[at - 1] if at else True
+
+
+def reading_eligible(window, rec, weekly, eligible):
+    return index_eligible(window, rec, eligibility_index(weekly, eligible))
 
 
 def _stamp(epoch):
@@ -483,21 +498,33 @@ def explain_block(grouped, now):
     seen = {key: [r for r in recs if r["observed_at"] <= now] for key, recs in grouped.items()}
     labels = sorted(ec.LABELS)
     walks = {label: doubt_walk(label, seen.get((label, WEEKLY), [])) for label in labels}
-    ok_ids = {label: {id(r) for window in ec.WINDOWS for r in seen.get((label, window), [])
-                      if reading_eligible(window, r, seen.get((label, WEEKLY), []), walks[label][0])} for label in labels}
+    indexes = {label: eligibility_index(seen.get((label, WEEKLY), []), walks[label][0]) for label in labels}
+    ok_ids = {label: {id(r) for window in ec.WINDOWS for r in seen.get((label, window), []) if index_eligible(window, r, indexes[label])} for label in labels}
 
-    def newest(label, window, trusted):
-        found = [r for r in seen.get((label, window), []) if (id(r) in ok_ids[label]) == trusted]
-        return found[-1] if found else None
+    def newest_group(label, window):
+        """All readings of the label's window that share its newest time (any eligibility), or None when there is none."""
+        recs = seen.get((label, window), [])
+        if not recs:
+            return None
+        latest = max(r["observed_at"] for r in recs)
+        return [r for r in recs if r["observed_at"] == latest]
+
+    def agree(mine, theirs):
+        """Within the switch tolerance: every reset time of the two groups (several readings may share a time) is within five minutes of every other."""
+        resets = [r["resets_at"] for r in mine + theirs]
+        return max(resets) - min(resets) <= SWITCH_RESET_TOLERANCE_S
 
     def looks_like(label):
-        """The other label whose newest trusted readings have exactly the reset times (weekly and 5-hour) of this label's newest doubtful ones, or None."""
-        mine = [newest(label, window, False) for window in ec.WINDOWS]
-        if None in mine:
+        """The other label whose newest weekly and 5-hour readings (of any eligibility) are both trusted and have the reset times of this label's newest weekly and
+        5-hour readings, which are both in doubt; None if either label lacks a reading of a window or any condition fails."""
+        mine = [newest_group(label, window) for window in ec.WINDOWS]
+        if None in mine or any(id(r) in ok_ids[label] for group in mine for r in group):
             return None
         for other in labels:
-            theirs = [newest(other, window, True) for window in ec.WINDOWS]
-            if other != label and None not in theirs and all(a["resets_at"] == b["resets_at"] for a, b in zip(mine, theirs, strict=True)):
+            theirs = [newest_group(other, window) for window in ec.WINDOWS]
+            if other == label or None in theirs or not all(id(r) in ok_ids[other] for group in theirs for r in group):
+                continue
+            if all(agree(a, b) for a, b in zip(mine, theirs, strict=True)):
                 return other
         return None
 
