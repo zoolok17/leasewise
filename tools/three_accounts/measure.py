@@ -470,7 +470,7 @@ def _sentence_t2(rec, window, history, now, eligible_ids):
                                                           _percent_text(same[-1]["used_percent"]), _stamp(same[-1]["observed_at"]))
 
 
-def _sentence_t3(label, episode, same_as):
+def _sentence_t3(label, episode):
     flag, earlier, later = episode["flag"], episode["earlier"], episode["later"]
     if "moved_s" in flag:
         reason = "its weekly reset moved from %s to %s and its figure went from %s to %s" % (
@@ -479,8 +479,6 @@ def _sentence_t3(label, episode, same_as):
         reason = "its weekly figure fell from %s to %s within one reset period (it resets %s)" % (
             _percent_text(earlier["used_percent"]), _percent_text(later["used_percent"]), _stamp(later["resets_at"]))
     text = "%s: a possible switch was flagged on %s: %s." % (label, datetime.datetime.fromtimestamp(flag["at"], datetime.timezone.utc).strftime("%Y-%m-%d"), reason)
-    if same_as:
-        text += " Its newest reading has the same reset times as %s's, so it may be %s's reading under %s's label." % (same_as, same_as, label)
     return text + " %s's readings since then are not used here until one shows %s's own reset times again." % (label, label)
 
 
@@ -501,39 +499,12 @@ def explain_block(grouped, now):
     indexes = {label: eligibility_index(seen.get((label, WEEKLY), []), walks[label][0]) for label in labels}
     ok_ids = {label: {id(r) for window in ec.WINDOWS for r in seen.get((label, window), []) if index_eligible(window, r, indexes[label])} for label in labels}
 
-    def newest_group(label, window):
-        """All readings of the label's window that share its newest time (any eligibility), or None when there is none."""
-        recs = seen.get((label, window), [])
-        if not recs:
-            return None
-        latest = max(r["observed_at"] for r in recs)
-        return [r for r in recs if r["observed_at"] == latest]
-
-    def agree(mine, theirs):
-        """Within the switch tolerance: every reset time of the two groups (several readings may share a time) is within five minutes of every other."""
-        resets = [r["resets_at"] for r in mine + theirs]
-        return max(resets) - min(resets) <= SWITCH_RESET_TOLERANCE_S
-
-    def looks_like(label):
-        """The other label whose newest weekly and 5-hour readings (of any eligibility) are both trusted and have the reset times of this label's newest weekly and
-        5-hour readings, which are both in doubt; None if either label lacks a reading of a window or any condition fails."""
-        mine = [newest_group(label, window) for window in ec.WINDOWS]
-        if None in mine or any(id(r) in ok_ids[label] for group in mine for r in group):
-            return None
-        for other in labels:
-            theirs = [newest_group(other, window) for window in ec.WINDOWS]
-            if other == label or None in theirs or not all(id(r) in ok_ids[other] for group in theirs for r in group):
-                continue
-            if all(agree(a, b) for a, b in zip(mine, theirs, strict=True)):
-                return other
-        return None
-
     lines = []
     for label in labels:
         episode = walks[label][1]
         never_seen = not any(seen.get((label, window)) for window in ec.WINDOWS)
         if episode is not None:
-            lines.append(_sentence_t3(label, episode, looks_like(label)))
+            lines.append(_sentence_t3(label, episode))
         for window in ec.WINDOWS:
             history = seen.get((label, window), [])
             kind, rec = classify(history, now) if history else ("unknown", None)

@@ -37,13 +37,11 @@ another day's.
    It uses the oldest and the newest readings that may be relied on, of the same label, window and reset period, in the last 12 hours before the table's time; the times
    are the readings' own times. It is left out when the rise is under one point or fewer than two readings qualify. It gives no rate and no forecast.
 3. **T3, a label in doubt.**
-   `B: a possible switch was flagged on 2026-10-21: its weekly reset moved from Fri 2026-10-23 21:00 UTC to Sat 2026-10-24 01:00 UTC and its figure went from 92% to 60%. Its newest reading has the same reset times as A's, so it may be A's reading under B's label. B's readings since then are not used here until one shows B's own reset times again.`
-   The "may be" sentence is a hint, and it is printed only when all of these hold; if any fails, it is left out:
-   - take the label's newest weekly reading and its newest 5-hour reading, of any kind: both must exist, and both must be in doubt;
-   - take the other label's newest weekly reading and newest 5-hour reading, of any kind: both must exist, and both must be readings that may be relied on;
-   - the weekly reset times must agree, and the 5-hour reset times must agree, within the same five minutes as the series rule;
-   - if several readings share the newest time within one window, all of them count, and their reset times must all agree (otherwise no hint).
-   Older readings are never used to fill the hint. Nothing is relabelled.
+   `B: a possible switch was flagged on 2026-10-21: its weekly reset moved from Fri 2026-10-23 21:00 UTC to Sat 2026-10-24 01:00 UTC and its figure went from 92% to 60%. B's readings since then are not used here until one shows B's own reset times again.`
+   **The "may be A's reading under B's label" hint of the design is cut** (decision of the lead after the second read). The design allows the clause only when the reset
+   times are exactly equal, but one reset time differs by seconds between reads (`SWITCH_RESET_TOLERANCE_S`), so an exact comparison would almost never print it, and a
+   comparison within five minutes says "the same reset times" of times that are not. The design makes the clause optional, so never printing it complies with it. The doubt
+   sentence never names another label, and nothing is relabelled.
    A flag that was a drop of the percentage inside one reset period reads: `... its weekly figure fell from 80% to 30% within one reset period (it resets <time>).`
 4. **T4, cannot tell.** `C weekly: no reading has been recorded here. A turn by a seat logged into C may supply one; check that a usable reading arrives under C before relying on it.`
    For a label that has readings, but none newer that can be used: `A 5-hour: no newer reading has been recorded here. ...`. Printed for each row that has no figure to rely
@@ -81,13 +79,13 @@ check every output against the five sentence shapes and against a list of forbid
 
 ## Tests
 
-`tests/test_three_accounts_explain.py` (57 tests). Fixtures are a store and a history folder the test builds, with the labels and percentages of 21 October.
+`tests/test_three_accounts_explain.py` (46 tests). Fixtures are a store and a history folder the test builds, with the labels and percentages of 21 October.
 
 **What is checked on every output.** One shared check, `check_wording`, is called by every test of the file that prints an explanation (the direct, command-line and
 read-only tests included). It checks that the table comes first and unchanged, that every line of the block is one of the five sentence shapes, and that none of the
 forbidden words appears anywhere in the output **except in the four fixed footer sentences of the table**. Those four sentences were approved before this card and
 must stay byte-for-byte (the default output must not change), and one of them says "available". `WordingChecksReachEveryOutput` proves the wiring: it puts a forbidden
-word, and a sentence outside the five shapes, into the printed text in memory and asserts that the checks fail on the paths that print an explanation.
+word, and a sentence outside the five shapes, into the printed text in memory and asserts that the checks fail on every path that prints an explanation, the speed test included (the bound sentence T1 for the T1-only paths, the doubt sentence T3 for the others).
 
 The binding tests, by name:
 
@@ -96,12 +94,11 @@ The binding tests, by name:
 - the 21 October misfiled reading: `test_the_doubt_outlives_the_seven_day_note`, `test_a_later_b_reading_on_the_other_subscriptions_reset_times_does_not_end_it`,
   `test_b_is_eligible_again_only_on_its_own_friday_series`; the trusted series (`TrustedSeries`: Friday, Saturday, Friday, then Saturday again after the Friday reset;
   tied readings in both orders) and the separate `DoubtRuleItself` tests;
-- the hint (`IdentityHint`): both windows equal gives the clause; a different 5-hour reset, a missing 5-hour reading, or a missing reading of the other label gives none;
-  both sequences of the second read (an older doubtful reading, or an older trusted pair of the other label, that matched while the newest readings do not); the
-  five-minute edge (300 s agrees, 301 s does not); ties at the newest time, with agreeing and with different reset times;
+- the cut hint (`NoIdentityHint`): exactly equal reset times in both windows, a five-minute difference, and a tie at the newest instant all print the doubt sentence with no
+  "may be" and no other label named; the shape check also no longer allows the clause, so any return of it fails every test that prints a doubt sentence;
 - speed (`Speed`): three labels with a week of readings every five minutes in both windows (2,016 per window) must explain in under 3 seconds. After the fix this takes
   about 0.2 s on the build machine, so 3 s leaves room for a slow shared machine; before the fix the same week took about 160 s. The index used for the 5-hour readings
-  is also compared with the plain rule for every reading;
+  is also compared with the plain rule for every reading; the output of this test is word-checked too (the table is built before the timer, the shared check runs after it);
 - `test_the_default_output_is_byte_identical_to_the_code_before_this_change` (SHA-256 of the default output for a fixture, recorded from the code at `bd3332b`);
 - `test_nothing_is_written_to_the_history_or_the_store_folder` and `test_the_store_is_opened_read_only`;
 - `test_times_are_the_observations_own_times_to_the_minute`; the T4 tests (never suggests using a label or starting work).
@@ -111,9 +108,8 @@ The binding tests, by name:
 1. **`For <label>:` in front of T1.** The template has no label; the design's example does.
 2. **Full time stamps** (weekday, date, hour:minute UTC) everywhere, where the design's example shows only the hour.
 3. **T2 only with a T1,** using that figure's reset period.
-4. **The "may be" label.** First version: compared on the weekly reset time only. Changed after the first read: both windows; changed after the second read: the newest
-   readings of any kind of both labels (not the newest of those that passed a filter), within five minutes, with ties handled conservatively (see the rule under T3). With
-   two matches, the first label in order is named.
+4. **The "may be" hint is cut** (lead's decision, delta read 2): see under T3. It was first compared on the weekly reset time only, then on both windows, then on the newest
+   readings of any kind within five minutes; the read showed that no tolerance is right (the design wants exact equality, which almost never happens).
 5. **5-hour readings and the doubt:** judged by the label's latest weekly reading at their time.
 6. **A flag raised while the doubt is open does not start a new doubt.** (The returning reading raises a flag against the wrong readings before it.) Since the read, the
    trusted series itself decides what ends a doubt, not the flags.
@@ -123,7 +119,6 @@ The binding tests, by name:
 9. **T5 is a safety net.** Every row gets a T1, T3 or T4, so "Nothing to add to the table." does not appear in practice; it is implemented and its text is tested.
 10. **The trusted series is the label's earliest reading** (added after the read; see the known limit above), and readings sharing a time are judged together, conservatively.
 11. **An over-use figure** (stored 100 or more) gives `at most 0%` (the lead's decision after the read).
-12. **The hint's tolerance is the series rule's five minutes** (lead's decision, second read), so "the same reset times" means "within five minutes"; two newest readings
-    that share a time and disagree give no hint.
+12. **No tolerance question remains for the hint:** the clause is cut (choice 4). `SWITCH_RESET_TOLERANCE_S` stays for the series rule.
 13. **The 5-hour readings are judged through a once-built index** of the label's weekly instants (a lookup per reading instead of a scan), with the tie meaning unchanged:
     when several weekly readings share the latest time, the 5-hour reading is in doubt if any of them is.

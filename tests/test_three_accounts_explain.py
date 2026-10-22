@@ -37,7 +37,7 @@ T1 = r"If this reading and its label are right, at most %s of the %s allowance i
 T2 = r" Its readings rose from %s \(%s\) to %s \(%s\)\." % (PCT, STAMP, PCT, STAMP)
 T3_REASON = (r"(?:its weekly reset moved from %s to %s and its figure went from %s to %s"
              r"|its weekly figure fell from %s to %s within one reset period \(it resets %s\))" % (STAMP, STAMP, PCT, PCT, PCT, PCT, STAMP))
-T3 = (r"[ABC]: a possible switch was flagged on \d{4}-\d{2}-\d{2}: %s\.(?: Its newest reading has the same reset times as [ABC]'s, so it may be [ABC]'s reading under [ABC]'s label\.)?"
+T3 = (r"[ABC]: a possible switch was flagged on \d{4}-\d{2}-\d{2}: %s\."
       r" [ABC]'s readings since then are not used here until one shows [ABC]'s own reset times again\." % T3_REASON)
 T4 = r"[ABC] %s: no (?:newer )?reading has been recorded here\. A turn by a seat logged into [ABC] may supply one; check that a usable reading arrives under [ABC] before relying on it\." % WIN
 SENTENCE = re.compile(r"(?:For [ABC]: %s(?:%s)?|%s|%s|Nothing to add to the table\.)" % (T1, T2, T3, T4))
@@ -215,25 +215,18 @@ class ObservedChange(ExplainCase):
 
 
 class LabelInDoubt(ExplainCase):
-    def test_case_two_the_misfiled_reading_gets_the_doubt_sentence_and_no_bound(self):
+    def test_case_two_the_misfiled_reading_gets_the_doubt_sentence_without_a_hint_and_no_bound(self):
         self.a_readings()
         self.put(self.b_series() + self.misfiled(), receipt=at(15, 15))
         _default, lines = self.run_both(now=NOW21)
         t3 = next(line for line in lines if line.startswith("B: a possible switch"))
         self.assertIn("flagged on 2026-10-21", t3)
         self.assertIn("moved from Fri 2026-10-23 21:00 UTC to Sat 2026-10-24 01:00 UTC and its figure went from 92% to 60%", t3)
-        self.assertIn("same reset times as A's, so it may be A's reading under B's label", t3)
+        self.assertNotIn("may be", t3)                                                              # the hint is cut: the sentence names no other label
+        self.assertEqual(set(re.findall(r"\b[ABC]\b", t3)), {"B"})
         self.assertFalse(any(line.startswith("For B") for line in lines), "no bound and no change sentence for the label in doubt")
         self.assertFalse(any(line.startswith("B ") for line in lines), "and no 'cannot tell' sentence for rows that do have readings")
         self.assertTrue(any(line.startswith("For A") for line in lines))
-
-    def test_the_may_be_clause_needs_exactly_matching_reset_times(self):
-        self.a_readings()
-        shifted = self.misfiled()
-        shifted[0]["resets_at"] = SATURDAY_01 + 600
-        self.put(self.b_series() + shifted)
-        _default, lines = self.run_both(now=NOW21)
-        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
 
     def test_the_doubt_outlives_the_seven_day_note(self):
         self.a_readings()
@@ -386,114 +379,27 @@ class TrustedSeries(unittest.TestCase):
         self.assertFalse(measure.reading_eligible("five_hour", five, series, eligible))
 
 
-class IdentityHint(ExplainCase):
-    """The "may be <M>'s reading" clause needs both windows' reset times to match, checked for real."""
+class NoIdentityHint(ExplainCase):
+    """The hint "it may be <M>'s reading" is cut (decision of the lead after the second read): the doubt sentence never names another label."""
 
-    CLAUSE = "so it may be A's reading under B's label"
-
-    def fixture(self, five_resets=FIVE_1530, with_five=True):
+    def t3_for(self, five_resets=FIVE_1530, extra=()):
         self.a_readings()
-        misfiled = [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop")]
-        if with_five:
-            misfiled.append(record(label="B", window="five_hour", used=6.0, resets=five_resets, observed=at(14, 48, 58), machine="desktop"))
-        self.put(self.b_series() + misfiled)
-
-    def t3(self):
+        self.put(self.b_series() + [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop"),
+                                    record(label="B", window="five_hour", used=6.0, resets=five_resets, observed=at(14, 48, 58), machine="desktop"), *extra])
         _default, lines = self.run_both(now=NOW21)
-        return next(line for line in lines if line.startswith("B: a possible switch"))
-
-    def test_both_windows_equal_gives_the_clause(self):
-        self.fixture()
-        self.assertIn(self.CLAUSE, self.t3())
-
-    def test_the_same_weekly_but_a_different_five_hour_reset_gives_no_clause(self):
-        self.fixture(five_resets=FIVE_1530 + 600)
-        self.assertNotIn("may be", self.t3())
-
-    def test_a_missing_five_hour_reading_gives_no_clause(self):
-        self.fixture(with_five=False)
-        self.assertNotIn("may be", self.t3())
-
-    def test_the_tolerance_is_five_minutes_like_the_series_rule(self):
-        self.fixture(five_resets=FIVE_1530 + 300)
-        self.assertIn(self.CLAUSE, self.t3())
-        self.db.unlink()
-        self.readings.clear()
-        self.fixture(five_resets=FIVE_1530 + 301)
-        self.assertNotIn("may be", self.t3())
-
-    def test_an_older_doubtful_reading_that_matched_cannot_supply_the_hint_when_the_newest_five_hour_reading_differs(self):
-        """The first reviewer sequence: B's 06:00 pair matched A's, but B's newest 5-hour reading (08:00) has a different reset time."""
-        self.store(ALIAS_ONE, at(5, 0), five=800, week=4100, reset5=FIVE_1530, reset7=SATURDAY_01)
-        self.put([record(label="B", window="seven_day", used=90.0, resets=FRIDAY_21, observed=at(1, 0), machine="desktop"),
-                  record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(6, 0), machine="desktop"),
-                  record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(6, 0), machine="desktop"),
-                  record(label="B", window="five_hour", used=7.0, resets=FIVE_1530 + 3600, observed=at(8, 0), machine="desktop")])
-        _default, lines = self.run_both(now=at(9, 0))
         t3 = next(line for line in lines if line.startswith("B: a possible switch"))
         self.assertNotIn("may be", t3)
+        self.assertEqual(set(re.findall(r"\b[ABC]\b", t3)), {"B"}, "no other label is named")
+        return t3
 
-    def test_the_same_pair_with_the_newest_five_hour_reading_equal_does_give_the_hint(self):
-        self.store(ALIAS_ONE, at(5, 0), five=800, week=4100, reset5=FIVE_1530, reset7=SATURDAY_01)
-        self.put([record(label="B", window="seven_day", used=90.0, resets=FRIDAY_21, observed=at(1, 0), machine="desktop"),
-                  record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(6, 0), machine="desktop"),
-                  record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(6, 0), machine="desktop"),
-                  record(label="B", window="five_hour", used=7.0, resets=FIVE_1530, observed=at(8, 0), machine="desktop")])
-        _default, lines = self.run_both(now=at(9, 0))
-        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
+    def test_exactly_equal_reset_times_in_both_windows_still_print_no_hint(self):
+        self.t3_for()
 
-    def test_the_other_label_whose_newest_readings_became_doubtful_cannot_supply_the_hint(self):
-        """The second reviewer sequence: A's older pair matched B's, but A's newest weekly reading has a different reset time and is itself in doubt."""
-        self.a_readings()                                                                              # A: weekly Sat 01:00, 5-hour 15:30 at 10:35 (trusted)
-        self.store(ALIAS_ONE, at(15, 0), week=4200, reset7=SATURDAY_01 + 3 * HOUR)                     # A's newest weekly reading does not fit its own series
-        self.put(self.b_series() + self.misfiled())
-        _default, lines = self.run_both(now=NOW21)
-        self.assertTrue(any(line.startswith("A: a possible switch") for line in lines), lines)
-        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
+    def test_a_five_minute_difference_prints_no_hint(self):
+        self.t3_for(five_resets=FIVE_1530 + 300)
 
-    def test_two_newest_readings_with_different_reset_times_at_one_instant_give_no_hint(self):
-        self.a_readings()
-        self.put(self.b_series() + self.misfiled() + [record(label="B", window="seven_day", used=61.0, resets=SATURDAY_01 + 3 * HOUR, observed=at(14, 48, 58), machine="desktop-two")])
-        _default, lines = self.run_both(now=NOW21)
-        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
-
-    def test_two_newest_readings_with_agreeing_reset_times_at_one_instant_still_give_the_hint(self):
-        self.a_readings()
-        self.put(self.b_series() + self.misfiled() + [record(label="B", window="seven_day", used=61.0, resets=SATURDAY_01 + 100, observed=at(14, 48, 58), machine="desktop-two")])
-        _default, lines = self.run_both(now=NOW21)
-        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
-
-    def reading(self, label, window, resets, hour, used=20.0):
-        return record(label=label, window=window, resets=resets, observed=at(hour, 0), used=used, machine="desktop")
-
-    def test_reviewer_sequence_one_an_older_doubtful_reading_cannot_supply_the_hint_after_the_newest_five_hour_reading_came_back_trusted(self):
-        """B falls into doubt, its 5-hour reading of that time matches A's, B then returns to its own series (a trusted 5-hour reading with another reset),
-        and a later weekly misfit opens a second doubt: B's newest 5-hour reading is the trusted one, so nothing in doubt can be matched with A's."""
-        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
-                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 2, 60.0), self.reading("B", "five_hour", at(6, 0), 2),
-                  self.reading("B", "seven_day", FRIDAY_21, 3, 91.0), self.reading("B", "five_hour", at(8, 0), 3), self.reading("B", "seven_day", SATURDAY_01, 4, 61.0)])
-        _default, lines = self.run_both(now=at(4, 1))
-        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
-
-    def test_reviewer_sequence_two_the_other_labels_older_trusted_pair_cannot_supply_the_hint(self):
-        """A's older weekly and 5-hour readings matched B's, but A's newest ones (Friday, 09:00) are different and in doubt."""
-        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
-                  self.reading("A", "seven_day", FRIDAY_21, 3), self.reading("A", "five_hour", at(9, 0), 3),
-                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 4, 60.0), self.reading("B", "five_hour", at(6, 0), 4)])
-        _default, lines = self.run_both(now=at(4, 1))
-        self.assertNotIn("may be", next(line for line in lines if line.startswith("B: a possible switch")))
-
-    def test_the_positive_case_on_the_same_shape_still_gives_the_hint(self):
-        self.put([self.reading("A", "seven_day", SATURDAY_01, 1), self.reading("A", "five_hour", at(6, 0), 1),
-                  self.reading("B", "seven_day", FRIDAY_21, 1, 90.0), self.reading("B", "seven_day", SATURDAY_01, 4, 60.0), self.reading("B", "five_hour", at(6, 0), 4)])
-        _default, lines = self.run_both(now=at(4, 1))
-        self.assertIn(self.CLAUSE, next(line for line in lines if line.startswith("B: a possible switch")))
-
-    def test_the_other_label_must_have_both_trusted_readings_too(self):
-        self.store(ALIAS_ONE, at(10, 35), week=4100, reset7=SATURDAY_01)                              # A has no 5-hour reading to compare with
-        self.put(self.b_series() + [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop"),
-                                    record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(14, 48, 58), machine="desktop")])
-        self.assertNotIn("may be", self.t3())
+    def test_a_tie_at_the_newest_instant_prints_no_hint(self):
+        self.t3_for(extra=[record(label="B", window="seven_day", used=61.0, resets=SATURDAY_01 + 3 * HOUR, observed=at(14, 48, 58), machine="desktop-two")])
 
 
 class Speed(ExplainCase):
@@ -517,11 +423,15 @@ class Speed(ExplainCase):
         count = 2016
         self.put(self.week(count), receipt=self.WEEK_START + count * self.STEP)
         self.build_store()
+        args = (str(self.db), str(self.labels), str(self.history))
+        now = self.WEEK_START + count * self.STEP
+        default = measure.now_command(*args, now=now)                                                   # built before the timer: only the explanation is timed
         started = time.monotonic()
-        text = measure.now_command(str(self.db), str(self.labels), str(self.history), now=self.WEEK_START + count * self.STEP, explain=True)
+        text = measure.now_command(*args, now=now, explain=True)
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 3.0, "explaining a week of readings took %.1f s" % elapsed)
         self.assertIn("For A: If this reading and its label are right", text)
+        self.check_wording(default, text)
 
     def test_the_index_gives_the_same_answers_as_the_plain_rule_for_every_reading(self):
         weekly = [record(label="B", window="seven_day", used=1.0, resets=FRIDAY_21 + (SATURDAY_01 - FRIDAY_21) * (n % 2), observed=at(n // 2, 0), machine="m%d" % n) for n in range(12)]
@@ -610,25 +520,30 @@ class WordingChecksReachEveryOutput(ExplainCase):
 
     PATHS = (("Promise", "test_nothing_is_written_to_the_history_or_the_store_folder"), ("Promise", "test_the_store_is_opened_read_only"),
              ("Promise", "test_the_flag_is_wired_through_the_command_line_and_prints_no_identifier"),
-             ("LabelInDoubt", "test_case_two_the_misfiled_reading_gets_the_doubt_sentence_and_no_bound"),
-             ("UpperBound", "test_case_one_b_before_the_switch"), ("CannotTell", "test_a_label_seen_before_says_no_newer_reading"))
+             ("LabelInDoubt", "test_case_two_the_misfiled_reading_gets_the_doubt_sentence_without_a_hint_and_no_bound"),
+             ("UpperBound", "test_case_one_b_before_the_switch"), ("CannotTell", "test_a_label_seen_before_says_no_newer_reading"),
+             ("Speed", "test_a_full_week_of_five_minute_readings_in_both_windows_explains_in_under_three_seconds"))
 
-    def broken(self, text):
-        original = measure._sentence_t3
+    SENTENCE_OF = {"Promise": "_sentence_t3", "LabelInDoubt": "_sentence_t3", "UpperBound": "_sentence_t1", "Speed": "_sentence_t1", "CannotTell": "_sentence_t4"}
+
+    def broken(self, name, text):
+        """Patch one sentence builder so that it adds `text` (before its final full stop for the doubt sentence)."""
+        original = getattr(measure, name)
 
         def wrapper(*args):
-            return original(*args)[:-1] + text + "."
+            made = original(*args)
+            return made[:-1] + text + "." if name == "_sentence_t3" else made + text
 
-        return mock.patch.object(measure, "_sentence_t3", wrapper)
+        return mock.patch.object(measure, name, wrapper)
 
-    def test_a_forbidden_word_in_the_doubt_sentence_fails_every_path_that_prints_one(self):
+    def test_a_forbidden_word_fails_every_path_that_prints_a_doubt_or_a_bound_sentence(self):
         for class_name, test_name in self.PATHS:
-            if class_name == "UpperBound" or class_name == "CannotTell":
-                continue                                          # these paths print no doubt sentence; their T1 and T4 are checked below
+            if class_name == "CannotTell":
+                continue                                          # its T4 sentence is checked by the shape test below
             case = globals()[class_name](test_name)
             case.setUp()
             self.addCleanup(case._tmp.cleanup)
-            with self.broken(" available"), self.assertRaises(AssertionError) as caught:
+            with self.broken(self.SENTENCE_OF[class_name], " available"), self.assertRaises(AssertionError) as caught:
                 getattr(case, test_name)()
             self.assertIn("available", str(caught.exception), (class_name, test_name))
 
@@ -637,9 +552,7 @@ class WordingChecksReachEveryOutput(ExplainCase):
             case = globals()[class_name](test_name)
             case.setUp()
             self.addCleanup(case._tmp.cleanup)
-            patched = ("_sentence_t3" if class_name in ("Promise", "LabelInDoubt") else "_sentence_t1" if class_name == "UpperBound" else "_sentence_t4")
-            original = getattr(measure, patched)
-            with mock.patch.object(measure, patched, lambda *a, _o=original: _o(*a) + " Extra words."), self.assertRaises(AssertionError):
+            with self.broken(self.SENTENCE_OF[class_name], " Extra words"), self.assertRaises(AssertionError):
                 getattr(case, test_name)()
 
 
