@@ -30,14 +30,16 @@ another day's.
 
 1. **T1, the most that can be left.** Printed for a row whose figure may be relied on and whose reset is still ahead.
    `For A: If this reading and its label are right, at most 59% of the weekly allowance is left until Sat 2026-10-24 01:00 UTC (reading of Wed 2026-10-21 10:35 UTC).`
-   The percentage is 100 minus the stored figure, rounded **up** to one decimal, worked from the stored value (the table shows a cut figure, so it can differ by a
-   tenth). A bound on what is left is never shown smaller than it is.
+   The percentage is 100 minus the stored figure, never below 0, rounded toward plus infinity to one decimal, worked from the stored value (the table shows a cut
+   figure, so it can differ by a tenth). A bound on what is left is never shown smaller than 100 minus the stored figure; a stored figure at or above 100 (the reader
+   accepts up to 1000%) gives `at most 0%`, never a negative number.
 2. **T2, the observed change.** Added to the same line when it applies: `Its readings rose from 87% (Wed 2026-10-21 06:08 UTC) to 91% (Wed 2026-10-21 12:31 UTC).`
    It uses the oldest and the newest readings that may be relied on, of the same label, window and reset period, in the last 12 hours before the table's time; the times
    are the readings' own times. It is left out when the rise is under one point or fewer than two readings qualify. It gives no rate and no forecast.
 3. **T3, a label in doubt.**
    `B: a possible switch was flagged on 2026-10-21: its weekly reset moved from Fri 2026-10-23 21:00 UTC to Sat 2026-10-24 01:00 UTC and its figure went from 92% to 60%. Its newest reading has the same reset times as A's, so it may be A's reading under B's label. B's readings since then are not used here until one shows B's own reset times again.`
-   The "may be" sentence appears only when the label's newest weekly reset time is exactly the same as another label's newest one. It is a hint; nothing is relabelled.
+   The "may be" sentence appears only when both windows match: the reset times (weekly and 5-hour) of the label's newest readings in doubt are present and exactly
+   equal to the other label's newest readings that may be relied on. If either window is missing or differs, the sentence is left out. It is a hint; nothing is relabelled.
    A flag that was a drop of the percentage inside one reset period reads: `... its weekly figure fell from 80% to 30% within one reset period (it resets <time>).`
 4. **T4, cannot tell.** `C weekly: no reading has been recorded here. A turn by a seat logged into C may supply one; check that a usable reading arrives under C before relying on it.`
    For a label that has readings, but none newer that can be used: `A 5-hour: no newer reading has been recorded here. ...`. Printed for each row that has no figure to rely
@@ -49,19 +51,23 @@ another day's.
 
 ## The doubt rule
 
-- **It starts** at the time of any possible-switch flag on a label's weekly series, however old the flag is.
-- **It covers** the flagged reading and every later reading of that label. None of them gets a T1 or a T2.
-- **It ends** only when a later weekly reading of the label has a reset time that fits the label's own series from before the flag: the last known reset time before
-  it, or that plus a whole number of weeks (within five minutes). From then on readings on that series are used again; readings that do not fit stay out.
-- **It does not end** because time passes (the table's own 7-day note ends, the doubt does not), because a later reading came on another series (for example a second
-  reading of the other subscription's reset times under the same label), or because of anything outside the readings (a message, a changed label table).
-- **A flag raised while the doubt is open** (including the flag the returning reading raises against the wrong readings before it) does not start a new doubt and does
-  not move the series. A new wrong reading after the return starts a new doubt on the recovered series.
-- **A 5-hour reading** has no weekly series of its own, so it is judged by the label's latest weekly reading at its time: used when that one may be relied on, kept out when
-  it is in doubt.
+- **A trusted series, always.** Each label keeps one trusted weekly series: the reset time of its earliest reading, and that plus a whole number of weeks (within five
+  minutes). This holds at all times, not only while a doubt is open.
+- **It starts** when a weekly reading does not fit the trusted series, whether or not the possible-switch detector flagged it (the detector says nothing once the earlier
+  reset has passed), and at any possible-switch flag, however old the flag is.
+- **It covers** that reading and every later one of the label until it ends. None of them gets a T1 or a T2.
+- **It ends** only when a later weekly reading fits the trusted series. From then on readings on that series are used again; readings that do not fit stay out, and a new
+  one that does not fit starts a new doubt.
+- **It does not end** because time passes (the table's own 7-day note ends, the doubt does not), because a later reading came on another series, or because of anything
+  outside the readings (a message, a changed label table).
+- **A flag raised while the doubt is open** (including the flag the returning reading raises against the wrong readings before it) does not start a new doubt.
+- **Readings with the same time** are judged together, and the same way in any list order: if any of them does not fit, all of them are in doubt and that instant does not
+  end a doubt.
+- **A 5-hour reading** has no weekly series of its own, so it is judged by the label's latest weekly reading at its time (all of them, when several share that time).
 - It is the function `doubt_walk` (with `fits_series` and `reading_eligible`), tested on its own.
-- **Known limit:** if a label's machine really moves to another subscription for good, the label stays in doubt until its readings fit its old series again. The cure is
-  the label table (map the folder to the label of the subscription it now uses); until then the block says T3.
+- **Known limit:** the trusted series is the label's earliest reading in the history. If a label's machine really moves to another subscription for good, the label stays
+  in doubt until its readings fit its old series again. The cure is the label table (map the folder to the label of the subscription it now uses); until then the block
+  says T3. If the earliest reading kept were itself misfiled, the label's good readings would be the ones in doubt.
 
 ## What the block never says
 
@@ -71,24 +77,39 @@ check every output against the five sentence shapes and against a list of forbid
 
 ## Tests
 
-`tests/test_three_accounts_explain.py` (32 tests). Fixtures are a store and a history folder the test builds, with the labels and percentages of 21 October. The binding
-tests, by name:
+`tests/test_three_accounts_explain.py` (46 tests). Fixtures are a store and a history folder the test builds, with the labels and percentages of 21 October.
 
-- every printed line matches T1 to T5, and no forbidden word appears: `run_both` runs both checks on every output the file produces;
-- `test_the_bound_is_never_below_one_hundred_minus_the_stored_value_for_every_hundredth` (every hundredth from 0 to 100) and the stored-value test;
-- the misfiled reading: `test_the_doubt_outlives_the_seven_day_note`, `test_a_later_b_reading_on_the_other_subscriptions_reset_times_does_not_end_it`,
-  `test_b_is_eligible_again_only_on_its_own_friday_series`, and the separate `DoubtRuleItself` tests;
+**What is checked on every output.** One shared check, `check_wording`, is called by every test of the file that prints an explanation (the direct, command-line and
+read-only tests included). It checks that the table comes first and unchanged, that every line of the block is one of the five sentence shapes, and that none of the
+forbidden words appears anywhere in the output **except in the four fixed footer sentences of the table**. Those four sentences were approved before this card and
+must stay byte-for-byte (the default output must not change), and one of them says "available". `WordingChecksReachEveryOutput` proves the wiring: it puts a forbidden
+word, and a sentence outside the five shapes, into the printed text in memory and asserts that the checks fail on the paths that print an explanation.
+
+The binding tests, by name:
+
+- the bound: `test_the_bound_is_never_below_one_hundred_minus_the_stored_value_and_never_negative_for_every_hundredth_to_1000` (every hundredth from 0 to 1000, each
+  also matched against the T1 grammar), the over-use test, and the stored-value test;
+- the 21 October misfiled reading: `test_the_doubt_outlives_the_seven_day_note`, `test_a_later_b_reading_on_the_other_subscriptions_reset_times_does_not_end_it`,
+  `test_b_is_eligible_again_only_on_its_own_friday_series`; the trusted series (`TrustedSeries`: Friday, Saturday, Friday, then Saturday again after the Friday reset;
+  tied readings in both orders) and the separate `DoubtRuleItself` tests;
+- the hint (`IdentityHint`): both windows equal gives the clause; a different 5-hour reset, a missing 5-hour reading, or a missing reading of the other label gives none;
 - `test_the_default_output_is_byte_identical_to_the_code_before_this_change` (SHA-256 of the default output for a fixture, recorded from the code at `bd3332b`);
 - `test_nothing_is_written_to_the_history_or_the_store_folder` and `test_the_store_is_opened_read_only`;
 - `test_times_are_the_observations_own_times_to_the_minute`; the T4 tests (never suggests using a label or starting work).
 
-## Choices the design did not settle
+## Choices the design did not settle, and what the read changed
 
-1. **`For <label>:` in front of T1.** The template has no label; the design's example does, so each T1 line starts with it.
-2. **Full time stamps** (weekday, date, hour:minute) in every sentence, where the design's example shows only the hour.
-3. **T2 only with a T1.** It appears only for a row that also gets a bound (reset ahead, reading may be relied on), using that figure's reset period.
-4. **The "may be" label.** Compared on the weekly reset time only; when two other labels match, the first in order is named.
-5. **5-hour readings and the doubt** (see the rule above).
-6. **The forbidden-word test skips the four fixed footer sentences of the table**, which were approved before this card and one of which says "available"; every other
-   character of every output is checked.
-7. **No T4 for a label in doubt that has readings.** T3 explains those rows; T4 would say "no newer reading" when there is a newer, disputed one.
+1. **`For <label>:` in front of T1.** The template has no label; the design's example does.
+2. **Full time stamps** (weekday, date, hour:minute UTC) everywhere, where the design's example shows only the hour.
+3. **T2 only with a T1,** using that figure's reset period.
+4. **The "may be" label.** First version: compared on the weekly reset time only. Changed after the read: both windows (weekly and 5-hour) must match the other label's newest
+   trusted readings; with two matches, the first in order is named.
+5. **5-hour readings and the doubt:** judged by the label's latest weekly reading at their time.
+6. **A flag raised while the doubt is open does not start a new doubt.** (The returning reading raises a flag against the wrong readings before it.) Since the read, the
+   trusted series itself decides what ends a doubt, not the flags.
+7. **No T4 for a label in doubt that has readings:** T3 speaks for those rows.
+8. **The forbidden-word check skips the four fixed footer sentences of the table** (one of them says "available"); every other character of every output is checked.
+   Changing that footer would be a separate wording card.
+9. **T5 is a safety net.** Every row gets a T1, T3 or T4, so "Nothing to add to the table." does not appear in practice; it is implemented and its text is tested.
+10. **The trusted series is the label's earliest reading** (added after the read; see the known limit above), and readings sharing a time are judged together, conservatively.
+11. **An over-use figure** (stored 100 or more) gives `at most 0%` (the lead's decision after the read).

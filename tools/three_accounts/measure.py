@@ -372,42 +372,59 @@ def fits_series(resets_at, anchor):
 
 
 def doubt_walk(label, weekly):
-    """Walk a label's weekly readings (sorted by time) and decide which ones may be relied on.
+    """Walk a label's weekly readings and decide which ones may be relied on.
 
-    -> (eligible, episode): `eligible[i]` is False for a reading that is in doubt; `episode` describes the doubt still open after the last reading, or is None.
-    A doubt starts at any possible-switch flag, whatever its age; the flagged reading and every later one are in doubt. It ends only when a later reading
-    has a weekly reset time that fits the label's own series from before the flag (the last reset time before it, or that plus whole weeks). Time passing,
-    another label's readings, and anything outside the readings never end it. A flag raised while the doubt is open (including the one raised by the
-    returning reading itself) does not start a new doubt or move the series.
+    -> (eligible, episode): `eligible[i]` is False for a reading that is in doubt (aligned with `weekly`, whatever its order); `episode` describes the doubt
+    still open after the last reading, or is None.
+    The label keeps one trusted weekly series at all times: the reset time of its earliest reading, and that plus whole weeks. A reading that does not fit it
+    opens a doubt, whether or not the possible-switch detector flagged it; so does any possible-switch flag (the flagged reading and every later one are in
+    doubt, however old the flag is). A doubt ends only when a later reading fits the trusted series. Time passing, another label's readings, and anything outside
+    the readings never end it. A flag raised while a doubt is open (including the one raised by the returning reading itself) does not start a new doubt.
+    Readings with the same time are judged together and conservatively: if any of them misfits, none of them ends a doubt, and all of them are in doubt.
     """
-    raised = {id(later): (flag, earlier) for flag, earlier, later in flag_pairs(label, weekly)}
-    eligible, episode = [], None
-    for rec in weekly:
-        if episode is None:
-            if id(rec) in raised:
-                flag, earlier = raised[id(rec)]
-                episode = {"flag": flag, "anchor": earlier["resets_at"], "earlier": earlier, "later": rec}
-                eligible.append(False)
-            else:
-                eligible.append(True)
-        elif fits_series(rec["resets_at"], episode["anchor"]):
-            episode = None
-            eligible.append(True)
+    ordered = sorted(weekly, key=lambda r: (r["observed_at"], r["machine"], r["resets_at"], r["used_percent"]))
+    raised = {id(later): (flag, earlier) for flag, earlier, later in flag_pairs(label, ordered)}
+    groups = []
+    for rec in ordered:
+        if groups and groups[-1][0]["observed_at"] == rec["observed_at"]:
+            groups[-1].append(rec)
         else:
-            eligible.append(False)
-    return eligible, episode
+            groups.append([rec])
+    anchor = min(r["resets_at"] for r in groups[0]) if groups else None
+    verdict, episode, previous = {}, None, None
+    for group in groups:
+        misfits = [r for r in group if not fits_series(r["resets_at"], anchor)]
+        flagged = [r for r in group if id(r) in raised]
+        if episode is None and (misfits or flagged):
+            if flagged:
+                flag, earlier = raised[id(flagged[0])]
+                later = flagged[0]
+            else:
+                later = misfits[0]
+                earlier = previous if previous is not None else next(r for r in group if r not in misfits)
+                flag = {"label": label, "kind": "possible switch", "reason": "weekly reset time changed before the earlier one passed",
+                        "at": later["observed_at"], "moved_s": abs(later["resets_at"] - earlier["resets_at"])}
+            episode = {"flag": flag, "anchor": anchor, "earlier": earlier, "later": later}
+            good = False
+        elif episode is not None and not misfits:
+            episode, good = None, True
+        else:
+            good = episode is None
+        for rec in group:
+            verdict[id(rec)] = good
+        previous = group[-1]
+    return [verdict[id(r)] for r in weekly], episode
 
 
 def reading_eligible(window, rec, weekly, eligible):
-    """A weekly reading is eligible as `doubt_walk` says. A 5-hour reading has no weekly series of its own, so it follows the label's latest weekly reading at its time."""
+    """A weekly reading is eligible as `doubt_walk` says. A 5-hour reading has no weekly series of its own, so it follows the label's latest weekly reading at
+    its time (all of them, when several share that time)."""
     if window == WEEKLY:
-        return eligible[weekly.index(rec)]
-    state = True
-    for other, ok in zip(weekly, eligible, strict=True):
-        if other["observed_at"] > rec["observed_at"]:
-            break
-        state = ok
-    return state
+        return next(ok for other, ok in zip(weekly, eligible, strict=True) if other is rec)
+    instants = [other["observed_at"] for other in weekly if other["observed_at"] <= rec["observed_at"]]
+    if not instants:
+        return True
+    return all(ok for other, ok in zip(weekly, eligible, strict=True) if other["observed_at"] == max(instants))
 
 
 def _stamp(epoch):
@@ -419,8 +436,9 @@ def _window_name(window):
 
 
 def _left_text(used):
-    """100 minus the stored percentage, rounded UP to one decimal: a bound on what is left is never shown smaller than it is."""
-    left = (decimal.Decimal(100) - decimal.Decimal(str(used))).quantize(decimal.Decimal("0.1"), rounding=decimal.ROUND_UP)
+    """100 minus the stored percentage, never below 0, rounded toward plus infinity to one decimal: a bound on what is left is never shown smaller than
+    100 minus the stored figure, and an over-use figure (the reader accepts up to 1000%) gives 0, never a negative number."""
+    left = max(decimal.Decimal(0), decimal.Decimal(100) - decimal.Decimal(str(used))).quantize(decimal.Decimal("0.1"), rounding=decimal.ROUND_CEILING)
     return format(left, "f").rstrip("0").rstrip(".") + "%"
 
 
@@ -437,7 +455,7 @@ def _sentence_t2(rec, window, history, now, eligible_ids):
                                                           _percent_text(same[-1]["used_percent"]), _stamp(same[-1]["observed_at"]))
 
 
-def _sentence_t3(label, episode, weekly, other_newest):
+def _sentence_t3(label, episode, same_as):
     flag, earlier, later = episode["flag"], episode["earlier"], episode["later"]
     if "moved_s" in flag:
         reason = "its weekly reset moved from %s to %s and its figure went from %s to %s" % (
@@ -446,9 +464,8 @@ def _sentence_t3(label, episode, weekly, other_newest):
         reason = "its weekly figure fell from %s to %s within one reset period (it resets %s)" % (
             _percent_text(earlier["used_percent"]), _percent_text(later["used_percent"]), _stamp(later["resets_at"]))
     text = "%s: a possible switch was flagged on %s: %s." % (label, datetime.datetime.fromtimestamp(flag["at"], datetime.timezone.utc).strftime("%Y-%m-%d"), reason)
-    same_as = [other for other, resets in other_newest if other != label and resets == weekly[-1]["resets_at"]]
     if same_as:
-        text += " Its newest reading has the same reset times as %s's, so it may be %s's reading under %s's label." % (same_as[0], same_as[0], label)
+        text += " Its newest reading has the same reset times as %s's, so it may be %s's reading under %s's label." % (same_as, same_as, label)
     return text + " %s's readings since then are not used here until one shows %s's own reset times again." % (label, label)
 
 
@@ -464,20 +481,37 @@ def explain_block(grouped, now):
     """-> the lines of the explanations block. Order: by label (A, B, C); for each, the doubt sentence (T3) first, then the 5-hour and the weekly window
     (T1 with T2 after it when the reading may be relied on, otherwise T4). T5 stands alone when nothing else applies. Nothing else is ever printed."""
     seen = {key: [r for r in recs if r["observed_at"] <= now] for key, recs in grouped.items()}
-    walks = {label: doubt_walk(label, seen.get((label, WEEKLY), [])) for label in ec.LABELS}
-    newest_weekly = [(label, seen[(label, WEEKLY)][-1]["resets_at"]) for label in sorted(ec.LABELS) if seen.get((label, WEEKLY))]
+    labels = sorted(ec.LABELS)
+    walks = {label: doubt_walk(label, seen.get((label, WEEKLY), [])) for label in labels}
+    ok_ids = {label: {id(r) for window in ec.WINDOWS for r in seen.get((label, window), [])
+                      if reading_eligible(window, r, seen.get((label, WEEKLY), []), walks[label][0])} for label in labels}
+
+    def newest(label, window, trusted):
+        found = [r for r in seen.get((label, window), []) if (id(r) in ok_ids[label]) == trusted]
+        return found[-1] if found else None
+
+    def looks_like(label):
+        """The other label whose newest trusted readings have exactly the reset times (weekly and 5-hour) of this label's newest doubtful ones, or None."""
+        mine = [newest(label, window, False) for window in ec.WINDOWS]
+        if None in mine:
+            return None
+        for other in labels:
+            theirs = [newest(other, window, True) for window in ec.WINDOWS]
+            if other != label and None not in theirs and all(a["resets_at"] == b["resets_at"] for a, b in zip(mine, theirs, strict=True)):
+                return other
+        return None
+
     lines = []
-    for label in sorted(ec.LABELS):
-        weekly, (eligible, episode) = seen.get((label, WEEKLY), []), walks[label]
+    for label in labels:
+        episode = walks[label][1]
         never_seen = not any(seen.get((label, window)) for window in ec.WINDOWS)
         if episode is not None:
-            lines.append(_sentence_t3(label, episode, weekly, newest_weekly))
-        ok_ids = {id(r) for window in ec.WINDOWS for r in seen.get((label, window), []) if reading_eligible(window, r, weekly, eligible)}
+            lines.append(_sentence_t3(label, episode, looks_like(label)))
         for window in ec.WINDOWS:
             history = seen.get((label, window), [])
             kind, rec = classify(history, now) if history else ("unknown", None)
-            if kind != "unknown" and id(rec) in ok_ids:
-                lines.append("For %s: %s%s" % (label, _sentence_t1(rec, window), _sentence_t2(rec, window, history, now, ok_ids)))
+            if kind != "unknown" and id(rec) in ok_ids[label]:
+                lines.append("For %s: %s%s" % (label, _sentence_t1(rec, window), _sentence_t2(rec, window, history, now, ok_ids[label])))
             elif episode is None or not history:
                 lines.append(_sentence_t4(label, window, never_seen))
     return lines or [NOTHING_TO_ADD]

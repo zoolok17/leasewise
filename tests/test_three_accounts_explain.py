@@ -4,7 +4,6 @@ import contextlib
 import decimal
 import hashlib
 import io
-import json
 import re
 import sys
 import unittest
@@ -14,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_three_accounts_measure import record  # noqa: E402
-from test_three_accounts_now import ALIAS_ONE, ALIAS_TWO, DAY, HOUR, NowCase, measure  # noqa: E402
+from test_three_accounts_now import ALIAS_ONE, ALIAS_TWO, DAY, HOUR, NOW, NowCase, measure  # noqa: E402
 
 D = calendar.timegm((2026, 10, 21, 0, 0, 0))                   # Wednesday 21 October 2026, 00:00 UTC
 FRIDAY_21 = calendar.timegm((2026, 10, 23, 21, 0, 0))          # B's own weekly reset, Fri 21:00 UTC
@@ -50,25 +49,44 @@ def explanations(output, default_output):
 
 
 class ExplainCase(NowCase):
-    def run_both(self, **kwargs):
-        """-> (default output, explain output); every sentence of the block is checked against T1-T5 and the forbidden words here, for every test."""
+    def explain_via(self, how="direct", incomplete=(), now=None):
+        """-> (default output, explain output), by calling `now_command` or by running the command line; both read the same fixtures."""
         if self.db.exists():
             self.db.unlink()
         self.build_store()
+        when = NOW if now is None else now
         args = (str(self.db), str(self.labels), str(self.history))
-        default = measure.now_command(*args, **kwargs)
-        explained = measure.now_command(*args, explain=True, **kwargs)
+        default = measure.now_command(*args, incomplete, now=when)
+        if how == "direct":
+            return default, measure.now_command(*args, incomplete, now=when, explain=True)
+        argv = ["now", "--db", args[0], "--labels", args[1], "--history", args[2], "--now", str(when), "--explain"]
+        for label in incomplete:
+            argv += ["--incomplete-coverage", label]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = measure.main(argv)
+        self.assertEqual((code, stderr.getvalue()), (0, ""))
+        return default, stdout.getvalue().rstrip("\n")
+
+    def check_wording(self, default, explained):
+        """THE shared check on every explanation output (every test of this file that prints one calls it): the table comes first and unchanged, every line of the
+        block is one of the five sentences, and no forbidden word appears anywhere in the output apart from the four fixed footer sentences of the table, which
+        were approved before this card and must stay byte-for-byte (one of them says "available"). -> the lines of the block."""
         lines = explanations(explained, default)
         self.assertTrue(lines and all(lines), "the block has sentences, one per line, no blank line")
         for line in lines:
             self.assertRegex(line, "^" + SENTENCE.pattern + "$", line)
-        # the four fixed footer sentences of the table are approved text from before this card (one of them says "available"); everything else is checked
         checked = explained
         for fixed in measure.NOW_FOOTER:
             checked = checked.replace(fixed, "")
         for word in FORBIDDEN:
             self.assertIsNone(re.search(r"\b%s\b" % re.escape(word), checked, re.IGNORECASE), word)
-        return default, lines
+        return lines
+
+    def run_both(self, how="direct", incomplete=(), **kwargs):
+        """-> (default output, lines of the block), after the shared check."""
+        default, explained = self.explain_via(how, incomplete, **kwargs)
+        return default, self.check_wording(default, explained)
 
     def b_series(self):
         """B's own weekly readings of 21 October, all resetting Friday 21:00 UTC."""
@@ -124,13 +142,26 @@ class UpperBound(ExplainCase):
         self.assertIn("For A: If this reading and its label are right, at most 59% of the weekly allowance is left until Sat 2026-10-24 01:00 UTC "
                       "(reading of Wed 2026-10-21 10:35 UTC).", lines)
 
-    def test_the_bound_is_never_below_one_hundred_minus_the_stored_value_for_every_hundredth(self):
-        for hundredths in range(0, 10001, 1):
+    def test_the_bound_is_never_below_one_hundred_minus_the_stored_value_and_never_negative_for_every_hundredth_to_1000(self):
+        t1 = re.compile("^" + T1 + "$")
+        for hundredths in range(0, 100001):
             used = hundredths / 100
             text = measure._left_text(used)
             shown = decimal.Decimal(text.rstrip("%"))
-            self.assertGreaterEqual(shown, decimal.Decimal(100) - decimal.Decimal(str(used)), used)
-            self.assertLess(shown - (decimal.Decimal(100) - decimal.Decimal(str(used))), decimal.Decimal("0.1"), used)       # and no looser than one decimal
+            exact = decimal.Decimal(100) - decimal.Decimal(str(used))
+            self.assertGreaterEqual(shown, exact, used)
+            self.assertGreaterEqual(shown, 0, used)
+            self.assertNotIn("-", text, used)
+            self.assertLess(shown - max(exact, decimal.Decimal(0)), decimal.Decimal("0.1"), used)                    # and no looser than one decimal
+            self.assertRegex(measure._sentence_t1(record(window="seven_day", used=used, resets=SATURDAY_01, observed=at(10, 0)), "seven_day"), t1)
+
+    def test_an_over_use_figure_gives_a_bound_of_zero_in_the_real_output(self):
+        for stored_bps in (10004, 10000, 99999):
+            self.readings.clear()
+            self.store(ALIAS_ONE, at(15, 15), week=stored_bps, reset7=SATURDAY_01)
+            self.put([])
+            _default, lines = self.run_both(now=NOW21)
+            self.assertTrue(any("at most 0% of the weekly allowance" in line for line in lines), (stored_bps, lines))
 
     def test_the_bound_comes_from_the_stored_value_not_the_cut_figure_of_the_table(self):
         self.store(ALIAS_ONE, at(15, 15), week=int(8764), reset7=SATURDAY_01)                 # stored 87.64%: the table shows 87.6%, the bound is 12.4%
@@ -290,6 +321,105 @@ class DoubtRuleItself(unittest.TestCase):
         self.assertEqual(verdicts, [True, False, True])
 
 
+class TrustedSeries(unittest.TestCase):
+    """The label keeps its own weekly series for good, not only while a doubt is open."""
+
+    def weekly(self, *readings):
+        return [record(label="B", window="seven_day", used=used, resets=resets, observed=observed, machine="desktop") for used, resets, observed in readings]
+
+    def test_friday_saturday_friday_then_saturday_again_after_the_friday_reset_is_ineligible(self):
+        after_reset = FRIDAY_21 + 3600
+        series = self.weekly((90, FRIDAY_21, at(1, 0)), (60, SATURDAY_01, at(2, 0)), (91, FRIDAY_21, at(3, 0)), (5, SATURDAY_01, after_reset))
+        eligible, episode = measure.doubt_walk("B", series)
+        self.assertEqual(eligible, [True, False, True, False])
+        self.assertIsNotNone(episode)
+        self.assertEqual(episode["anchor"], FRIDAY_21)
+
+    def test_that_end_to_end_prints_the_doubt_sentence_and_no_bound(self):
+        case = ExplainCase("run_both")
+        case.setUp()
+        self.addCleanup(case._tmp.cleanup)
+        after_reset = FRIDAY_21 + 3600
+        case.put([record(label="B", window="seven_day", used=u, resets=r, observed=o, machine="desktop") for u, r, o in
+                  ((90, FRIDAY_21, at(1, 0)), (60, SATURDAY_01, at(2, 0)), (91, FRIDAY_21, at(3, 0)), (5, SATURDAY_01, after_reset))], receipt=after_reset - 60)
+        _default, lines = case.run_both(now=after_reset + 600)
+        self.assertTrue(any(line.startswith("B: a possible switch") for line in lines), lines)
+        self.assertFalse(any(line.startswith("For B") for line in lines), lines)
+
+    def test_a_reset_that_moves_without_any_flag_still_opens_a_doubt(self):
+        series = self.weekly((90, FRIDAY_21, at(1, 0)), (91, FRIDAY_21 + 1800, at(2, 0)))              # the earlier reset had not passed, but 30 minutes apart is a flag anyway
+        eligible, _episode = measure.doubt_walk("B", series)
+        self.assertEqual(eligible, [True, False])
+        late = self.weekly((90, FRIDAY_21, at(1, 0)), (3, SATURDAY_01, FRIDAY_21 + 600))                # after the earlier reset: the detector says nothing, the series does
+        self.assertEqual(measure.flag_pairs("B", late), [])
+        self.assertEqual(measure.doubt_walk("B", late)[0], [True, False])
+
+    def test_readings_with_the_same_time_give_the_same_result_in_any_order(self):
+        fit = (91, FRIDAY_21, at(3, 0))
+        misfit = (60, SATURDAY_01, at(3, 0))
+        for series in (self.weekly((90, FRIDAY_21, at(1, 0)), fit, misfit), self.weekly((90, FRIDAY_21, at(1, 0)), misfit, fit)):
+            eligible, episode = measure.doubt_walk("B", series)
+            self.assertEqual(eligible[0], True)
+            self.assertEqual(eligible[1:], [False, False], "a tied misfit puts the whole instant in doubt")
+            self.assertIsNotNone(episode)
+
+    def test_a_tied_misfit_does_not_end_an_open_doubt_in_either_order(self):
+        for order in (0, 1):
+            tied = [(91, FRIDAY_21, at(4, 0)), (60, SATURDAY_01, at(4, 0))]
+            tied = tied if order == 0 else tied[::-1]
+            series = self.weekly((90, FRIDAY_21, at(1, 0)), (60, SATURDAY_01, at(2, 0)), *tied, (92, FRIDAY_21, at(5, 0)))
+            eligible, episode = measure.doubt_walk("B", series)
+            self.assertEqual(eligible, [True, False, False, False, True], order)
+            self.assertIsNone(episode)
+
+    def test_a_reading_list_in_another_order_gives_the_same_verdicts_per_reading(self):
+        series = self.weekly((90, FRIDAY_21, at(1, 0)), (60, SATURDAY_01, at(2, 0)), (91, FRIDAY_21, at(3, 0)))
+        forward, _ = measure.doubt_walk("B", series)
+        backward, _ = measure.doubt_walk("B", series[::-1])
+        self.assertEqual(forward, backward[::-1])
+
+    def test_a_five_hour_reading_at_a_tied_instant_is_in_doubt_if_any_weekly_reading_there_is(self):
+        series = self.weekly((90, FRIDAY_21, at(1, 0)), (91, FRIDAY_21, at(3, 0)), (60, SATURDAY_01, at(3, 0)))
+        eligible, _ = measure.doubt_walk("B", series)
+        five = record(label="B", window="five_hour", observed=at(3, 0))
+        self.assertFalse(measure.reading_eligible("five_hour", five, series, eligible))
+
+
+class IdentityHint(ExplainCase):
+    """The "may be <M>'s reading" clause needs both windows' reset times to match, checked for real."""
+
+    CLAUSE = "so it may be A's reading under B's label"
+
+    def fixture(self, five_resets=FIVE_1530, with_five=True):
+        self.a_readings()
+        misfiled = [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop")]
+        if with_five:
+            misfiled.append(record(label="B", window="five_hour", used=6.0, resets=five_resets, observed=at(14, 48, 58), machine="desktop"))
+        self.put(self.b_series() + misfiled)
+
+    def t3(self):
+        _default, lines = self.run_both(now=NOW21)
+        return next(line for line in lines if line.startswith("B: a possible switch"))
+
+    def test_both_windows_equal_gives_the_clause(self):
+        self.fixture()
+        self.assertIn(self.CLAUSE, self.t3())
+
+    def test_the_same_weekly_but_a_different_five_hour_reset_gives_no_clause(self):
+        self.fixture(five_resets=FIVE_1530 + 60)
+        self.assertNotIn("may be", self.t3())
+
+    def test_a_missing_five_hour_reading_gives_no_clause(self):
+        self.fixture(with_five=False)
+        self.assertNotIn("may be", self.t3())
+
+    def test_the_other_label_must_have_both_trusted_readings_too(self):
+        self.store(ALIAS_ONE, at(10, 35), week=4100, reset7=SATURDAY_01)                              # A has no 5-hour reading to compare with
+        self.put(self.b_series() + [record(label="B", window="seven_day", used=60.0, resets=SATURDAY_01, observed=at(14, 48, 58), machine="desktop"),
+                                    record(label="B", window="five_hour", used=6.0, resets=FIVE_1530, observed=at(14, 48, 58), machine="desktop")])
+        self.assertNotIn("may be", self.t3())
+
+
 class CannotTell(ExplainCase):
     def test_c_and_every_row_without_a_usable_figure_get_the_cannot_tell_sentence(self):
         self.put([])
@@ -329,7 +459,8 @@ class Promise(ExplainCase):
         self.rich()
         self.build_store()
         before = self.snapshot()
-        measure.now_command(str(self.db), str(self.labels), str(self.history), ("A",), now=NOW21, explain=True)
+        default, explained = self.explain_via("direct", ("A",), NOW21)
+        self.check_wording(default, explained)
         self.assertEqual(self.snapshot(), before)
 
     def test_the_store_is_opened_read_only(self):
@@ -343,22 +474,57 @@ class Promise(ExplainCase):
             return real(target, *args, **kwargs)
 
         with mock.patch.object(measure.sqlite3, "connect", spy):
-            measure.now_command(str(self.db), str(self.labels), str(self.history), now=NOW21, explain=True)
-        self.assertEqual(len(uris), 1)
-        self.assertTrue(uris[0].endswith("?mode=ro"))
+            default, explained = self.explain_via("direct", (), NOW21)
+        self.check_wording(default, explained)
+        readers = [uri for uri in uris if str(uri).startswith("file:")]                                 # the fixture's own builder opens a plain path, not a URI
+        self.assertEqual(len(readers), 2)                                                               # the default table and the explained one, one connection each
+        self.assertTrue(all(uri.endswith("?mode=ro") for uri in readers))
 
     def test_the_flag_is_wired_through_the_command_line_and_prints_no_identifier(self):
         self.rich()
-        self.build_store()
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = measure.main(["now", "--db", str(self.db), "--labels", str(self.labels), "--history", str(self.history), "--now", str(NOW21), "--explain"])
-        self.assertEqual(code, 0)
-        shown = stdout.getvalue()
+        default, shown = self.explain_via("cli", ("A",), NOW21)
+        self.check_wording(default, shown)
         self.assertIn("a possible switch was flagged on", shown)
         for private in (ALIAS_ONE, ALIAS_TWO, str(self.tmp), self.tmp.name, "@", "home-", "\\"):
-            self.assertNotIn(private, shown + stderr.getvalue())
-        self.assertEqual(json.dumps(stderr.getvalue()), '""')
+            self.assertNotIn(private, shown)
+
+
+class WordingChecksReachEveryOutput(ExplainCase):
+    """The shared check must really fail when a sentence goes wrong, on every path that prints an explanation."""
+
+    PATHS = (("Promise", "test_nothing_is_written_to_the_history_or_the_store_folder"), ("Promise", "test_the_store_is_opened_read_only"),
+             ("Promise", "test_the_flag_is_wired_through_the_command_line_and_prints_no_identifier"),
+             ("LabelInDoubt", "test_case_two_the_misfiled_reading_gets_the_doubt_sentence_and_no_bound"),
+             ("UpperBound", "test_case_one_b_before_the_switch"), ("CannotTell", "test_a_label_seen_before_says_no_newer_reading"))
+
+    def broken(self, text):
+        original = measure._sentence_t3
+
+        def wrapper(*args):
+            return original(*args)[:-1] + text + "."
+
+        return mock.patch.object(measure, "_sentence_t3", wrapper)
+
+    def test_a_forbidden_word_in_the_doubt_sentence_fails_every_path_that_prints_one(self):
+        for class_name, test_name in self.PATHS:
+            if class_name == "UpperBound" or class_name == "CannotTell":
+                continue                                          # these paths print no doubt sentence; their T1 and T4 are checked below
+            case = globals()[class_name](test_name)
+            case.setUp()
+            self.addCleanup(case._tmp.cleanup)
+            with self.broken(" available"), self.assertRaises(AssertionError) as caught:
+                getattr(case, test_name)()
+            self.assertIn("available", str(caught.exception), (class_name, test_name))
+
+    def test_a_sentence_outside_the_five_shapes_fails_every_path_that_prints_one(self):
+        for class_name, test_name in self.PATHS:
+            case = globals()[class_name](test_name)
+            case.setUp()
+            self.addCleanup(case._tmp.cleanup)
+            patched = ("_sentence_t3" if class_name in ("Promise", "LabelInDoubt") else "_sentence_t1" if class_name == "UpperBound" else "_sentence_t4")
+            original = getattr(measure, patched)
+            with mock.patch.object(measure, patched, lambda *a, _o=original: _o(*a) + " Extra words."), self.assertRaises(AssertionError):
+                getattr(case, test_name)()
 
 
 if __name__ == "__main__":
