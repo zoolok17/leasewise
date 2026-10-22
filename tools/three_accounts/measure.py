@@ -49,6 +49,9 @@ DESKTOP_MACHINE = "desktop"            # the machine name the desktop's export c
 DESKTOP_LATE_S = 900                   # a copy older than 15 minutes is "late" (design section 2): three missed 5-minute copies
 COPY_CLOCK_SKEW_S = 60                 # a copy time up to a minute ahead is clock drift between machines; more than that is a clock problem worth saying
 SWITCH_LOOKBACK_S = 7 * 86400          # the table shows a possible switch only if it happened in the last 7 days
+WEEK_S = 7 * 86400                     # a weekly allowance resets every 7 days, so a label's own reset times repeat in whole weeks
+EXPLAIN_LOOKBACK_S = 12 * 3600         # the observed change (T2) looks at the last 12 hours only
+EXPLAIN_MIN_RISE = 1.0                 # a rise under one point is within the rounding of a stored percentage, so it is not reported
 LOCK_NAME = ".collect.lock"            # exactly one collector writes a history folder
 
 
@@ -359,7 +362,128 @@ def desktop_copy_line(history_dir, now):
     return "desktop copy %d min old" % (age // 60)
 
 
-def now_command(db_path, labels_path, history_dir, incomplete=(), now=None):
+# ---------------------------------------------------------------- explanations (--explain)
+# Only five fixed sentences are ever printed here (T1 to T5 of docs/DESIGN-STEP3-EXPLANATIONS.md); the words allowed are fixed by the tests.
+
+def fits_series(resets_at, anchor):
+    """True when `resets_at` is the label's own weekly reset time `anchor`, or that plus a whole number of weeks (within the switch tolerance)."""
+    weeks = round((resets_at - anchor) / WEEK_S)
+    return weeks >= 0 and abs(resets_at - anchor - weeks * WEEK_S) <= SWITCH_RESET_TOLERANCE_S
+
+
+def doubt_walk(label, weekly):
+    """Walk a label's weekly readings (sorted by time) and decide which ones may be relied on.
+
+    -> (eligible, episode): `eligible[i]` is False for a reading that is in doubt; `episode` describes the doubt still open after the last reading, or is None.
+    A doubt starts at any possible-switch flag, whatever its age; the flagged reading and every later one are in doubt. It ends only when a later reading
+    has a weekly reset time that fits the label's own series from before the flag (the last reset time before it, or that plus whole weeks). Time passing,
+    another label's readings, and anything outside the readings never end it. A flag raised while the doubt is open (including the one raised by the
+    returning reading itself) does not start a new doubt or move the series.
+    """
+    raised = {id(later): (flag, earlier) for flag, earlier, later in flag_pairs(label, weekly)}
+    eligible, episode = [], None
+    for rec in weekly:
+        if episode is None:
+            if id(rec) in raised:
+                flag, earlier = raised[id(rec)]
+                episode = {"flag": flag, "anchor": earlier["resets_at"], "earlier": earlier, "later": rec}
+                eligible.append(False)
+            else:
+                eligible.append(True)
+        elif fits_series(rec["resets_at"], episode["anchor"]):
+            episode = None
+            eligible.append(True)
+        else:
+            eligible.append(False)
+    return eligible, episode
+
+
+def reading_eligible(window, rec, weekly, eligible):
+    """A weekly reading is eligible as `doubt_walk` says. A 5-hour reading has no weekly series of its own, so it follows the label's latest weekly reading at its time."""
+    if window == WEEKLY:
+        return eligible[weekly.index(rec)]
+    state = True
+    for other, ok in zip(weekly, eligible, strict=True):
+        if other["observed_at"] > rec["observed_at"]:
+            break
+        state = ok
+    return state
+
+
+def _stamp(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%a %Y-%m-%d %H:%M UTC")
+
+
+def _window_name(window):
+    return "weekly" if window == WEEKLY else "5-hour"
+
+
+def _left_text(used):
+    """100 minus the stored percentage, rounded UP to one decimal: a bound on what is left is never shown smaller than it is."""
+    left = (decimal.Decimal(100) - decimal.Decimal(str(used))).quantize(decimal.Decimal("0.1"), rounding=decimal.ROUND_UP)
+    return format(left, "f").rstrip("0").rstrip(".") + "%"
+
+
+def _sentence_t1(rec, window):
+    return "If this reading and its label are right, at most %s of the %s allowance is left until %s (reading of %s)." % (
+        _left_text(rec["used_percent"]), _window_name(window), _stamp(rec["resets_at"]), _stamp(rec["observed_at"]))
+
+
+def _sentence_t2(rec, window, history, now, eligible_ids):
+    same = [r for r in history if id(r) in eligible_ids and r["resets_at"] == rec["resets_at"] and now - EXPLAIN_LOOKBACK_S <= r["observed_at"] <= now]
+    if len(same) < 2 or same[-1]["used_percent"] - same[0]["used_percent"] < EXPLAIN_MIN_RISE:
+        return ""
+    return " Its readings rose from %s (%s) to %s (%s)." % (_percent_text(same[0]["used_percent"]), _stamp(same[0]["observed_at"]),
+                                                          _percent_text(same[-1]["used_percent"]), _stamp(same[-1]["observed_at"]))
+
+
+def _sentence_t3(label, episode, weekly, other_newest):
+    flag, earlier, later = episode["flag"], episode["earlier"], episode["later"]
+    if "moved_s" in flag:
+        reason = "its weekly reset moved from %s to %s and its figure went from %s to %s" % (
+            _stamp(earlier["resets_at"]), _stamp(later["resets_at"]), _percent_text(earlier["used_percent"]), _percent_text(later["used_percent"]))
+    else:
+        reason = "its weekly figure fell from %s to %s within one reset period (it resets %s)" % (
+            _percent_text(earlier["used_percent"]), _percent_text(later["used_percent"]), _stamp(later["resets_at"]))
+    text = "%s: a possible switch was flagged on %s: %s." % (label, datetime.datetime.fromtimestamp(flag["at"], datetime.timezone.utc).strftime("%Y-%m-%d"), reason)
+    same_as = [other for other, resets in other_newest if other != label and resets == weekly[-1]["resets_at"]]
+    if same_as:
+        text += " Its newest reading has the same reset times as %s's, so it may be %s's reading under %s's label." % (same_as[0], same_as[0], label)
+    return text + " %s's readings since then are not used here until one shows %s's own reset times again." % (label, label)
+
+
+def _sentence_t4(label, window, never_seen):
+    return "%s %s: no %sreading has been recorded here. A turn by a seat logged into %s may supply one; check that a usable reading arrives under %s before relying on it." % (
+        label, _window_name(window), "" if never_seen else "newer ", label, label)
+
+
+NOTHING_TO_ADD = "Nothing to add to the table."
+
+
+def explain_block(grouped, now):
+    """-> the lines of the explanations block. Order: by label (A, B, C); for each, the doubt sentence (T3) first, then the 5-hour and the weekly window
+    (T1 with T2 after it when the reading may be relied on, otherwise T4). T5 stands alone when nothing else applies. Nothing else is ever printed."""
+    seen = {key: [r for r in recs if r["observed_at"] <= now] for key, recs in grouped.items()}
+    walks = {label: doubt_walk(label, seen.get((label, WEEKLY), [])) for label in ec.LABELS}
+    newest_weekly = [(label, seen[(label, WEEKLY)][-1]["resets_at"]) for label in sorted(ec.LABELS) if seen.get((label, WEEKLY))]
+    lines = []
+    for label in sorted(ec.LABELS):
+        weekly, (eligible, episode) = seen.get((label, WEEKLY), []), walks[label]
+        never_seen = not any(seen.get((label, window)) for window in ec.WINDOWS)
+        if episode is not None:
+            lines.append(_sentence_t3(label, episode, weekly, newest_weekly))
+        ok_ids = {id(r) for window in ec.WINDOWS for r in seen.get((label, window), []) if reading_eligible(window, r, weekly, eligible)}
+        for window in ec.WINDOWS:
+            history = seen.get((label, window), [])
+            kind, rec = classify(history, now) if history else ("unknown", None)
+            if kind != "unknown" and id(rec) in ok_ids:
+                lines.append("For %s: %s%s" % (label, _sentence_t1(rec, window), _sentence_t2(rec, window, history, now, ok_ids)))
+            elif episode is None or not history:
+                lines.append(_sentence_t4(label, window, never_seen))
+    return lines or [NOTHING_TO_ADD]
+
+
+def now_command(db_path, labels_path, history_dir, incomplete=(), now=None, explain=False):
     """The 'now' table as text. Reads the store and two files of the history folder; writes nothing."""
     now = int(time.time() if now is None else now)
     for label in incomplete:
@@ -389,6 +513,9 @@ def now_command(db_path, labels_path, history_dir, incomplete=(), now=None):
         lines.append("(%d unreadable history line(s) skipped)" % bad)
     lines.append("")
     lines.extend(NOW_FOOTER)
+    if explain:
+        lines.append("")
+        lines.extend(explain_block(grouped, now))
     return "\n".join(lines)
 
 
@@ -427,16 +554,21 @@ def distinct(records):
 
 def switch_flags(label, history):
     """Weekly window only: a reset time that moved while the earlier one had not passed, or a percentage that fell inside one period."""
+    return [flag for flag, _earlier, _later in flag_pairs(label, history)]
+
+
+def flag_pairs(label, history):
+    """-> [(flag, earlier observation, later observation)]: each flag of `switch_flags` with the two readings it was raised from."""
     flags = []
     for earlier, later in zip(history, history[1:], strict=False):
         moved = abs(later["resets_at"] - earlier["resets_at"])
         if moved > SWITCH_RESET_TOLERANCE_S and earlier["resets_at"] > later["observed_at"]:
-            flags.append({"label": label, "kind": "possible switch", "reason": "weekly reset time changed before the earlier one passed",
-                          "at": later["observed_at"], "moved_s": moved})
+            flags.append(({"label": label, "kind": "possible switch", "reason": "weekly reset time changed before the earlier one passed",
+                           "at": later["observed_at"], "moved_s": moved}, earlier, later))
         elif (moved <= SWITCH_RESET_TOLERANCE_S and later["observed_at"] < earlier["resets_at"]          # the earlier period must still be live at the later figure
               and later["used_percent"] < earlier["used_percent"] - PERCENT_FALL_TOLERANCE):
-            flags.append({"label": label, "kind": "possible switch", "reason": "used percentage fell within one reset period",
-                          "at": later["observed_at"], "fell_points": round(earlier["used_percent"] - later["used_percent"], 2)})
+            flags.append(({"label": label, "kind": "possible switch", "reason": "used percentage fell within one reset period",
+                           "at": later["observed_at"], "fell_points": round(earlier["used_percent"] - later["used_percent"], 2)}, earlier, later))
     return flags
 
 
@@ -533,6 +665,7 @@ def main(argv=None):
     now_parser.add_argument("--history", required=True)
     now_parser.add_argument("--incomplete-coverage", action="append", default=[], metavar="LABEL")
     now_parser.add_argument("--now", type=int)
+    now_parser.add_argument("--explain", action="store_true", help="print plain explanations under the table (what the readings allow, what is in doubt, what to check)")
     three = sub.add_parser("report")
     three.add_argument("--observations", nargs="+", required=True)
     three.add_argument("--from", dest="day_from", required=True)
@@ -553,7 +686,7 @@ def main(argv=None):
             print(line)
             return code
         if args.command == "now":
-            print(now_command(args.db, args.labels, args.history, args.incomplete_coverage, args.now))
+            print(now_command(args.db, args.labels, args.history, args.incomplete_coverage, args.now, args.explain))
             return 0
         print(report_command(args.observations, args.day_from, args.day_to, args.json))
         return 0
