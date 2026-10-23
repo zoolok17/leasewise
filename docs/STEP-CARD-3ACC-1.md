@@ -56,7 +56,7 @@ C:\lw\venv\Scripts\python.exe -I -B tools\three_accounts\measure.py now --db C:\
 | Option | Meaning |
 | --- | --- |
 | `--db` | The Leasewise store. Opened read-only (`file:...?mode=ro`), as `from-store` does. |
-| `--labels` | The alias table, `{store alias: "A" or "B" or "C"}`, kept outside the repository. |
+| `--labels` | The alias table, `{store alias: "A" or "B" or "C"}` or, for an alias whose seats changed subscription, a list of periods (card 3acc-4, `docs/STEP-CARD-3ACC-4.md`); kept outside the repository. |
 | `--history` | The folder the collector writes. Only `observations.jsonl` and `receipts.json` are read. |
 | `--incomplete-coverage LABEL` | Optional, may be repeated. Adds the coverage line under that label. |
 | `--now` | Optional, epoch seconds, for tests. The default is the clock. |
