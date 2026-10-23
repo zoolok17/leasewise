@@ -283,7 +283,7 @@ def parse_periods(value):
             raise Problem("every period except the last needs an until")
         if later[1] is None:
             raise Problem("every period after the first needs a from")
-        if (earlier[1] is not None and later[1] < earlier[1]) or later[2] is not None and later[2] <= earlier[1 if earlier[1] is not None else 2]:
+        if earlier[1] is not None and later[1] < earlier[1]:          # an open start is the earliest possible time, so it can never be overtaken
             raise Problem("periods of one alias must be in time order")
         if later[1] < earlier[2]:
             raise Problem("periods of one alias must not overlap")
@@ -319,10 +319,17 @@ def read_store(db_path, labels_path, seen_at):
         query = ("SELECT a.alias, r.observed_at, r.payload FROM readings r JOIN accounts a ON a.id = r.account_id JOIN machines m ON m.id = r.machine_id "
                  "WHERE r.kind = 'cli_window' AND m.alias = ? ORDER BY r.observed_at")
         for alias, observed_ms, payload in conn.execute(query, (STORE_MACHINE,)):
-            label = label_at(table.get(alias, []), observed_ms // 1000) if type(observed_ms) is int else None
-            if label is None:
+            periods = table.get(alias)
+            if periods is None:
                 skipped += 1
                 continue
+            if type(observed_ms) is int:
+                label = label_at(periods, observed_ms // 1000)
+                if label is None:                          # an integer time in no period: counted once, like an unmapped alias
+                    skipped += 1
+                    continue
+            else:
+                label = periods[0][0]                      # no usable time: the window loop below counts each recognised window, as before periods existed
             try:
                 windows = json.loads(payload)["windows"]
             except (ValueError, KeyError, TypeError):

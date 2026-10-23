@@ -131,6 +131,43 @@ class Boundaries(Periods):
         self.assertEqual(skipped, 0 + 2)
 
 
+class SkippedCount(Periods):
+    """A row whose observation time is not an integer is counted once per recognised window, as before periods existed; the old form and a period table agree."""
+
+    def build_bad(self, alias_value, rows):
+        self.table({ALIAS_ONE: alias_value})
+        self.build_store()
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("DELETE FROM readings")
+        for number, (observed, windows) in enumerate(rows):
+            payload = json.dumps({"windows": [{"key": k, "used_bps": 100, "resets_at": 1_000_000} for k in windows]})
+            conn.execute("INSERT INTO readings VALUES(?,?,?,?,?,?,?,?)", ("x%d" % number, "m1", "a1", None, "cli_window", observed, 0, payload))
+        conn.commit()
+        conn.close()
+        return measure.read_store(str(self.db), str(self.labels), LATER)
+
+    def test_two_rows_with_a_bad_time_and_two_windows_each_count_four_in_both_forms(self):
+        both = ["five_hour", "seven_day"]
+        for value in ("A", [{"label": "A"}], SPLIT[ALIAS_ONE]):
+            if self.db.exists():
+                self.db.unlink()
+            recs, skipped = self.build_bad(value, [("bad", both), ("bad", both)])
+            self.assertEqual((len(recs), skipped), (0, 4), value)
+
+    def test_rows_with_no_window_or_one_window_and_a_bad_time(self):
+        for value in ("A", SPLIT[ALIAS_ONE]):
+            if self.db.exists():
+                self.db.unlink()
+            recs, skipped = self.build_bad(value, [("bad", []), ("bad", ["five_hour"]), ("bad", ["five_hour", "seven_day"])])
+            self.assertEqual((len(recs), skipped), (0, 3), value)
+
+    def test_a_row_in_no_period_still_counts_once(self):
+        both = ["five_hour", "seven_day"]
+        recs, skipped = self.build_bad([{"label": "A", "from": "2026-10-23T09:00:00Z"}], [(1_000_000, both)])
+        self.assertEqual((len(recs), skipped), (0, 1))
+
+
 class Invalid(Periods):
     def test_each_invalid_table_exits_3_with_its_own_plain_sentence(self):
         good = {"label": "A", "until": "2026-10-23T07:50:00Z"}
@@ -157,6 +194,17 @@ class Invalid(Periods):
         }
         for name, (value, sentence) in cases.items():
             self.assertEqual(self.problem({ALIAS_ONE: value}), "not done: " + sentence, name)
+
+    def test_overlap_and_order_are_told_apart_by_the_start_only(self):
+        order, overlap = "periods of one alias must be in time order", "periods of one alias must not overlap"
+        cases = [
+            ([{"label": "A", "until": "2026-10-23T10:00:00Z"}, {"label": "C", "from": "2026-10-23T08:00:00Z", "until": "2026-10-23T09:00:00Z"}], overlap),     # inside an open start
+            ([{"label": "A", "from": "2026-10-23T09:00:00Z", "until": "2026-10-23T10:00:00Z"},
+              {"label": "C", "from": "2026-10-23T07:00:00Z", "until": "2026-10-23T08:00:00Z"}], order),
+            ([{"label": "A", "from": "2026-10-23T07:00:00Z", "until": "2026-10-23T10:00:00Z"}, {"label": "C", "from": "2026-10-23T09:00:00Z"}], overlap),
+        ]
+        for number, (value, sentence) in enumerate(cases):
+            self.assertEqual(self.problem({ALIAS_ONE: value}), "not done: " + sentence, number)
 
     def test_a_table_that_is_not_an_object_keeps_todays_sentence(self):
         self.assertEqual(self.problem(["A"]), "not done: " + BAD_ALIAS_SENTENCE)

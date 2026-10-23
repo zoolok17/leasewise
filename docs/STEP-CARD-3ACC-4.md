@@ -53,14 +53,16 @@ The program exits 3 with one plain sentence and never prints a path or a value f
 ## Choices the brief did not settle
 
 1. **A period after the first without `from`** gets its own sentence (the brief said such a period needs a `from`).
-2. **Order versus overlap:** a period that starts before the previous one starts, or ends no later than it starts, is "out of order"; otherwise a start before the previous `until` is "overlap".
+2. **Order versus overlap:** an open start counts as the earliest possible time. A period that starts before the previous period's start is "out of order" (a previous period with no start can never be overtaken this way); otherwise a period that starts before the previous `until` is "overlap". A period's `until` is not compared with the previous period's start.
 3. **The reading's time** is its observation time in whole seconds (the store's milliseconds divided by 1000, cut), the same value `now` and `report` use.
 4. **Checking happens when the table is read**, for every alias, so a mistake in an alias with no readings still stops the program.
-5. **The table is not checked for readings that fall in no period of an alias that has them** beyond counting them as skipped.
+5. **Counting skipped rows.** A row of an alias not in the table counts 1. A row of an alias in the table whose observation time is not an integer goes on to the window loop, so each recognised window counts once, as before periods existed (whatever form the alias's value has). A row with an integer time that falls in no period counts 1, like an unmapped alias.
 
 ## Tests
 
-`tests/test_three_accounts_periods.py` (9 tests), with made-up aliases and the shapes of the real case. They cover: the repro (the 07:35 readings under A and the 07:52 readings under C
+`tests/test_three_accounts_periods.py` (13 tests), with made-up aliases and the shapes of the real case. They cover: the repro (the 07:35 readings under A and the 07:52 readings under C
 through `read_store`, `from_store` and `now_command`; A's weekly row shows 92%, C's 0%, no "possible switch" in the table or the `--explain` block, and the explanation output goes
 through the shared `check_wording`); the store still opened with `mode=ro`; the old form and one all-time period giving byte-identical `from-store` and `now` output; a reading exactly at a
 `from` (in) and at an `until` (out); readings in a gap or before the first `from` skipped and counted; and each mistake above exiting 3 with its sentence. Every earlier test passes untouched.
+
+Added in fix round 1: the skipped-count tests (two rows with a bad time and two windows each give 4 in the old form, as one all-time period and as a period table; rows with no window or one window; a row in no period counts 1) and a test that asserts the overlap and out-of-order sentences, including an open first start followed by a period inside it (overlap).
