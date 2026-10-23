@@ -21,6 +21,7 @@ import datetime
 import decimal
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -242,6 +243,61 @@ def _collect_locked(data, history, now):
 
 # ---------------------------------------------------------------- from-store
 
+PERIOD_KEYS = {"label", "from", "until"}
+PERIOD_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def _period_time(value):
+    """Epoch seconds of a UTC time written exactly as 2026-10-23T07:50:00Z; a plain sentence otherwise."""
+    if type(value) is str and PERIOD_TIME.fullmatch(value):
+        try:
+            return calendar.timegm(datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").timetuple())
+        except ValueError:
+            pass
+    raise Problem("a period time must look like 2026-10-23T07:50:00Z")
+
+
+def parse_periods(value):
+    """-> [(label, start, end)] for one alias: a label for all time, or a list of periods in time order (start inclusive, end exclusive; None is open)."""
+    if type(value) is str and value in ec.LABELS:
+        return [(value, None, None)]
+    if type(value) is not list:
+        raise Problem("the alias table must map an account alias to exactly A, B or C")
+    if not value:
+        raise Problem("an alias with a list of periods needs at least one period")
+    periods = []
+    for item in value:
+        if type(item) is not dict:
+            raise Problem("each period must be an object with a label and optional from and until")
+        if not set(item) <= PERIOD_KEYS:
+            raise Problem("a period may only have the keys label, from and until")
+        if item.get("label") not in ec.LABELS:
+            raise Problem("a period label must be exactly A, B or C")
+        start = _period_time(item["from"]) if "from" in item else None
+        end = _period_time(item["until"]) if "until" in item else None
+        if start is not None and end is not None and start >= end:
+            raise Problem("a period must start before it ends")
+        periods.append((item["label"], start, end))
+    for earlier, later in zip(periods, periods[1:], strict=False):
+        if earlier[2] is None:
+            raise Problem("every period except the last needs an until")
+        if later[1] is None:
+            raise Problem("every period after the first needs a from")
+        if earlier[1] is not None and later[1] < earlier[1]:          # an open start is the earliest possible time, so it can never be overtaken
+            raise Problem("periods of one alias must be in time order")
+        if later[1] < earlier[2]:
+            raise Problem("periods of one alias must not overlap")
+    return periods
+
+
+def label_at(periods, observed_at):
+    """The label of the period holding `observed_at`, or None."""
+    for label, start, end in periods:
+        if (start is None or start <= observed_at) and (end is None or observed_at < end):
+            return label
+    return None
+
+
 def read_store(db_path, labels_path, seen_at):
     """-> (observation records, number skipped). The store is opened read-only; STORE_PROMISE says exactly what that leaves on disk."""
     try:
@@ -249,8 +305,9 @@ def read_store(db_path, labels_path, seen_at):
             table = json.loads(handle.read(65_537).decode("utf-8"), object_pairs_hook=ec._pairs)
     except (OSError, ValueError):
         raise Problem("the alias table cannot be read as a JSON object") from None
-    if type(table) is not dict or not all(type(k) is str and v in ec.LABELS for k, v in table.items()):
+    if type(table) is not dict or not all(type(k) is str for k in table):
         raise Problem("the alias table must map an account alias to exactly A, B or C")
+    table = {alias: parse_periods(value) for alias, value in table.items()}
     uri = Path(db_path).resolve().as_uri() + "?mode=ro"
     records = []
     skipped = 0
@@ -262,10 +319,17 @@ def read_store(db_path, labels_path, seen_at):
         query = ("SELECT a.alias, r.observed_at, r.payload FROM readings r JOIN accounts a ON a.id = r.account_id JOIN machines m ON m.id = r.machine_id "
                  "WHERE r.kind = 'cli_window' AND m.alias = ? ORDER BY r.observed_at")
         for alias, observed_ms, payload in conn.execute(query, (STORE_MACHINE,)):
-            label = table.get(alias)
-            if label is None:
+            periods = table.get(alias)
+            if periods is None:
                 skipped += 1
                 continue
+            if type(observed_ms) is int:
+                label = label_at(periods, observed_ms // 1000)
+                if label is None:                          # an integer time in no period: counted once, like an unmapped alias
+                    skipped += 1
+                    continue
+            else:
+                label = periods[0][0]                      # no usable time: the window loop below counts each recognised window, as before periods existed
             try:
                 windows = json.loads(payload)["windows"]
             except (ValueError, KeyError, TypeError):
